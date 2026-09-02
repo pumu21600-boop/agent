@@ -2,8 +2,11 @@
 //!
 //! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
 //! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
+//! P8：请求参数结构化（采样/思考按厂商适配，数据来自 providers.json）、本地限流（max_rpm）、
+//! embeddings 接口（EMBEDDING 角色预留）。
 
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
@@ -14,11 +17,152 @@ use crate::observability::{self, EventType};
 
 pub mod providers;
 
+use providers::{ProviderPreset, ReasoningStyle};
+
 pub struct Gateway {
     /// 热可重建的 HTTP 客户端：reqwest 在构建时固化系统代理设置，
     /// 之后 Clash 开/关/换节点不会自动跟进。网络层失败时 rebuild_client()
     /// 重新读系统代理，服务不用重启就能自愈。
     client: RwLock<reqwest::Client>,
+    /// 本地限流（P8）：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
+    throttle: Option<Throttle>,
+}
+
+/// 请求参数（P8）：全部可选，None=不发字段走渠道默认。
+/// 思考字段来自「每配置用户设置 + providers.json 厂商适配」的组合。
+#[derive(Debug, Clone, Default)]
+pub struct ChatParams {
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    /// 思考开关：Some("on")/Some("off")；None=渠道默认（不发参数）
+    pub thinking: Option<String>,
+    /// 思考预算（thinking_budget_param 指定的参数值，Qwen 系）
+    pub thinking_budget: Option<u64>,
+    /// 思考接线方式（providers.json reasoning_style）
+    pub reasoning_style: ReasoningStyle,
+    /// 布尔思考开关参数名（Qwen 系 enable_thinking）
+    pub enable_thinking_param: Option<String>,
+    /// 思考预算参数名（Qwen 系 thinking_budget）
+    pub thinking_budget_param: Option<String>,
+    /// 思考是否计入 max_tokens（GLM 实测占；仅记日志供截断排查，不改语义）
+    pub reasoning_counts_in_max_tokens: bool,
+}
+
+impl ChatParams {
+    /// 从供应商预设取厂商适配字段（用户设置字段由调用方另行填入）。
+    pub fn from_preset(p: &ProviderPreset) -> Self {
+        Self {
+            reasoning_style: p.reasoning_style,
+            enable_thinking_param: p.enable_thinking_param.clone(),
+            thinking_budget_param: p.thinking_budget_param.clone(),
+            reasoning_counts_in_max_tokens: p.reasoning_counts_in_max_tokens,
+            ..Default::default()
+        }
+    }
+
+    fn describe_reasoning(&self) -> Value {
+        json!({
+            "reasoning_style": self.reasoning_style.as_str(),
+            "thinking": self.thinking,
+            "reasoning_counts_in_max_tokens": self.reasoning_counts_in_max_tokens,
+        })
+    }
+}
+
+/// 组装 /chat/completions 请求体（纯函数，单测覆盖各厂商样式）。
+/// 硬约束：不含 api_key；思考参数按 reasoning_style 适配而非按 provider id 分支。
+pub fn build_body(
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    params: &ChatParams,
+    tools: Option<&Value>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+    if stream {
+        // 流式末尾带回 usage（OpenAI 兼容渠道普遍支持；不支持的渠道会忽略）
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    if let Some(t) = tools {
+        body["tools"] = t.clone();
+    }
+    if let Some(mt) = params.max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
+    if let Some(t) = params.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(t) = params.top_p {
+        body["top_p"] = json!(t);
+    }
+    match params.reasoning_style {
+        // GLM：{"thinking":{"type":"enabled|disabled"}}
+        ReasoningStyle::ThinkingParam => {
+            if let Some(t) = params.thinking.as_deref() {
+                body["thinking"] = json!({ "type": if t == "on" { "enabled" } else { "disabled" } });
+            }
+        }
+        // OpenAI 风格：on→medium；off 不发（o 系无可靠"关"参数）
+        ReasoningStyle::EffortParam => {
+            if params.thinking.as_deref() == Some("on") {
+                body["reasoning_effort"] = json!("medium");
+            }
+        }
+        _ => {}
+    }
+    // Qwen 系布尔开关（enable_thinking）与预算参数（thinking_budget）独立于样式生效
+    if let (Some(name), Some(t)) = (&params.enable_thinking_param, params.thinking.as_deref()) {
+        body[name.as_str()] = json!(t == "on");
+    }
+    if let (Some(name), Some(b)) = (&params.thinking_budget_param, params.thinking_budget) {
+        body[name.as_str()] = json!(b);
+    }
+    body
+}
+
+/// 本地限流器（P8）：请求间保证最小间隔，排队等待而非拒绝。
+struct Throttle {
+    min_interval: std::time::Duration,
+    last: tokio::sync::Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    fn new(max_rpm: u32) -> Self {
+        // ceil(60_000 / rpm) ms；rpm=0 不该走到这（Gateway 里已判空）
+        let ms = (60_000f64 / max_rpm.max(1) as f64).ceil() as u64;
+        Self { min_interval: std::time::Duration::from_millis(ms.max(1)), last: tokio::sync::Mutex::new(None) }
+    }
+
+    async fn gate(&self) {
+        let wait = {
+            let mut last = self.last.lock().await;
+            let w = match *last {
+                Some(t) => self
+                    .min_interval
+                    .checked_sub(t.elapsed())
+                    .unwrap_or(std::time::Duration::ZERO),
+                None => std::time::Duration::ZERO,
+            };
+            if w.is_zero() {
+                *last = Some(Instant::now());
+            }
+            w
+        };
+        if !wait.is_zero() {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.throttle", "wait_ms": wait.as_millis() as u64 }),
+            );
+            tokio::time::sleep(wait).await;
+            // 睡完补记时间戳，保证下一发的间隔基准
+            *self.last.lock().await = Some(Instant::now());
+        }
+    }
 }
 
 fn build_client() -> reqwest::Client {
@@ -63,7 +207,21 @@ pub enum ChatOutcome {
 
 impl Gateway {
     pub fn new() -> Self {
-        Self { client: RwLock::new(build_client()) }
+        Self { client: RwLock::new(build_client()), throttle: None }
+    }
+
+    /// 打开本地限流（P8）：max_rpm>0 时生效。启动时由 main 配置一次（Arc 包装前）。
+    pub fn set_max_rpm(&mut self, max_rpm: u32) {
+        if max_rpm > 0 && self.throttle.is_none() {
+            self.throttle = Some(Throttle::new(max_rpm));
+        }
+    }
+
+    /// 发请求前过本地限流（max_rpm=0 时直通）。
+    async fn gate(&self) {
+        if let Some(t) = &self.throttle {
+            t.gate().await;
+        }
     }
 
     /// 重建 HTTP 客户端（重新读系统代理）。网络层失败时由 send() 路径调用；
@@ -93,6 +251,7 @@ impl Gateway {
         &self,
         build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
+        self.gate().await;
         let mut rebuilt = false;
         let mut attempt_429 = 0u32;
         loop {
@@ -187,7 +346,7 @@ impl Gateway {
         Ok(ids)
     }
 
-    /// 非流式单轮补全（P7 滚动摘要用）：返回 choices[0].message.content。
+    /// 非流式单轮补全（P7 滚动摘要 / P8 标题生成用）：返回 choices[0].message.content。
     /// 不查取消标志（摘要失败由调用方降级），超时走客户端全局 600s。
     pub async fn complete(
         &self,
@@ -195,19 +354,11 @@ impl Gateway {
         model: &str,
         api_key: &str,
         messages: &Value,
-        max_tokens: u64,
+        params: &ChatParams,
     ) -> anyhow::Result<String> {
-        if api_key.trim().is_empty() {
-            return Err(anyhow!("API key 未设置，无法生成摘要"));
-        }
         let url = Self::chat_url(base_url);
-        let body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-            "max_tokens": max_tokens,
-        });
-        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "summary" }));
+        let body = build_body(model, messages, false, params, None);
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "aux" }));
         let response = self
             .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
             .await
@@ -217,7 +368,7 @@ impl Gateway {
             let text = response.text().await.unwrap_or_default();
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
-        let data: Value = response.json().await.context("解析摘要响应失败")?;
+        let data: Value = response.json().await.context("解析补全响应失败")?;
         let raw = data
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
@@ -231,22 +382,88 @@ impl Gateway {
         Ok(clean)
     }
 
-    /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
-    /// 1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
-    /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn stream_chat(
-        self: &Arc<Self>,
+    /// 向量嵌入（P8 EMBEDDING 角色预留，OpenAI 兼容 /embeddings）。
+    /// 记忆 v1 不消费；语义检索需求真实出现后由上层接线。
+    pub async fn embed(
+        &self,
         base_url: &str,
         model: &str,
         api_key: &str,
+        input: &[String],
+    ) -> anyhow::Result<Vec<Vec<f64>>> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("API key 未设置，无法调用 embeddings"));
+        }
+        let b = base_url.trim().trim_end_matches('/');
+        let url = format!("{b}/embeddings");
+        let body = json!({ "model": model, "input": input });
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "purpose": "embedding", "inputs": input.len() }));
+        let response = self
+            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
+            .await
+            .with_context(|| format!("请求渠道失败: {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+        let data: Value = response.json().await.context("解析 embeddings 响应失败")?;
+        let vecs: Vec<Vec<f64>> = data
+            .pointer("/data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|d| {
+                        d.get("embedding")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_f64).collect())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if vecs.is_empty() {
+            return Err(anyhow!("embeddings 响应不含向量"));
+        }
+        Ok(vecs)
+    }
+}
+
+/// 一轮模型调用的目标渠道（P8 降级链/角色映射的基本单位）。
+#[derive(Debug, Clone, Default)]
+pub struct Channel {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub params: ChatParams,
+}
+
+impl Channel {
+    pub fn new(base_url: &str, model: &str, api_key: &str, params: ChatParams) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            params,
+        }
+    }
+}
+
+impl Gateway {
+    /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
+    /// 1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
+    /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
+    pub async fn stream_chat(
+        self: &Arc<Self>,
+        channel: &Channel,
         messages: &Value,
         tools: Option<&Value>,
-        max_tokens: Option<u64>,
         cancel: &CancelFlag,
         on_chunk: impl Fn(&Value),
     ) -> anyhow::Result<ChatOutcome> {
-        if api_key.trim().is_empty() {
+        let base_url = &channel.base_url;
+        let model = &channel.model;
+        if channel.api_key.trim().is_empty() {
             let msg = "API key 未设置：请在设置面板填写并保存（或设环境变量 DEEPSEEK_API_KEY）";
             observability::event(EventType::Error, json!({ "message": msg }));
             return Err(anyhow!(msg));
@@ -259,27 +476,18 @@ impl Gateway {
         }
 
         let url = Self::chat_url(base_url);
-        let mut body = json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-            // 流式末尾带回 usage（OpenAI 兼容渠道普遍支持；不支持的渠道会忽略）
-            "stream_options": { "include_usage": true },
-        });
-        if let Some(t) = tools {
-            body["tools"] = t.clone();
-        }
-        if let Some(mt) = max_tokens {
-            body["max_tokens"] = json!(mt);
-        }
+        let body = build_body(model, messages, true, &channel.params, tools);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
-        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body }));
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.request", "url": url, "body": body, "reasoning": channel.params.describe_reasoning() }),
+        );
         observability::debug(&format!("[gateway] POST {url}"));
         observability::debug(&format!("[gateway] request body: {body}"));
 
         let response = self
-            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
+            .send(|c| c.post(&url).bearer_auth(&channel.api_key).json(&body))
             .await
             .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
 
@@ -541,6 +749,70 @@ mod tests {
             let dir = std::env::temp_dir().join("agent-test-logs");
             let _ = crate::observability::init(&dir, "gw.jsonl", format!("gw-{}", uuid::Uuid::new_v4()));
         });
+    }
+
+    #[test]
+    fn build_body_vendor_styles() {
+        // REGISTRY 是进程级 OnceLock：测试进程里手动加载一次（幂等）
+        let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
+        let msgs = json!([{"role":"user","content":"hi"}]);
+        // GLM（thinking_param）：on/off 对象形态；思考占 max_tokens 只影响日志
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
+        p.thinking = Some("on".into());
+        p.max_tokens = Some(2048);
+        let b = build_body("glm-4.6", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"enabled"}));
+        assert_eq!(b["max_tokens"], json!(2048));
+        assert_eq!(b["stream_options"]["include_usage"], json!(true));
+        p.thinking = Some("off".into());
+        let b = build_body("glm-4.6", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"disabled"}));
+        // Qwen（布尔开关 + 预算，官方思考不占 max_tokens）
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("dashscope").unwrap());
+        p.thinking = Some("off".into());
+        p.thinking_budget = Some(512);
+        let b = build_body("qwen-plus", &msgs, false, &p, None);
+        assert_eq!(b["enable_thinking"], json!(false));
+        assert_eq!(b["thinking_budget"], json!(512));
+        assert!(b.get("thinking").is_none(), "reasoning_content 样式不发 thinking 对象");
+        p.thinking = Some("on".into());
+        let b = build_body("qwen-plus", &msgs, false, &p, None);
+        assert_eq!(b["enable_thinking"], json!(true));
+        // OpenAI（effort_param）：on 发 medium，off 不发
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap());
+        p.thinking = Some("on".into());
+        let b = build_body("gpt-5", &msgs, true, &p, None);
+        assert_eq!(b["reasoning_effort"], json!("medium"));
+        p.thinking = Some("off".into());
+        let b = build_body("gpt-5", &msgs, true, &p, None);
+        assert!(b.get("reasoning_effort").is_none(), "o 系无可靠关参数，off 不发");
+        // 默认（reasoning_content）：完全不带思考参数
+        let b = build_body("deepseek-chat", &msgs, true, &ChatParams::default(), None);
+        assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none());
+        // 采样参数：有值才发
+        let mut p = ChatParams::default();
+        p.temperature = Some(0.3);
+        p.top_p = Some(0.9);
+        let b = build_body("m", &msgs, true, &p, None);
+        assert_eq!(b["temperature"], json!(0.3));
+        assert_eq!(b["top_p"], json!(0.9));
+        let b = build_body("m", &msgs, true, &ChatParams::default(), None);
+        assert!(b.get("temperature").is_none() && b.get("top_p").is_none());
+        // 非流式不带 stream_options
+        let b = build_body("m", &msgs, false, &ChatParams::default(), None);
+        assert!(b.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn throttle_enforces_interval() {
+        init_logger();
+        let t = Throttle::new(60); // 60 rpm → 最小间隔 1s
+        let start = Instant::now();
+        t.gate().await; // 第一发直通
+        t.gate().await; // 第二发必须等满 1s
+        let elapsed = start.elapsed();
+        assert!(elapsed >= std::time::Duration::from_millis(900), "应被节流 ≥0.9s，实际 {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_millis(2500), "不应过度等待，实际 {elapsed:?}");
     }
 
     #[test]

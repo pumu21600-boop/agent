@@ -58,7 +58,13 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
 
-    let gateway = Arc::new(gateway::Gateway::new());
+    let mut gw = gateway::Gateway::new();
+    // P8 本地限流：[gateway] max_rpm>0 时打开（全渠道共用节流器）
+    gw.set_max_rpm(config.gateway.max_rpm);
+    if config.gateway.max_rpm > 0 {
+        observability::debug(&format!("[gateway] 本地限流已开启: {} rpm", config.gateway.max_rpm));
+    }
+    let gateway = Arc::new(gw);
     let cancel = Arc::new(core::cancel::CancelFlag::new());
     let prompt_path = manifest.join("prompts").join("system.md");
     let system_prompt = std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
@@ -85,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         memory,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
+        // P8 角色映射与网关级配置（降级链/限流参数）
+        roles_cfg: Arc::new(config.roles.clone()),
+        gateway_cfg: Arc::new(config.gateway.clone()),
     };
     let app = server::router(state, manifest.join("web").join("dist"));
 

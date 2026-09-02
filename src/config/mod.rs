@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub gateway: GatewayConfig,
     #[serde(default)]
+    pub roles: RolesConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub agent: AgentConfig,
@@ -28,6 +30,21 @@ pub struct Config {
     pub recovery: RecoveryConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+}
+
+/// P8 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的
+/// 配置名或配置 id；未配置的角色回落主渠道。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RolesConfig {
+    /// 滚动摘要（SUMMARY）
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// 会话标题生成（TITLE_GENERATION）
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 向量嵌入（EMBEDDING，接口已预留 gateway.embed，暂无消费方）
+    #[serde(default)]
+    pub embedding: Option<String>,
 }
 
 /// 记忆系统参数（施工单 009）。
@@ -135,6 +152,14 @@ pub struct GatewayConfig {
     pub base_url: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// 本地限流（P8）：每分钟最多发起多少次模型请求；0=不限（默认）。
+    /// 全渠道共用一个节流器，超过时排队等待（只影响节奏，不报错）。
+    #[serde(default)]
+    pub max_rpm: u32,
+    /// 降级链（P8）：主渠道当轮调用失败时按序切换的配置名（settings.configs 的 name）。
+    /// 每次切换发 Notice；全部失败才报错。取消标志置位时立即停，不降级。
+    #[serde(default)]
+    pub fallback_configs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +220,12 @@ impl Default for ServerConfig {
 }
 impl Default for GatewayConfig {
     fn default() -> Self {
-        Self { base_url: default_base_url(), model: default_model() }
+        Self {
+            base_url: default_base_url(),
+            model: default_model(),
+            max_rpm: 0,
+            fallback_configs: Vec::new(),
+        }
     }
 }
 impl Default for LoggingConfig {
@@ -236,6 +266,7 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             gateway: GatewayConfig::default(),
+            roles: RolesConfig::default(),
             logging: LoggingConfig::default(),
             agent: AgentConfig::default(),
             sandbox: SandboxConfig::default(),

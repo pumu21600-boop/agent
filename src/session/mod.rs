@@ -154,6 +154,26 @@ impl SessionManager {
             Err(e) => Err(e).with_context(|| format!("删除会话失败: {}", self.path(id).display())),
         }
     }
+
+    /// 改会话标题（P8 TITLE 角色）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
+    pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        let Some(mut f) = self.get(id) else { return Ok(()) };
+        f.title = title.chars().take(60).collect();
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let file = SessionFile {
+            id: f.id,
+            title: f.title,
+            created_at: f.created_at,
+            updated_at: now,
+            messages: f.messages,
+            summary: f.summary,
+        };
+        let tmp = self.path(id).with_extension("json.tmp");
+        let text = serde_json::to_string(&file).context("会话序列化失败")?;
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, self.path(id))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

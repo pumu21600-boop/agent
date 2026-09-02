@@ -44,6 +44,18 @@ pub struct Config {
     /// 该配置模型的最大输出长度（tokens）；随请求作为 max_tokens 发给渠道
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// 采样参数（P8）：None=不发字段走渠道默认
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// 思考开关（P8）："on"/"off"；None=渠道默认。参数形态由 providers.json 的
+    /// reasoning_style/enable_thinking_param 按厂商适配
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// 思考预算（P8；Qwen 系 thinking_budget，厂商适配字段指定参数名）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +71,15 @@ pub struct Settings {
     pub context_length: Option<u64>,
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// 镜像：采样参数与思考开关（None=渠道默认）
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub thinking_budget: Option<u64>,
     /// 归一化 base_url → DPAPI 加密后的 key（base64）
     #[serde(default)]
     pub keys: BTreeMap<String, String>,
@@ -82,6 +103,10 @@ impl Default for Settings {
             models: Vec::new(),
             context_length: None,
             max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_budget: None,
             keys: BTreeMap::new(),
             key_cipher: None,
             configs: Vec::new(),
@@ -220,6 +245,10 @@ impl Settings {
                 key_cipher: None,
                 context_length: None,
                 max_output_tokens: None,
+                temperature: None,
+                top_p: None,
+                thinking: None,
+                thinking_budget: None,
             });
         }
         self.assign_missing_names();
@@ -282,6 +311,10 @@ impl Settings {
             self.models.clone(),
             self.context_length,
             self.max_output_tokens,
+            self.temperature,
+            self.top_p,
+            self.thinking.clone(),
+            self.thinking_budget,
         );
         if let Some(c) = self.active_mut_() {
             c.provider_id = snap.0;
@@ -290,6 +323,10 @@ impl Settings {
             c.models = snap.3;
             c.context_length = snap.4;
             c.max_output_tokens = snap.5;
+            c.temperature = snap.6;
+            c.top_p = snap.7;
+            c.thinking = snap.8;
+            c.thinking_budget = snap.9;
         }
     }
 
@@ -305,6 +342,12 @@ impl Settings {
         self.base_url = c.base_url;
         self.model = c.model;
         self.models = c.models;
+        self.context_length = c.context_length;
+        self.max_output_tokens = c.max_output_tokens;
+        self.temperature = c.temperature;
+        self.top_p = c.top_p;
+        self.thinking = c.thinking;
+        self.thinking_budget = c.thinking_budget;
         self.active_config_id = Some(id.to_string());
         true
     }
@@ -324,6 +367,10 @@ impl Settings {
             key_cipher: None,
             context_length: None,
             max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_budget: None,
         });
         self.active_config_id = Some(id.clone());
         id
@@ -339,13 +386,17 @@ impl Settings {
         if self.active_config_id.as_deref() == Some(id) {
             self.active_config_id = None;
             self.ensure_active_config();
-            if let Some(c) = self.active() {
-                let (p, b, m, ms) =
-                    (c.provider_id.clone(), c.base_url.clone(), c.model.clone(), c.models.clone());
-                self.provider_id = p;
-                self.base_url = b;
-                self.model = m;
-                self.models = ms;
+            if let Some(c) = self.active().cloned() {
+                self.provider_id = c.provider_id;
+                self.base_url = c.base_url;
+                self.model = c.model;
+                self.models = c.models;
+                self.context_length = c.context_length;
+                self.max_output_tokens = c.max_output_tokens;
+                self.temperature = c.temperature;
+                self.top_p = c.top_p;
+                self.thinking = c.thinking;
+                self.thinking_budget = c.thinking_budget;
             }
         }
         true

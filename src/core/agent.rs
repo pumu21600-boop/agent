@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::config::{AgentConfig, ContextConfig, RecoveryConfig, SandboxConfig};
 use crate::context;
 use crate::core::cancel::CancelFlag;
-use crate::gateway::{ChatOutcome, Gateway, extract_delta};
+use crate::gateway::{Channel, ChatOutcome, ChatParams, Gateway, extract_delta};
 use crate::observability::{self, EventType};
 use crate::recovery;
 use crate::tools::{self, ExecConfig};
@@ -31,6 +31,8 @@ pub enum AgentEvent {
     Snapshot { messages: Vec<Value> },
     /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
     Notice(String),
+    /// P8 TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
+    Title(String),
     /// 任务改动统计条（P6.1）：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
     Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
     /// P7 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
@@ -50,11 +52,11 @@ fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
 }
 
 /// P7 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
+/// P8 角色映射：优先走 [roles] summary 专用渠道，失败回落主渠道再降级占位符。
 async fn summarize_folded(
     gateway: &Arc<Gateway>,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    primary: &Channel,
+    summary_role: Option<&Channel>,
     prior: &Option<String>,
     folded: &[Value],
 ) -> Option<String> {
@@ -89,9 +91,50 @@ async fn summarize_folded(
         {"role": "system", "content": "你是对话历史压缩器。把给定对话压成不超过300字中文要点，必须保留：任务目标、关键决定、改过哪些文件、未完成事项。只输出要点正文，不要开场白。"},
         {"role": "user", "content": text},
     ]);
-    let out = gateway.complete(base_url, model, api_key, &req, 400).await.ok()?;
+    // 辅助调用固定小输出，压 max_tokens=400；其余参数跟渠道走
+    let params = ChatParams { max_tokens: Some(400), ..primary.params.clone() };
+    let mut out = None;
+    // 角色渠道优先（参数用角色的；无角色渠道则直接主渠道）
+    if let Some(role) = summary_role {
+        let rp = ChatParams { max_tokens: Some(400), ..role.params.clone() };
+        let ch = Channel { params: rp, ..role.clone() };
+        out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
+    }
+    // 回落主渠道
+    if out.is_none() {
+        let ch = Channel { params, ..primary.clone() };
+        out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
+    }
+    let out = out?;
     let out = out.trim().to_string();
     (!out.is_empty()).then_some(out)
+}
+
+/// P8 TITLE 角色：用最终回答生成 ≤20 字会话标题。失败返回 None（保留机械截断标题）。
+async fn generate_title(gateway: &Arc<Gateway>, ch: &Channel, answer: &str) -> Option<String> {
+    let text: String = answer.chars().take(1200).collect();
+    let req = json!([
+        {"role": "system", "content": "根据对话内容生成一个不超过20字的中文会话标题。只输出标题本身，不要引号、句号或任何解释。"},
+        {"role": "user", "content": text},
+    ]);
+    let params = ChatParams { max_tokens: Some(50), ..ch.params.clone() };
+    let out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &params).await.ok()?;
+    let mut t = out.trim().trim_matches(|c| c == '"' || c == '“' || c == '”' || c == '「' || c == '」').to_string();
+    // 防跑偏：截到 30 字符以内（标题超长说明模型没听话，硬截断）
+    t = t.chars().take(30).collect();
+    (!t.is_empty()).then_some(t)
+}
+
+/// P8 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
+pub struct LoopChannels {
+    /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
+    pub primary: Channel,
+    /// SUMMARY 专用渠道（未配置=主渠道）
+    pub summary: Option<Channel>,
+    /// TITLE 专用渠道；None=不生成标题
+    pub title: Option<Channel>,
+    /// 降级链：主渠道当轮失败时按序替换重试
+    pub fallbacks: Vec<Channel>,
 }
 
 /// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
@@ -169,9 +212,7 @@ fn short_args(args: &str, max_chars: usize) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task(
     gateway: &Arc<Gateway>,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
+    channels: &LoopChannels,
     system_prompt: &str,
     messages: &[Value],
     cancel: &CancelFlag,
@@ -181,10 +222,11 @@ pub async fn run_task(
     rec_cfg: &RecoveryConfig,
     mem: &crate::memory::Memory,
     prior_summary: Option<String>,
-    max_output_tokens: Option<u64>,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent) + Send + Sync,
 ) -> anyhow::Result<LoopOutcome> {
+    let primary = &channels.primary;
+    let max_output_tokens = primary.params.max_tokens;
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
     msgs.extend(messages.iter().cloned());
@@ -244,7 +286,7 @@ pub async fn run_task(
                 );
                 // P7 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
                 if !stats.folded.is_empty() && mem.enabled {
-                    match summarize_folded(gateway, base_url, model, api_key, &running_summary, &stats.folded).await {
+                    match summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded).await {
                         Some(s) => {
                             running_summary = Some(s.clone());
                             observability::event(
@@ -318,30 +360,51 @@ pub async fn run_task(
                 }
             }
         }
-        observability::debug(&format!("[loop] step {step} 调用模型 {model}"));
+        observability::debug(&format!("[loop] step {step} 调用模型 {}", primary.model));
 
-        let outcome = gateway
-            .stream_chat(
-                base_url,
-                model,
-                api_key,
-                &Value::Array(msgs.clone()),
-                Some(&tools_def),
-                max_output_tokens,
-                cancel,
-                |chunk| {
-                    let delta = extract_delta(chunk);
-                    if !delta.content.is_empty() {
-                        on_event(AgentEvent::Content(delta.content));
-                    }
-                    if let Some(r) = delta.reasoning {
-                        if !r.is_empty() {
-                            on_event(AgentEvent::Reasoning(r));
+        // P8 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）
+        let mut chain: Vec<&Channel> = Vec::with_capacity(1 + channels.fallbacks.len());
+        chain.push(primary);
+        chain.extend(channels.fallbacks.iter());
+        let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
+        for (i, ch) in chain.iter().enumerate() {
+            if i > 0 {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.fallback", "step": step, "from": primary.model, "to": ch.model, "base_url": ch.base_url }),
+                );
+                let last_err = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+                on_event(AgentEvent::Notice(format!(
+                    "主渠道调用失败（{last_err}），已切换到降级渠道「{}」",
+                    ch.model
+                )));
+            }
+            outcome = gateway
+                .stream_chat(
+                    ch,
+                    &Value::Array(msgs.clone()),
+                    Some(&tools_def),
+                    cancel,
+                    |chunk| {
+                        let delta = extract_delta(chunk);
+                        if !delta.content.is_empty() {
+                            on_event(AgentEvent::Content(delta.content));
                         }
-                    }
-                },
-            )
-            .await?;
+                        if let Some(r) = delta.reasoning {
+                            if !r.is_empty() {
+                                on_event(AgentEvent::Reasoning(r));
+                            }
+                        }
+                    },
+                )
+                .await;
+            match &outcome {
+                Ok(ChatOutcome::Done(_)) => break,
+                Ok(ChatOutcome::Cancelled) => return Ok(LoopOutcome::Cancelled),
+                Err(_) => continue, // 换下一个渠道
+            }
+        }
+        let outcome = outcome?;
 
         let turn = match outcome {
             ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
@@ -392,6 +455,16 @@ pub async fn run_task(
             );
             // P7 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
+            // P8 TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
+            if let Some(tch) = &channels.title {
+                if let Some(title) = generate_title(gateway, tch, &final_text).await {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "session.titled", "title": title }),
+                    );
+                    on_event(AgentEvent::Title(title));
+                }
+            }
             return Ok(LoopOutcome::Done);
         }
 

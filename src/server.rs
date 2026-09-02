@@ -53,6 +53,10 @@ pub struct AppState {
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
     pub approval_mode: Arc<std::sync::RwLock<String>>,
+    /// P8 角色映射（config.toml [roles]：summary/title/embedding 的配置名）
+    pub roles_cfg: Arc<crate::config::RolesConfig>,
+    /// P8 网关级配置（config.toml [gateway]：max_rpm / fallback_configs）
+    pub gateway_cfg: Arc<crate::config::GatewayConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +114,17 @@ pub struct SettingsUpdate {
     /// 当前模型最大输出长度（tokens；0=清除）
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
+    /// 采样参数（P8；null/缺省=不动，0 或 -1=清除走渠道默认）
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    /// 思考开关（P8）："on"/"off"/""（空=清除走渠道默认）
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// 思考预算（P8；0=清除）
+    #[serde(default)]
+    pub thinking_budget: Option<u64>,
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
@@ -148,6 +163,55 @@ fn json_event(payload: Value) -> Event {
     Event::default().json_data(payload).expect("SSE 事件序列化失败")
 }
 
+/// P8：从设置镜像 + 供应商预设组装请求参数（采样/思考/厂商适配）。
+fn build_chat_params(
+    s: &Settings,
+    preset: Option<&gateway::providers::ProviderPreset>,
+) -> gateway::ChatParams {
+    let mut p = match preset {
+        Some(p) => gateway::ChatParams::from_preset(p),
+        None => gateway::ChatParams::default(),
+    };
+    p.max_tokens = s.max_output_tokens;
+    p.temperature = s.temperature;
+    p.top_p = s.top_p;
+    p.thinking = s.thinking.clone();
+    p.thinking_budget = s.thinking_budget;
+    p
+}
+
+/// P8：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
+fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
+    let c = s
+        .configs
+        .iter()
+        .find(|c| c.name == name || c.id == name)?;
+    let base_url = if !c.base_url.trim().is_empty() {
+        c.base_url.trim().to_string()
+    } else {
+        gateway::providers::find(&c.provider_id)
+            .map(|p| p.default_base_url.clone())
+            .unwrap_or_default()
+    };
+    if base_url.trim().is_empty() {
+        return None;
+    }
+    let model = if !c.model.trim().is_empty() {
+        c.model.trim().to_string()
+    } else {
+        c.models.first().cloned().unwrap_or_else(|| {
+            gateway::providers::find(&c.provider_id)
+                .map(|p| p.default_model.clone())
+                .unwrap_or_default()
+        })
+    };
+    let preset = gateway::providers::find(&c.provider_id);
+    let mut params = build_chat_params(s, preset);
+    // 角色/降级渠道用自己的 max_output_tokens（若该配置单独设置过）
+    params.max_tokens = c.max_output_tokens;
+    Some(gateway::Channel::new(&base_url, &model, &s.config_key(c).unwrap_or_default(), params))
+}
+
 /// 供应商预设列表（数据驱动自 providers.json）。
 async fn list_providers() -> Json<Value> {
     let list: Vec<Value> = gateway::providers::list()
@@ -158,6 +222,12 @@ async fn list_providers() -> Json<Value> {
                 "name": p.name,
                 "default_base_url": p.default_base_url,
                 "default_model": p.default_model,
+                // P8 行为字段：前端按它决定思考开关是否可用/如何提示
+                "reasoning_style": p.reasoning_style.as_str(),
+                "enable_thinking_param": p.enable_thinking_param,
+                "thinking_budget_param": p.thinking_budget_param,
+                "reasoning_counts_in_max_tokens": p.reasoning_counts_in_max_tokens,
+                "key_optional": p.key_optional,
             })
         })
         .collect();
@@ -215,6 +285,23 @@ async fn put_settings(
     }
     if let Some(v) = req.max_output_tokens {
         s.max_output_tokens = if v == 0 { None } else { Some(v) };
+    }
+    // P8 采样参数：temperature 0.0 是合法值（确定性输出），清除用负数
+    if let Some(v) = req.temperature {
+        s.temperature = if v < 0.0 { None } else { Some(v) };
+    }
+    if let Some(v) = req.top_p {
+        s.top_p = if v < 0.0 { None } else { Some(v) };
+    }
+    if let Some(v) = req.thinking {
+        let v = v.trim().to_lowercase();
+        s.thinking = match v.as_str() {
+            "on" | "off" => Some(v),
+            _ => None,
+        };
+    }
+    if let Some(v) = req.thinking_budget {
+        s.thinking_budget = if v == 0 { None } else { Some(v) };
     }
     if url_before != crate::config::settings::normalize_base(&s.effective_base_url()) {
         s.models.clear();
@@ -326,6 +413,8 @@ async fn manage_configs(
 
 /// 配置快照（含各配置 key 状态），供前端全量刷新。
 fn config_state_json(s: &Settings) -> Value {
+    // P8：当前供应商的思考适配画像（前端决定思考开关是否展示、预算参数是否有意义）
+    let preset = gateway::providers::find(&s.provider_id);
     json!({
         "ok": true,
         "configs": s.configs.iter().map(|c| {
@@ -341,6 +430,10 @@ fn config_state_json(s: &Settings) -> Value {
                 "key_hint": key_hint_of(key),
                 "context_length": c.context_length,
                 "max_output_tokens": c.max_output_tokens,
+                "temperature": c.temperature,
+                "top_p": c.top_p,
+                "thinking": c.thinking,
+                "thinking_budget": c.thinking_budget,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
@@ -352,8 +445,15 @@ fn config_state_json(s: &Settings) -> Value {
         "models": s.models,
         "context_length": s.context_length,
         "max_output_tokens": s.max_output_tokens,
+        "temperature": s.temperature,
+        "top_p": s.top_p,
+        "thinking": s.thinking,
+        "thinking_budget": s.thinking_budget,
         "has_key": s.get_key().is_some(),
         "key_hint": key_hint_of(s.get_key()),
+        "reasoning_style": preset.map(|p| p.reasoning_style.as_str()),
+        "thinking_budget_param": preset.and_then(|p| p.thinking_budget_param.clone()),
+        "reasoning_counts_in_max_tokens": preset.map(|p| p.reasoning_counts_in_max_tokens),
     })
 }
 
@@ -391,7 +491,6 @@ async fn chat(
         }
         c
     };
-    let max_output = s.max_output_tokens;
     let prompt = state.system_prompt.clone();
     // P7 AGENTS.md 双层注入（全局在前、项目在后）
     let agents_md = state.memory.agents_md();
@@ -459,11 +558,23 @@ async fn chat(
         } else {
             s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
+        // P8：主渠道 = 设置镜像（采样/思考）+ 供应商预设（厂商适配字段）→ ChatParams
+        let params = build_chat_params(&s, gateway::providers::find(&s.provider_id));
+        let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
+        // P8 角色映射：[roles] summary/title 按配置名或 id 解析成完整渠道；解析失败回落主渠道
+        let roles = &state.roles_cfg;
+        let summary = roles.summary.as_deref().and_then(|n| find_channel(&s, n));
+        let title = roles.title.as_deref().and_then(|n| find_channel(&s, n));
+        // P8 降级链：fallback_configs 按配置名解析；解析不到的名字跳过并记日志
+        let fallbacks: Vec<gateway::Channel> = state
+            .gateway_cfg
+            .fallback_configs
+            .iter()
+            .filter_map(|n| find_channel(&s, n))
+            .collect();
         let outcome = agent::run_task(
             &gateway,
-            &base_url,
-            &model,
-            &api_key,
+            &agent::LoopChannels { primary, summary, title, fallbacks },
             // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实。
             // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
             &format!("{prompt}{agents_md}"),
@@ -475,7 +586,6 @@ async fn chat(
             &rec_cfg,
             &mem,
             prior_summary,
-            max_output,
             &ChatGate {
                 mode: state.approval_mode.clone(),
                 allow_unsandboxed,
@@ -531,6 +641,16 @@ async fn chat(
                 // P6.1 改动统计条：撤销按钮恢复到任务起点基线
                 AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
                     send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
+                }
+                // P8 TITLE 角色：标题已生成 → 改会话文件并转前端
+                AgentEvent::Title(t) => {
+                    match session.rename(&session_id, &t) {
+                        Ok(()) => send(json!({ "title": t })),
+                        Err(e) => observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("会话改名失败: {e}") }),
+                        ),
+                    }
                 }
                 AgentEvent::Notice(n) => send(json!({ "notice": n }))
             },
