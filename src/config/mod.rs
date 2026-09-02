@@ -20,6 +20,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 /// 核心循环参数（施工单 003）。
@@ -31,6 +33,20 @@ pub struct AgentConfig {
     /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
+}
+
+/// 执行沙箱参数（施工单 004，P4 shell 工具也走这套限额）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// 墙钟超时（ms）：到点整树击杀
+    #[serde(default = "default_sandbox_timeout_ms")]
+    pub timeout_ms: u32,
+    /// 进程树内单进程 commit 内存上限（MB）
+    #[serde(default = "default_sandbox_memory_mb")]
+    pub memory_mb: u32,
+    /// 进程树内活跃进程数上限
+    #[serde(default = "default_sandbox_active_processes")]
+    pub active_processes: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +98,15 @@ fn default_max_steps() -> u32 {
 fn default_tool_result_max_chars() -> usize {
     8000
 }
+fn default_sandbox_timeout_ms() -> u32 {
+    10_000
+}
+fn default_sandbox_memory_mb() -> u32 {
+    1024
+}
+fn default_sandbox_active_processes() -> u32 {
+    64
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -103,6 +128,15 @@ impl Default for AgentConfig {
         Self { max_steps: default_max_steps(), tool_result_max_chars: default_tool_result_max_chars() }
     }
 }
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: default_sandbox_timeout_ms(),
+            memory_mb: default_sandbox_memory_mb(),
+            active_processes: default_sandbox_active_processes(),
+        }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -110,6 +144,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             logging: LoggingConfig::default(),
             agent: AgentConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
