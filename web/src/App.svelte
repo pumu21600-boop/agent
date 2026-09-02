@@ -15,6 +15,7 @@
   let settingsMsg = '';
   let settingsOpen = false;
   let autoSaveTimer = null;
+  let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -73,16 +74,28 @@
     settingsMsg = '已自动保存 ' + new Date().toTimeString().slice(0, 8);
   }
 
-  // 防抖自动保存设置字段
+  // 防抖自动保存设置字段；挂起的字段先记下来，切换配置前必须落盘到当前配置
   function autoSave(fields, delay = 500) {
     clearTimeout(autoSaveTimer);
+    pendingSave = fields;
     autoSaveTimer = setTimeout(async () => {
       const body = { ...fields };
       if (apiKey.trim()) {
         body.api_key = apiKey.trim();
       }
+      pendingSave = null;
       await sendSettings(body);
     }, delay);
+  }
+
+  // 把挂起的防抖保存立即落盘（落给此刻的激活配置，防止串到切换后的配置）
+  async function flushPendingSave() {
+    clearTimeout(autoSaveTimer);
+    if (!pendingSave) return;
+    const body = { ...pendingSave };
+    pendingSave = null;
+    if (apiKey.trim()) body.api_key = apiKey.trim();
+    await sendSettings(body);
   }
 
   async function sendSettings(body) {
@@ -107,6 +120,8 @@
 
   // —— 配置切换 / 新建 / 删除 ——
   async function manageConfig(action, id) {
+    // 先把挂起的字段改动落给当前配置，再切——防抖的尾巴不能甩到新配置头上
+    await flushPendingSave();
     const r = await fetch('/api/configs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
