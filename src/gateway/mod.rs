@@ -47,6 +47,8 @@ pub struct ChatParams {
     pub thinking_budget_param: Option<String>,
     /// 思考是否计入 max_tokens（GLM 实测占；仅记日志供截断排查，不改语义）
     pub reasoning_counts_in_max_tokens: bool,
+    /// 思考模式为独立模型的厂商（DeepSeek 官方）：thinking=on 时模型名换成它
+    pub thinking_model: Option<String>,
 }
 
 impl ChatParams {
@@ -57,8 +59,22 @@ impl ChatParams {
             enable_thinking_param: p.enable_thinking_param.clone(),
             thinking_budget_param: p.thinking_budget_param.clone(),
             reasoning_counts_in_max_tokens: p.reasoning_counts_in_max_tokens,
+            thinking_model: p.thinking_model.clone(),
             ..Default::default()
         }
+    }
+
+    /// 思考模式为独立模型的厂商（DeepSeek 官方无思考开关参数，思考=换 reasoner 模型）：
+    /// thinking=on 且配了 thinking_model 时返回要换用的模型名，否则 None（沿用原模型）。
+    pub fn apply_thinking_model<'a>(&self, model: &'a str) -> Option<String> {
+        if self.thinking.as_deref() == Some("on") {
+            if let Some(tm) = &self.thinking_model {
+                if model != tm {
+                    return Some(tm.clone());
+                }
+            }
+        }
+        None
     }
 
     fn describe_reasoning(&self) -> Value {
@@ -357,6 +373,8 @@ impl Gateway {
         params: &ChatParams,
     ) -> anyhow::Result<String> {
         let url = Self::chat_url(base_url);
+        let effective_model = params.apply_thinking_model(model);
+        let model: &str = effective_model.as_deref().unwrap_or(model);
         let body = build_body(model, messages, false, params, None);
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "aux" }));
         let response = self
@@ -476,6 +494,9 @@ impl Gateway {
         }
 
         let url = Self::chat_url(base_url);
+        // 思考=独立模型的厂商（DeepSeek 官方）：on 时换 reasoner 模型
+        let effective_model = channel.params.apply_thinking_model(model);
+        let model: &str = effective_model.as_deref().unwrap_or(model);
         let body = build_body(model, messages, true, &channel.params, tools);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
@@ -749,6 +770,23 @@ mod tests {
             let dir = std::env::temp_dir().join("agent-test-logs");
             let _ = crate::observability::init(&dir, "gw.jsonl", format!("gw-{}", uuid::Uuid::new_v4()));
         });
+    }
+
+    #[test]
+    fn thinking_model_switch() {
+        let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
+        // DeepSeek：思考=独立模型（官方无开关参数），on 时换 deepseek-reasoner
+        let mut ds = ChatParams::from_preset(crate::gateway::providers::find("deepseek").unwrap());
+        assert_eq!(ds.apply_thinking_model("deepseek-chat"), None, "默认（不发开关）不换模型");
+        ds.thinking = Some("on".into());
+        assert_eq!(ds.apply_thinking_model("deepseek-chat").as_deref(), Some("deepseek-reasoner"));
+        let mut off = ds.clone();
+        off.thinking = Some("off".into());
+        assert_eq!(off.apply_thinking_model("deepseek-chat"), None);
+        let none = ChatParams::default();
+        assert_eq!(none.apply_thinking_model("deepseek-chat"), None);
+        // 已是思考模型则不重复换
+        assert_eq!(ds.apply_thinking_model("deepseek-reasoner"), None);
     }
 
     #[test]

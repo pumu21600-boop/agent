@@ -6,7 +6,32 @@
       "default_base_url": "https://api.deepseek.com",
       "default_model": "deepseek-chat",
       "reasoning_style": "reasoning_content",
-      "reasoning_counts_in_max_tokens": true
+      "reasoning_counts_in_max_tokens": true,
+      "thinking_model": "deepseek-reasoner"
+    },
+    {
+      "id": "qwen",
+      "name": "通义千问（Qwen·百炼）",
+      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "default_model": "qwen-plus",
+      "reasoning_style": "reasoning_content",
+      "enable_thinking_param": "enable_thinking",
+      "thinking_budget_param": "thinking_budget",
+      "reasoning_counts_in_max_tokens": false
+    },
+    {
+      "id": "ernie",
+      "name": "百度文心（千帆 API）",
+      "default_base_url": "https://qianfan.baidubce.com/v2",
+      "default_model": "ernie-4.0-8k",
+      "reasoning_style": "reasoning_content"
+    },
+    {
+      "id": "spark",
+      "name": "讯飞星火",
+      "default_base_url": "https://spark-api-open.xf-yun.com/v1",
+      "default_model": "generalv3.5",
+      "reasoning_style": "reasoning_content"
     },
     {
       "id": "moonshot",

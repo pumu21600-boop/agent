@@ -53,6 +53,10 @@ pub struct ProviderPreset {
     /// 思考是否计入 max_tokens（GLM 实测占、Qwen 官方不占；截断排查与预算提示用）
     #[serde(default)]
     pub reasoning_counts_in_max_tokens: bool,
+    /// 思考模式为独立模型的厂商（DeepSeek 官方走 deepseek-reasoner，无开关参数）：
+    /// 用户开思考（thinking=on）时网关把模型名换成它
+    #[serde(default)]
+    pub thinking_model: Option<String>,
     /// 本渠道 key 可空（本地推理服务：Ollama/LM Studio/MNN/llama.cpp/自定义）
     #[serde(default)]
     pub key_optional: bool,
@@ -98,17 +102,27 @@ mod tests {
     #[test]
     fn presets_parse_with_new_fields() {
         let ps = load_test();
-        assert!(ps.len() >= 15, "官方网关 10 家 + 本地/自定义 5 家，实际 {}", ps.len());
+        assert!(ps.len() >= 18, "官方网关 13 家 + 本地/自定义 5 家，实际 {}", ps.len());
         // 只保留大模型厂商官方网关与本地推理服务，第三方中转/聚合已移除
         for id in [
-            "deepseek", "moonshot", "zhipu", "minimax", "doubao", "hunyuan", "openai",
-            "anthropic", "gemini", "xai", "ollama", "lmstudio", "mnn", "llamacpp", "custom",
+            "deepseek", "qwen", "ernie", "spark", "moonshot", "zhipu", "minimax", "doubao",
+            "hunyuan", "openai", "anthropic", "gemini", "xai", "ollama", "lmstudio", "mnn",
+            "llamacpp", "custom",
         ] {
             assert!(ps.iter().any(|p| p.id == id), "缺预设 {id}");
         }
-        for gone in ["sensenova", "dashscope", "baidu", "spark", "siliconflow", "groq", "openrouter"] {
+        for gone in ["sensenova", "siliconflow", "groq", "openrouter"] {
             assert!(!ps.iter().any(|p| p.id == gone), "{gone} 应已移除（第三方中转/聚合，非官方网关）");
         }
+        // DeepSeek 思考=独立模型（官方无开关参数）
+        let ds = ps.iter().find(|p| p.id == "deepseek").unwrap();
+        assert_eq!(ds.thinking_model.as_deref(), Some("deepseek-reasoner"));
+        // Qwen：布尔开关 + 预算，官方思考不占 max_tokens（实测）
+        let qwen = ps.iter().find(|p| p.id == "qwen").unwrap();
+        assert_eq!(qwen.reasoning_style, ReasoningStyle::ReasoningContent);
+        assert_eq!(qwen.enable_thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(qwen.thinking_budget_param.as_deref(), Some("thinking_budget"));
+        assert!(!qwen.reasoning_counts_in_max_tokens, "Qwen 官方思考不占 max_tokens");
         let glm = ps.iter().find(|p| p.id == "zhipu").unwrap();
         assert_eq!(glm.reasoning_style, ReasoningStyle::ThinkingParam);
         assert!(glm.reasoning_counts_in_max_tokens, "GLM 思考占 max_tokens（实测）");
