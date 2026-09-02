@@ -33,7 +33,6 @@ use crate::{
 };
 
 use crate::config::AgentConfig;
-use crate::config::settings::Config;
 use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 #[derive(Clone)]
@@ -154,18 +153,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     Json(v)
 }
 
-/// 配置的生效 base_url（自定义 > 预设默认）。
-fn effective_of(s: &Settings, c: &Config) -> String {
-    if !c.base_url.trim().is_empty() {
-        c.base_url.trim().to_string()
-    } else {
-        gateway::providers::find(&c.provider_id)
-            .map(|p| p.default_base_url.clone())
-            .unwrap_or_else(|| s.effective_base_url())
-    }
-}
-
-/// 保存设置。api_key 非空则 DPAPI 加密持久化；clear_key=true 则清除。
+/// 保存设置。api_key 非空则 DPAPI 加密持久化到当前激活配置；clear_key=true 则清除。
 async fn put_settings(
     State(state): State<AppState>,
     Json(req): Json<SettingsUpdate>,
@@ -192,14 +180,13 @@ async fn put_settings(
         list.dedup();
         s.models = list;
     }
-    let key_scope = s.effective_base_url();
     if req.clear_key == Some(true) {
-        if let Err(e) = s.clear_key(&key_scope) {
+        if let Err(e) = s.clear_key() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
         }
     } else if let Some(k) = &req.api_key {
         if !k.trim().is_empty() {
-            if let Err(e) = s.set_key(&key_scope, k.trim()) {
+            if let Err(e) = s.set_key(k.trim()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
             }
         }
@@ -216,7 +203,7 @@ async fn put_settings(
     );
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "has_key": s.get_key(&s.effective_base_url()).is_some(), "key_hint": key_hint_of(s.get_key(&s.effective_base_url())) })),
+        Json(json!({ "ok": true, "has_key": s.get_key().is_some(), "key_hint": key_hint_of(s.get_key()) })),
     )
 }
 
@@ -230,7 +217,7 @@ async fn list_models(
     let api_key = if !req.api_key.trim().is_empty() {
         req.api_key.trim().to_string()
     } else {
-        s.get_key(&base_url).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+        s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
     };
     if base_url.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url 为空" })));
@@ -298,7 +285,7 @@ fn config_state_json(s: &Settings) -> Value {
     json!({
         "ok": true,
         "configs": s.configs.iter().map(|c| {
-            let key = s.get_key(&effective_of(s, c));
+            let key = s.config_key(c);
             json!({
                 "id": c.id,
                 "name": c.name.clone(),
@@ -317,8 +304,8 @@ fn config_state_json(s: &Settings) -> Value {
         "effective_base_url": s.effective_base_url(),
         "model": s.model,
         "models": s.models,
-        "has_key": s.get_key(&s.effective_base_url()).is_some(),
-        "key_hint": key_hint_of(s.get_key(&s.effective_base_url())),
+        "has_key": s.get_key().is_some(),
+        "key_hint": key_hint_of(s.get_key()),
     })
 }
 
@@ -365,7 +352,7 @@ async fn chat(
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
-            s.get_key(&base_url).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+            s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
         let outcome = agent::run_task(
             &gateway,

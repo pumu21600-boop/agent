@@ -3,9 +3,9 @@
 //! 设计（配置即生效）：顶层 provider_id/base_url/model/models 是**当前激活配置的镜像**，
 //! 网关只读镜像；`configs` 是多套「供应商+Base URL+模型+已勾选模型」组合，切换即改镜像。
 //! api_key：Windows DPAPI（CryptProtectData，用户账户绑定）加密成 base64，
-//! **按归一化 base_url 存**（换地址=独立一格 key，互不串）。本机同账户才能解密；
-//! 文件里不出现明文 key，也绝不写日志。（同账户进程理论上能解——DPAPI 的语义就是
-//! "本用户的数据保险箱"，与浏览器保存密码同级）
+//! **按配置存**（每套配置独立一份 key_cipher，互不共享、互不覆盖）。
+//! 本机同账户才能解密；文件里不出现明文 key，也绝不写日志。
+//! （同账户进程理论上能解——DPAPI 的语义就是"本用户的数据保险箱"，与浏览器保存密码同级）
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -23,7 +23,7 @@ use crate::gateway::providers;
 
 const ENTROPY: &[u8] = b"agent-gateway-settings-v1";
 
-/// 一套配置（名称 + 供应商 + Base URL + 模型 + 勾选的模型清单）。
+/// 一套配置（名称 + 供应商 + Base URL + 模型 + 勾选的模型清单 + 本配置专属 key）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub id: String,
@@ -35,6 +35,9 @@ pub struct Config {
     pub model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// 本配置专属 key（DPAPI 密文 base64）；同地址的不同配置各有各的 key
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_cipher: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +97,8 @@ impl Settings {
                 }
                 // v2 → v2.2：provider 作用域 key 归位到 base_url 作用域
                 s.migrate_provider_keys_to_urls();
+                // v2.3 → v2.4：key 从按 base_url 共享改为按配置独占
+                s.migrate_url_keys_to_configs();
                 // v2.2 → v2.3：确保存在激活配置（没有就用镜像造一套）
                 s.ensure_active_config();
                 if s.key_cipher.is_some() {
@@ -165,6 +170,30 @@ impl Settings {
         }
     }
 
+    /// 把遗留的"按 base_url 存"的 key 迁移到"按配置独占"。
+    /// 每个没有专属 key 的配置，从旧地址槽（自定义地址 > 预设默认）拷一份密文过来；
+    /// 旧 keys 映射原样保留（仅作迁移源，运行时不再读写）。
+    fn migrate_url_keys_to_configs(&mut self) {
+        for c in &mut self.configs {
+            if c.key_cipher.is_some() {
+                continue;
+            }
+            let url = if !c.base_url.trim().is_empty() {
+                c.base_url.clone()
+            } else {
+                providers::find(&c.provider_id)
+                    .map(|p| p.default_base_url.clone())
+                    .unwrap_or_default()
+            };
+            if url.trim().is_empty() {
+                continue;
+            }
+            if let Some(cipher) = self.keys.get(&normalize_base(&url)) {
+                c.key_cipher = Some(cipher.clone());
+            }
+        }
+    }
+
     /// 确保 configs 非空且有激活项；镜像与激活配置对齐；缺名的补「配置 N」。
     pub fn ensure_active_config(&mut self) {
         if self.configs.is_empty() && !self.provider_id.trim().is_empty() {
@@ -175,6 +204,7 @@ impl Settings {
                 base_url: self.base_url.clone(),
                 model: self.model.clone(),
                 models: self.models.clone(),
+                key_cipher: None,
             });
         }
         self.assign_missing_names();
@@ -271,6 +301,7 @@ impl Settings {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             models: self.models.clone(),
+            key_cipher: None,
         });
         self.active_config_id = Some(id.clone());
         id
@@ -322,10 +353,37 @@ impl Settings {
         }
     }
 
-    /// 按归一化 base_url 解密取出 key（仅内存）。
-    pub fn get_key(&self, base_url: &str) -> Option<String> {
-        let cipher = self.keys.get(&normalize_base(base_url))?;
-        let bytes = base64::engine::general_purpose::STANDARD.decode(cipher).ok()?;
+    /// 某套配置的 key（解密，仅内存）。
+    pub fn config_key(&self, c: &Config) -> Option<String> {
+        c.key_cipher.as_deref().and_then(Self::decrypt)
+    }
+
+    /// 当前激活配置的 key（仅内存）。
+    pub fn get_key(&self) -> Option<String> {
+        self.active().and_then(|c| self.config_key(c))
+    }
+
+    /// 保存 key 到当前激活配置（无激活则新建后写入）。
+    pub fn set_key(&mut self, key: &str) -> anyhow::Result<()> {
+        let cipher = Self::protect(key)?;
+        self.ensure_active_config();
+        if let Some(c) = self.active_mut_() {
+            c.key_cipher = Some(cipher);
+        }
+        self.save()
+    }
+
+    /// 清除当前激活配置的 key。
+    pub fn clear_key(&mut self) -> anyhow::Result<()> {
+        if let Some(c) = self.active_mut_() {
+            c.key_cipher = None;
+        }
+        self.save()
+    }
+
+    /// DPAPI 解密（密文 base64）。
+    fn decrypt(cipher_b64: &str) -> Option<String> {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(cipher_b64).ok()?;
         let input = CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
         let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
@@ -348,8 +406,8 @@ impl Settings {
         String::from_utf8(plain).ok()
     }
 
-    /// DPAPI 加密并按 base_url 保存。
-    pub fn set_key(&mut self, base_url: &str, key: &str) -> anyhow::Result<()> {
+    /// DPAPI 加密成 base64。
+    fn protect(key: &str) -> anyhow::Result<String> {
         let data = key.as_bytes();
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
@@ -357,7 +415,7 @@ impl Settings {
         let ok = unsafe {
             CryptProtectData(
                 &input,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 &entropy,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -370,14 +428,7 @@ impl Settings {
         }
         let cipher = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
         unsafe { LocalFree(output.pbData as *mut _) };
-        self.keys
-            .insert(normalize_base(base_url), base64::engine::general_purpose::STANDARD.encode(cipher));
-        self.save()
-    }
-
-    pub fn clear_key(&mut self, base_url: &str) -> anyhow::Result<()> {
-        self.keys.remove(&normalize_base(base_url));
-        self.save()
+        Ok(base64::engine::general_purpose::STANDARD.encode(cipher))
     }
 }
 

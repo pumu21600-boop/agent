@@ -11,8 +11,7 @@
   let apiKey = '';
   let configName = '';
   let savedModels = [];
-  let savedKeyUrl = '';   // 当前生效 url 的已存 key 尾号
-  let urlKeyHints = {};   // 归一化 url → 尾号
+  let savedKeyUrl = '';   // 当前激活配置的已存 key 尾号
   let settingsMsg = '';
   let settingsOpen = false;
   let autoSaveTimer = null;
@@ -63,19 +62,12 @@
     savedModels = s.models || [];
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
+    // key 按配置独占：hint 直接用当前激活配置的，与其他配置无关
     savedKeyUrl = s.key_hint || '';
-    urlKeyHints = {};
-    for (const c of configs) if (c.key_hint) urlKeyHints[norm(c.base_url)] = c.key_hint;
-    urlKeyHints[norm(s.effective_base_url)] = s.key_hint || urlKeyHints[norm(s.effective_base_url)] || '';
   }
 
-  // 当前输入中的 url 是否已有 key（实时）
-  $: typingHint = urlKeyHints[norm(baseUrl)] || (norm(baseUrl) === norm(currentEffectiveUrl()) ? savedKeyUrl : '');
-  function currentEffectiveUrl() {
-    if (baseUrl) return baseUrl;
-    const p = providers.find((x) => x.id === providerId);
-    return p ? p.default_base_url : '';
-  }
+  // 当前激活配置是否已有 key（随配置切换刷新，不随地址输入实时变化）
+  $: typingHint = savedKeyUrl;
 
   function flashSaved() {
     settingsMsg = '已自动保存 ' + new Date().toTimeString().slice(0, 8);
@@ -463,13 +455,13 @@
       </div>
 
       <div class="field">
-        <label>API Key（按 Base URL 独立保存）</label>
+        <label>API Key（按配置独立保存）</label>
         <input
           bind:value={apiKey}
           type="password"
           placeholder={typingHint
-            ? `该地址已保存(…${typingHint})，重新输入即覆盖`
-            : '此地址还没有 key，填入即自动保存'}
+            ? `本配置已保存(…${typingHint})，重新输入即覆盖`
+            : '此配置还没有 key，填入即自动保存'}
           on:blur={() => apiKey.trim() && autoSave({})}
           on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
         />
