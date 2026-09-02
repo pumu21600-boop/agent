@@ -59,6 +59,47 @@ pub fn estimate_messages(messages: &[Value]) -> u64 {
     messages.iter().map(estimate_message).sum()
 }
 
+/// 分类占比（前端「上下文容量」卡片用）：各分类之和 == estimate_messages。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Breakdown {
+    /// user + assistant 正文
+    pub messages: u64,
+    /// 工具结果（role=tool）
+    pub tools: u64,
+    /// 系统提示词（role=system）
+    pub system: u64,
+    /// tool_calls 结构与每条消息的固定开销
+    pub other: u64,
+}
+
+impl Breakdown {
+    pub fn total(&self) -> u64 {
+        self.messages + self.tools + self.system + self.other
+    }
+}
+
+pub fn estimate_breakdown(messages: &[Value]) -> Breakdown {
+    let mut b = Breakdown::default();
+    for m in messages {
+        match m.get("role").and_then(Value::as_str).unwrap_or("") {
+            "system" => b.system += estimate_message(m),
+            "tool" => b.tools += estimate_message(m),
+            "user" => b.messages += estimate_message(m),
+            "assistant" => {
+                if let Some(c) = m.get("content") {
+                    b.messages += value_tokens(c);
+                }
+                if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                    b.other += 8 * calls.len() as u64 + calls.iter().map(value_tokens).sum::<u64>();
+                }
+                b.other += 4;
+            }
+            _ => b.other += estimate_message(m),
+        }
+    }
+    b
+}
+
 /// 头尾压缩：短文本原样返回；超限保留头 60% + 尾 40%。
 pub fn compress(text: &str, max_chars: usize) -> String {
     let total = text.chars().count();

@@ -23,7 +23,7 @@
     return map[saved] || saved || 'auto';
   })(); // 审批三档：read-only / auto / full-access
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
-  let ctxUsage = { tokens: 0, budget: 0 }; // 上下文占用（P5 圆环）
+  let ctxUsage = { tokens: 0, budget: 0, breakdown: null }; // 上下文占用（P5 圆环+明细卡）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -53,6 +53,27 @@
   function onChatScroll() {
     if (!chatBody) return;
     chatPinned = chatBody.scrollTop + chatBody.clientHeight >= chatBody.scrollHeight - 60;
+  }
+
+  // —— 上下文圆环（P5）——
+  $: ctxPct = ctxUsage.budget ? Math.min(100, Math.round((ctxUsage.tokens / ctxUsage.budget) * 100)) : 0;
+  $: ctxCirc = 2 * Math.PI * 13;
+  // 常态浅灰（同参考样式）；占用高时转警示色
+  $: ctxColor = ctxPct >= 85 ? '#f87171' : ctxPct >= 60 ? '#facc15' : '#a9b1c2';
+  $: ctxRows = (() => {
+    const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0 };
+    const sum = Math.max(1, b.messages + b.tools + b.system + b.other);
+    const row = (label, v, color) => ({ label, v, color, pct: ((v / sum) * 100).toFixed(1) + '%' });
+    return [
+      row('消息', b.messages, '#3b82f6'),
+      row('工具结果', b.tools, '#22d3ee'),
+      row('系统提示词', b.system, '#a78bfa'),
+      row('其他', b.other, '#6b7280'),
+    ];
+  })();
+  function fmtTok(n) {
+    if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+    return String(n);
   }
 
   function scrollToBottom() {
@@ -304,7 +325,7 @@
               else if (d.notice)
                 messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
               else if (d.context_usage)
-                ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget };
+                ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
               else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
@@ -404,32 +425,6 @@
         <div class="chat-title">对话</div>
         <div class="chat-sub">P5 上下文工程 · 历史不跨刷新（P6 落盘）</div>
       </div>
-      {#if ctxUsage.budget > 0}
-        {@const pct = Math.min(100, Math.round((ctxUsage.tokens / ctxUsage.budget) * 100))}
-        {@const r = 15.9}
-        {@const circ = 2 * Math.PI * r}
-        {@const color = pct >= 85 ? '#f87171' : pct >= 60 ? '#facc15' : '#4ade80'}
-        <div
-          class="ctx-ring"
-          title={`上下文占用约 ${ctxUsage.tokens} / ${ctxUsage.budget} tokens（估算值），超过预算自动裁剪历史`}
-        >
-          <svg viewBox="0 0 36 36" width="42" height="42">
-            <circle cx="18" cy="18" {r} fill="none" stroke="#2f323c" stroke-width="3.6" />
-            <circle
-              cx="18"
-              cy="18"
-              {r}
-              fill="none"
-              stroke={color}
-              stroke-width="3.6"
-              stroke-linecap="round"
-              stroke-dasharray={`${(circ * pct) / 100} ${circ}`}
-              transform="rotate(-90 18 18)"
-            />
-          </svg>
-          <span class="ctx-pct" style:color={color}>{pct}%</span>
-        </div>
-      {/if}
     </header>
 
     <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
@@ -527,6 +522,39 @@
         on:keydown={onKey}
         disabled={streaming}
       />
+      {#if ctxUsage.budget > 0}
+        <div class="ctx-wrap">
+          <svg class="ctx-ring" viewBox="0 0 30 30" width="28" height="28">
+            <circle cx="15" cy="15" r="13" fill="none" stroke="#2b2e36" stroke-width="2.6" />
+            <circle
+              cx="15"
+              cy="15"
+              r="13"
+              fill="none"
+              stroke={ctxColor}
+              stroke-width="2.6"
+              stroke-linecap="round"
+              stroke-dasharray={`${(ctxCirc * ctxPct) / 100} ${ctxCirc}`}
+              transform="rotate(-90 15 15)"
+            />
+          </svg>
+          <div class="ctx-card">
+            <div class="ctx-card-head">
+              <b>上下文容量</b>
+              <span>{fmtTok(ctxUsage.tokens)}/{fmtTok(ctxUsage.budget)}（{ctxPct}%）</span>
+            </div>
+            <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
+            {#each ctxRows as row}
+              <div class="ctx-row">
+                <span class="ctx-dot" style:background={row.color}></span>
+                <span class="ctx-label">{row.label}</span>
+                <span class="ctx-val">{row.pct}</span>
+              </div>
+            {/each}
+            <div class="ctx-card-foot">超过预算自动归档旧工具结果并折叠早期对话</div>
+          </div>
+        </div>
+      {/if}
       {#if streaming}
         <button class="btn danger" on:click={stop}>停止</button>
       {:else}
@@ -708,20 +736,92 @@
   .jump-bottom:hover {
     border-color: #5a6070;
   }
-  .ctx-ring {
+  .ctx-wrap {
     position: relative;
-    width: 42px;
-    height: 42px;
-    margin-left: auto;
-  }
-  .ctx-pct {
-    position: absolute;
-    inset: 0;
     display: flex;
     align-items: center;
-    justify-content: center;
-    font-size: 10px;
-    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .ctx-ring {
+    display: block;
+    cursor: default;
+  }
+  .ctx-card {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 12px);
+    right: -8px;
+    width: 300px;
+    background: #1b1d23;
+    border: 1px solid #3d4150;
+    border-radius: 10px;
+    padding: 12px 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 20;
+    font-size: 13px;
+  }
+  /* 悬停桥：卡片与环之间的间隙保持 hover 不断 */
+  .ctx-card::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    right: 0;
+    width: 60%;
+    height: 12px;
+  }
+  .ctx-wrap:hover .ctx-card {
+    display: block;
+  }
+  .ctx-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 10px;
+    color: #e8eaf0;
+  }
+  .ctx-card-head span {
+    color: #9aa0ae;
+    font-size: 12px;
+  }
+  .ctx-bar {
+    height: 8px;
+    border-radius: 4px;
+    background: #2b2e36;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .ctx-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: #3b82f6;
+    transition: width 0.3s;
+  }
+  .ctx-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    color: #cdd2dd;
+  }
+  .ctx-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .ctx-label {
+    flex: 1;
+  }
+  .ctx-val {
+    color: #9aa0ae;
+    font-variant-numeric: tabular-nums;
+  }
+  .ctx-card-foot {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid #2f323c;
+    color: #6f7686;
+    font-size: 11px;
   }
   .chat-head {
     display: flex;

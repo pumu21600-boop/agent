@@ -22,8 +22,8 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     ToolResult { name: String, ok: bool, preview: String },
     StepLimit(u32),
-    /// 上下文占用（每轮模型调用前更新；P5 圆环数据源）
-    ContextUsage { tokens: u64, budget: u64 },
+    /// 上下文占用与分类占比（每轮模型调用前更新；P5 圆环数据源）
+    ContextUsage { tokens: u64, budget: u64, breakdown: context::Breakdown },
 }
 
 /// 审批三档判定（Codex 式，施工单 005/006）：
@@ -86,10 +86,6 @@ pub async fn run_task(
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
         {
             let (compacted, stats) = context::compact_messages(&msgs, ctx_cfg);
-            on_event(AgentEvent::ContextUsage {
-                tokens: stats.tokens_after.max(stats.tokens_before),
-                budget: ctx_cfg.budget_tokens,
-            });
             if stats.compacted {
                 observability::event(
                     EventType::State,
@@ -104,6 +100,15 @@ pub async fn run_task(
                 );
                 msgs = compacted;
             }
+        }
+        // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
+        {
+            let breakdown = context::estimate_breakdown(&msgs);
+            on_event(AgentEvent::ContextUsage {
+                tokens: breakdown.total(),
+                budget: ctx_cfg.budget_tokens,
+                breakdown,
+            });
         }
         observability::debug(&format!("[loop] step {step} 调用模型 {model}"));
 

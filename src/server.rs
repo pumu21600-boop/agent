@@ -434,9 +434,18 @@ async fn chat(
                     send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
                 }
                 AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
-                AgentEvent::ContextUsage { tokens, budget } => {
-                    send(json!({ "context_usage": { "tokens": tokens, "budget": budget } }))
-                }
+                AgentEvent::ContextUsage { tokens, budget, breakdown } => send(json!({
+                    "context_usage": {
+                        "tokens": tokens,
+                        "budget": budget,
+                        "breakdown": {
+                            "messages": breakdown.messages,
+                            "tools": breakdown.tools,
+                            "system": breakdown.system,
+                            "other": breakdown.other,
+                        },
+                    }
+                })),
             },
         )
         .await;
