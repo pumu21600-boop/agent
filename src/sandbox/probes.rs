@@ -146,7 +146,7 @@ pub fn probe_privilege_strip(_limits: SandboxLimits) -> ProbeResult {
 /// 工作目录可达：cwd=工程根 type Cargo.toml 成功（隔离不能过头，正常读写面必须保留）。
 pub fn probe_workspace_read(limits: SandboxLimits) -> ProbeResult {
     let root = workspace_root();
-    let out = run(&cmd_spec("/C type Cargo.toml", root, limits));
+    let out = run(&cmd_spec("/C type Cargo.toml", &root, limits));
     match out {
         Ok(o) if o.stdout.contains("[package]") => {
             ProbeResult { name: "workspace_read", ok: true, detail: "工作目录内文件可读".into() }

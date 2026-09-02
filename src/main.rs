@@ -75,9 +75,25 @@ async fn main() -> anyhow::Result<()> {
         "用中文简洁回答。".to_string()
     });
     let approval_default = config.agent.default_approval.clone();
-    // P7 记忆层：双层存储 + index 登记 + AGENTS.md 模板（开箱即用）
-    let memory = std::sync::Arc::new(memory::Memory::open(&manifest, &config.memory));
-    memory.ensure_agents_template(&manifest);
+    // P8.2 工作区：settings 里记了就用它（存在才生效），否则工程根
+    let ws = match user_settings.workspace.as_deref() {
+        Some(p) => {
+            let path = std::path::PathBuf::from(p);
+            if path.is_dir() {
+                tools::set_workspace_root(&path);
+                path
+            } else {
+                manifest.clone()
+            }
+        }
+        None => manifest.clone(),
+    };
+    // P7 记忆层：双层存储 + index 登记 + AGENTS.md 模板（开箱即用）；工作区切换时热重开
+    let mem_cfg = std::sync::Arc::new(config.memory.clone());
+    let memory = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+        memory::Memory::open(&ws, &mem_cfg),
+    )));
+    memory.read().unwrap().ensure_agents_template(&ws);
     let state = server::AppState {
         gateway,
         cancel,
@@ -89,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         system_prompt: Arc::new(system_prompt),
         session: Arc::new(session::SessionManager::new(&log_dir)),
         memory,
+        mem_cfg,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
         // P8 角色映射与网关级配置（降级链/限流参数）

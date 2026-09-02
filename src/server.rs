@@ -48,7 +48,10 @@ pub struct AppState {
     /// 会话落盘（P6.1 多会话）：Snapshot 事件按 session_id 写入
     pub session: Arc<crate::session::SessionManager>,
     /// P7 记忆层（events.log / AGENTS.md / index；开关在 [memory]）
-    pub memory: Arc<crate::memory::Memory>,
+    /// P8.2：工作区可切换 → 记忆层跟着重开，用 RwLock 换引用
+    pub memory: Arc<std::sync::RwLock<Arc<crate::memory::Memory>>>,
+    /// P8.2 记忆配置（切换工作区时重开 Memory 用）
+    pub mem_cfg: Arc<crate::config::MemoryConfig>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
@@ -125,6 +128,10 @@ pub struct SettingsUpdate {
     /// 思考预算（P8；0=清除）
     #[serde(default)]
     pub thinking_budget: Option<u64>,
+    /// 思考参数形态覆盖（P8.3）："auto" 或 ""=跟预设；none/thinking_object/reasoning_effort/
+    /// enable_thinking/enable_thinking_budget
+    #[serde(default)]
+    pub thinking_style: Option<String>,
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
@@ -133,6 +140,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models", post(list_models))
         .route("/api/configs", post(manage_configs))
+        .route("/api/workspace", get(get_workspace).post(set_workspace))
         .route("/api/approvals", post(decide_approval))
         .route("/api/approval-mode", post(set_approval_mode))
         .route("/api/chat", post(chat))
@@ -177,7 +185,42 @@ fn build_chat_params(
     p.top_p = s.top_p;
     p.thinking = s.thinking.clone();
     p.thinking_budget = s.thinking_budget;
+    apply_thinking_style(&mut p, s.thinking_style.as_deref());
     p
+}
+
+/// P8.3：思考参数形态覆盖——自定义/中转渠道预设拿不准时显式指定。
+/// none=不发任何思考参数；其余按形态重设 reasoning_style/参数名。
+fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
+    use gateway::providers::ReasoningStyle as RS;
+    match style {
+        Some("none") => {
+            p.reasoning_style = RS::ReasoningContent;
+            p.enable_thinking_param = None;
+            p.thinking_budget_param = None;
+        }
+        Some("thinking_object") => {
+            p.reasoning_style = RS::ThinkingParam;
+            p.enable_thinking_param = None;
+            p.thinking_budget_param = None;
+        }
+        Some("reasoning_effort") => {
+            p.reasoning_style = RS::EffortParam;
+            p.enable_thinking_param = None;
+            p.thinking_budget_param = None;
+        }
+        Some("enable_thinking") => {
+            p.reasoning_style = RS::ReasoningContent;
+            p.enable_thinking_param = Some("enable_thinking".into());
+            p.thinking_budget_param = None;
+        }
+        Some("enable_thinking_budget") => {
+            p.reasoning_style = RS::ReasoningContent;
+            p.enable_thinking_param = Some("enable_thinking".into());
+            p.thinking_budget_param = Some("thinking_budget".into());
+        }
+        _ => {} // auto/未知：跟预设
+    }
 }
 
 /// P8：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
@@ -207,8 +250,9 @@ fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
     };
     let preset = gateway::providers::find(&c.provider_id);
     let mut params = build_chat_params(s, preset);
-    // 角色/降级渠道用自己的 max_output_tokens（若该配置单独设置过）
+    // 角色/降级渠道用自己的 max_output_tokens（若该配置单独设置过）与思考形态覆盖
     params.max_tokens = c.max_output_tokens;
+    apply_thinking_style(&mut params, c.thinking_style.as_deref());
     Some(gateway::Channel::new(&base_url, &model, &s.config_key(c).unwrap_or_default(), params))
 }
 
@@ -302,6 +346,10 @@ async fn put_settings(
     }
     if let Some(v) = req.thinking_budget {
         s.thinking_budget = if v == 0 { None } else { Some(v) };
+    }
+    if let Some(v) = req.thinking_style {
+        let v = v.trim().to_lowercase();
+        s.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v) };
     }
     if url_before != crate::config::settings::normalize_base(&s.effective_base_url()) {
         s.models.clear();
@@ -411,9 +459,71 @@ async fn manage_configs(
     (StatusCode::OK, Json(config_state_json(&s)))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceRequest {
+    pub path: String,
+}
+
+/// GET /api/workspace —— 当前工作区 + 最近列表（P8.2）。
+async fn get_workspace(State(state): State<AppState>) -> Json<Value> {
+    let s = state.settings.read().unwrap();
+    Json(json!({
+        "current": crate::tools::workspace_root().display().to_string(),
+        "recent": s.recent_workspaces,
+    }))
+}
+
+/// POST /api/workspace —— 切换工作区：校验目录存在 → 改全局根 → 记忆层热重开
+/// （新项目 .agent/index/AGENTS.md 模板）→ settings 持久化 + 最近列表。
+/// 进行中的任务不拦（前端流式期间禁用按钮）；切换只影响之后的工具调用。
+async fn set_workspace(
+    State(state): State<AppState>,
+    Json(req): Json<WorkspaceRequest>,
+) -> (StatusCode, Json<Value>) {
+    let path = req.path.trim();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
+    }
+    let p = std::path::PathBuf::from(path);
+    if !p.is_dir() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("目录不存在: {path}") })));
+    }
+    // Windows canonicalize 会加 \\?\ 扩展前缀：显示与持久化都难看，剥掉
+    let canon = match p.canonicalize() {
+        Ok(c) => {
+            let s = c.display().to_string();
+            match s.strip_prefix(r"\\?\") {
+                Some(stripped) => std::path::PathBuf::from(stripped),
+                None => c,
+            }
+        }
+        Err(_) => p,
+    };
+    let old = crate::tools::set_workspace_root(&canon);
+    // 记忆层重开：新项目的双层存储/index 登记/AGENTS.md 模板
+    let new_mem = Arc::new(crate::memory::Memory::open(&canon, &state.mem_cfg));
+    new_mem.ensure_agents_template(&canon);
+    *state.memory.write().unwrap() = new_mem;
+    // 持久化 + 最近列表（去重、新→旧、最多 8）
+    let cur = canon.display().to_string();
+    let mut s = state.settings.write().unwrap().clone();
+    s.workspace = Some(cur.clone());
+    s.recent_workspaces.retain(|w| *w != cur);
+    s.recent_workspaces.insert(0, cur.clone());
+    s.recent_workspaces.truncate(8);
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap() = s.clone();
+    observability::event(
+        EventType::State,
+        json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
+    );
+    (StatusCode::OK, Json(json!({ "ok": true, "current": cur, "recent": s.recent_workspaces })))
+}
+
 /// 配置快照（含各配置 key 状态），供前端全量刷新。
-fn config_state_json(s: &Settings) -> Value {
-    // P8：当前供应商的思考适配画像（前端决定思考开关是否展示、预算参数是否有意义）
+fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思考适配画像（前端决定思考开关是否展示、预算参数是否有意义）
     let preset = gateway::providers::find(&s.provider_id);
     json!({
         "ok": true,
@@ -434,6 +544,7 @@ fn config_state_json(s: &Settings) -> Value {
                 "top_p": c.top_p,
                 "thinking": c.thinking,
                 "thinking_budget": c.thinking_budget,
+                "thinking_style": c.thinking_style,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
@@ -454,7 +565,41 @@ fn config_state_json(s: &Settings) -> Value {
         "reasoning_style": preset.map(|p| p.reasoning_style.as_str()),
         "thinking_budget_param": preset.and_then(|p| p.thinking_budget_param.clone()),
         "reasoning_counts_in_max_tokens": preset.map(|p| p.reasoning_counts_in_max_tokens),
+        // P8.2 工作区 + P8.3 思考参数形态覆盖（前端按它渲染档位菜单）
+        "workspace": crate::tools::workspace_root().display().to_string(),
+        "recent_workspaces": s.recent_workspaces,
+        "thinking_style_override": s.thinking_style,
+        "thinking_style": effective_thinking_style(s, preset),
     })
+}
+
+/// 生效的思考参数形态（P8.3）：配置覆盖 > 供应商预设推导。
+/// 值：none | thinking_object | reasoning_effort | enable_thinking | enable_thinking_budget | auto
+fn effective_thinking_style(
+    s: &Settings,
+    preset: Option<&gateway::providers::ProviderPreset>,
+) -> &'static str {
+    match s.thinking_style.as_deref() {
+        Some("none") => "none",
+        Some("thinking_object") => "thinking_object",
+        Some("reasoning_effort") => "reasoning_effort",
+        Some("enable_thinking") => "enable_thinking",
+        Some("enable_thinking_budget") => "enable_thinking_budget",
+        _ => match preset.map(|p| p.reasoning_style) {
+            Some(gateway::providers::ReasoningStyle::ThinkingParam) => "thinking_object",
+            Some(gateway::providers::ReasoningStyle::EffortParam) => "reasoning_effort",
+            Some(gateway::providers::ReasoningStyle::InContent) => "in_content",
+            _ => {
+                if preset.is_some_and(|p| p.thinking_budget_param.is_some()) {
+                    "enable_thinking_budget"
+                } else if preset.is_some_and(|p| p.enable_thinking_param.is_some()) {
+                    "enable_thinking"
+                } else {
+                    "auto"
+                }
+            }
+        },
+    }
 }
 
 /// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
@@ -492,11 +637,11 @@ async fn chat(
         c
     };
     let prompt = state.system_prompt.clone();
-    // P7 AGENTS.md 双层注入（全局在前、项目在后）
-    let agents_md = state.memory.agents_md();
+    // P7 AGENTS.md 双层注入（全局在前、项目在后）；P8.2 记忆层随工作区热重开
+    let agents_md = state.memory.read().unwrap().agents_md();
     let approvals = state.approvals.clone();
     let session = state.session.clone();
-    let mem = state.memory.clone();
+    let mem = state.memory.read().unwrap().clone();
     let rec_cfg = (*state.recovery_cfg).clone();
     // P6.1 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
     let session_id = {
@@ -1157,3 +1302,51 @@ loadProviders().then(loadSettings);
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway::providers::ReasoningStyle;
+
+    #[test]
+    fn thinking_style_override() {
+        let _ = gateway::providers::init(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
+        );
+        // 自定义渠道（custom=in_content）拿不准参数形态 → 覆盖为 enable_thinking 布尔
+        let preset = gateway::providers::find("custom");
+        let mut s = Settings::default();
+        s.provider_id = "custom".into();
+        s.thinking = Some("off".into());
+        s.thinking_style = Some("enable_thinking".into());
+        let p = build_chat_params(&s, preset);
+        assert_eq!(p.enable_thinking_param.as_deref(), Some("enable_thinking"));
+        assert_eq!(p.reasoning_style, ReasoningStyle::ReasoningContent);
+        // 覆盖后 off 真的会发 enable_thinking:false
+        let body = gateway::build_body("m", &json!([]), true, &p, None);
+        assert_eq!(body["enable_thinking"], json!(false));
+        // none：任何思考参数都不发
+        s.thinking_style = Some("none".into());
+        let p = build_chat_params(&s, gateway::providers::find("zhipu"));
+        let body = gateway::build_body("m", &json!([]), true, &p, None);
+        assert!(body.get("thinking").is_none() && body.get("enable_thinking").is_none());
+        // auto：跟预设（zhipu=thinking_object）
+        s.thinking_style = None;
+        let p = build_chat_params(&s, gateway::providers::find("zhipu"));
+        assert_eq!(p.reasoning_style, ReasoningStyle::ThinkingParam);
+    }
+
+    #[test]
+    fn effective_thinking_style_resolution() {
+        let _ = gateway::providers::init(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
+        );
+        let mut s = Settings::default();
+        s.provider_id = "custom".into();
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("custom")), "in_content");
+        s.provider_id = "openai".into();
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("openai")), "reasoning_effort");
+        s.thinking_style = Some("enable_thinking_budget".into());
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("openai")), "enable_thinking_budget");
+    }
+}

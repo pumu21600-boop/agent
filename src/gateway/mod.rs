@@ -117,23 +117,28 @@ pub fn build_body(
         body["top_p"] = json!(t);
     }
     match params.reasoning_style {
-        // GLM：{"thinking":{"type":"enabled|disabled"}}
+        // GLM：{"thinking":{"type":"enabled|disabled"}}（档位对 GLM 无意义，一律 enabled）
         ReasoningStyle::ThinkingParam => {
             if let Some(t) = params.thinking.as_deref() {
-                body["thinking"] = json!({ "type": if t == "on" { "enabled" } else { "disabled" } });
+                body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
             }
         }
-        // OpenAI 风格：on→medium；off 不发（o 系无可靠"关"参数）
+        // OpenAI 风格：on→medium，low/medium/high→对应档；off 不发（o 系无可靠"关"参数）
         ReasoningStyle::EffortParam => {
-            if params.thinking.as_deref() == Some("on") {
-                body["reasoning_effort"] = json!("medium");
+            let effort = match params.thinking.as_deref() {
+                Some("on") => Some("medium"),
+                Some(v @ ("low" | "medium" | "high")) => Some(v),
+                _ => None,
+            };
+            if let Some(e) = effort {
+                body["reasoning_effort"] = json!(e);
             }
         }
         _ => {}
     }
     // Qwen 系布尔开关（enable_thinking）与预算参数（thinking_budget）独立于样式生效
     if let (Some(name), Some(t)) = (&params.enable_thinking_param, params.thinking.as_deref()) {
-        body[name.as_str()] = json!(t == "on");
+        body[name.as_str()] = json!(t != "off");
     }
     if let (Some(name), Some(b)) = (&params.thinking_budget_param, params.thinking_budget) {
         body[name.as_str()] = json!(b);
@@ -817,14 +822,24 @@ mod tests {
         p.thinking = Some("on".into());
         let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(true));
-        // OpenAI（effort_param）：on 发 medium，off 不发
+        // OpenAI（effort_param）：on 发 medium，low/medium/high 发对应档，off 不发
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap());
         p.thinking = Some("on".into());
         let b = build_body("gpt-5", &msgs, true, &p, None);
         assert_eq!(b["reasoning_effort"], json!("medium"));
+        for lvl in ["low", "medium", "high"] {
+            p.thinking = Some(lvl.into());
+            let b = build_body("gpt-5", &msgs, true, &p, None);
+            assert_eq!(b["reasoning_effort"], json!(lvl), "档位 {lvl} 应原样发出");
+        }
         p.thinking = Some("off".into());
         let b = build_body("gpt-5", &msgs, true, &p, None);
         assert!(b.get("reasoning_effort").is_none(), "o 系无可靠关参数，off 不发");
+        // GLM（thinking_param）：档位无意义，非 off 一律 enabled
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
+        p.thinking = Some("high".into());
+        let b = build_body("glm-4.6", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"enabled"}));
         // 默认（reasoning_content）：完全不带思考参数
         let b = build_body("deepseek-chat", &msgs, true, &ChatParams::default(), None);
         assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none());

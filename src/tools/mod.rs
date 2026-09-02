@@ -5,7 +5,10 @@
 //! 按 danger_level 判定，工具层只管执行。
 //! shell / git 是阻塞的沙箱调用，包在 spawn_blocking 里。
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::PathBuf,
+    sync::{OnceLock, RwLock},
+};
 
 use serde_json::{Value, json};
 use tokio::task::spawn_blocking;
@@ -22,10 +25,24 @@ pub struct ToolSpec {
     pub danger_level: u8,
 }
 
-/// 工作目录根（P2 固定为工程根；P6 会话系统接入后按项目会话切换）。
-pub fn workspace_root() -> &'static std::path::Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+static WORKSPACE: OnceLock<RwLock<PathBuf>> = OnceLock::new();
+
+fn workspace_slot() -> &'static RwLock<PathBuf> {
+    WORKSPACE.get_or_init(|| RwLock::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))))
+}
+
+/// 工作目录根（P8.2 起运行时可切换：/api/workspace 设置，默认工程根）。
+pub fn workspace_root() -> PathBuf {
+    workspace_slot()
+        .read()
+        .map(|p| p.clone())
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// 切换工作目录（调用方已校验路径存在）；返回旧值供日志。
+pub fn set_workspace_root(path: &PathBuf) -> PathBuf {
+    let mut slot = workspace_slot().write().expect("workspace 锁毒化");
+    std::mem::replace(&mut *slot, path.clone())
 }
 
 /// 工具执行所需的配置快照。

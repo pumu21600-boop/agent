@@ -32,6 +32,14 @@
   let thinkingBudget = 0; // 思考预算（0=不设；Qwen 系）
   let reasoningStyle = 'reasoning_content'; // 当前供应商思考接线方式（P8）
   let thinkingBudgetParam = null; // 供应商思考预算参数名（有才显示预算输入）
+  let thinkingStyle = 'auto'; // 生效的思考参数形态（P8.3：覆盖 > 预设）
+  let thinkingStyleOverride = null; // 配置里的形态覆盖值（设置面板回显）
+  // —— P8.2 工作区 ——
+  let workspace = '';
+  let recentWorkspaces = [];
+  let wsModalOpen = false;
+  let wsPath = '';
+  let wsMsg = '';
   let apiTotals = { prompt: 0, cached: 0 }; // 渠道真实用量累计（平均缓存命中率）
 
   // —— 获取模型弹窗 ——
@@ -58,7 +66,41 @@
     await loadProviders();
     await loadSettings();
     await loadSessions(true);
+    // 点工具栏菜单外部 → 全部收起（问题1）
+    document.addEventListener('click', closeMenusOnOutside);
   });
+
+  function closeMenusOnOutside(e) {
+    if (e.target && e.target.closest && e.target.closest('.bar-menu')) return;
+    modelMenuOpen = false;
+    thinkMenuOpen = false;
+    approvalMenuOpen = false;
+  }
+
+  // —— P8.2 工作区切换 ——
+  async function applyWorkspace(path) {
+    wsMsg = '切换中…';
+    try {
+      const r = await fetch('/api/workspace', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
+      wsMsg = '';
+      wsPath = '';
+      wsModalOpen = false;
+      // 工作区变了：会话/消息/圆环全部重置，重新拉列表
+      currentSessionId = null;
+      messages = [];
+      resetCtxUsage();
+      await loadSettings();
+      await loadSessions(true);
+    } catch (e) {
+      wsMsg = `切换失败: ${e.message}`;
+    }
+  }
 
   function relTime(iso) {
     if (!iso) return '';
@@ -110,7 +152,7 @@
   // —— ZCode 式输入框：思考模式选择器（常驻）——
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
-  const THINK_LABELS = { '': '默认', on: '开启', off: '关闭' };
+  const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低', medium: '中', high: '高' };
   $: thinkHint =
     reasoningStyle === 'in_content'
       ? '该渠道思考混在正文，自动剥离展示'
@@ -190,6 +232,10 @@
     thinkingBudget = s.thinking_budget || 0;
     reasoningStyle = s.reasoning_style || 'reasoning_content';
     thinkingBudgetParam = s.thinking_budget_param || null;
+    thinkingStyle = s.thinking_style || 'auto';
+    thinkingStyleOverride = s.thinking_style_override || null;
+    workspace = s.workspace || '';
+    recentWorkspaces = s.recent_workspaces || [];
     // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
     if (!ctxUsage.budget) {
       ctxUsage = { ...ctxUsage, budget: s.context_length || 96000 };
@@ -627,8 +673,11 @@
   <aside class="sidebar">
     <div class="brand">Agent</div>
     <div class="side-project">
-      <label class="side-label">项目</label>
-      <div class="proj-name">📁 {projectName || 'agent'}</div>
+      <label class="side-label">工作区</label>
+      <div class="proj-name" title={workspace}>📁 {projectName || 'agent'}</div>
+      <button class="btn ghost ws-switch" on:click={() => { wsModalOpen = true; wsPath = ''; wsMsg = ''; }} disabled={streaming}>
+        切换工作区…
+      </button>
       <button class="new-chat" on:click={startNewSession} disabled={streaming}>＋ 新建对话</button>
       <div class="sess-list">
         {#each sessions as s (s.id)}
@@ -858,12 +907,28 @@
                   <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
                     默认<span class="bar-item-hint">跟渠道自身行为走</span>
                   </button>
-                  <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
-                    开启<span class="bar-item-hint">{thinkHint}</span>
-                  </button>
-                  <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                    关闭<span class="bar-item-hint">{reasoningStyle === 'effort_param' ? 'o 系不发参数' : '发关闭参数'}</span>
-                  </button>
+                  {#if thinkingStyle === 'reasoning_effort'}
+                    <!-- OpenAI 风格：思考分档 -->
+                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
+                      低<span class="bar-item-hint">reasoning_effort: low</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
+                      中<span class="bar-item-hint">reasoning_effort: medium</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'high'} on:click={() => pickThinking('high')}>
+                      高<span class="bar-item-hint">reasoning_effort: high</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">o 系无可靠关参数，不发</span>
+                    </button>
+                  {:else}
+                    <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
+                      开启<span class="bar-item-hint">{thinkHint}</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">{thinkingStyle === 'none' ? '不发参数（形态=无）' : '发关闭参数'}</span>
+                    </button>
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -1038,6 +1103,58 @@
         </div>
         <div class="param-hint">{thinkingBudgetParam ? `左：思考开关　右：${thinkingBudgetParam}` : '开关是否生效取决于渠道（参数形态按供应商自动适配）'}</div>
       </div>
+
+      <div class="field">
+        <label>思考参数形态（自定义/中转渠道拿不准时手动指定；P8.3）</label>
+        <select
+          bind:value={thinkingStyleOverride}
+          on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
+        >
+          <option value={null}>自动（按供应商预设）</option>
+          <option value="none">不发思考参数（思考关不掉/渠道不认参数）</option>
+          <option value="thinking_object">thinking 对象（GLM/豆包）</option>
+          <option value="reasoning_effort">reasoning_effort 档位（OpenAI/Claude/Gemini）</option>
+          <option value="enable_thinking">enable_thinking 布尔（Qwen 系）</option>
+          <option value="enable_thinking_budget">enable_thinking + thinking_budget（Qwen 带预算）</option>
+        </select>
+        <div class="param-hint">当前生效：{thinkingStyle}；选「enable_thinking 布尔」后，关闭思考会真的发 enable_thinking:false</div>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if wsModalOpen}
+  <div class="modal-backdrop" on:click={() => (wsModalOpen = false)}>
+    <div class="modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>切换工作区</b>
+        <span class="hint">{wsMsg}</span>
+        <button class="btn ghost" on:click={() => (wsModalOpen = false)}>关闭</button>
+      </div>
+      <div class="field">
+        <label>当前工作区</label>
+        <div class="ws-current" title={workspace}>{workspace || '（工程根）'}</div>
+      </div>
+      <div class="field">
+        <label>本地文件夹路径（agent 的文件读写/命令执行/影子仓库都在这里，与 agent 自身目录隔离）</label>
+        <div class="sub-row">
+          <input bind:value={wsPath} placeholder="如 D:\projects\demo 或 C:\Users\你\test" />
+          <button class="btn primary" on:click={() => applyWorkspace(wsPath)} disabled={!wsPath.trim()}>应用</button>
+        </div>
+      </div>
+      {#if recentWorkspaces.length}
+        <div class="field">
+          <label>最近使用</label>
+          <div class="ws-recent">
+            {#each recentWorkspaces as w}
+              <button class="ws-chip" class:active={w === workspace} title={w} on:click={() => applyWorkspace(w)}>
+                {w.split(/[\\/]/).filter(Boolean).pop()}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      <div class="param-hint">切换后：会话列表/记忆层（.agent、AGENTS.md）按新工作区重开；进行中的任务不受影响</div>
     </div>
   </div>
 {/if}
@@ -1759,6 +1876,49 @@
   }
   .send-btn.stop:hover {
     background: #a83a3a;
+  }
+  /* —— P8.2 工作区切换 —— */
+  .ws-switch {
+    width: 100%;
+    margin: 6px 0 4px;
+    font-size: 12px;
+    padding: 5px 8px;
+  }
+  .ws-current {
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    color: #9aa0ae;
+    background: #1b1d23;
+    border: 1px solid #2f323c;
+    border-radius: 6px;
+    padding: 6px 8px;
+    word-break: break-all;
+  }
+  .ws-recent {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .ws-chip {
+    padding: 4px 10px;
+    border-radius: 12px;
+    border: 1px solid #333742;
+    background: #1b1d23;
+    color: #b6bcc9;
+    font-size: 12px;
+    cursor: pointer;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ws-chip:hover {
+    border-color: #4a5062;
+    color: #e6e6eb;
+  }
+  .ws-chip.active {
+    border-color: #2f5fd0;
+    color: #cdd6f4;
   }
   .menu-sep {
     height: 1px;

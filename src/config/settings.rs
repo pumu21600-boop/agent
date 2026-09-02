@@ -56,6 +56,11 @@ pub struct Config {
     /// 思考预算（P8；Qwen 系 thinking_budget，厂商适配字段指定参数名）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u64>,
+    /// 思考参数形态覆盖（P8.3）：auto/none/thinking_object/reasoning_effort/
+    /// enable_thinking/enable_thinking_budget；None=auto 跟供应商预设。
+    /// 自定义/中转渠道（provider=custom）预设拿不准时，用它显式指定
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_style: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +85,9 @@ pub struct Settings {
     pub thinking: Option<String>,
     #[serde(default)]
     pub thinking_budget: Option<u64>,
+    /// 镜像：思考参数形态覆盖（P8.3）
+    #[serde(default)]
+    pub thinking_style: Option<String>,
     /// 归一化 base_url → DPAPI 加密后的 key（base64）
     #[serde(default)]
     pub keys: BTreeMap<String, String>,
@@ -92,6 +100,12 @@ pub struct Settings {
     /// 当前激活配置 id（兼容旧 active_profile_id 字段）
     #[serde(default, alias = "active_profile_id")]
     pub active_config_id: Option<String>,
+    /// P8.2 工作区：agent 实际操作的项目目录（None=工程根）；切换即改这里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// 最近用过的工作区（新→旧，最多 8 个）
+    #[serde(default)]
+    pub recent_workspaces: Vec<String>,
 }
 
 impl Default for Settings {
@@ -107,10 +121,13 @@ impl Default for Settings {
             top_p: None,
             thinking: None,
             thinking_budget: None,
+            thinking_style: None,
             keys: BTreeMap::new(),
             key_cipher: None,
             configs: Vec::new(),
             active_config_id: None,
+            workspace: None,
+            recent_workspaces: Vec::new(),
         }
     }
 }
@@ -249,6 +266,7 @@ impl Settings {
                 top_p: None,
                 thinking: None,
                 thinking_budget: None,
+                thinking_style: None,
             });
         }
         self.assign_missing_names();
@@ -315,6 +333,7 @@ impl Settings {
             self.top_p,
             self.thinking.clone(),
             self.thinking_budget,
+            self.thinking_style.clone(),
         );
         if let Some(c) = self.active_mut_() {
             c.provider_id = snap.0;
@@ -327,6 +346,7 @@ impl Settings {
             c.top_p = snap.7;
             c.thinking = snap.8;
             c.thinking_budget = snap.9;
+            c.thinking_style = snap.10;
         }
     }
 
@@ -348,6 +368,7 @@ impl Settings {
         self.top_p = c.top_p;
         self.thinking = c.thinking;
         self.thinking_budget = c.thinking_budget;
+        self.thinking_style = c.thinking_style;
         self.active_config_id = Some(id.to_string());
         true
     }
@@ -371,6 +392,7 @@ impl Settings {
             top_p: None,
             thinking: None,
             thinking_budget: None,
+            thinking_style: None,
         });
         self.active_config_id = Some(id.clone());
         id
@@ -397,6 +419,7 @@ impl Settings {
                 self.top_p = c.top_p;
                 self.thinking = c.thinking;
                 self.thinking_budget = c.thinking_budget;
+                self.thinking_style = c.thinking_style;
             }
         }
         true
