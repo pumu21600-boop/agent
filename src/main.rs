@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         cancel,
         settings: Arc::new(std::sync::RwLock::new(user_settings)),
         agent_cfg: Arc::new(config.agent),
+        sandbox_cfg: Arc::new(config.sandbox),
         system_prompt: Arc::new(system_prompt),
     };
     let app = server::router(state, manifest.join("web").join("dist"));

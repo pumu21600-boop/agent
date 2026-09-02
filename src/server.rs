@@ -42,6 +42,7 @@ pub struct AppState {
     pub cancel: Arc<CancelFlag>,
     pub settings: Arc<std::sync::RwLock<Settings>>,
     pub agent_cfg: Arc<AgentConfig>,
+    pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
     pub system_prompt: Arc<String>,
 }
 
@@ -100,6 +101,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/chat", post(chat))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
+        .route("/api/sandbox/selftest", get(sandbox_selftest))
         .route("/api/health", get(|| async { "ok" }))
         .with_state(state);
 
@@ -410,6 +412,26 @@ async fn cancel(State(state): State<AppState>) -> Json<Value> {
 /// GET /api/cancel —— 查询取消标志当前状态。
 async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "cancelled": state.cancel.is_set() }))
+}
+
+/// GET /api/sandbox/selftest —— 跑快速探针（真实拉起受限进程），逐项返回结果。
+/// 阻塞在 spawn_blocking 里做；kill-tree / 内存上限探针较慢，只在 cargo test 跑。
+async fn sandbox_selftest(State(state): State<AppState>) -> Json<Value> {
+    let cfg = (*state.sandbox_cfg).clone();
+    let results = tokio::task::spawn_blocking(move || crate::sandbox::probes::run_fast_suite(&cfg))
+        .await
+        .unwrap_or_default();
+    observability::event(
+        EventType::State,
+        json!({ "kind": "sandbox.selftest", "ok": results.iter().all(|r| r.ok) }),
+    );
+    Json(json!({
+        "ok": results.iter().all(|r| r.ok),
+        "results": results
+            .iter()
+            .map(|r| json!({ "name": r.name, "ok": r.ok, "detail": r.detail }))
+            .collect::<Vec<Value>>(),
+    }))
 }
 
 /// 内置冒烟页（frontend/dist 未构建时的回退）：设置面板 + 输入框 + 发送 + 流式显示 + 停止。

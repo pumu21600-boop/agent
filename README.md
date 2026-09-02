@@ -1,7 +1,16 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P2 完成**（核心循环 v1 + 工具调用闭环），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P3 完成**（执行沙箱 v1：Job Objects + 受限 token），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P3 执行沙箱（真实隔离，壳先于 shell）
+
+- **Job Objects**：`kill-on-close` 整树必灭（孤儿零残留）、内存/进程数/CPU 上限、UI 限制（剪贴板/全局原子/桌面）
+- **受限 token**：`CreateRestrictedToken` 剥光特权 + 受限 SID 白名单（用户/Everyone/Users/登录会话），普通用户权限运行、无需管理员
+- **环境白名单**：子进程环境重建注入，密钥（API key 等）永不进沙箱
+- 配置：`config.toml [sandbox]`（timeout_ms / memory_mb / active_processes）
+- 探针验收：`cargo test` 8 项 + `GET /api/sandbox/selftest`（输出/环境/特权/工作目录/超时/树杀/内存）
+- P4 的 shell / 文件写工具将统一走这套壳
 
 ## P2 核心循环（模型驱动 agentic loop）
 
@@ -23,7 +32,8 @@ agent/
 │   ├── gateway/          # 模型网关 + providers 数据加载
 │   ├── config/           # config.toml + settings 持久化（DPAPI 存 key）
 │   ├── observability/    # JSONL 日志（6 类事件）
-│   └── tools/ sandbox/ plugin/ memory/ session/ recovery/ context/  # 占位，后续单实现
+│   ├── sandbox/          # 执行沙箱（P3：Job Objects + 受限 token + 探针）
+│   └── tools/ plugin/ memory/ session/ recovery/ context/  # 占位，后续单实现
 ├── web/                  # Svelte + Vite 聊天界面（侧栏 + 对话 + 设置弹窗）
 ├── providers.json        # 供应商预设（数据驱动）
 ├── docs/                 # jsonl-schema.md / ROADMAP.md / workorders/
