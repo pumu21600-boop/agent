@@ -1,17 +1,19 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P6 完成**（恢复与续命），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P6 完成**（恢复与续命，含 P6.1 多会话/改动条修订），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## P6 恢复与续命
 
 - **影子仓库检查点**：danger≥1 工具（write_file/shell/git）审批通过后、执行前，把真仓库已跟踪文件
   提交进 `<workspace>/.agent/shadow`（独立 git dir，只跟踪 `git ls-files` + 排除目录 + 10MB 上限，
   pathspec 走文件防命令行超长）；失败只记日志绝不阻断工具。
-- **回滚**：GET /api/checkpoints 列表、POST /api/checkpoints/restore 恢复工作树到检查点
-  （`reset --hard`，含删除其后新建的已跟踪文件）；shell 副作用不可回滚，绝不碰真仓库 HEAD。
-- **会话落盘**：核心循环任务开始/每步工具回填完/终止时发 `Snapshot` 事件 → `logs/session.json`
-  原子写；前端启动拉 GET /api/session 重建对话（含工具卡片）；「新会话」= DELETE /api/session。
+- **改动条与撤销**：任务起点当场拍基线快照，结束时补「结束快照」并算 diff——对话流内显示
+  「N 个文件已更改 +x −y ↩ 撤销」；撤销**只回退本任务改过的文件**（逐文件恢复，绝不整树 reset，
+  用户自己的改动不受牵连）；shell 副作用不可回滚，绝不碰真仓库 HEAD。
+- **多会话落盘**：每条会话一个文件 `logs/sessions/<id>.json`（核心循环任务开始/每步/终止发
+  `Snapshot` 事件原子写）；侧栏「项目 → 会话列表」点选切换，「＋ 新建对话」不清空历史，
+  标题自动取首条用户消息；重启/刷新自动恢复最近会话。
 - **HANDOFF 交接**：手动（侧栏按钮 / POST /api/handoff）或自动（上下文占用 ≥
   `[recovery].handoff_token_ratio` 默认 80% 时每任务一次）生成 `<workspace>/HANDOFF.md`，
   头部强制项目名/git remote/commit/时间戳，正文含最近请求、最后回答摘要、工具计数。
@@ -124,11 +126,12 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/cancel` | 置位全局取消标志 |
 | GET | `/api/cancel` | 查询取消标志（`{"cancelled":bool}`） |
 | GET | `/api/health` | 健康检查 |
-| GET | `/api/session` | 恢复落盘会话（`{id, updated_at, messages}`） |
-| DELETE | `/api/session` | 新会话（清盘） |
+| GET | `/api/sessions` | 会话列表（项目名 + 标题/时间/条数，新→旧） |
+| GET | `/api/session?id=` | 恢复指定会话（缺省=最近一条） |
+| DELETE | `/api/session?id=` | 删除单条会话（其余不受影响） |
 | POST | `/api/handoff` | 手动生成交接文档 HANDOFF.md |
 | GET | `/api/checkpoints` | 影子仓库检查点列表（新→旧，≤20） |
-| POST | `/api/checkpoints/restore` | 工作树回滚到指定检查点（body: `{id}`） |
+| POST | `/api/checkpoints/restore` | 撤销：只回退该基线之后 agent 改过的文件（body: `{id}`） |
 
 ## 无 key 冒烟（可选）
 

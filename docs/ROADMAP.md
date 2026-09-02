@@ -13,11 +13,11 @@
 | P3 执行沙箱 v1 | Job Objects + 受限 token（壳先于 shell） | ✅ 已完成（tag v0.4-p3） |
 | P4 工具第一批 + 审批三档 | shell（入沙箱）、文件写、ripgrep、web 抓取、git；注册表；suggest/auto-edit/full-auto | ✅ 已完成（tag v0.5-p4） |
 | P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ✅ 已完成（tag v0.6-p5） |
-| P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ✅ 已完成（tag v0.7-p6） |
+| P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ✅ 已完成（tag v0.7-p6；P6.1 多会话+改动条 v0.7.1-p6） |
 | P7 记忆 v1 + AGENTS.md | events.log + 滚动摘要、双层存储（~/.agent + 项目 .agent）、index.json | ⏳ |
 | P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补 OpenRouter/Gemini/LMStudio/MNN/llama.cpp | ⏳ |
 | P9 Plan 模式 + 审批规则引擎 | 留口转正式 | ⏳ |
-| P10（第二个月） | 多开会话 + trace 时间线视图 + eval 体系 | ⏳ |
+| P10（第二个月） | 多开会话 + trace 时间线视图 + eval 体系 | ⏳（多开会话 v1 已于 P6.1 提前落地；工作区切换仍在本单） |
 | P11 | MCP client + WASM 插件 + 双总线 | ⏳ |
 | P12 | AppContainer + 网络出向限制；并行工具调用 + 写冲突检测 | ⏳ |
 | P13 | Tauri 桌面封装 | ⏳ |
@@ -48,3 +48,4 @@
 9. **SeChangeNotifyPrivilege 剥不掉**：`CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 只把特权置禁用不删名字，且系统固定保留 SeChangeNotifyPrivilege（遍历绕过，无害）；探针按名字白名单断言，别用 whoami 输出数个数。
 10. **沙箱内存上限探针别用 powershell**：受限 token 下 .NET 启动即 0xC0000142；且 PS 里 `New-Object byte[]` 分配失败会当非终止错误吞掉继续跑，结论不可信。用原生 hog（src/bin/sandbox_hog.rs）做差分。
 11. **Git Bash PATH 污染对照组**：测试进程 PATH 里的 Git usr/bin 会让 `cmd /C whoami` 解析到 GNU whoami；沙箱内没事（环境是白名单重建的），不经沙箱的对照组要写绝对路径。
+12. **影子仓库回滚绝不整树 reset**（P6.1 教训）：`reset --hard <旧基线>` 会把基线之后**用户自己**的提交/改动一并刷回旧快照（真实发生过：点旧检查点回滚把已提交的文档刷回 P5 状态）。restore 必须按 `diff --name-status 基线..HEAD` 逐文件回退 agent 实际改过的文件；改动统计条的基线也必须是**任务起点当场拍的快照**，不能拿影子 HEAD 凑数（会把历史漂移算进条里）。
