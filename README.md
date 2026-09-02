@@ -52,6 +52,7 @@ cargo run                            # 前台调试运行（关终端即停）
 - 内置 13 个供应商预设：DeepSeek / OpenAI / 商汤 / 通义 / 智谱 / Kimi / 百度千帆 / 星火 / SiliconFlow / Groq / xAI / Ollama / **OpenAI 兼容（自定义兜底）**。
 - 每个预设自带默认 Base URL（可改）；**不带模型清单**——点「获取模型」实时从渠道拉取（OpenAI 兼容的 `GET /models`），列表下拉选择，也能手动填。
 - 用中转渠道：选对应供应商（如 DeepSeek），把 Base URL 改成中转地址、Key 填中转 key，其余不用管。思考模式（reasoning_content）自动解析显示。
+- **配置方案**：设置弹窗里可「另存为/应用/覆盖/删除」多套「供应商+Base URL+模型」组合，一键切换；key 按供应商独立保存，不随方案动。
 - 设置持久化到 `settings.json`；**API Key 用 Windows DPAPI 加密存储、按供应商分别保存**（本机本用户才能解，文件里是密文），重新打开网页/重启服务都还在，无需重配。
 - Key 也支持环境变量 `DEEPSEEK_API_KEY` 兜底（未保存 key 时使用）。key 永不写日志。
 

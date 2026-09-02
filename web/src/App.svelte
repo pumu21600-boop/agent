@@ -14,6 +14,11 @@
   let settingsOpen = false;
   let modelMenuOpen = false;
 
+  // —— 配置方案 ——
+  let profiles = [];
+  let profileSel = '';
+  let profileName = '';
+
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
   let fetchedModels = [];
@@ -51,7 +56,63 @@
     savedModels = s.models || [];
     hasKey = !!s.has_key;
     keyHint = s.key_hint || '';
+    profiles = s.profiles || [];
+    profileSel = s.active_profile_id || '';
     if (!baseUrl) applyDefault();
+  }
+
+  async function manageProfiles(body) {
+    const r = await fetch('/api/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.error) {
+      settingsMsg = `方案操作失败: ${d.error}`;
+      return;
+    }
+    profiles = d.profiles || [];
+    profileSel = d.active_profile_id || '';
+    providerId = d.provider_id;
+    baseUrl = d.base_url;
+    model = d.model;
+    savedModels = d.models || [];
+    hasKey = !!d.has_key;
+    keyHint = d.key_hint || '';
+  }
+
+  function saveAsProfile() {
+    const name = profileName.trim();
+    if (!name) {
+      settingsMsg = '先填方案名称';
+      return;
+    }
+    manageProfiles({ action: 'save', name });
+    profileName = '';
+    settingsMsg = '已另存为方案';
+  }
+
+  function overwriteProfile() {
+    const name = profileName.trim();
+    if (!name) {
+      settingsMsg = '先填方案名称';
+      return;
+    }
+    manageProfiles({ action: 'save', id: profileSel, name });
+    settingsMsg = '已覆盖方案';
+  }
+
+  function applyProfile() {
+    if (!profileSel) return;
+    manageProfiles({ action: 'apply', id: profileSel });
+    settingsMsg = '已切换配置方案';
+  }
+
+  function deleteProfile() {
+    if (!profileSel) return;
+    manageProfiles({ action: 'delete', id: profileSel });
+    settingsMsg = '已删除方案（当前配置保持不变）';
   }
 
   function applyDefault() {
@@ -418,6 +479,24 @@
             <option value="">（先获取模型）</option>
           {/if}
         </select>
+      </div>
+      <div class="field">
+        <label>配置方案（保存多套供应商+模型组合，一键切换；key 按供应商独立保存，不受方案影响）</label>
+        <div class="sub-row">
+          <select bind:value={profileSel}>
+            <option value="">（当前配置未关联方案）</option>
+            {#each profiles as p}
+              <option value={p.id}>{p.name}</option>
+            {/each}
+          </select>
+          <button class="btn" on:click={applyProfile} disabled={!profileSel}>应用</button>
+          <button class="btn" on:click={overwriteProfile} disabled={!profileSel}>覆盖</button>
+          <button class="btn" on:click={deleteProfile} disabled={!profileSel}>删除</button>
+        </div>
+        <div class="sub-row">
+          <input bind:value={profileName} placeholder="方案名称，如：商汤主力 / DS官方" />
+          <button class="btn primary" on:click={saveAsProfile}>另存当前为方案</button>
+        </div>
       </div>
       <div class="modal-foot">
         <span class="msg">{settingsMsg}</span>
@@ -793,6 +872,22 @@
   }
   .field input,
   .field select {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #333742;
+    background: #1b1d23;
+    color: #e6e6eb;
+    font-size: 13px;
+  }
+  .sub-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .sub-row input {
+    flex: 1;
+    min-width: 140px;
     padding: 8px 10px;
     border-radius: 8px;
     border: 1px solid #333742;
