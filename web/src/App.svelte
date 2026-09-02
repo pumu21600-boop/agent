@@ -43,15 +43,29 @@
   let seq = 0;
   let chatBody;
 
-  // —— P6 恢复与续命 ——
-  let checkpoints = []; // 影子仓库检查点（新→旧）
+  // —— P6 恢复与续命 / P6.1 多会话 ——
+  let sessions = []; // 会话列表（新→旧）
+  let currentSessionId = null; // 当前会话（null=下次发送自动新建）
+  let projectName = ''; // 工作区目录名
 
   onMount(async () => {
     await loadProviders();
     await loadSettings();
-    await restoreSession();
-    loadCheckpoints();
+    await loadSessions(true);
   });
+
+  function relTime(iso) {
+    if (!iso) return '';
+    const ms = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return '刚刚';
+    if (m < 60) return `${m}分钟前`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}小时前`;
+    const d = Math.floor(h / 24);
+    if (d < 30) return `${d}天前`;
+    return new Date(iso).toLocaleDateString();
+  }
 
   afterUpdate(() => {
     // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断
@@ -284,7 +298,13 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history, model, base_url: baseUrl, approval_mode: approvalMode }),
+        body: JSON.stringify({
+          messages: history,
+          model,
+          base_url: baseUrl,
+          approval_mode: approvalMode,
+          session_id: currentSessionId || '',
+        }),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -303,7 +323,9 @@
             if (!line.startsWith('data: ')) continue;
             try {
               const d = JSON.parse(line.slice(6));
-              if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
+              if (d.session) {
+                currentSessionId = d.session;
+              } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
               else if (d.tool_call)
                 patch((m) => ({
@@ -332,6 +354,11 @@
                     ? { ...m, approval: { ...m.approval, decided: d.approval_decided.approved } }
                     : m
                 );
+              else if (d.checkpoint)
+                messages = [
+                  ...messages,
+                  { id: nextId(), role: 'cp', cp: d.checkpoint },
+                ];
               else if (d.notice)
                 messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
               else if (d.context_usage)
@@ -371,6 +398,7 @@
     } finally {
       streaming = false;
       controller = null;
+      loadSessions(); // 刷新会话列表（新会话出现/标题更新）
     }
   }
 
@@ -386,14 +414,69 @@
     return '';
   }
 
-  // 启动时拉取落盘会话，重建对话视图（assistant 的 tool_calls + tool 结果配对成工具卡）
-  async function restoreSession() {
+  // —— P6.1 多会话：列表 / 切换 / 新建（新建不清空历史）——
+  async function loadSessions(autoPick = false) {
     try {
-      const r = await fetch('/api/session').then((r) => r.json());
-      const msgs = r.messages || [];
-      if (msgs.length) messages = rebuildFromSession(msgs);
+      const r = await fetch('/api/sessions').then((r) => r.json());
+      projectName = r.project || '';
+      sessions = r.sessions || [];
+      // 启动时默认恢复最近一条会话
+      if (autoPick && currentSessionId === null && sessions.length) {
+        await loadSession(sessions[0].id);
+      }
     } catch (e) {
-      // 恢复失败不阻塞使用
+      sessions = [];
+    }
+  }
+
+  async function loadSession(id) {
+    if (streaming) return;
+    try {
+      const r = await fetch(`/api/session?id=${encodeURIComponent(id)}`).then((r) => r.json());
+      currentSessionId = id;
+      messages = rebuildFromSession(r.messages || []);
+      ctxUsage = { tokens: 0, budget: 0, breakdown: null };
+    } catch (e) {
+      // 加载失败不阻塞
+    }
+  }
+
+  function startNewSession() {
+    if (streaming) return;
+    currentSessionId = null;
+    messages = [];
+    ctxUsage = { tokens: 0, budget: 0, breakdown: null };
+    apiTotals = { prompt: 0, cached: 0 };
+  }
+
+  async function deleteSession(id) {
+    if (!confirm('删除这条会话？其余会话不受影响')) return;
+    await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (id === currentSessionId) startNewSession();
+    loadSessions();
+  }
+
+  // —— P6.1 改动统计条：撤销 = 工作树回滚到任务起点基线 ——
+  async function undoCheckpoint(cp) {
+    if (!confirm(`撤销本次任务的改动？\n${cp.files} 个文件将恢复到任务开始前（含删除本次新建的已跟踪文件）。\nshell 副作用不可回滚。`))
+      return;
+    try {
+      const r = await fetch('/api/checkpoints/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: cp.id }),
+      });
+      const d = await r.json();
+      messages = [
+        ...messages,
+        {
+          id: nextId(),
+          role: 'system',
+          content: d.ok ? `↩ 已撤销：${cp.files} 个文件恢复到任务开始前` : `⚠️ 撤销失败：${d.error}`,
+        },
+      ];
+    } catch (e) {
+      messages = [...messages, { id: nextId(), role: 'error', content: `[撤销请求失败] ${e}` }];
     }
   }
 
@@ -429,15 +512,6 @@
     return out;
   }
 
-  async function newSession() {
-    if (messages.length && !confirm('清空当前会话？落盘的对话消息会一并删除')) return;
-    await fetch('/api/session', { method: 'DELETE' });
-    messages = [];
-    ctxUsage = { tokens: 0, budget: 0, breakdown: null };
-    apiTotals = { prompt: 0, cached: 0 };
-    checkpoints = [];
-  }
-
   async function makeHandoff() {
     try {
       const r = await fetch('/api/handoff', { method: 'POST' });
@@ -452,43 +526,6 @@
       ];
     } catch (e) {
       messages = [...messages, { id: nextId(), role: 'error', content: `[HANDOFF 请求失败] ${e}` }];
-    }
-  }
-
-  async function loadCheckpoints() {
-    try {
-      const r = await fetch('/api/checkpoints').then((r) => r.json());
-      checkpoints = r.checkpoints || [];
-    } catch (e) {
-      checkpoints = [];
-    }
-  }
-
-  async function restoreCheckpoint(cp) {
-    if (
-      !confirm(
-        `回滚到检查点 ${cp.id.slice(0, 7)}？\n此后对已跟踪文件的改动会被覆盖（含删除其后新建的文件）。\nshell 副作用不可回滚。`
-      )
-    )
-      return;
-    try {
-      const r = await fetch('/api/checkpoints/restore', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: cp.id }),
-      });
-      const d = await r.json();
-      messages = [
-        ...messages,
-        {
-          id: nextId(),
-          role: 'system',
-          content: d.ok ? `⏪ 已回滚到检查点 ${cp.id.slice(0, 7)}（${cp.reason}）` : `⚠️ 回滚失败：${d.error}`,
-        },
-      ];
-      loadCheckpoints();
-    } catch (e) {
-      messages = [...messages, { id: nextId(), role: 'error', content: `[回滚请求失败] ${e}` }];
     }
   }
 
@@ -542,26 +579,29 @@
         <option value="full-access">完全访问（脱沙箱！）</option>
       </select>
     </div>
-    <div class="side-p6">
-      <label class="side-label">恢复与续命</label>
-      <div class="side-actions">
-        <button class="btn ghost" on:click={newSession} disabled={streaming}>新会话</button>
-        <button class="btn ghost" on:click={makeHandoff}>生成 HANDOFF</button>
+    <div class="side-project">
+      <label class="side-label">项目</label>
+      <div class="proj-name">📁 {projectName || 'agent'}</div>
+      <button class="new-chat" on:click={startNewSession} disabled={streaming}>＋ 新建对话</button>
+      <div class="sess-list">
+        {#each sessions as s (s.id)}
+          <div
+            class="sess-item"
+            class:active={s.id === currentSessionId}
+            role="button"
+            tabindex="0"
+            on:click={() => loadSession(s.id)}
+            on:keydown={(e) => e.key === 'Enter' && loadSession(s.id)}
+          >
+            <span class="sess-title" title={s.title}>{s.title}</span>
+            <span class="sess-side">
+              <button class="sess-del" title="删除会话" on:click|stopPropagation={() => deleteSession(s.id)}>✕</button>
+              <span class="sess-time">{relTime(s.updated_at)}</span>
+            </span>
+          </div>
+        {/each}
       </div>
-      {#if checkpoints.length}
-        <label class="side-label">检查点（可回滚）</label>
-        <div class="cp-list">
-          {#each checkpoints as cp (cp.id)}
-            <div class="cp-item">
-              <div class="cp-meta">
-                <span class="cp-hash">{cp.id.slice(0, 7)}</span>
-                <span class="cp-reason" title={cp.reason}>{cp.reason}</span>
-              </div>
-              <button class="cp-btn" on:click={() => restoreCheckpoint(cp)}>回滚</button>
-            </div>
-          {/each}
-        </div>
-      {/if}
+      <button class="btn ghost handoff-btn" on:click={makeHandoff}>生成 HANDOFF</button>
     </div>
     <div class="side-foot">
       <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
@@ -630,6 +670,13 @@
               {/if}
               {#if m.streaming && m.content}<span class="cursor">▍</span>{/if}
             </div>
+          </div>
+        {:else if m.role === 'cp'}
+          <div class="cp-bar">
+            <span class="cp-sum">› <b>{m.cp.files}</b> 个文件已更改</span>
+            <span class="cp-add">+{m.cp.additions}</span>
+            <span class="cp-del">−{m.cp.deletions}</span>
+            <button class="cp-undo" on:click={() => undoCheckpoint(m.cp)}>↩ 撤销</button>
           </div>
         {:else if m.role === 'error'}
           <div class="msg system"><div class="bubble error-bubble">{m.content}</div></div>
@@ -1160,66 +1207,128 @@
     border-color: #b3403a;
     color: #ff7b72;
   }
-  .side-p6 {
+  .side-project {
     display: flex;
     flex-direction: column;
     gap: 6px;
     padding: 14px 12px 0;
+    min-height: 0;
   }
-  .side-actions {
-    display: flex;
-    gap: 6px;
+  .proj-name {
+    font-size: 13px;
+    color: #e6e9f0;
+    font-weight: 600;
   }
-  .side-actions .btn {
-    flex: 1;
+  .new-chat {
+    background: #2f6feb;
+    border: none;
+    color: #fff;
+    border-radius: 6px;
+    padding: 6px;
     font-size: 12px;
-    padding: 5px 4px;
+    cursor: pointer;
   }
-  .cp-list {
+  .new-chat:hover {
+    background: #3d7bf5;
+  }
+  .new-chat:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .sess-list {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    max-height: 180px;
+    gap: 2px;
     overflow-y: auto;
+    min-height: 0;
   }
-  .cp-item {
+  .sess-item {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 6px;
-    background: #1b1d23;
-    border: 1px solid #2f323c;
+    padding: 6px 8px;
     border-radius: 6px;
-    padding: 4px 6px;
-    font-size: 11px;
-  }
-  .cp-meta {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-  .cp-hash {
-    font-family: monospace;
+    cursor: pointer;
+    font-size: 12px;
     color: #cdd2dd;
   }
-  .cp-reason {
-    color: #9aa0ae;
+  .sess-item:hover {
+    background: #262932;
+  }
+  .sess-item.active {
+    background: #2f323c;
+  }
+  .sess-title {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    min-width: 0;
   }
-  .cp-btn {
+  .sess-side {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     flex-shrink: 0;
-    background: transparent;
-    border: 1px solid #3d4150;
-    color: #cdd2dd;
-    border-radius: 4px;
-    font-size: 11px;
-    padding: 2px 6px;
-    cursor: pointer;
   }
-  .cp-btn:hover {
-    border-color: #b3403a;
+  .sess-time {
+    color: #9aa0ae;
+    font-size: 11px;
+  }
+  .sess-del {
+    background: transparent;
+    border: none;
+    color: #6b7280;
+    cursor: pointer;
+    font-size: 10px;
+    padding: 0 2px;
+    display: none;
+  }
+  .sess-item:hover .sess-del {
+    display: inline;
+  }
+  .sess-del:hover {
+    color: #ff7b72;
+  }
+  .handoff-btn {
+    font-size: 12px;
+    padding: 5px 4px;
+  }
+  .cp-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #1b1d23;
+    border: 1px solid #2f323c;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    color: #9aa0ae;
+    max-width: 720px;
+  }
+  .cp-sum b {
+    color: #e6e9f0;
+  }
+  .cp-add {
+    color: #4ade80;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  .cp-del {
+    color: #f87171;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  .cp-undo {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    color: #cdd2dd;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .cp-undo:hover {
     color: #ff7b72;
   }
   .tool-head {

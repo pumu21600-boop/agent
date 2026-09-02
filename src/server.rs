@@ -45,8 +45,8 @@ pub struct AppState {
     pub context_cfg: Arc<crate::config::ContextConfig>,
     pub recovery_cfg: Arc<crate::config::RecoveryConfig>,
     pub system_prompt: Arc<String>,
-    /// 会话落盘（P6）：Snapshot 事件写入，GET/DELETE /api/session 读写
-    pub session: Arc<crate::session::Store>,
+    /// 会话落盘（P6.1 多会话）：Snapshot 事件按 session_id 写入
+    pub session: Arc<crate::session::SessionManager>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
@@ -72,6 +72,9 @@ pub struct ChatRequest {
     /// 审批档位覆盖：suggest / auto-edit / full-auto（缺省用配置默认）
     #[serde(default)]
     pub approval_mode: String,
+    /// P6.1 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
+    #[serde(default)]
+    pub session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +120,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/approval-mode", post(set_approval_mode))
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session).delete(clear_session))
+        .route("/api/sessions", get(list_sessions))
         .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
@@ -390,6 +394,14 @@ async fn chat(
     let approvals = state.approvals.clone();
     let session = state.session.clone();
     let rec_cfg = (*state.recovery_cfg).clone();
+    // P6.1 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
+    let session_id = {
+        let sid = req.session_id.trim().to_string();
+        let valid = !sid.is_empty()
+            && sid.len() <= 64
+            && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if valid { sid } else { session.new_id() }
+    };
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就回退 auto 并告知前端。
     let norm = |m: &str| -> String {
@@ -427,6 +439,8 @@ async fn chat(
             send(json!({ "error": "消息为空" }));
             return;
         }
+        // P6.1：先把会话 id 告诉前端（新建时它还不知道）
+        send(json!({ "session": session_id }));
         // 请求级覆盖优先：页面当前选择即时生效，不等保存
         let base_url = if !req_base_url.is_empty() { req_base_url } else { s.effective_base_url() };
         let model = if !req_model.is_empty() { req_model } else { s.effective_model() };
@@ -486,17 +500,20 @@ async fn chat(
                 }
                 // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                 AgentEvent::Snapshot { messages } => {
-                    let session_id = observability::get().session_id().to_string();
                     match session.save(&session_id, &messages) {
                         Ok(()) => observability::event(
                             EventType::State,
-                            json!({ "kind": "session.saved", "messages": messages.len() }),
+                            json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
                         ),
                         Err(e) => observability::event(
                             EventType::Error,
                             json!({ "message": format!("会话落盘失败: {e}") }),
                         ),
                     }
+                }
+                // P6.1 改动统计条：撤销按钮恢复到任务起点基线
+                AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
+                    send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
                 }
                 AgentEvent::Notice(n) => send(json!({ "notice": n }))
             },
@@ -639,19 +656,35 @@ async fn decide_approval(
     }
 }
 
-/// GET /api/session —— 恢复落盘会话（前端启动时拉取重建对话视图）。
-async fn get_session(State(state): State<AppState>) -> Json<Value> {
-    match state.session.load() {
-        Some(f) => Json(json!({ "id": f.id, "updated_at": f.updated_at, "messages": f.messages })),
-        None => Json(json!({ "messages": [] })),
+/// GET /api/sessions —— 会话列表（新→旧）+ 项目名（P6.1 多会话）。
+async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
+    let project = crate::tools::workspace_root()
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Json(json!({ "project": project, "sessions": state.session.list() }))
+}
+
+/// GET /api/session?id=xxx —— 恢复指定会话；缺省返回最近更新的一条。
+async fn get_session(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+    let f = match q.get("id") {
+        Some(id) => state.session.get(id),
+        None => state.session.latest(),
+    };
+    match f {
+        Some(f) => (StatusCode::OK, Json(json!({ "id": f.id, "title": f.title, "updated_at": f.updated_at, "messages": f.messages }))),
+        None => (StatusCode::OK, Json(json!({ "messages": [] }))),
     }
 }
 
-/// DELETE /api/session —— 新会话（清盘）。
-async fn clear_session(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    match state.session.clear() {
+/// DELETE /api/session?id=xxx —— 删除一条会话（其余不受影响）。
+async fn clear_session(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> (StatusCode, Json<Value>) {
+    let Some(id) = q.get("id") else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
+    };
+    match state.session.delete(id) {
         Ok(()) => {
-            observability::event(EventType::State, json!({ "kind": "session.cleared" }));
+            observability::event(EventType::State, json!({ "kind": "session.cleared", "session": id }));
             (StatusCode::OK, Json(json!({ "ok": true })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
@@ -662,7 +695,7 @@ async fn clear_session(State(state): State<AppState>) -> (StatusCode, Json<Value
 async fn make_handoff(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let ws = crate::tools::workspace_root().to_path_buf();
     let session_id = observability::get().session_id().to_string();
-    let messages = state.session.load().map(|f| f.messages);
+    let messages = state.session.latest().map(|f| f.messages);
     let input = crate::recovery::HandoffInput {
         trigger: "手动（用户请求）".to_string(),
         session_id,

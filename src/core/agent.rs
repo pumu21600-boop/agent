@@ -31,6 +31,44 @@ pub enum AgentEvent {
     Snapshot { messages: Vec<Value> },
     /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
     Notice(String),
+    /// 任务改动统计条（P6.1）：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
+    Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
+}
+
+/// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
+/// 再算相对基线的 numstat；无改动不发。撤销 = 影子仓库 reset --hard 回基线。
+async fn emit_checkpoint_bar(
+    baseline: Option<String>,
+    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+) {
+    let Some(base) = baseline else { return };
+    let ws = tools::workspace_root().to_path_buf();
+    let res = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || -> anyhow::Result<(usize, u64, u64)> {
+            recovery::checkpoint(&ws, "任务结束快照")?;
+            recovery::diff_stat(&ws, &base)
+        }
+    })
+    .await;
+    match res {
+        Ok(Ok((files, adds, dels))) if files > 0 => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "checkpoint.summary", "baseline": base, "files": files, "additions": adds, "deletions": dels }),
+            );
+            on_event(AgentEvent::Checkpoint { id: base, files_changed: files, additions: adds, deletions: dels });
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => observability::event(
+            EventType::State,
+            json!({ "kind": "checkpoint.skipped", "reason": e.to_string() }),
+        ),
+        Err(e) => observability::event(
+            EventType::State,
+            json!({ "kind": "checkpoint.skipped", "reason": format!("任务失败: {e}") }),
+        ),
+    }
 }
 
 /// 审批三档判定（Codex 式，施工单 005/006）：
@@ -83,13 +121,27 @@ pub async fn run_task(
     rec_cfg: &RecoveryConfig,
     max_output_tokens: Option<u64>,
     gate: &dyn ApprovalGate,
-    on_event: impl Fn(AgentEvent),
+    on_event: impl Fn(AgentEvent) + Send + Sync,
 ) -> anyhow::Result<LoopOutcome> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
     msgs.extend(messages.iter().cloned());
     // P6 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
     on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+    // P6.1 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
+    // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
+    let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
+        let ws = tools::workspace_root().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Option<String> {
+            let _ = recovery::checkpoint(&ws, "任务起点");
+            recovery::head_id(&ws).ok().flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
     // P6 自动交接：本任务内只触发一次
     let mut handoff_done = false;
 
@@ -101,6 +153,7 @@ pub async fn run_task(
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
             on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+            emit_checkpoint_bar(baseline, &on_event).await;
             return Ok(LoopOutcome::Cancelled);
         }
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
@@ -228,6 +281,7 @@ pub async fn run_task(
             // P6：最终回答写入会话并落盘（与前端看到的一致）
             msgs.push(json!({ "role": "assistant", "content": final_text }));
             on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+            emit_checkpoint_bar(baseline, &on_event).await;
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
@@ -275,6 +329,7 @@ pub async fn run_task(
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+                emit_checkpoint_bar(baseline, &on_event).await;
                 return Ok(LoopOutcome::Cancelled);
             }
             observability::event(

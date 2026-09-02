@@ -191,8 +191,9 @@ pub fn list(ws: &Path, limit: usize) -> anyhow::Result<Vec<Checkpoint>> {
         .collect())
 }
 
-/// 工作树恢复到指定检查点（含删除其后新建的已跟踪文件）。
-/// 只动影子仓库与工作区文件，绝不碰真仓库的 HEAD/分支/暂存区。
+/// 工作树恢复到指定检查点。只回退**该检查点之后被影子仓库跟踪且发生变化的文件**
+/// （agent 实际碰过的），绝不整树 reset——基线过旧时不会误伤 agent 没碰过的文件
+/// （如用户自己已提交/未提交的改动）。只动影子仓库与工作区文件，不碰真仓库 HEAD。
 pub fn restore(ws: &Path, id: &str) -> anyhow::Result<()> {
     if !id.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&id.len()) {
         bail!("非法检查点 id: {id}");
@@ -202,8 +203,74 @@ pub fn restore(ws: &Path, id: &str) -> anyhow::Result<()> {
     if !gitdir.exists() {
         bail!("影子仓库不存在");
     }
-    git_ok(&bin, Some(&gitdir), ws, &["reset", "--hard", id])?;
+    // 该检查点与当前 HEAD 之间 agent 改了哪些文件（M/D=改/删 → 恢复；A=新增 → 删除）
+    let out = git_ok(&bin, Some(&gitdir), ws, &["diff", "--name-status", id, "HEAD"])?;
+    let mut touched = 0usize;
+    for line in out.lines() {
+        let mut it = line.splitn(2, '\t');
+        let status = it.next().unwrap_or("").to_string();
+        let path = match it.next() {
+            Some(p) => p.trim().to_string(),
+            None => continue,
+        };
+        let status0 = status.chars().next().unwrap_or('M');
+        if status0 == 'A' {
+            // 影子仓库在检查点后新增的文件：直接从工作区删掉
+            let full = ws.join(&path);
+            let _ = std::fs::remove_file(&full);
+            let _ = git_ok(&bin, Some(&gitdir), ws, &["reset", "--quiet", id, "--", &path]);
+        } else {
+            // M / D：把该文件恢复回检查点时的内容
+            git_ok(&bin, Some(&gitdir), ws, &["checkout", id, "--", &path])?;
+        }
+        touched += 1;
+    }
+    if touched == 0 {
+        bail!("该检查点之后没有需要回退的文件改动");
+    }
     Ok(())
+}
+
+/// 影子仓库当前 HEAD（最近一次检查点）；空仓库/不存在返回 None。
+/// 用作任务起点基线：结束时的改动统计与「撤销」都以它为参照。
+pub fn head_id(ws: &Path) -> anyhow::Result<Option<String>> {
+    let gitdir = shadow_gitdir(ws);
+    if !gitdir.exists() {
+        return Ok(None);
+    }
+    let bin = git_bin()?;
+    match git_ok(&bin, Some(&gitdir), ws, &["rev-parse", "HEAD"]) {
+        Ok(id) => Ok(Some(id)),
+        // 空仓库 rev-parse 失败属正常
+        Err(_) => Ok(None),
+    }
+}
+
+/// 工作树相对基线 commit 的改动统计：(文件数, 增行, 删行)。
+/// 用 `diff --numstat`（覆盖暂存+未暂存，即当前工作树全量相对基线）。
+pub fn diff_stat(ws: &Path, baseline: &str) -> anyhow::Result<(usize, u64, u64)> {
+    if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
+        bail!("非法基线 id: {baseline}");
+    }
+    let bin = git_bin()?;
+    let gitdir = shadow_gitdir(ws);
+    if !gitdir.exists() {
+        bail!("影子仓库不存在");
+    }
+    let out = git_ok(&bin, Some(&gitdir), ws, &["diff", "--numstat", baseline])?;
+    let mut files = 0usize;
+    let (mut adds, mut dels) = (0u64, 0u64);
+    for line in out.lines() {
+        let mut it = line.splitn(3, '\t');
+        let (a, d) = match (it.next(), it.next()) {
+            (Some(a), Some(d)) => (a, d),
+            _ => continue,
+        };
+        files += 1;
+        adds += a.parse::<u64>().unwrap_or(0); // 二进制文件为 "-"，按 0 计
+        dels += d.parse::<u64>().unwrap_or(0);
+    }
+    Ok((files, adds, dels))
 }
 
 /// 测试与排障用：影子仓库当前跟踪的文件清单。
@@ -450,6 +517,65 @@ mod tests {
         assert!(checkpoint(w, "大文件前").unwrap().is_none(), "被排除的大文件不应触发检查点");
         let files = shadow_files(w);
         assert!(!files.iter().any(|f| f == "huge.bin"), "超 10MB 文件不进影子仓库: {files:?}");
+    }
+
+    #[test]
+    fn head_id_and_diff_stat() {
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("diffstat");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        assert!(head_id(w).unwrap().is_none(), "空影子仓库无 HEAD");
+
+        std::fs::write(w.join("a.txt"), "v1\n").unwrap();
+        ws.git(&["add", "a.txt"]);
+        let cp = checkpoint(w, "基线").unwrap().expect("应有检查点");
+        assert_eq!(head_id(w).unwrap().as_deref(), Some(cp.id.as_str()));
+
+        // 检查点之后改 2 个文件：结束快照提交进影子仓库后，diff_stat 相对基线应为 2 文件 +7 -1
+        std::fs::write(w.join("a.txt"), "v2\nline2\nline3\nline4\n").unwrap();
+        std::fs::write(w.join("b.txt"), "1\n2\n3\n4\n").unwrap();
+        ws.git(&["add", "b.txt"]);
+        checkpoint(w, "任务结束快照").unwrap().expect("有变更应提交");
+        let (files, adds, dels) = diff_stat(w, &cp.id).unwrap();
+        assert_eq!(files, 2, "numstat 两行: {files}");
+        assert_eq!((adds, dels), (8, 1), "a.txt +4/-1，b.txt 新文件 +4/-0: ({adds},{dels})");
+
+        // 撤销语义验证：reset 回基线 → 改动还原、任务内新建文件被删、diff 归零
+        restore(w, &cp.id).unwrap();
+        assert!(!w.join("b.txt").exists(), "结束快照已跟踪的新文件应被回滚删除");
+        assert_eq!(diff_stat(w, &cp.id).unwrap(), (0, 0, 0));
+    }
+
+    #[test]
+    fn restore_only_touches_agent_changed_files() {
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("restore-scope");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::write(w.join("a.txt"), "v1\n").unwrap();
+        std::fs::write(w.join("b.txt"), "b1\n").unwrap();
+        ws.git(&["add", "a.txt", "b.txt"]);
+        let cp1 = checkpoint(w, "基线").unwrap().expect("应有检查点");
+
+        // agent 只改 a.txt；b.txt 在快照里没变
+        std::fs::write(w.join("a.txt"), "v2\n").unwrap();
+        checkpoint(w, "结束快照").unwrap().expect("应有提交");
+
+        // 用户在快照之后自己改了 b.txt（影子仓库没见过这次改动）
+        std::fs::write(w.join("b.txt"), "b2-user\n").unwrap();
+
+        restore(w, &cp1.id).unwrap();
+        assert_eq!(std::fs::read_to_string(w.join("a.txt")).unwrap(), "v1\n", "agent 改的文件应回退");
+        assert_eq!(
+            std::fs::read_to_string(w.join("b.txt")).unwrap(),
+            "b2-user\n",
+            "用户自己的改动不得被回滚误伤"
+        );
     }
 
     #[test]
