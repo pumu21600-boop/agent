@@ -20,6 +20,20 @@ use windows_sys::Win32::{
 use crate::gateway::providers;
 
 const ENTROPY: &[u8] = b"agent-gateway-settings-v1";
+const DEFAULT_PROFILE_ID: &str = "profile-default";
+
+/// 配置方案：一套「供应商 + Base URL + 模型 + 已勾选模型」组合，可保存多套快速切换。
+/// key 不随方案存——仍按 provider_id 存（切换方案后各家 key 都在）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -36,6 +50,12 @@ pub struct Settings {
     /// v1 遗留：单把 key 密文，load 时自动迁移进 keys 后置空
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_cipher: Option<String>,
+    /// 配置方案列表
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
+    /// 当前生效方案 id；None = 游离配置（手改字段后与方案脱钩）
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
 }
 
 impl Default for Settings {
@@ -47,6 +67,8 @@ impl Default for Settings {
             models: Vec::new(),
             keys: BTreeMap::new(),
             key_cipher: None,
+            profiles: Vec::new(),
+            active_profile_id: None,
         }
     }
 }
@@ -64,6 +86,19 @@ impl Settings {
                         s.keys.insert(s.provider_id.clone(), cipher);
                         let _ = s.save();
                     }
+                }
+                // v2 → v2.1 迁移：把当前配置自动登记为「默认配置」方案（不改任何字段）
+                if s.profiles.is_empty() && !s.provider_id.trim().is_empty() {
+                    s.profiles.push(Profile {
+                        id: DEFAULT_PROFILE_ID.into(),
+                        name: "默认配置".into(),
+                        provider_id: s.provider_id.clone(),
+                        base_url: s.base_url.clone(),
+                        model: s.model.clone(),
+                        models: s.models.clone(),
+                    });
+                    s.active_profile_id = Some(DEFAULT_PROFILE_ID.into());
+                    let _ = s.save();
                 }
                 return s;
             }

@@ -33,6 +33,7 @@ use crate::{
 };
 
 use crate::config::AgentConfig;
+use crate::config::settings::Profile;
 use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 #[derive(Clone)]
@@ -92,6 +93,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/providers", get(list_providers))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models", post(list_models))
+        .route("/api/profiles", post(manage_profiles))
         .route("/api/chat", post(chat))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
@@ -151,6 +153,8 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         "model": s.model,
         "effective_model": s.effective_model(),
         "models": s.models,
+        "profiles": s.profiles,
+        "active_profile_id": s.active_profile_id,
         "has_key": has_key,
         "key_hint": key_hint_of(saved_key),
         "env_key": std::env::var("DEEPSEEK_API_KEY").is_ok(),
@@ -231,6 +235,111 @@ async fn list_models(
             observability::event(EventType::Error, json!({ "message": e.to_string() }));
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() })))
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProfileRequest {
+    /// save（另存/覆盖当前配置为方案，带 id 则覆盖）| apply（切换生效）| delete
+    pub action: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 配置方案管理：save / apply / delete。key 不动（按 provider 存）。
+async fn manage_profiles(
+    State(state): State<AppState>,
+    Json(req): Json<ProfileRequest>,
+) -> (StatusCode, Json<Value>) {
+    let mut s = state.settings.write().unwrap().clone();
+    let err = |m: &str| {
+        (StatusCode::BAD_REQUEST, Json(json!({ "error": m })))
+    };
+    match req.action.as_str() {
+        "save" => {
+            let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) else {
+                return err("缺少方案名称");
+            };
+            let id = match req.id {
+                Some(id) => {
+                    if !s.profiles.iter().any(|p| p.id == id) {
+                        return err("方案不存在");
+                    }
+                    id
+                }
+                // 同名即更新，避免另存为产生重复档案
+                None => match s.profiles.iter().find(|p| p.name == name) {
+                    Some(existing) => existing.id.clone(),
+                    None => format!("p{}", uuid::Uuid::new_v4().simple()),
+                },
+            };
+            let profile = settings_profile(&s, &id, &name);
+            match s.profiles.iter_mut().find(|p| p.id == id) {
+                Some(old) => *old = profile,
+                None => s.profiles.push(profile),
+            }
+            if s.active_profile_id.is_none() {
+                s.active_profile_id = Some(id.clone());
+            }
+        }
+        "apply" => {
+            let Some(id) = req.id else { return err("缺少方案 id") };
+            let Some(p) = s.profiles.iter().find(|p| p.id == id).cloned() else {
+                return err("方案不存在");
+            };
+            s.provider_id = p.provider_id;
+            s.base_url = p.base_url;
+            s.model = p.model;
+            s.models = p.models;
+            s.active_profile_id = Some(id);
+        }
+        "delete" => {
+            let Some(id) = req.id else { return err("缺少方案 id") };
+            s.profiles.retain(|p| p.id != id);
+            if s.active_profile_id.as_deref() == Some(id.as_str()) {
+                s.active_profile_id = None;
+            }
+        }
+        other => return err(&format!("未知操作: {other}")),
+    }
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap() = s.clone();
+    observability::event(
+        EventType::State,
+        json!({ "kind": "profile.updated", "action": req.action, "provider_id": s.provider_id, "model": s.model }),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "profiles": s.profiles,
+            "active_profile_id": s.active_profile_id,
+            "provider_id": s.provider_id,
+            "base_url": s.base_url,
+            "model": s.model,
+            "models": s.models,
+            "has_key": s.get_key(&s.provider_id).is_some(),
+            "key_hint": key_hint_of(s.get_key(&s.provider_id)),
+        })),
+    )
+}
+
+fn settings_profile(
+    s: &Settings,
+    id: &str,
+    name: &str,
+) -> Profile {
+    Profile {
+        id: id.to_string(),
+        name: name.to_string(),
+        provider_id: s.provider_id.clone(),
+        base_url: s.base_url.clone(),
+        model: s.model.clone(),
+        models: s.models.clone(),
     }
 }
 
