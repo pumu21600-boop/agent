@@ -9,8 +9,19 @@ port = 8321
 # DeepSeek 官方渠道
 base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
-# 换商汤中转示例（按实际渠道地址填写，形如 OpenAI 兼容的 /chat/completions 前缀）：
-# base_url = "https://<商汤中转域名>/v1"
+# 换渠道示例（形如 OpenAI 兼容的 /chat/completions 前缀）：
+# base_url = "https://<渠道域名>/v1"
+# P8 本地限流：每分钟最多发起多少次模型请求；0=不限。超出时请求排队等待（不报错）
+max_rpm = 0
+# P8 降级链：主渠道当轮调用失败时按序切换的配置（写 settings 里的配置名，逗号分隔多个）
+# fallback_configs = ["配置 2", "商汤主力"]
+
+# P8 角色映射：辅助功能用专用渠道（写 settings 里的配置名或配置 id）；
+# 未配置的角色回落主渠道。EMBEDDING 为接口预留（暂无消费方）。
+[roles]
+# summary = "配置 2"   # 滚动摘要专用渠道
+# title = "配置 2"     # 会话标题生成专用渠道
+# embedding = ""       # 向量嵌入（预留）
 
 [logging]
 dir = "logs"

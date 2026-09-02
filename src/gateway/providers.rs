@@ -98,18 +98,30 @@ mod tests {
     #[test]
     fn presets_parse_with_new_fields() {
         let ps = load_test();
-        assert!(ps.len() >= 17, "至少 13 家原有 + 5 家新增，实际 {}", ps.len());
-        for id in ["openrouter", "gemini", "lmstudio", "mnn", "llamacpp"] {
+        assert!(ps.len() >= 15, "官方网关 10 家 + 本地/自定义 5 家，实际 {}", ps.len());
+        // 只保留大模型厂商官方网关与本地推理服务，第三方中转/聚合已移除
+        for id in [
+            "deepseek", "moonshot", "zhipu", "minimax", "doubao", "hunyuan", "openai",
+            "anthropic", "gemini", "xai", "ollama", "lmstudio", "mnn", "llamacpp", "custom",
+        ] {
             assert!(ps.iter().any(|p| p.id == id), "缺预设 {id}");
+        }
+        for gone in ["sensenova", "dashscope", "baidu", "spark", "siliconflow", "groq", "openrouter"] {
+            assert!(!ps.iter().any(|p| p.id == gone), "{gone} 应已移除（第三方中转/聚合，非官方网关）");
         }
         let glm = ps.iter().find(|p| p.id == "zhipu").unwrap();
         assert_eq!(glm.reasoning_style, ReasoningStyle::ThinkingParam);
         assert!(glm.reasoning_counts_in_max_tokens, "GLM 思考占 max_tokens（实测）");
-        let qwen = ps.iter().find(|p| p.id == "dashscope").unwrap();
-        assert_eq!(qwen.reasoning_style, ReasoningStyle::ReasoningContent);
-        assert_eq!(qwen.enable_thinking_param.as_deref(), Some("enable_thinking"));
-        assert_eq!(qwen.thinking_budget_param.as_deref(), Some("thinking_budget"));
-        assert!(!qwen.reasoning_counts_in_max_tokens, "Qwen 官方思考不占 max_tokens");
+        // 官方网关各家的思考接线样式
+        let anthropic = ps.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!(anthropic.reasoning_style, ReasoningStyle::EffortParam);
+        assert!(anthropic.reasoning_counts_in_max_tokens);
+        let doubao = ps.iter().find(|p| p.id == "doubao").unwrap();
+        assert_eq!(doubao.reasoning_style, ReasoningStyle::ThinkingParam);
+        let hunyuan = ps.iter().find(|p| p.id == "hunyuan").unwrap();
+        assert_eq!(hunyuan.enable_thinking_param.as_deref(), Some("enable_thinking"));
+        let minimax = ps.iter().find(|p| p.id == "minimax").unwrap();
+        assert_eq!(minimax.reasoning_style, ReasoningStyle::InContent, "M2 思考混在正文 <think> 标签");
         for local in ["ollama", "lmstudio", "mnn", "llamacpp", "custom"] {
             assert!(
                 ps.iter().find(|p| p.id == local).unwrap().key_optional,

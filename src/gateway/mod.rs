@@ -767,16 +767,17 @@ mod tests {
         p.thinking = Some("off".into());
         let b = build_body("glm-4.6", &msgs, true, &p, None);
         assert_eq!(b["thinking"], json!({"type":"disabled"}));
-        // Qwen（布尔开关 + 预算，官方思考不占 max_tokens）
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("dashscope").unwrap());
+        // 布尔开关（enable_thinking，腾讯混元样式）：on/off 映射 true/false；预算参数独立生效
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("hunyuan").unwrap());
         p.thinking = Some("off".into());
         p.thinking_budget = Some(512);
-        let b = build_body("qwen-plus", &msgs, false, &p, None);
+        p.thinking_budget_param = Some("thinking_budget".into());
+        let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(false));
         assert_eq!(b["thinking_budget"], json!(512));
         assert!(b.get("thinking").is_none(), "reasoning_content 样式不发 thinking 对象");
         p.thinking = Some("on".into());
-        let b = build_body("qwen-plus", &msgs, false, &p, None);
+        let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(true));
         // OpenAI（effort_param）：on 发 medium，off 不发
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap());

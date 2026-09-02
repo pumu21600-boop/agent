@@ -9,29 +9,11 @@
       "reasoning_counts_in_max_tokens": true
     },
     {
-      "id": "openai",
-      "name": "OpenAI",
-      "default_base_url": "https://api.openai.com/v1",
-      "default_model": "gpt-4o-mini",
-      "reasoning_style": "effort_param",
-      "reasoning_counts_in_max_tokens": true
-    },
-    {
-      "id": "sensenova",
-      "name": "商汤日日新（SenseNova）",
-      "default_base_url": "https://api.sensenova.cn/compatible-mode/v1",
-      "default_model": "DeepSeek-V3",
+      "id": "moonshot",
+      "name": "Moonshot（Kimi）",
+      "default_base_url": "https://api.moonshot.cn/v1",
+      "default_model": "kimi-k2-thinking",
       "reasoning_style": "reasoning_content"
-    },
-    {
-      "id": "dashscope",
-      "name": "阿里云百炼（通义千问）",
-      "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      "default_model": "qwen-plus",
-      "reasoning_style": "reasoning_content",
-      "enable_thinking_param": "enable_thinking",
-      "thinking_budget_param": "thinking_budget",
-      "reasoning_counts_in_max_tokens": false
     },
     {
       "id": "zhipu",
@@ -42,60 +24,60 @@
       "reasoning_counts_in_max_tokens": true
     },
     {
-      "id": "moonshot",
-      "name": "Moonshot（Kimi）",
-      "default_base_url": "https://api.moonshot.cn/v1",
-      "default_model": "moonshot-v1-8k",
-      "reasoning_style": "reasoning_content"
+      "id": "minimax",
+      "name": "MiniMax",
+      "default_base_url": "https://api.minimaxi.com/v1",
+      "default_model": "MiniMax-M2",
+      "reasoning_style": "in_content",
+      "reasoning_counts_in_max_tokens": true
     },
     {
-      "id": "baidu",
-      "name": "百度千帆",
-      "default_base_url": "https://qianfan.baidubce.com/v2",
-      "default_model": "ernie-4.0-8k",
-      "reasoning_style": "reasoning_content"
+      "id": "doubao",
+      "name": "字节跳动（豆包·火山方舟）",
+      "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "default_model": "doubao-seed-1.6",
+      "reasoning_style": "thinking_param",
+      "reasoning_counts_in_max_tokens": true
     },
     {
-      "id": "spark",
-      "name": "讯飞星火",
-      "default_base_url": "https://spark-api-open.xf-yun.com/v1",
-      "default_model": "generalv3.5",
-      "reasoning_style": "reasoning_content"
+      "id": "hunyuan",
+      "name": "腾讯混元",
+      "default_base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+      "default_model": "hunyuan-turbos-latest",
+      "reasoning_style": "reasoning_content",
+      "enable_thinking_param": "enable_thinking"
     },
     {
-      "id": "siliconflow",
-      "name": "硅基流动 SiliconFlow",
-      "default_base_url": "https://api.siliconflow.cn/v1",
-      "default_model": "deepseek-ai/DeepSeek-V3",
-      "reasoning_style": "reasoning_content"
+      "id": "openai",
+      "name": "OpenAI",
+      "default_base_url": "https://api.openai.com/v1",
+      "default_model": "gpt-4o-mini",
+      "reasoning_style": "effort_param",
+      "reasoning_counts_in_max_tokens": true
     },
     {
-      "id": "groq",
-      "name": "Groq",
-      "default_base_url": "https://api.groq.com/openai/v1",
-      "default_model": "llama-3.3-70b-versatile",
-      "reasoning_style": "reasoning_content"
+      "id": "anthropic",
+      "name": "Anthropic（Claude·OpenAI 兼容层）",
+      "default_base_url": "https://api.anthropic.com/v1",
+      "default_model": "claude-sonnet-4-5",
+      "reasoning_style": "effort_param",
+      "reasoning_counts_in_max_tokens": true
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini（OpenAI 兼容层）",
+      "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "default_model": "gemini-2.0-flash",
+      "reasoning_style": "effort_param",
+      "reasoning_counts_in_max_tokens": true
     },
     {
       "id": "xai",
       "name": "xAI（Grok）",
       "default_base_url": "https://api.x.ai/v1",
-      "default_model": "grok-2-latest",
-      "reasoning_style": "reasoning_content"
-    },
-    {
-      "id": "openrouter",
-      "name": "OpenRouter",
-      "default_base_url": "https://openrouter.ai/api/v1",
-      "default_model": "openai/gpt-4o-mini",
-      "reasoning_style": "reasoning_content"
-    },
-    {
-      "id": "gemini",
-      "name": "Google Gemini（OpenAI 兼容端点）",
-      "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-      "default_model": "gemini-2.0-flash",
-      "reasoning_style": "reasoning_content"
+      "default_model": "grok-4",
+      "reasoning_style": "effort_param",
+      "reasoning_counts_in_max_tokens": true
     },
     {
       "id": "ollama",

@@ -26,6 +26,12 @@
   let ctxUsage = { tokens: 0, budget: 0, breakdown: null }; // 上下文占用（P5 圆环+明细卡）
   let ctxLen = 0; // 当前模型上下文长度（0=默认）
   let maxOut = 0; // 当前模型最大输出长度（0=默认）
+  let temperature = null; // 采样温度（null=渠道默认）
+  let topP = null; // 核采样（null=渠道默认）
+  let thinking = ''; // 思考开关：''=渠道默认 / on / off
+  let thinkingBudget = 0; // 思考预算（0=不设；Qwen 系）
+  let reasoningStyle = 'reasoning_content'; // 当前供应商思考接线方式（P8）
+  let thinkingBudgetParam = null; // 供应商思考预算参数名（有才显示预算输入）
   let apiTotals = { prompt: 0, cached: 0 }; // 渠道真实用量累计（平均缓存命中率）
 
   // —— 获取模型弹窗 ——
@@ -126,6 +132,12 @@
     savedModels = s.models || [];
     ctxLen = s.context_length || 0;
     maxOut = s.max_output_tokens || 0;
+    temperature = s.temperature ?? null;
+    topP = s.top_p ?? null;
+    thinking = s.thinking || '';
+    thinkingBudget = s.thinking_budget || 0;
+    reasoningStyle = s.reasoning_style || 'reasoning_content';
+    thinkingBudgetParam = s.thinking_budget_param || null;
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
     // key 按配置独占：hint 直接用当前激活配置的，与其他配置无关
@@ -361,6 +373,7 @@
                 ];
               else if (d.notice)
                 messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
+              else if (d.title) loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
               else if (d.context_usage)
                 ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
               else if (d.api_usage) {
@@ -873,6 +886,55 @@
           />
         </div>
         <div class="param-hint">左：上下文长度　右：最大输出长度</div>
+      </div>
+
+      <div class="field">
+        <label>采样参数（留空=渠道默认）</label>
+        <div class="sub-row">
+          <input
+            class="num-input"
+            type="number" step="0.1" min="0" max="2"
+            placeholder="温度"
+            bind:value={temperature}
+            title="temperature：越低越稳定，0=确定性输出"
+            on:change={() => autoSave({ temperature: temperature === null || temperature === '' ? -1 : Number(temperature) }, 0)}
+          />
+          <input
+            class="num-input"
+            type="number" step="0.05" min="0" max="1"
+            placeholder="top_p"
+            bind:value={topP}
+            title="top_p：核采样截断"
+            on:change={() => autoSave({ top_p: topP === null || topP === '' ? -1 : Number(topP) }, 0)}
+          />
+        </div>
+        <div class="param-hint">左：temperature（-1 清除）　右：top_p（-1 清除）</div>
+      </div>
+
+      <div class="field">
+        <label>思考{reasoningStyle === 'in_content' ? '（该渠道思考混在正文，自动剥离）' : reasoningStyle === 'effort_param' ? '（OpenAI 风格 reasoning_effort，off 不发参数）' : ''}</label>
+        <div class="sub-row">
+          <select
+            bind:value={thinking}
+            on:change={() => autoSave({ thinking }, 0)}
+            disabled={reasoningStyle === 'in_content'}
+          >
+            <option value="">渠道默认</option>
+            <option value="on">开启思考</option>
+            <option value="off">关闭思考</option>
+          </select>
+          {#if thinkingBudgetParam}
+            <input
+              class="num-input"
+              type="number" min="0"
+              placeholder="思考预算"
+              bind:value={thinkingBudget}
+              title={thinkingBudgetParam + '：思考阶段 token 预算，0=不设'}
+              on:change={() => autoSave({ thinking_budget: Number(thinkingBudget) || 0 }, 0)}
+            />
+          {/if}
+        </div>
+        <div class="param-hint">{thinkingBudgetParam ? `左：思考开关　右：${thinkingBudgetParam}` : '开关是否生效取决于渠道（参数形态按供应商自动适配）'}</div>
       </div>
     </div>
   </div>
