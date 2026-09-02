@@ -73,6 +73,9 @@ pub struct ModelsRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdate {
+    /// 配置名称（改当前激活配置的名）
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub provider_id: Option<String>,
     #[serde(default)]
@@ -166,6 +169,9 @@ async fn put_settings(
     Json(req): Json<SettingsUpdate>,
 ) -> (StatusCode, Json<Value>) {
     let mut s = state.settings.write().unwrap().clone();
+    if let Some(v) = &req.name {
+        s.set_active_name(v);
+    }
     if let Some(v) = &req.provider_id {
         if !v.trim().is_empty() {
             s.provider_id = v.trim().to_string();
@@ -293,6 +299,7 @@ fn config_state_json(s: &Settings) -> Value {
             let key = s.get_key(&effective_of(s, c));
             json!({
                 "id": c.id,
+                "name": c.name.clone(),
                 "provider_id": c.provider_id,
                 "base_url": c.base_url.clone(),
                 "model": c.model.clone(),
@@ -302,6 +309,7 @@ fn config_state_json(s: &Settings) -> Value {
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
+        "name": s.active().map(|c| c.name.clone()).unwrap_or_default(),
         "provider_id": s.provider_id,
         "base_url": s.base_url,
         "effective_base_url": s.effective_base_url(),

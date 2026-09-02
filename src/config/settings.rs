@@ -23,10 +23,13 @@ use crate::gateway::providers;
 
 const ENTROPY: &[u8] = b"agent-gateway-settings-v1";
 
-/// 一套配置（供应商 + Base URL + 模型 + 勾选的模型清单）。
+/// 一套配置（名称 + 供应商 + Base URL + 模型 + 勾选的模型清单）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub id: String,
+    /// 用户起的名字；空则自动补「配置 N」
+    #[serde(default)]
+    pub name: String,
     pub provider_id: String,
     pub base_url: String,
     pub model: String,
@@ -162,17 +165,19 @@ impl Settings {
         }
     }
 
-    /// 确保 configs 非空且有激活项；镜像与激活配置对齐。
+    /// 确保 configs 非空且有激活项；镜像与激活配置对齐；缺名的补「配置 N」。
     pub fn ensure_active_config(&mut self) {
         if self.configs.is_empty() && !self.provider_id.trim().is_empty() {
             self.configs.push(Config {
                 id: new_config_id(),
+                name: String::new(),
                 provider_id: self.provider_id.clone(),
                 base_url: self.base_url.clone(),
                 model: self.model.clone(),
                 models: self.models.clone(),
             });
         }
+        self.assign_missing_names();
         if self
             .active_config_id
             .as_ref()
@@ -180,6 +185,40 @@ impl Settings {
         {
             self.active_config_id = self.configs.first().map(|c| c.id.clone());
         }
+    }
+
+    /// 给没有名字的配置按序号补名（配置 1、配置 2…跳过已占用序号）。
+    fn assign_missing_names(&mut self) {
+        let mut n = 1;
+        let mut i = 0;
+        while i < self.configs.len() {
+            if self.configs[i].name.trim().is_empty() {
+                while self.configs.iter().any(|o| o.name == format!("配置 {n}")) {
+                    n += 1;
+                }
+                self.configs[i].name = format!("配置 {n}");
+            }
+            i += 1;
+        }
+    }
+
+    /// 下一个可用「配置 N」序号。
+    fn next_name_seq(&self) -> u32 {
+        let mut n = 1;
+        while self.configs.iter().any(|c| c.name == format!("配置 {n}")) {
+            n += 1;
+        }
+        n
+    }
+
+    /// 改当前激活配置的名字（空名回退自动编号）。
+    pub fn set_active_name(&mut self, name: &str) {
+        let name = name.trim().to_string();
+        let Some(id) = self.active_config_id.clone() else { return };
+        if let Some(c) = self.configs.iter_mut().find(|c| c.id == id) {
+            c.name = name;
+        }
+        self.assign_missing_names();
     }
 
     /// 当前激活配置（镜像即其值）。
@@ -224,8 +263,10 @@ impl Settings {
     /// 新建一套配置（复制当前镜像值作起点）并激活。
     pub fn new_config(&mut self) -> String {
         let id = new_config_id();
+        let name = format!("配置 {}", self.next_name_seq());
         self.configs.push(Config {
             id: id.clone(),
+            name,
             provider_id: self.provider_id.clone(),
             base_url: self.base_url.clone(),
             model: self.model.clone(),

@@ -9,6 +9,7 @@
   let baseUrl = '';
   let model = '';
   let apiKey = '';
+  let configName = '';
   let savedModels = [];
   let savedKeyUrl = '';   // 当前生效 url 的已存 key 尾号
   let urlKeyHints = {};   // 归一化 url → 尾号
@@ -58,6 +59,7 @@
     providerId = s.provider_id || 'deepseek';
     baseUrl = s.base_url || '';
     model = s.model || '';
+    configName = s.name || '';
     savedModels = s.models || [];
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
@@ -140,10 +142,7 @@
   }
 
   function configLabel(c) {
-    const p = providers.find((x) => x.id === c.provider_id);
-    const prov = p ? p.name.split('（')[0] : c.provider_id;
-    const host = norm(c.base_url).replace(/^https?:\/\//, '').slice(0, 18);
-    return `${prov} · ${c.model || host || '未配置'}`;
+    return c.name || '未命名';
   }
 
   function onProviderChange() {
@@ -425,14 +424,24 @@
             <button
               class="chip"
               class:active={c.id === activeConfigId}
+              title={configLabel(c) + ' · ' + (c.model || '未选模型') + (c.has_key ? ' · 有key' : ' · 无key')}
               on:click={() => manageConfig('apply', c.id)}
             >
-              {configLabel(c)}{#if c.has_key} · {c.key_hint}{/if}
+              <span class="dot" class:haskey={c.has_key}></span>{configLabel(c)}
             </button>
           {/each}
           <button class="chip add" on:click={newConfig}>＋ 新建配置</button>
           <button class="chip del" on:click={deleteConfig}>✕ 删除当前</button>
         </div>
+      </div>
+
+      <div class="field">
+        <label>配置名称</label>
+        <input
+          bind:value={configName}
+          placeholder="给这套配置起个名，如：商汤主力 / tokeness 免费"
+          on:input={() => autoSave({ name: configName })}
+        />
       </div>
 
       <div class="field">
@@ -864,6 +873,18 @@
     background: #2f5fd0;
     border-color: #2f5fd0;
     color: #fff;
+  }
+  .dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 6px;
+    background: #5c606b;
+    vertical-align: middle;
+  }
+  .dot.haskey {
+    background: #57c467;
   }
   .chip.add {
     color: #9fdcae;
