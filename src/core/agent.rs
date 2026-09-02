@@ -46,6 +46,7 @@ pub async fn run_task(
     msgs.extend(messages.iter().cloned());
 
     let tools_def = Value::Array(tools::definitions());
+    let mut prev_tool_sigs: Vec<String> = Vec::new();
 
     for step in 0..cfg.max_steps {
         // 每轮模型决策前查取消标志（核心循环刚性检查点）
@@ -89,12 +90,32 @@ pub async fn run_task(
 
         // 没有工具调用 → 纯文本即最终回答（已流式转发），终止
         if turn.tool_calls.is_empty() {
+            // 兜底：弱模型/免费模型常只给 reasoning 不给 content，避免前端空回答
+            if turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty() {
+                observability::event(
+                    EventType::Error,
+                    json!({ "message": "模型未输出正文，回退展示思考内容" }),
+                );
+                on_event(AgentEvent::Content(turn.reasoning.clone()));
+            }
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
             );
             return Ok(LoopOutcome::Done);
         }
+
+        // 护栏：模型连续两步请求完全相同的工具调用 → 死循环，立即终止
+        let sigs: Vec<String> =
+            turn.tool_calls.iter().map(|c| format!("{}|{}", c.name, c.arguments)).collect();
+        if prev_tool_sigs == sigs {
+            observability::event(
+                EventType::Error,
+                json!({ "message": "模型重复请求相同工具调用，已终止循环" }),
+            );
+            return Err(anyhow::anyhow!("模型重复请求相同工具调用，已终止"));
+        }
+        prev_tool_sigs = sigs;
 
         // 回填 assistant 消息（含 tool_calls）
         let calls_json: Vec<Value> = turn
