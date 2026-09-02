@@ -8,7 +8,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde_json::{Value, json};
 
-use crate::config::{AgentConfig, SandboxConfig};
+use crate::config::{AgentConfig, ContextConfig, SandboxConfig};
+use crate::context;
 use crate::core::cancel::CancelFlag;
 use crate::gateway::{ChatOutcome, Gateway, extract_delta};
 use crate::observability::{self, EventType};
@@ -63,6 +64,7 @@ pub async fn run_task(
     cancel: &CancelFlag,
     cfg: &AgentConfig,
     sandbox_cfg: &SandboxConfig,
+    ctx_cfg: &ContextConfig,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent),
 ) -> anyhow::Result<LoopOutcome> {
@@ -78,6 +80,24 @@ pub async fn run_task(
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
             return Ok(LoopOutcome::Cancelled);
+        }
+        // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次
+        {
+            let (compacted, stats) = context::compact_messages(&msgs, ctx_cfg);
+            if stats.compacted {
+                observability::event(
+                    EventType::State,
+                    json!({
+                        "kind": "context.compacted",
+                        "step": step,
+                        "archived_tools": stats.archived_tools,
+                        "folded_messages": stats.folded_messages,
+                        "tokens_before": stats.tokens_before,
+                        "tokens_after": stats.tokens_after,
+                    }),
+                );
+                msgs = compacted;
+            }
         }
         observability::debug(&format!("[loop] step {step} 调用模型 {model}"));
 
@@ -199,9 +219,10 @@ pub async fn run_task(
             };
 
             let preview: String = content.chars().take(300).collect();
+            let truncated = content.contains(context::OMITTED_MARK);
             observability::event(
                 EventType::ToolResult,
-                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "preview": preview }),
+                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": truncated, "preview": preview }),
             );
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
             msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));

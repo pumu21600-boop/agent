@@ -42,6 +42,7 @@ pub struct AppState {
     pub settings: Arc<std::sync::RwLock<Settings>>,
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
+    pub context_cfg: Arc<crate::config::ContextConfig>,
     pub system_prompt: Arc<String>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
@@ -353,6 +354,7 @@ async fn chat(
     let s = state.settings.read().unwrap().clone();
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
+    let ctx_cfg = (*state.context_cfg).clone();
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
@@ -413,6 +415,7 @@ async fn chat(
             &cancel,
             &cfg,
             &sandbox_cfg,
+            &ctx_cfg,
             &ChatGate {
                 mode: state.approval_mode.clone(),
                 allow_unsandboxed,

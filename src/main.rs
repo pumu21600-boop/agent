@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         settings: Arc::new(std::sync::RwLock::new(user_settings)),
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),
+        context_cfg: Arc::new(config.context),
         system_prompt: Arc::new(system_prompt),
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),

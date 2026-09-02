@@ -26,3 +26,8 @@ default_approval = "auto"
 allow_unsandboxed = true
 # 完全访问档下，执行类命令是否仍要审批（false=连审批一起跳过，Codex Full Access 等价）
 unsandboxed_approval = false
+
+[context]
+# P5 上下文预算：全 messages 超过此 token 估算值才触发裁剪
+budget_tokens = 96000
+recent_tool_results_kept = 6

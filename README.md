@@ -1,7 +1,14 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P4 完成**（工具第一批 + 审批三档），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P5 完成**（上下文工程 v1），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P5 上下文工程 v1
+
+- **token 预算**：启发式估算（CJK≈1/字、ASCII≈1/4 字符），全 messages 超 `[context].budget_tokens`（默认 96k）才裁
+- **工具结果头尾压缩**：超限保留头 60% + 尾 40%，中间标省略（JSONL `tool_result.truncated`）
+- **历史裁剪**：先归档旧工具结果（保留最近 `[context].recent_tool_results_kept`=6 个），仍超按「轮」折叠——tool_calls/tool 配对永不破坏
+- **read_page 工具**：大文件分页读（默认 200 行/页），模型主动翻页替代一次读全
 
 ## P4 工具第一批 + 审批三档
 
