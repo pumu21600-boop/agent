@@ -71,7 +71,7 @@
 | `loop.finish` | 核心循环终止（模型给出纯文本） | `step`、`content_chars` |
 | `settings.updated` | 设置保存 | `provider_id`、`model` |
 | `cancel` | 取消事件 | `flag`（置位）、或 `phase`（`before_request`/`streaming`/`tool`/`loop`） |
-| `sandbox.spawn` | 沙箱拉起受限进程（P3） | `pid`、`app`、`working_dir`、`timeout_ms`、`memory_mb`、`active_processes` |
+| `sandbox.spawn` | 沙箱/本机直跑拉起进程（P3/P4） | `pid`、`app`、`working_dir`、`restricted`（false=本机直跑）、`timeout_ms`、`memory_mb`、`active_processes` |
 | `sandbox.exit` | 沙箱进程树收割（P3） | `pid`、`exit_code`、`timed_out`、`stdout_chars`、`stderr_chars` |
 | `sandbox.selftest` | 沙箱探针套件结果（P3） | `ok` |
 | `gateway.client_rebuild` | 网关 HTTP 客户端热重建（网络自愈） | `note` |

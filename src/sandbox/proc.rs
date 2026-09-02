@@ -57,10 +57,16 @@ pub(crate) fn system_dir() -> PathBuf {
     PathBuf::from(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
-/// 拉起受限进程。失败即无进程可谈（句柄全部就地回收）。
+/// 拉起进程。失败即无进程可谈（句柄全部就地回收）。
+/// restricted=true：受限 token + 白名单环境（权限笼）；false：完整用户 token + 继承父环境（本机直跑）。
+/// 两种模式都保留 Job 生命周期保险丝（kill-on-close、超时整树击杀）。
 pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
-    let token = token::create_restricted_token()?;
-    let job = JobGuard::new(&spec.limits)?;
+    let token = if spec.restricted {
+        token::create_restricted_token()?
+    } else {
+        token::full_token()?
+    };
+    let job = JobGuard::new(&spec.limits, spec.restricted)?;
 
     if !spec.working_dir.exists() {
         bail!("工作目录不存在: {}", spec.working_dir.display());
@@ -102,7 +108,8 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         // CreateProcess 可能临时改写命令行缓冲，故给 mut
         let mut cmd_line = wide(&spec.command_line);
         let cwd = wide(spec.working_dir.to_str().ok_or_else(|| anyhow!("working_dir 非 UTF-8"))?);
-        let env = build_env_block();
+        // 受限模式注入白名单环境；本机直跑传 NULL 继承父进程完整环境
+        let env = if spec.restricted { build_env_block() } else { Vec::new() };
 
         let mut pi: PROCESS_INFORMATION = mem::zeroed();
         if CreateProcessAsUserW(
@@ -113,7 +120,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             ptr::null(),
             1, // bInheritHandles：只继承我们标了 inherit 的三个句柄
             CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            env.as_ptr() as *const c_void,
+            if spec.restricted { env.as_ptr() as *const c_void } else { ptr::null() },
             cwd.as_ptr(),
             &si,
             &mut pi,
@@ -142,6 +149,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
                 "pid": pi.dwProcessId,
                 "app": spec.application.display().to_string(),
                 "working_dir": spec.working_dir.display().to_string(),
+                "restricted": spec.restricted,
                 "timeout_ms": spec.limits.timeout_ms,
                 "memory_mb": spec.limits.memory_mb,
                 "active_processes": spec.limits.active_processes,

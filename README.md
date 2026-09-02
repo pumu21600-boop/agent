@@ -7,10 +7,13 @@
 
 - 工具：read_file / search（rg，findstr 兜底）/ web_fetch（去标签出正文）/ write_file / shell / git
 - shell 与 git **跑在 P3 沙箱里**：超时整树击杀、内存/进程数上限、密钥不进环境；工作目录=项目根
-- 审批三档（侧栏切换，请求级可覆盖，默认 auto-edit）：
+- 审批四档（侧栏切换，请求级可覆盖，默认 auto-edit）：
   - **建议**：读自动，写/执行要批
   - **自动编辑**：读/写自动，执行要批
-  - **全自动**：全部自动
+  - **全自动**：全部自动，沙箱内跑
+  - **本机直跑**：脱沙箱（完整用户 token + 继承父环境），需 `config.toml [agent] allow_unsandboxed = true`
+    总开关（默认关，未开自动回退全自动并提示）；`unsandboxed_approval = true` 可让它保留执行审批；
+    无论哪档都保留超时整树击杀与防孤儿
 - 审批交互：SSE 推 `approval_request` → 卡片内「允许/拒绝」→ POST /api/approvals；120s 超时视为拒绝，停止立即中断
 - 工具结果按 [agent].tool_result_max_chars 截断回填
 

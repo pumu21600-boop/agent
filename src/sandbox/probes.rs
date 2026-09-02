@@ -55,6 +55,7 @@ fn cmd_spec(command: &str, working_dir: &Path, limits: SandboxLimits) -> Sandbox
         command_line: format!("\"{}\" {command}", cmd.display()),
         working_dir: working_dir.to_path_buf(),
         limits,
+        restricted: true,
     }
 }
 
@@ -245,6 +246,7 @@ pub fn probe_memory_cap(limits: SandboxLimits) -> ProbeResult {
             command_line: format!("\"{}\" {mb}", hog.display()),
             working_dir: probe_workdir(),
             limits: SandboxLimits { timeout_ms: 60_000, memory_mb, ..limits },
+            restricted: true,
         })
     };
     let control = run_hog(512, 2048);

@@ -43,7 +43,8 @@
 4. **商汤中转 401 code 16 Forbidden** = key 无效；key 走 DPAPI，页面显示尾 4 位（key_hint）供自查，完整 key 永不出内存/日志。
 5. **换模型立即生效**：/api/chat 已支持请求级 model/base_url 覆盖，前端发送时携带当前下拉框值。
 6. **key 按配置独占（2026-09-02 起）**：v2.4 起 key_cipher 存进每套配置，同地址不同配置各有各的 key。此前按 base_url 共享导致「新建配置显示别的配置 key 尾 4 位、输新 key 会覆盖别的配置」。旧 settings.json 的 keys 映射在 load 时自动迁移（仅作迁移源，运行时不再读写）。
-6. **受限 token 必须带 logon SID**：窗口站/桌面的 ACL 按登录会话 SID 授权，受限 SID 白名单缺了它，powershell 等 .NET 进程起手 0xC0000142 DLL 初始化失败。
-7. **SeChangeNotifyPrivilege 剥不掉**：`CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 只把特权置禁用不删名字，且系统固定保留 SeChangeNotifyPrivilege（遍历绕过，无害）；探针按名字白名单断言，别用 whoami 输出数个数。
-8. **沙箱内存上限探针别用 powershell**：受限 token 下 .NET 启动即 0xC0000142；且 PS 里 `New-Object byte[]` 分配失败会当非终止错误吞掉继续跑，结论不可信。用原生 hog（src/bin/sandbox_hog.rs）做差分。
-9. **Git Bash PATH 污染对照组**：测试进程 PATH 里的 Git usr/bin 会让 `cmd /C whoami` 解析到 GNU whoami；沙箱内没事（环境是白名单重建的），不经沙箱的对照组要写绝对路径。
+7. **本机直跑（local 档）红线**：脱沙箱=完整用户 token + 继承父环境（含 API key），仅当 `config.toml [agent] allow_unsandboxed = true` 才生效，未开时自动回退 full-auto 并 SSE 提示；无论哪档都保留超时整树击杀。审计看 JSONL `sandbox.spawn` 的 `restricted` 字段。
+8. **受限 token 必须带 logon SID**：窗口站/桌面的 ACL 按登录会话 SID 授权，受限 SID 白名单缺了它，powershell 等 .NET 进程起手 0xC0000142 DLL 初始化失败。
+9. **SeChangeNotifyPrivilege 剥不掉**：`CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 只把特权置禁用不删名字，且系统固定保留 SeChangeNotifyPrivilege（遍历绕过，无害）；探针按名字白名单断言，别用 whoami 输出数个数。
+10. **沙箱内存上限探针别用 powershell**：受限 token 下 .NET 启动即 0xC0000142；且 PS 里 `New-Object byte[]` 分配失败会当非终止错误吞掉继续跑，结论不可信。用原生 hog（src/bin/sandbox_hog.rs）做差分。
+11. **Git Bash PATH 污染对照组**：测试进程 PATH 里的 Git usr/bin 会让 `cmd /C whoami` 解析到 GNU whoami；沙箱内没事（环境是白名单重建的），不经沙箱的对照组要写绝对路径。

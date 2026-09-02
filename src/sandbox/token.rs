@@ -46,6 +46,17 @@ impl Drop for TokenHandle {
     }
 }
 
+/// 当前进程的完整 token（不剥特权、不加受限 SID）——本机直跑模式用。
+pub(crate) fn full_token() -> anyhow::Result<TokenHandle> {
+    unsafe {
+        let mut base: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY, &mut base) == 0 {
+            return Err(anyhow!("OpenProcessToken 失败: {}", GetLastError()));
+        }
+        Ok(TokenHandle(base))
+    }
+}
+
 /// 构造受限 token：特权全剥 + 受限 SID 白名单（见模块注释）。
 pub(crate) fn create_restricted_token() -> anyhow::Result<TokenHandle> {
     unsafe {

@@ -355,11 +355,19 @@ async fn chat(
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
-    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit。写入共享档位供 gate 活读
-    let mode = match req.approval_mode.trim() {
-        m @ ("suggest" | "auto-edit" | "full-auto") => m.to_string(),
+    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit。写入共享档位供 gate 活读。
+    // local（本机直跑）需 config 总开关，没开就回退 full-auto 并告知前端。
+    let allow_unsandboxed = cfg.allow_unsandboxed;
+    let mut mode = match req.approval_mode.trim() {
+        m @ ("suggest" | "auto-edit" | "full-auto" | "local") => m.to_string(),
         _ => cfg.default_approval.clone(),
     };
+    if mode == "local" && !allow_unsandboxed {
+        mode = "full-auto".to_string();
+        let _ = tx.send(Ok(json_event(json!({
+            "notice": "本机直跑未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为沙箱内全自动"
+        }))));
+    }
     if let Ok(mut m) = state.approval_mode.write() {
         *m = mode;
     }
@@ -398,6 +406,8 @@ async fn chat(
             &sandbox_cfg,
             &ChatGate {
                 mode: state.approval_mode.clone(),
+                allow_unsandboxed,
+                unsandboxed_approval: cfg.unsandboxed_approval,
                 pending: approvals,
                 tx: tx.clone(),
                 cancel: cancel.clone(),
@@ -440,11 +450,13 @@ async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "cancelled": state.cancel.is_set() }))
 }
 
-/// 审批门（施工单 005）：SSE 发审批请求，oneshot 等用户决定；
+/// 审批门（施工单 005 + 本机直跑）：SSE 发审批请求，oneshot 等用户决定；
 /// 120 秒不决定视为拒绝；用户点「停止」（取消标志）立即按拒绝返回。
 /// 档位读共享状态：侧栏切档即时生效（含进行中的请求）。
 struct ChatGate {
     mode: Arc<std::sync::RwLock<String>>,
+    allow_unsandboxed: bool,
+    unsandboxed_approval: bool,
     pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     cancel: Arc<CancelFlag>,
@@ -453,7 +465,15 @@ struct ChatGate {
 impl agent::ApprovalGate for ChatGate {
     fn needs_approval(&self, danger_level: u8) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        if mode == "local" && self.unsandboxed_approval {
+            return danger_level >= 2;
+        }
         agent::needs_approval(&mode, danger_level)
+    }
+
+    fn sandbox_enabled(&self) -> bool {
+        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        !(mode == "local" && self.allow_unsandboxed)
     }
 
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
@@ -503,7 +523,7 @@ async fn set_approval_mode(
     let Some(mode) = req.get("mode").and_then(Value::as_str) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 mode" })));
     };
-    if !matches!(mode, "suggest" | "auto-edit" | "full-auto") {
+    if !matches!(mode, "suggest" | "auto-edit" | "full-auto" | "local") {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未知档位" })));
     }
     if let Ok(mut m) = state.approval_mode.write() {

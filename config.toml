@@ -20,3 +20,9 @@ file = "agent.jsonl"
 # 核心循环（施工单 003）
 max_steps = 8
 tool_result_max_chars = 8000
+# 审批默认档：suggest / auto-edit / full-auto / local（前端可即时切换，这里是初始值）
+default_approval = "auto-edit"
+# 本机直跑总开关：true 后前端才允许切「本机直跑」档（脱沙箱=完整用户权限，命令继承你的全部环境）
+allow_unsandboxed = true
+# 本机直跑档下，执行类命令是否仍要审批（false=连审批一起跳过，最大自由）
+unsandboxed_approval = false

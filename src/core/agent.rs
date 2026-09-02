@@ -24,9 +24,10 @@ pub enum AgentEvent {
 }
 
 /// 审批三档判定（施工单 005）：suggest=写/执行都要批；auto-edit=只批执行；full-auto=全自动。
+/// local（本机直跑）的审批策略由 gate 按 unsandboxed_approval 配置决定。
 pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
     match mode {
-        "full-auto" => false,
+        "full-auto" | "local" => false,
         "auto-edit" => danger_level >= 2,
         _ => danger_level >= 1, // suggest（默认兜底）
     }
@@ -36,6 +37,8 @@ pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
 pub trait ApprovalGate: Send + Sync {
     /// 当前档位下该危险等级是否要审批（档位可被侧栏即时切换，实现方读活值）
     fn needs_approval(&self, danger_level: u8) -> bool;
+    /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）
+    fn sandbox_enabled(&self) -> bool;
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }
@@ -155,7 +158,11 @@ pub async fn run_task(
         }));
 
         // 逐个执行工具
-        let exec_cfg = ExecConfig { sandbox: sandbox_cfg.clone(), max_chars: cfg.tool_result_max_chars };
+        let exec_cfg = ExecConfig {
+            sandbox: sandbox_cfg.clone(),
+            max_chars: cfg.tool_result_max_chars,
+            unsandboxed: !gate.sandbox_enabled(),
+        };
         for call in turn.tool_calls {
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));

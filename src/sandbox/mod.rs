@@ -33,6 +33,9 @@ pub struct SandboxSpec {
     /// 工作目录（必须已存在）
     pub working_dir: std::path::PathBuf,
     pub limits: SandboxLimits,
+    /// true=权限笼（受限 token + 白名单环境 + 资源/UI 上限）；
+    /// false=本机直跑（完整用户 token + 继承父环境，仅留超时团灭保险丝）
+    pub restricted: bool,
 }
 
 /// 一次受限运行的产出。

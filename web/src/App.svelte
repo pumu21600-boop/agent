@@ -282,6 +282,8 @@
                     ? { ...m, approval: { ...m.approval, decided: d.approval_decided.approved } }
                     : m
                 );
+              else if (d.notice)
+                messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
               else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
@@ -353,6 +355,7 @@
     <div class="side-approval">
       <label class="side-label">审批档位</label>
       <select
+        class:danger={approvalMode === 'local'}
         bind:value={approvalMode}
         on:change={() => {
           localStorage.setItem('approvalMode', approvalMode);
@@ -366,7 +369,8 @@
       >
         <option value="suggest">建议（写/执行都要批）</option>
         <option value="auto-edit">自动编辑（只批命令）</option>
-        <option value="full-auto">全自动</option>
+        <option value="full-auto">全自动（沙箱内）</option>
+        <option value="local">本机直跑（脱沙箱！）</option>
       </select>
     </div>
     <div class="side-foot">
@@ -772,6 +776,10 @@
     border-radius: 6px;
     padding: 4px 6px;
     font-size: 12px;
+  }
+  .side-approval select.danger {
+    border-color: #b3403a;
+    color: #ff7b72;
   }
   .tool-head {
     display: flex;

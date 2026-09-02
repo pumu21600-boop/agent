@@ -33,9 +33,15 @@ pub struct AgentConfig {
     /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
-    /// 默认审批档位：suggest / auto-edit / full-auto（请求级可覆盖）
+    /// 默认审批档位：suggest / auto-edit / full-auto / local（请求级可覆盖）
     #[serde(default = "default_approval")]
     pub default_approval: String,
+    /// 本机直跑总开关：false 时 local 档回退 full-auto（脱沙箱=完整用户权限，必须显式开）
+    #[serde(default)]
+    pub allow_unsandboxed: bool,
+    /// 本机直跑档下，执行类(danger 2)是否仍要审批（false=全自动）
+    #[serde(default)]
+    pub unsandboxed_approval: bool,
 }
 
 /// 执行沙箱参数（施工单 004，P4 shell 工具也走这套限额）。
@@ -135,6 +141,8 @@ impl Default for AgentConfig {
             max_steps: default_max_steps(),
             tool_result_max_chars: default_tool_result_max_chars(),
             default_approval: default_approval(),
+            allow_unsandboxed: false,
+            unsandboxed_approval: false,
         }
     }
 }

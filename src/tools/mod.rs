@@ -33,6 +33,8 @@ pub fn workspace_root() -> &'static std::path::Path {
 pub struct ExecConfig {
     pub sandbox: SandboxConfig,
     pub max_chars: usize,
+    /// 本机直跑（脱沙箱）：shell/git 用完整用户 token + 继承父环境
+    pub unsandboxed: bool,
 }
 
 fn builtin_tools() -> Vec<ToolSpec> {
@@ -364,7 +366,7 @@ async fn web_fetch(args: &str, max_chars: usize) -> Result<String, String> {
     Ok(cap(&text, max_chars))
 }
 
-/// shell / git 共用：沙箱内跑命令行，格式化输出。
+/// shell / git 共用：沙箱（或本机直跑）内跑命令行，格式化输出。
 async fn run_in_sandbox(
     cfg: &ExecConfig,
     application: PathBuf,
@@ -380,6 +382,7 @@ async fn run_in_sandbox(
             memory_mb: cfg.sandbox.memory_mb,
             active_processes: cfg.sandbox.active_processes,
         },
+        restricted: !cfg.unsandboxed,
     };
     let out = spawn_blocking(move || sandbox::run(&spec))
         .await
@@ -462,7 +465,7 @@ mod tests {
     }
 
     fn cfg() -> ExecConfig {
-        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000 }
+        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false }
     }
 
     #[tokio::test]
@@ -515,5 +518,23 @@ mod tests {
         assert!(r.unwrap().contains("git version"));
         let r = execute(&cfg(), "git", r#"{"args":"push origin main"}"#).await;
         assert!(r.is_err() && r.unwrap_err().contains("push"), "push 应被工具层直接拒绝");
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_inherits_full_env() {
+        init_logger();
+        // 差分断言：父进程环境里的变量，本机直跑子进程能看到（沙箱白名单看不到）
+        unsafe { std::env::set_var("AGENT_P4_UNSAFE_MARKER", "local-run-ok") };
+        let mut c = cfg();
+        c.unsandboxed = true;
+        let r = execute(&c, "shell", r#"{"command":"echo %AGENT_P4_UNSAFE_MARKER%"}"#).await.unwrap();
+        assert!(r.contains("local-run-ok"), "本机直跑应继承完整环境: {r}");
+
+        let r2 = execute(&cfg(), "shell", r#"{"command":"echo %AGENT_P4_UNSAFE_MARKER%"}"#).await;
+        let out2 = r2.unwrap();
+        assert!(
+            !out2.contains("local-run-ok"),
+            "沙箱模式不得泄漏父环境变量: {out2}"
+        );
     }
 }
