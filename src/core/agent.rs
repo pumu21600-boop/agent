@@ -24,6 +24,8 @@ pub enum AgentEvent {
     StepLimit(u32),
     /// 上下文占用与分类占比（每轮模型调用前更新；P5 圆环数据源）
     ContextUsage { tokens: u64, budget: u64, breakdown: context::Breakdown },
+    /// 渠道返回的真实用量（P5：缓存命中率展示）
+    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
 }
 
 /// 审批三档判定（Codex 式，施工单 005/006）：
@@ -67,6 +69,7 @@ pub async fn run_task(
     cfg: &AgentConfig,
     sandbox_cfg: &SandboxConfig,
     ctx_cfg: &ContextConfig,
+    max_output_tokens: Option<u64>,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent),
 ) -> anyhow::Result<LoopOutcome> {
@@ -119,6 +122,7 @@ pub async fn run_task(
                 api_key,
                 &Value::Array(msgs.clone()),
                 Some(&tools_def),
+                max_output_tokens,
                 cancel,
                 |chunk| {
                     let delta = extract_delta(chunk);
@@ -138,6 +142,11 @@ pub async fn run_task(
             ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
             ChatOutcome::Done(t) => t,
         };
+
+        // 渠道真实用量（缓存命中率展示；渠道不支持时为空）
+        if let Some(p) = turn.prompt_tokens {
+            on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
+        }
 
         // 思考完整段落落 thought（分片级已记 model_chunk）
         if !turn.reasoning.is_empty() {

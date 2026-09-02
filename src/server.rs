@@ -78,7 +78,6 @@ pub struct ModelsRequest {
     #[serde(default)]
     pub api_key: String,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdate {
     /// 配置名称（改当前激活配置的名）
@@ -97,6 +96,12 @@ pub struct SettingsUpdate {
     pub api_key: Option<String>,
     #[serde(default)]
     pub clear_key: Option<bool>,
+    /// 当前模型上下文长度（tokens；0=清除恢复全局默认）
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    /// 当前模型最大输出长度（tokens；0=清除）
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
@@ -191,6 +196,12 @@ async fn put_settings(
         list.sort();
         list.dedup();
         s.models = list;
+    }
+    if let Some(v) = req.context_length {
+        s.context_length = if v == 0 { None } else { Some(v) };
+    }
+    if let Some(v) = req.max_output_tokens {
+        s.max_output_tokens = if v == 0 { None } else { Some(v) };
     }
     if url_before != crate::config::settings::normalize_base(&s.effective_base_url()) {
         s.models.clear();
@@ -315,6 +326,8 @@ fn config_state_json(s: &Settings) -> Value {
                 "models": c.models.clone(),
                 "has_key": key.is_some(),
                 "key_hint": key_hint_of(key),
+                "context_length": c.context_length,
+                "max_output_tokens": c.max_output_tokens,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
@@ -324,6 +337,8 @@ fn config_state_json(s: &Settings) -> Value {
         "effective_base_url": s.effective_base_url(),
         "model": s.model,
         "models": s.models,
+        "context_length": s.context_length,
+        "max_output_tokens": s.max_output_tokens,
         "has_key": s.get_key().is_some(),
         "key_hint": key_hint_of(s.get_key()),
     })
@@ -354,7 +369,16 @@ async fn chat(
     let s = state.settings.read().unwrap().clone();
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
-    let ctx_cfg = (*state.context_cfg).clone();
+    // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
+    let ctx_cfg = {
+        // 预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
+        let mut c = (*state.context_cfg).clone();
+        if let Some(cl) = s.context_length {
+            c.budget_tokens = cl;
+        }
+        c
+    };
+    let max_output = s.max_output_tokens;
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
@@ -416,6 +440,7 @@ async fn chat(
             &cfg,
             &sandbox_cfg,
             &ctx_cfg,
+            max_output,
             &ChatGate {
                 mode: state.approval_mode.clone(),
                 allow_unsandboxed,
@@ -446,6 +471,9 @@ async fn chat(
                         },
                     }
                 })),
+                AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
+                    send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
+                }
             },
         )
         .await;

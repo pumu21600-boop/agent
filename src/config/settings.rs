@@ -38,6 +38,12 @@ pub struct Config {
     /// 本配置专属 key（DPAPI 密文 base64）；同地址的不同配置各有各的 key
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_cipher: Option<String>,
+    /// 该配置模型的上下文长度（tokens）；影响圆环预算，未设走全局 [context].budget_tokens
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// 该配置模型的最大输出长度（tokens）；随请求作为 max_tokens 发给渠道
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +54,11 @@ pub struct Settings {
     pub model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// 镜像：当前模型的上下文长度 / 最大输出（None=未设，走全局默认）
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
     /// 归一化 base_url → DPAPI 加密后的 key（base64）
     #[serde(default)]
     pub keys: BTreeMap<String, String>,
@@ -69,6 +80,8 @@ impl Default for Settings {
             base_url: String::new(),
             model: "deepseek-chat".to_string(),
             models: Vec::new(),
+            context_length: None,
+            max_output_tokens: None,
             keys: BTreeMap::new(),
             key_cipher: None,
             configs: Vec::new(),
@@ -205,6 +218,8 @@ impl Settings {
                 model: self.model.clone(),
                 models: self.models.clone(),
                 key_cipher: None,
+                context_length: None,
+                max_output_tokens: None,
             });
         }
         self.assign_missing_names();
@@ -265,12 +280,16 @@ impl Settings {
             self.base_url.clone(),
             self.model.clone(),
             self.models.clone(),
+            self.context_length,
+            self.max_output_tokens,
         );
         if let Some(c) = self.active_mut_() {
             c.provider_id = snap.0;
             c.base_url = snap.1;
             c.model = snap.2;
             c.models = snap.3;
+            c.context_length = snap.4;
+            c.max_output_tokens = snap.5;
         }
     }
 
@@ -303,6 +322,8 @@ impl Settings {
             model: String::new(),
             models: Vec::new(),
             key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
         });
         self.active_config_id = Some(id.clone());
         id

@@ -24,6 +24,9 @@
   })(); // 审批三档：read-only / auto / full-access
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
   let ctxUsage = { tokens: 0, budget: 0, breakdown: null }; // 上下文占用（P5 圆环+明细卡）
+  let ctxLen = 0; // 当前模型上下文长度（0=默认）
+  let maxOut = 0; // 当前模型最大输出长度（0=默认）
+  let apiTotals = { prompt: 0, cached: 0 }; // 渠道真实用量累计（平均缓存命中率）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -102,6 +105,8 @@
     model = s.model || '';
     configName = s.name || '';
     savedModels = s.models || [];
+    ctxLen = s.context_length || 0;
+    maxOut = s.max_output_tokens || 0;
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
     // key 按配置独占：hint 直接用当前激活配置的，与其他配置无关
@@ -326,7 +331,12 @@
                 messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
               else if (d.context_usage)
                 ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
-              else if (d.step_limit) {
+              else if (d.api_usage) {
+                apiTotals = {
+                  prompt: apiTotals.prompt + (d.api_usage.prompt_tokens || 0),
+                  cached: apiTotals.cached + (d.api_usage.cached_tokens || 0),
+                };
+              } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
               } else if (d.error) {
@@ -551,6 +561,10 @@
                 <span class="ctx-val">{row.pct}</span>
               </div>
             {/each}
+            <div class="ctx-row cache-row">
+              <span class="ctx-label">平均缓存命中率</span>
+              <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
+            </div>
             <div class="ctx-card-foot">超过预算自动归档旧工具结果并折叠早期对话</div>
           </div>
         </div>
@@ -650,6 +664,29 @@
           </select>
           <button class="btn primary" on:click={fetchModels}>获取模型</button>
         </div>
+      </div>
+
+      <div class="field">
+        <label>模型参数（tokens，0=恢复默认）</label>
+        <div class="sub-row">
+          <input
+            class="num-input"
+            type="number"
+            min="0"
+            bind:value={ctxLen}
+            title="上下文长度：决定圆环预算与历史裁剪时机"
+            on:change={() => autoSave({ context_length: Number(ctxLen) || 0 }, 0)}
+          />
+          <input
+            class="num-input"
+            type="number"
+            min="0"
+            bind:value={maxOut}
+            title="最大输出长度：随请求作为 max_tokens 发给渠道"
+            on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
+          />
+        </div>
+        <div class="param-hint">左：上下文长度　右：最大输出长度</div>
       </div>
     </div>
   </div>
@@ -820,6 +857,25 @@
     margin-top: 10px;
     padding-top: 8px;
     border-top: 1px solid #2f323c;
+    color: #6f7686;
+    font-size: 11px;
+  }
+  .cache-row {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #2f323c;
+  }
+  .num-input {
+    width: 100%;
+    background: #1b1d23;
+    color: #cdd2dd;
+    border: 1px solid #2f323c;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .param-hint {
+    margin-top: 4px;
     color: #6f7686;
     font-size: 11px;
   }

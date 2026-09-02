@@ -42,6 +42,9 @@ pub struct AssistantTurn {
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    /// 渠道返回的用量（P5：缓存命中率展示用）
+    pub prompt_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +168,7 @@ impl Gateway {
         api_key: &str,
         messages: &Value,
         tools: Option<&Value>,
+        max_tokens: Option<u64>,
         cancel: &CancelFlag,
         on_chunk: impl Fn(&Value),
     ) -> anyhow::Result<ChatOutcome> {
@@ -185,9 +189,14 @@ impl Gateway {
             "model": model,
             "messages": messages,
             "stream": true,
+            // 流式末尾带回 usage（OpenAI 兼容渠道普遍支持；不支持的渠道会忽略）
+            "stream_options": { "include_usage": true },
         });
         if let Some(t) = tools {
             body["tools"] = t.clone();
+        }
+        if let Some(mt) = max_tokens {
+            body["max_tokens"] = json!(mt);
         }
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
@@ -261,6 +270,17 @@ impl Gateway {
                             json!({ "kind": "cancel", "phase": "streaming", "chunks": chunk_count }),
                         );
                         return Ok(ChatOutcome::Cancelled);
+                    }
+                    // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
+                    // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示用）
+                    if let Some(u) = chunk.get("usage") {
+                        if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                            turn.prompt_tokens = Some(p);
+                            turn.cached_tokens = u
+                                .pointer("/prompt_tokens_details/cached_tokens")
+                                .and_then(Value::as_u64)
+                                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+                        }
                     }
                     let delta = extract_delta(&chunk);
                     let mut payload = json!({ "raw": data, "content": delta.content });
