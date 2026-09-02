@@ -43,6 +43,11 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
+    /// 请求级覆盖：非空优先于已保存设置（页面当前选择即时生效）
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub base_url: String,
     /// 可选的请求级 key 覆盖（仅内存）；为空则用已保存设置
     #[serde(default)]
     pub api_key: String,
@@ -210,6 +215,8 @@ async fn chat(
     Json(req): Json<ChatRequest>,
 ) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
     let message = req.message.trim().to_string();
+    let req_model = req.model.trim().to_string();
+    let req_base_url = req.base_url.trim().to_string();
     let req_api_key = req.api_key.trim().to_string();
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let gateway = state.gateway.clone();
@@ -227,8 +234,9 @@ async fn chat(
             send(json!({ "error": "消息为空" }));
             return;
         }
-        let base_url = s.effective_base_url();
-        let model = s.effective_model();
+        // 请求级覆盖优先：页面当前选择即时生效，不等保存
+        let base_url = if !req_base_url.is_empty() { req_base_url } else { s.effective_base_url() };
+        let model = if !req_model.is_empty() { req_model } else { s.effective_model() };
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
@@ -478,7 +486,7 @@ function send() {
   fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: m }),
+    body: JSON.stringify({ message: m, model: $('model').value, base_url: $('baseUrl').value }),
     signal: controller.signal,
   })
     .then(res => {

@@ -152,7 +152,8 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg }),
+        // 带上当前选择的模型/base_url：下拉框改了立即生效，不必先点保存
+        body: JSON.stringify({ message: msg, model, base_url: baseUrl }),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
