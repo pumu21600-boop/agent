@@ -85,6 +85,9 @@
 
   // —— 上下文圆环（P5）——
   $: ctxPct = ctxUsage.budget ? Math.min(100, Math.round((ctxUsage.tokens / ctxUsage.budget) * 100)) : 0;
+  // 占用极少时百分比仍为 0，但弧保底 2%（实色弧可见，圆环"活"着）
+  $: ctxArcPct = ctxUsage.tokens > 0 && ctxPct === 0 ? 2 : ctxPct;
+  $: ctxPctText = ctxUsage.tokens > 0 && ctxPct === 0 ? '<1%' : ctxPct + '%';
   $: ctxCirc = 2 * Math.PI * 13;
   // 常态浅灰（同参考样式）；占用高时转警示色
   $: ctxColor = ctxPct >= 85 ? '#f87171' : ctxPct >= 60 ? '#facc15' : '#a9b1c2';
@@ -102,6 +105,55 @@
   function fmtTok(n) {
     if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
     return String(n);
+  }
+
+  // —— ZCode 式输入框：思考模式选择器（常驻）——
+  // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
+  let thinkMenuOpen = false;
+  const THINK_LABELS = { '': '默认', on: '开启', off: '关闭' };
+  $: thinkHint =
+    reasoningStyle === 'in_content'
+      ? '该渠道思考混在正文，自动剥离展示'
+      : reasoningStyle === 'effort_param'
+        ? thinking === 'off'
+          ? 'o 系无可靠关参数，off 不发'
+          : 'OpenAI 风格 reasoning_effort'
+        : reasoningStyle === 'thinking_param'
+          ? 'GLM/豆包 thinking 参数'
+          : thinkingBudgetParam
+            ? '布尔开关 + 思考预算'
+            : '思考参数按渠道自动适配';
+  function pickThinking(v) {
+    thinking = v;
+    thinkMenuOpen = false;
+    // 同步进设置（持久化到当前配置，刷新/切会话不丢）
+    autoSave({ thinking: v }, 0);
+  }
+
+  // —— 审批档位菜单（输入栏内）——
+  let approvalMenuOpen = false;
+  const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
+  function pickApproval(m) {
+    approvalMode = m;
+    approvalMenuOpen = false;
+    localStorage.setItem('approvalMode', m);
+    fetch('/api/approval-mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: m }),
+    });
+  }
+
+  function handleKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  }
+  function autoRows(e) {
+    const el = e.target;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   }
 
   function scrollToBottom() {
@@ -138,6 +190,10 @@
     thinkingBudget = s.thinking_budget || 0;
     reasoningStyle = s.reasoning_style || 'reasoning_content';
     thinkingBudgetParam = s.thinking_budget_param || null;
+    // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
+    if (!ctxUsage.budget) {
+      ctxUsage = { ...ctxUsage, budget: s.context_length || 96000 };
+    }
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
     // key 按配置独占：hint 直接用当前激活配置的，与其他配置无关
@@ -442,13 +498,18 @@
     }
   }
 
+  // 重置占用但保留预算（圆环常驻：预算来自设置，切会话不该归零）
+  function resetCtxUsage() {
+    ctxUsage = { tokens: 0, budget: ctxUsage.budget, breakdown: null };
+  }
+
   async function loadSession(id) {
     if (streaming) return;
     try {
       const r = await fetch(`/api/session?id=${encodeURIComponent(id)}`).then((r) => r.json());
       currentSessionId = id;
       messages = rebuildFromSession(r.messages || []);
-      ctxUsage = { tokens: 0, budget: 0, breakdown: null };
+      resetCtxUsage();
     } catch (e) {
       // 加载失败不阻塞
     }
@@ -458,7 +519,7 @@
     if (streaming) return;
     currentSessionId = null;
     messages = [];
-    ctxUsage = { tokens: 0, budget: 0, breakdown: null };
+    resetCtxUsage();
     apiTotals = { prompt: 0, cached: 0 };
   }
 
@@ -560,38 +621,11 @@
   function nextId() {
     return ++seq;
   }
-
-  function onKey(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      send();
-    }
-  }
 </script>
 
 <div class="app">
   <aside class="sidebar">
     <div class="brand">Agent</div>
-    <div class="side-approval">
-      <label class="side-label">审批档位</label>
-      <select
-        class:danger={approvalMode === 'full-access'}
-        bind:value={approvalMode}
-        on:change={() => {
-          localStorage.setItem('approvalMode', approvalMode);
-          // 即时同步到后端：进行中的请求下一次工具调用就按新档位走
-          fetch('/api/approval-mode', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ mode: approvalMode }),
-          });
-        }}
-      >
-        <option value="read-only">只读（改动要批）</option>
-        <option value="auto">自动（沙箱内全自动）</option>
-        <option value="full-access">完全访问（脱沙箱！）</option>
-      </select>
-    </div>
     <div class="side-project">
       <label class="side-label">项目</label>
       <div class="proj-name">📁 {projectName || 'agent'}</div>
@@ -704,75 +738,143 @@
     {/if}
 
     <footer class="chat-input">
-      <div class="model-pick">
-        <button class="btn" on:click={() => (modelMenuOpen = !modelMenuOpen)}>
-          模型：{model || '未选'} ▾
-        </button>
-        {#if modelMenuOpen}
-          <div class="model-menu">
-            {#if savedModels.length === 0}
-              <div class="menu-empty">暂无模型，先到设置里获取</div>
-            {/if}
-            {#each savedModels as m}
-              <button class="menu-item" class:active={m === model} on:click={() => pickModel(m)}>
-                {m}
+      <div class="composer">
+        <textarea
+          class="composer-input"
+          rows="1"
+          bind:value={input}
+          placeholder="提出后续修改要求"
+          on:keydown={handleKey}
+          on:input={autoRows}
+          disabled={streaming}
+        ></textarea>
+        <div class="composer-bar">
+          <div class="composer-left">
+            <button class="icon-btn" title="新建对话" on:click={startNewSession} disabled={streaming}>＋</button>
+            <div class="bar-menu">
+              <button
+                class="pill"
+                class:danger={approvalMode === 'full-access'}
+                on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
+                title="审批档位：控制工具执行要不要先问你"
+              >
+                <span class="pill-icon">{approvalMode === 'full-access' ? '🛡' : '🛡'}</span>
+                {APPROVAL_LABELS[approvalMode] || approvalMode}
+                <span class="caret">▾</span>
               </button>
-            {/each}
-            <div class="menu-sep"></div>
-            <button class="menu-item" on:click={() => { modelMenuOpen = false; settingsOpen = true; }}>
-              管理模型…
-            </button>
+              {#if approvalMenuOpen}
+                <div class="bar-dropdown">
+                  {#each Object.entries(APPROVAL_LABELS) as [val, label]}
+                    <button class="bar-item" class:active={val === approvalMode} on:click={() => pickApproval(val)}>
+                      {label}
+                      <span class="bar-item-hint">
+                        {val === 'read-only' ? '改动要批' : val === 'auto' ? '沙箱内全自动' : '脱沙箱！'}
+                      </span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           </div>
-        {/if}
-      </div>
-      <input
-        bind:value={input}
-        placeholder="输入消息，Enter 发送"
-        on:keydown={onKey}
-        disabled={streaming}
-      />
-      {#if ctxUsage.budget > 0}
-        <div class="ctx-wrap">
-          <svg class="ctx-ring" viewBox="0 0 30 30" width="28" height="28">
-            <circle cx="15" cy="15" r="13" fill="none" stroke="#2b2e36" stroke-width="2.6" />
-            <circle
-              cx="15"
-              cy="15"
-              r="13"
-              fill="none"
-              stroke={ctxColor}
-              stroke-width="2.6"
-              stroke-linecap="round"
-              stroke-dasharray={`${(ctxCirc * ctxPct) / 100} ${ctxCirc}`}
-              transform="rotate(-90 15 15)"
-            />
-          </svg>
-          <div class="ctx-card">
-            <div class="ctx-card-head">
-              <b>上下文容量</b>
-              <span>{fmtTok(ctxUsage.tokens)}/{fmtTok(ctxUsage.budget)}（{ctxPct}%）</span>
-            </div>
-            <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
-            {#each ctxRows as row}
-              <div class="ctx-row">
-                <span class="ctx-dot" style:background={row.color}></span>
-                <span class="ctx-label">{row.label}</span>
-                <span class="ctx-val">{row.pct}</span>
+          <div class="composer-right">
+            {#if ctxUsage.budget > 0}
+              <div class="ctx-wrap">
+                <svg class="ctx-ring" viewBox="0 0 30 30" width="22" height="22" title="上下文占用">
+                  <circle class="ctx-track" cx="15" cy="15" r="13" />
+                  <circle
+                    class="ctx-arc"
+                    cx="15"
+                    cy="15"
+                    r="13"
+                    stroke={ctxColor}
+                    stroke-dasharray={`${(ctxCirc * ctxArcPct) / 100} ${ctxCirc}`}
+                    transform="rotate(-90 15 15)"
+                  />
+                </svg>
+                <span class="ctx-pct" class:warn={ctxPct >= 60} class:crit={ctxPct >= 85}>{ctxPctText}</span>
+                <div class="ctx-card">
+                  <div class="ctx-card-head">
+                    <b>上下文容量</b>
+                    <span>{fmtTok(ctxUsage.tokens)}/{fmtTok(ctxUsage.budget)}（{ctxPct}%）</span>
+                  </div>
+                  <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
+                  {#each ctxRows as row}
+                    <div class="ctx-row">
+                      <span class="ctx-dot" style:background={row.color}></span>
+                      <span class="ctx-label">{row.label}</span>
+                      <span class="ctx-val">{row.pct}</span>
+                    </div>
+                  {/each}
+                  <div class="ctx-row cache-row">
+                    <span class="ctx-label">平均缓存命中率</span>
+                    <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
+                  </div>
+                  <div class="ctx-card-foot">超过预算自动归档旧工具结果并折叠早期对话</div>
+                </div>
               </div>
-            {/each}
-            <div class="ctx-row cache-row">
-              <span class="ctx-label">平均缓存命中率</span>
-              <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
+            {:else}
+              <!-- 常驻空环：会话还没用过（无预算数据）时也显示空轨道环 -->
+              <div class="ctx-wrap" title="上下文占用（发送消息后显示详情）">
+                <svg class="ctx-ring" viewBox="0 0 30 30" width="22" height="22">
+                  <circle class="ctx-track" cx="15" cy="15" r="13" />
+                </svg>
+              </div>
+            {/if}
+            <div class="bar-menu">
+              <button class="pill model-pill" on:click={() => (modelMenuOpen = !modelMenuOpen)} title="切换模型">
+                {model || '未选模型'}
+                <span class="caret">▾</span>
+              </button>
+              {#if modelMenuOpen}
+                <div class="bar-dropdown right">
+                  {#if savedModels.length === 0}
+                    <div class="menu-empty">暂无模型，先到设置里获取</div>
+                  {/if}
+                  {#each savedModels as m}
+                    <button class="bar-item" class:active={m === model} on:click={() => { pickModel(m); modelMenuOpen = false; }}>
+                      {m}
+                    </button>
+                  {/each}
+                  <div class="menu-sep"></div>
+                  <button class="bar-item" on:click={() => { modelMenuOpen = false; settingsOpen = true; }}>
+                    管理模型…
+                  </button>
+                </div>
+              {/if}
             </div>
-            <div class="ctx-card-foot">超过预算自动归档旧工具结果并折叠早期对话</div>
+            <div class="bar-menu">
+              <button
+                class="pill think-pill"
+                class:active={thinking === 'on'}
+                on:click={() => (thinkMenuOpen = !thinkMenuOpen)}
+                title={thinkHint}
+              >
+                <span class="pill-icon">🧠</span>
+                {THINK_LABELS[thinking] || '默认'}
+                <span class="caret">▾</span>
+              </button>
+              {#if thinkMenuOpen}
+                <div class="bar-dropdown right">
+                  <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
+                    默认<span class="bar-item-hint">跟渠道自身行为走</span>
+                  </button>
+                  <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
+                    开启<span class="bar-item-hint">{thinkHint}</span>
+                  </button>
+                  <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                    关闭<span class="bar-item-hint">{reasoningStyle === 'effort_param' ? 'o 系不发参数' : '发关闭参数'}</span>
+                  </button>
+                </div>
+              {/if}
+            </div>
+            {#if streaming}
+              <button class="send-btn stop" on:click={stop} title="停止">■</button>
+            {:else}
+              <button class="send-btn" on:click={send} disabled={!input.trim()} title="发送（Enter）">↑</button>
+            {/if}
           </div>
         </div>
-      {/if}
-      {#if streaming}
-        <button class="btn danger" on:click={stop}>停止</button>
-      {:else}
-        <button class="btn primary" on:click={send}>发送</button>
-      {/if}
+      </div>
     </footer>
   </main>
 </div>
@@ -1449,60 +1551,214 @@
   .typing {
     color: #9aa0ae;
   }
+  /* —— ZCode 式输入框：圆角容器 = 输入区 + 底部工具栏 —— */
   .chat-input {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    padding: 12px 16px;
+    padding: 10px 16px 14px;
     border-top: 1px solid #2a2d37;
     background: #1b1d23;
   }
-  .chat-input input {
-    flex: 1;
-    padding: 9px 12px;
-    border-radius: 8px;
-    border: 1px solid #333742;
+  .composer {
     background: #23252d;
+    border: 1px solid #333742;
+    border-radius: 14px;
+    padding: 4px 10px 8px;
+    transition: border-color 0.15s;
+  }
+  .composer:focus-within {
+    border-color: #4a5062;
+  }
+  .composer-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    resize: none;
+    border: none;
+    outline: none;
+    background: transparent;
     color: #e6e6eb;
     font-size: 14px;
+    line-height: 1.5;
+    padding: 8px 6px 6px;
+    max-height: 160px;
+    font-family: inherit;
   }
-  .model-pick {
+  .composer-input::placeholder {
+    color: #6b707c;
+  }
+  .composer-input:disabled {
+    opacity: 0.6;
+  }
+  .composer-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .composer-left,
+  .composer-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: #9aa0ae;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .icon-btn:hover {
+    background: #2a2d37;
+    color: #e6e6eb;
+  }
+  .icon-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .bar-menu {
     position: relative;
+    min-width: 0;
   }
-  .model-menu {
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 240px;
+    padding: 4px 8px;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
+    color: #b6bcc9;
+    font-size: 12.5px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pill:hover,
+  .pill.active {
+    background: #2a2d37;
+    color: #e6e6eb;
+  }
+  .pill.danger {
+    color: #f5a623;
+  }
+  .pill.danger:hover {
+    background: #33281a;
+  }
+  .pill .pill-icon {
+    font-size: 12px;
+  }
+  .pill .caret {
+    font-size: 9px;
+    color: #6f7686;
+  }
+  .model-pill {
+    font-family: Consolas, monospace;
+  }
+  .bar-dropdown {
     position: absolute;
     left: 0;
-    bottom: calc(100% + 6px);
-    min-width: 240px;
+    bottom: calc(100% + 8px);
+    min-width: 230px;
     max-height: 320px;
     overflow-y: auto;
     background: #23252d;
-    border: 1px solid #333742;
-    border-radius: 8px;
+    border: 1px solid #3d4150;
+    border-radius: 10px;
     padding: 4px;
-    z-index: 30;
-    display: flex;
-    flex-direction: column;
+    z-index: 40;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   }
-  .menu-item {
-    display: block;
+  .bar-dropdown.right {
+    left: auto;
+    right: 0;
+  }
+  .bar-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
     width: 100%;
     text-align: left;
     padding: 7px 10px;
     background: transparent;
     border: none;
-    border-radius: 6px;
+    border-radius: 7px;
     color: #e6e6eb;
-    font-family: Consolas, monospace;
     font-size: 13px;
     cursor: pointer;
+    white-space: nowrap;
   }
-  .menu-item:hover {
+  .bar-item:hover {
     background: #2a2d37;
   }
-  .menu-item.active {
+  .bar-item.active {
     background: #2f5fd0;
     color: #fff;
+  }
+  .bar-item.active .bar-item-hint {
+    color: #cdd6f4;
+  }
+  .bar-item-hint {
+    color: #6f7686;
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* 上下文圆环：空色轨道 + 实色占用弧 */
+  .ctx-ring .ctx-track {
+    fill: none;
+    stroke: #333742;
+    stroke-width: 3;
+  }
+  .ctx-ring .ctx-arc {
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+    transition: stroke-dasharray 0.3s;
+  }
+  .ctx-pct {
+    font-size: 11px;
+    color: #9aa0ae;
+    font-variant-numeric: tabular-nums;
+  }
+  .ctx-pct.warn {
+    color: #facc15;
+  }
+  .ctx-pct.crit {
+    color: #f87171;
+  }
+  .send-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
+    border: none;
+    background: #2f5fd0;
+    color: #fff;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .send-btn:hover:not(:disabled) {
+    background: #3d7bf5;
+  }
+  .send-btn:disabled {
+    background: #2b2e36;
+    color: #6f7686;
+    cursor: default;
+  }
+  .send-btn.stop {
+    background: #8a2f2f;
+  }
+  .send-btn.stop:hover {
+    background: #a83a3a;
   }
   .menu-sep {
     height: 1px;
