@@ -83,21 +83,49 @@ impl Gateway {
         fresh
     }
 
-    /// 发请求；网络层失败（连接/超时类，非渠道业务错误）先重建客户端重试一次。
-    /// connect/timeout 错误覆盖：DNS 解析失败、代理拒连、TLS 握手失败、连接超时——
-    /// 正是 Clash 开关切换会触发的那些。
+    /// 发请求；两类自愈：
+    /// 1) 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
+    /// 2) 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
+    ///    仍 429 才把错误抛给上层。用户不该看见瞬时限流。
     async fn send(
         &self,
         build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
-        let client = self.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client);
-        match build(client).send().await {
-            Ok(r) => Ok(r),
-            Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
-                let fresh = self.rebuild_client();
-                build(fresh).send().await.map_err(|e| anyhow!(e.to_string()))
+        let mut rebuilt = false;
+        let mut attempt_429 = 0u32;
+        loop {
+            let client = self.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client);
+            match build(client).send().await {
+                Ok(r) => {
+                    if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt_429 < 3 {
+                        attempt_429 += 1;
+                        let wait = r
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim_end_matches('s').parse::<u64>().ok())
+                            .map(|s| s.min(30))
+                            .unwrap_or(2u64.pow(attempt_429 - 1));
+                        observability::event(
+                            EventType::State,
+                            json!({ "kind": "gateway.retry_429", "attempt": attempt_429, "wait_ms": wait * 1000 }),
+                        );
+                        observability::debug(&format!("[gateway] 429 限流，{wait}s 后第 {attempt_429} 次重试"));
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    return Ok(r);
+                }
+                Err(e) if (e.is_connect() || e.is_timeout() || e.is_request()) && !rebuilt => {
+                    rebuilt = true;
+                    let fresh = self.rebuild_client();
+                    match build(fresh).send().await {
+                        Ok(r) => return Ok(r),
+                        Err(e) => return Err(anyhow!(e.to_string())),
+                    }
+                }
+                Err(e) => return Err(anyhow!(e.to_string())),
             }
-            Err(e) => Err(anyhow!(e.to_string())),
         }
     }
 
