@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),
         system_prompt: Arc::new(system_prompt),
+        approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let app = server::router(state, manifest.join("web").join("dist"));
 

@@ -24,7 +24,7 @@ pub struct Config {
     pub sandbox: SandboxConfig,
 }
 
-/// 核心循环参数（施工单 003）。
+/// 核心循环参数（施工单 003 / 005）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// 单次任务最大循环步数（防失控）
@@ -33,6 +33,9 @@ pub struct AgentConfig {
     /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
+    /// 默认审批档位：suggest / auto-edit / full-auto（请求级可覆盖）
+    #[serde(default = "default_approval")]
+    pub default_approval: String,
 }
 
 /// 执行沙箱参数（施工单 004，P4 shell 工具也走这套限额）。
@@ -98,6 +101,9 @@ fn default_max_steps() -> u32 {
 fn default_tool_result_max_chars() -> usize {
     8000
 }
+fn default_approval() -> String {
+    "auto-edit".to_string()
+}
 fn default_sandbox_timeout_ms() -> u32 {
     10_000
 }
@@ -125,7 +131,11 @@ impl Default for LoggingConfig {
 }
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { max_steps: default_max_steps(), tool_result_max_chars: default_tool_result_max_chars() }
+        Self {
+            max_steps: default_max_steps(),
+            tool_result_max_chars: default_tool_result_max_chars(),
+            default_approval: default_approval(),
+        }
     }
 }
 impl Default for SandboxConfig {

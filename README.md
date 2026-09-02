@@ -1,7 +1,18 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P3 完成**（执行沙箱 v1：Job Objects + 受限 token），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P4 完成**（工具第一批 + 审批三档），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P4 工具第一批 + 审批三档
+
+- 工具：read_file / search（rg，findstr 兜底）/ web_fetch（去标签出正文）/ write_file / shell / git
+- shell 与 git **跑在 P3 沙箱里**：超时整树击杀、内存/进程数上限、密钥不进环境；工作目录=项目根
+- 审批三档（侧栏切换，请求级可覆盖，默认 auto-edit）：
+  - **建议**：读自动，写/执行要批
+  - **自动编辑**：读/写自动，执行要批
+  - **全自动**：全部自动
+- 审批交互：SSE 推 `approval_request` → 卡片内「允许/拒绝」→ POST /api/approvals；120s 超时视为拒绝，停止立即中断
+- 工具结果按 [agent].tool_result_max_chars 截断回填
 
 ## P3 执行沙箱（真实隔离，壳先于 shell）
 
