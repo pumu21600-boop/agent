@@ -1,0 +1,4 @@
+# 本机默认工具链为 windows-gnu，但该工具链的 dlltool 无法工作（CreateProcess 失败），
+# 且系统装有 VS 2022 Community + MSVC。本项目固定使用 MSVC 工具链。
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"

@@ -1,0 +1,21 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+description = "Windows 原生、类 Codex 的自主编码 Agent —— 施工单 001：日志地基 + 网关冒烟 + 取消按钮"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
