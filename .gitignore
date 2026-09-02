@@ -4,3 +4,7 @@
 /web/dist/
 /settings.json
 _check*.ps1
+
+# P6 恢复与续命产物
+/.agent/
+HANDOFF.md
