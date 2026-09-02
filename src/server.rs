@@ -393,7 +393,6 @@ async fn chat(
     };
     let max_output = s.max_output_tokens;
     let prompt = state.system_prompt.clone();
-    let ws_root = crate::tools::workspace_root().to_string_lossy().to_string();
     // P7 AGENTS.md 双层注入（全局在前、项目在后）
     let agents_md = state.memory.agents_md();
     let approvals = state.approvals.clone();
@@ -465,10 +464,9 @@ async fn chat(
             &base_url,
             &model,
             &api_key,
-            // 把后端知道的事实注入（模型不知道自己在哪个渠道叫什么，还会自造产品身份）
-            &format!(
-                "{prompt}{agents_md}\n\n（系统注入的事实：你此刻运行的底层模型是「{model}」，经渠道 {base_url} 调用，当前工作目录是 {ws_root}。你没有预设的产品名称、角色或职责设定——被问是谁时照实说这些，不要自称任何产品名或给自己安固定人设。）"
-            ),
+            // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实。
+            // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
+            &format!("{prompt}{agents_md}"),
             &history,
             &cancel,
             &cfg,
