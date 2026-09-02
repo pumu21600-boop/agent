@@ -86,6 +86,8 @@
 | `session.saved` | 会话消息落盘（P6，每步/终止时） | `session`（会话 id）、`messages`（条数） |
 | `session.cleared` | 删除单条会话（P6.1） | `session` |
 | `handoff.written` | 交接文档已生成（P6） | `path`、`trigger`（auto/manual）、`context_pct`（auto 时） |
+| `memory.summarized` | 滚动摘要已生成并注入（P7） | `step`、`chars` |
+| `memory.summary_skipped` | 摘要调用失败，降级保留占位符（P7） | `step`、`note` |
 
 ### 4.5 error —— 错误
 
@@ -107,3 +109,10 @@
 - **API key 永不写入 JSONL / 任何文件 / 控制台**（只存在于环境变量与内存中的 Authorization 头）
 - 事件类型只允许上述 6 类，不新增
 - 每行必须完整，验收可用 `tail -1` / 逐行 JSON 解析校验
+
+## 7. 项目记忆 events.log（P7，区别于本文件）
+
+`<workspace>/.agent/memory/events.log` 是**记忆层**事件流水（跟 git 仓库走），
+与本文件的进程日志（`logs/agent.jsonl`，不入库）是两回事：
+每行 `{ts, session, kind, ...}`，kind ∈ task.start / tool.call / task.finish /
+handoff.written / checkpoint.created；默认脱敏（sk-/Bearer/api_key 打码）。

@@ -1,7 +1,21 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P6 完成**（恢复与续命，含 P6.1 多会话/改动条修订），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P7 完成**（记忆 v1 + AGENTS.md），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P7 记忆 v1 + AGENTS.md
+
+- **双层存储**：全局 `~/.agent/` + 项目 `<workspace>/.agent/memory/`；`~/.agent/index.json`
+  按项目身份（git remote 优先，无则根路径）登记防串项目；删掉后重启自动重建（静默原则）。
+- **events.log 事件流水**：task.start / tool.call / task.finish / handoff.written /
+  checkpoint.created 追加进项目层 events.log（跟 git 仓库走，区别于不入库的进程日志 logs/）；
+  默认脱敏（sk-/Bearer/api_key 打码），`[memory].persist_sensitive=true` 才存原文。
+- **滚动摘要**：P5 折叠旧对话时不再只留占位符——调模型把折叠内容压成 ≤300 字要点
+  （旧摘要+新折叠合并滚动），作为 system 消息注入；摘要持久化在会话文件 `summary` 字段，
+  跨任务/重启延续。摘要调用失败自动降级回占位符，绝不阻断循环。
+- **AGENTS.md**：全局 + 项目双层读取注入 system prompt；项目缺失时自动生成模板。
+  本项目的 AGENTS.md 已填真实约定（构建命令/分支规范/红线/坑索引）。
+- 配置：`config.toml [memory]`（enabled / persist_sensitive）；语义检索与 EMBEDDING 留 P8。
 
 ## P6 恢复与续命
 
