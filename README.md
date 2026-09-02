@@ -24,10 +24,17 @@ agent/
 
 ## 快速启动
 
+**日常使用（脱离终端，推荐）**：双击 `start.bat` 后台启动（隐藏窗口，关终端不影响），双击 `stop.bat` 停止。
+
+**开发模式**：
+
 ```powershell
 cd web; npm install; npm run build   # 一次性构建前端
-cd ..; cargo run                     # 打开 http://127.0.0.1:8321
+cd ..; cargo build --release         # 构建 release 二进制（start.bat 依赖）
+cargo run                            # 前台调试运行（关终端即停）
 ```
+
+打开 http://127.0.0.1:8321 。终态方案是 P13 的 Tauri 桌面封装，之后不再依赖任何终端。
 
 ## 模型设置（侧栏「模型设置」或右上角「设置」弹窗）
 
