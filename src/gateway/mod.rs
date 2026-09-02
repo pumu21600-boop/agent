@@ -218,12 +218,17 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
         let data: Value = response.json().await.context("解析摘要响应失败")?;
-        let content = data
+        let raw = data
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Ok(content)
+        // 反代 <think> 当正文吐：剥离标签，摘要只要正文
+        let mut ts = ThinkSplit::default();
+        let (_, mut clean) = ts.feed(&raw);
+        let (_, mut tail) = ts.finish();
+        clean.push_str(&tail);
+        Ok(clean)
     }
 
     /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
@@ -299,6 +304,8 @@ impl Gateway {
         let mut done = false;
         let mut turn = AssistantTurn::default();
         let mut calls: Vec<ToolCall> = Vec::new();
+        // 反代 <think> 剥离状态机（跨分片标签靠 hold 拼接）
+        let mut think_split = ThinkSplit::default();
         loop {
             let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
                 Ok(item) => item,
@@ -322,7 +329,7 @@ impl Gateway {
                         done = true;
                         break;
                     }
-                    let chunk: Value = match serde_json::from_str(data) {
+                    let mut chunk: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
                             observability::event(
@@ -351,7 +358,27 @@ impl Gateway {
                                 .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
                         }
                     }
-                    let delta = extract_delta(&chunk);
+                    let mut delta = extract_delta(&chunk);
+                    // 反代 <think> 剥离：标签内文字改道思考通道；
+                    // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
+                    if !delta.content.is_empty() {
+                        let (think, clean) = think_split.feed(&delta.content);
+                        if !think.is_empty() || clean.len() != delta.content.len() {
+                            if !think.is_empty() {
+                                delta.reasoning = Some(match delta.reasoning.take() {
+                                    Some(r) => format!("{r}{think}"),
+                                    None => think,
+                                });
+                            }
+                            delta.content = clean.clone();
+                            if let Some(d) = chunk.pointer_mut("/choices/0/delta") {
+                                d["content"] = json!(clean);
+                                if let Some(r) = &delta.reasoning {
+                                    d["reasoning_content"] = json!(r);
+                                }
+                            }
+                        }
+                    }
                     let mut payload = json!({ "raw": data, "content": delta.content });
                     if let Some(r) = &delta.reasoning {
                         payload["reasoning_content"] = json!(r);
@@ -382,12 +409,86 @@ impl Gateway {
                 break;
             }
         }
+        // 流结束：hold 里若剩半截标签（如截断在 "<thi"），按当前通道归位
+        let (tail_think, tail_content) = think_split.finish();
+        turn.reasoning.push_str(&tail_think);
+        turn.content.push_str(&tail_content);
         turn.tool_calls = calls;
         observability::event(
             EventType::State,
             json!({ "kind": "gateway.stream_end", "chunks": chunk_count, "done": done, "tool_calls": turn.tool_calls.len() }),
         );
         Ok(ChatOutcome::Done(turn))
+    }
+}
+
+/// 反代端点 `<think>` 标签剥离状态机（P7.7）。
+/// 有些免费反代不写 reasoning_content 字段，把思考当正文吐（带 `<think>` 标签）——
+/// 标签内文字走思考通道：不进正文、不进历史、前端折叠显示。标签可跨分片断裂，
+/// 用 hold 缓冲半截标签。
+#[derive(Default)]
+struct ThinkSplit {
+    in_think: bool,
+    hold: String,
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+impl ThinkSplit {
+    /// 喂入一段增量，返回 (思考文本, 正文文本)。
+    fn feed(&mut self, text: &str) -> (String, String) {
+        let mut think = String::new();
+        let mut content = String::new();
+        for ch in text.chars() {
+            self.hold.push(ch);
+            if self.hold.ends_with(THINK_OPEN) {
+                self.hold.truncate(self.hold.len() - THINK_OPEN.len());
+                self.flush_before_tag(&mut think, &mut content);
+                self.in_think = true;
+                self.hold.clear();
+            } else if self.hold.ends_with(THINK_CLOSE) {
+                self.hold.truncate(self.hold.len() - THINK_CLOSE.len());
+                self.flush_before_tag(&mut think, &mut content);
+                if self.in_think {
+                    self.in_think = false; // 正常闭合
+                }
+                // 流落在正文里的孤立 </think>：当普通文本（flush_before_tag 已带出）
+                self.hold.clear();
+            } else if !THINK_OPEN.starts_with(self.hold.as_str())
+                && !THINK_CLOSE.starts_with(self.hold.as_str())
+            {
+                // 不可能凑成标签了：整段 hold 落入当前通道
+                self.flush_before_tag(&mut think, &mut content);
+            }
+            // 否则 hold 还是某个标签的前缀，留给下一片
+        }
+        (think, content)
+    }
+
+    fn flush_before_tag(&mut self, think: &mut String, content: &mut String) {
+        let s = std::mem::take(&mut self.hold);
+        if s.is_empty() {
+            return;
+        }
+        if self.in_think {
+            think.push_str(&s);
+        } else {
+            content.push_str(&s);
+        }
+    }
+
+    /// 流结束：hold 里剩下的半截标签不是标签，归入当前通道。
+    fn finish(&mut self) -> (String, String) {
+        let s = std::mem::take(&mut self.hold);
+        if s.is_empty() {
+            return (String::new(), String::new());
+        }
+        if self.in_think {
+            (s, String::new())
+        } else {
+            (String::new(), s)
+        }
     }
 }
 
@@ -440,6 +541,44 @@ mod tests {
             let dir = std::env::temp_dir().join("agent-test-logs");
             let _ = crate::observability::init(&dir, "gw.jsonl", format!("gw-{}", uuid::Uuid::new_v4()));
         });
+    }
+
+    #[test]
+    fn think_split_variants() {
+        // 无标签：原样走正文
+        let mut ts = ThinkSplit::default();
+        assert_eq!(ts.feed("普通回答"), ("".into(), "普通回答".into()));
+        // 标签整段：思考与正文分离
+        let mut ts = ThinkSplit::default();
+        assert_eq!(ts.feed("<think>先想想</think>答案"), ("先想想".into(), "答案".into()));
+        // 标签跨分片断裂："<thi|nk>AB</thi|nk>CD"
+        let mut ts = ThinkSplit::default();
+        let (t1, c1) = ts.feed("<thi");
+        assert_eq!((t1.as_str(), c1.as_str()), ("", ""));
+        let (t2, c2) = ts.feed("nk>AB</thi");
+        assert_eq!((t2.as_str(), c2.as_str()), ("AB", ""));
+        let (t3, c3) = ts.feed("nk>CD");
+        assert_eq!((t3.as_str(), c3.as_str()), ("", "CD"));
+        let (t4, c4) = ts.finish();
+        assert_eq!((t4.as_str(), c4.as_str()), ("", ""));
+        // 未闭合 <think>（流在思考中被截断）：全部走思考
+        let mut ts = ThinkSplit::default();
+        let (t, c) = ts.feed("<think>还没想完");
+        assert_eq!((t.as_str(), c.as_str()), ("还没想完", ""));
+        // 正文里出现 "<thinking" 这类伪前缀：不误伤
+        let mut ts = ThinkSplit::default();
+        let (t, c) = ts.feed("a<thinking>b");
+        assert_eq!((t.as_str(), c.as_str()), ("", "a<thinking>b"));
+        // 孤立 </think>（不在思考态）：当普通文本
+        let mut ts = ThinkSplit::default();
+        let (t, c) = ts.feed("x</think>y");
+        assert_eq!((t.as_str(), c.as_str()), ("", "xy"));
+        // 截断在半截标签：finish 归位正文
+        let mut ts = ThinkSplit::default();
+        let (t, c) = ts.feed("尾<thi");
+        assert_eq!((t.as_str(), c.as_str()), ("", "尾"));
+        let (t2, c2) = ts.finish();
+        assert_eq!((t2.as_str(), c2.as_str()), ("", "<thi"));
     }
 
     #[tokio::test]
