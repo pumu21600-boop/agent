@@ -1,40 +1,42 @@
-# agent —— 施工单 001：日志地基 + 网关冒烟 + 取消按钮
+# agent —— Windows 原生类 Codex 自主编码 Agent
 
-Windows 原生、类 Codex 的自主编码 Agent 的第一期工程。
-本单范围：单会话、无历史、无记忆、无工具（取消按钮除外）。
+技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
+当前进度：P1 完成（结构模块化 + 聊天 UI 骨架），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
 ## 目录结构
 
 ```
 agent/
-├── src/                  # Rust 后端
-│   ├── main.rs           # 启动：配置 → 日志 → 网关 → HTTP 服务
-│   ├── config.rs         # config.toml 加载 + 环境变量覆盖
-│   ├── logging.rs        # JSONL logger（6 类事件，全工程统一走它）
-│   ├── gateway.rs        # DeepSeek 官方 API 网关（唯一 provider，流式）
-│   ├── server.rs         # axum：静态页 + /api/chat 流式 + /cancel
-│   └── cancel.rs         # 全局取消标志（AtomicBool）
-├── frontend/             # Svelte + Vite 冒烟页（输入框/发送/停止/流式显示）
-├── docs/jsonl-schema.md  # JSONL 日志 schema（定死）
-├── config.toml           # 渠道/端口/日志配置
+├── src/                  # Rust 后端（按总架构 §17 模块化）
+│   ├── main.rs           # 启动
+│   ├── server.rs         # axum：静态页 + 流式接口 + 取消
+│   ├── core/             # 核心循环（P2）、取消标志
+│   ├── gateway/          # 模型网关 + providers 数据加载
+│   ├── config/           # config.toml + settings 持久化（DPAPI 存 key）
+│   ├── observability/    # JSONL 日志（6 类事件）
+│   └── tools/ sandbox/ plugin/ memory/ session/ recovery/ context/  # 占位，后续单实现
+├── web/                  # Svelte + Vite 聊天界面（侧栏 + 对话 + 设置弹窗）
+├── providers.json        # 供应商预设（数据驱动）
+├── docs/                 # jsonl-schema.md / ROADMAP.md / workorders/
+├── config.toml           # 服务/日志配置
 └── scripts/mock_provider.mjs  # 无 key 冒烟用的本地模拟渠道（测试工具，非 provider）
 ```
 
 ## 快速启动
 
 ```powershell
-cd frontend; npm install; npm run build   # 一次性构建前端
-cd ..; cargo run                          # 打开 http://127.0.0.1:8321
+cd web; npm install; npm run build   # 一次性构建前端
+cd ..; cargo run                     # 打开 http://127.0.0.1:8321
 ```
 
-## 模型设置（网页里配，持久化）
+## 模型设置（侧栏「模型设置」或右上角「设置」弹窗）
 
-页面上方设置面板，流程：**选供应商 → 填 Base URL 和 Key → 获取模型 → 选模型 → 保存**。
+流程：**选供应商 → 填 Base URL 和 Key → 获取模型（弹窗多选/全选/保存）→ 选模型 → 保存**。
 
 - 内置 13 个供应商预设：DeepSeek / OpenAI / 商汤 / 通义 / 智谱 / Kimi / 百度千帆 / 星火 / SiliconFlow / Groq / xAI / Ollama / **OpenAI 兼容（自定义兜底）**。
 - 每个预设自带默认 Base URL（可改）；**不带模型清单**——点「获取模型」实时从渠道拉取（OpenAI 兼容的 `GET /models`），列表下拉选择，也能手动填。
 - 用中转渠道：选对应供应商（如 DeepSeek），把 Base URL 改成中转地址、Key 填中转 key，其余不用管。思考模式（reasoning_content）自动解析显示。
-- 设置持久化到 `settings.json`；**API Key 用 Windows DPAPI 加密存储**（本机本用户才能解，文件里是密文），重新打开网页/重启服务都还在，无需重配。
+- 设置持久化到 `settings.json`；**API Key 用 Windows DPAPI 加密存储、按供应商分别保存**（本机本用户才能解，文件里是密文），重新打开网页/重启服务都还在，无需重配。
 - Key 也支持环境变量 `DEEPSEEK_API_KEY` 兜底（未保存 key 时使用）。key 永不写日志。
 
 ## 查日志
