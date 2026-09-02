@@ -74,6 +74,10 @@
 | `sandbox.spawn` | 沙箱拉起受限进程（P3） | `pid`、`app`、`working_dir`、`timeout_ms`、`memory_mb`、`active_processes` |
 | `sandbox.exit` | 沙箱进程树收割（P3） | `pid`、`exit_code`、`timed_out`、`stdout_chars`、`stderr_chars` |
 | `sandbox.selftest` | 沙箱探针套件结果（P3） | `ok` |
+| `gateway.client_rebuild` | 网关 HTTP 客户端热重建（网络自愈） | `note` |
+| `settings.channel_changed` | 配置渠道地址变更，模型清单作废 | `base_url` |
+| `approval.requested` | 工具调用待审批（P4） | `id`、`tool` |
+| `approval.decided` | 审批决定（P4） | `id`、`approved` |
 
 ### 4.5 error —— 错误
 
