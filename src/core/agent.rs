@@ -33,6 +33,65 @@ pub enum AgentEvent {
     Notice(String),
     /// 任务改动统计条（P6.1）：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
     Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
+    /// P7 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
+    Summary(String),
+}
+
+/// P7 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
+pub const SUMMARY_PREFIX: &str = "【历史摘要】";
+
+fn is_summary_msg(m: &Value) -> bool {
+    m.get("content").and_then(Value::as_str).map(|c| c.starts_with(SUMMARY_PREFIX)).unwrap_or(false)
+}
+
+/// 快照用：去掉 system 头与摘要消息（摘要由会话文件 summary 字段单独持久化）。
+fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
+    msgs.iter().skip(1).filter(|m| !is_summary_msg(m)).cloned().collect()
+}
+
+/// P7 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
+async fn summarize_folded(
+    gateway: &Arc<Gateway>,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    prior: &Option<String>,
+    folded: &[Value],
+) -> Option<String> {
+    let mut text = String::new();
+    if let Some(p) = prior {
+        text.push_str(&format!("已有摘要：{p}\n\n"));
+    }
+    text.push_str("新增对话：\n");
+    for m in folded {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
+        let body: String = match m.get("content") {
+            Some(Value::String(s)) => s.chars().take(500).collect(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string().chars().take(500).collect(),
+        };
+        let calls = m
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.pointer("/function/name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        text.push_str(&format!("{role}: {body}{}\n", if calls.is_empty() { String::new() } else { format!(" [调用工具: {calls}]") }));
+        if text.chars().count() > 8000 {
+            break;
+        }
+    }
+    let req = json!([
+        {"role": "system", "content": "你是对话历史压缩器。把给定对话压成不超过300字中文要点，必须保留：任务目标、关键决定、改过哪些文件、未完成事项。只输出要点正文，不要开场白。"},
+        {"role": "user", "content": text},
+    ]);
+    let out = gateway.complete(base_url, model, api_key, &req, 400).await.ok()?;
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
 }
 
 /// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
@@ -107,6 +166,7 @@ fn short_args(args: &str, max_chars: usize) -> String {
 }
 
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_task(
     gateway: &Arc<Gateway>,
     base_url: &str,
@@ -119,6 +179,8 @@ pub async fn run_task(
     sandbox_cfg: &SandboxConfig,
     ctx_cfg: &ContextConfig,
     rec_cfg: &RecoveryConfig,
+    mem: &crate::memory::Memory,
+    prior_summary: Option<String>,
     max_output_tokens: Option<u64>,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent) + Send + Sync,
@@ -127,7 +189,14 @@ pub async fn run_task(
     msgs.push(json!({ "role": "system", "content": system_prompt }));
     msgs.extend(messages.iter().cloned());
     // P6 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
-    on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+    // P7 事件流水：任务开始
+    mem.record(
+        "task.start",
+        json!({ "text": messages.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.chars().take(200).collect::<String>()).unwrap_or_default() }),
+    );
+    // P7 滚动摘要：跨任务延续的当前摘要
+    let mut running_summary = prior_summary.filter(|s| !s.trim().is_empty());
     // P6.1 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
     // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
     let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
@@ -152,13 +221,15 @@ pub async fn run_task(
         // 每轮模型决策前查取消标志（核心循环刚性检查点）
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
-            on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
             emit_checkpoint_bar(baseline, &on_event).await;
             return Ok(LoopOutcome::Cancelled);
         }
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
         {
-            let (compacted, stats) = context::compact_messages(&msgs, ctx_cfg);
+            // P7：摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
+            msgs.retain(|m| !is_summary_msg(m));
+            let (mut compacted, stats) = context::compact_messages(&msgs, ctx_cfg);
             if stats.compacted {
                 observability::event(
                     EventType::State,
@@ -171,8 +242,29 @@ pub async fn run_task(
                         "tokens_after": stats.tokens_after,
                     }),
                 );
-                msgs = compacted;
+                // P7 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
+                if !stats.folded.is_empty() && mem.enabled {
+                    match summarize_folded(gateway, base_url, model, api_key, &running_summary, &stats.folded).await {
+                        Some(s) => {
+                            running_summary = Some(s.clone());
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "memory.summarized", "step": step, "chars": s.chars().count() }),
+                            );
+                            on_event(AgentEvent::Summary(s));
+                        }
+                        None => observability::event(
+                            EventType::State,
+                            json!({ "kind": "memory.summary_skipped", "step": step, "note": "摘要调用失败，保留占位符" }),
+                        ),
+                    }
+                }
             }
+            // P7：把当前摘要作为 system 消息紧跟主 system 注入（不进快照、不参与折叠）
+            if let Some(s) = &running_summary {
+                compacted.insert(1, json!({ "role": "system", "content": format!("{SUMMARY_PREFIX}{s}") }));
+            }
+            msgs = compacted;
         }
         // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
         let breakdown = context::estimate_breakdown(&msgs);
@@ -193,7 +285,7 @@ pub async fn run_task(
                 let session_id = observability::get().session_id().to_string();
                 let trigger =
                     format!("自动：上下文占用 {pct}%（阈值 {}%）", (ratio * 100.0).round() as u64);
-                let task_msgs = msgs[1..].to_vec();
+                let task_msgs = snapshot_msgs(&msgs);
                 let res = tokio::task::spawn_blocking(move || {
                     recovery::write_handoff(
                         &ws,
@@ -211,6 +303,7 @@ pub async fn run_task(
                             EventType::State,
                             json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "auto", "context_pct": pct }),
                         );
+                        mem.record("handoff.written", json!({ "trigger": "auto", "context_pct": pct }));
                         on_event(AgentEvent::Notice(format!(
                             "上下文占用 {pct}%，已自动生成交接文档 {}",
                             path.display()
@@ -280,12 +373,14 @@ pub async fn run_task(
             };
             // P6：最终回答写入会话并落盘（与前端看到的一致）
             msgs.push(json!({ "role": "assistant", "content": final_text }));
-            on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
             emit_checkpoint_bar(baseline, &on_event).await;
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
             );
+            // P7 事件流水：任务完成
+            mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
             return Ok(LoopOutcome::Done);
         }
 
@@ -328,7 +423,7 @@ pub async fn run_task(
         for call in turn.tool_calls {
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
-                on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
                 emit_checkpoint_bar(baseline, &on_event).await;
                 return Ok(LoopOutcome::Cancelled);
             }
@@ -355,10 +450,13 @@ pub async fn run_task(
                     let reason = format!("{} {}", call.name, short_args(&call.arguments, 100));
                     let ws = tools::workspace_root().to_path_buf();
                     match tokio::task::spawn_blocking(move || recovery::checkpoint(&ws, &reason)).await {
-                        Ok(Ok(Some(cp))) => observability::event(
-                            EventType::State,
-                            json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason }),
-                        ),
+                        Ok(Ok(Some(cp))) => {
+                            observability::event(
+                                EventType::State,
+                                json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason }),
+                            );
+                            mem.record("checkpoint.created", json!({ "reason": cp.reason }));
+                        }
                         Ok(Ok(None)) => {}
                         Ok(Err(e)) => observability::event(
                             EventType::State,
@@ -383,10 +481,12 @@ pub async fn run_task(
                 json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": truncated, "preview": preview }),
             );
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            // P7 事件流水：工具调用结果
+            mem.record("tool.call", json!({ "name": call.name, "danger": danger, "ok": ok }));
             msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));
         }
         // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
-        on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+        on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
     }
 
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));

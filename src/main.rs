@@ -69,6 +69,9 @@ async fn main() -> anyhow::Result<()> {
         "用中文简洁回答。".to_string()
     });
     let approval_default = config.agent.default_approval.clone();
+    // P7 记忆层：双层存储 + index 登记 + AGENTS.md 模板（开箱即用）
+    let memory = std::sync::Arc::new(memory::Memory::open(&manifest, &config.memory));
+    memory.ensure_agents_template(&manifest);
     let state = server::AppState {
         gateway,
         cancel,
@@ -79,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         recovery_cfg: Arc::new(config.recovery),
         system_prompt: Arc::new(system_prompt),
         session: Arc::new(session::SessionManager::new(&log_dir)),
+        memory,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
     };

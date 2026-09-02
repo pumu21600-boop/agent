@@ -20,6 +20,9 @@ pub struct SessionFile {
     pub created_at: String,
     pub updated_at: String,
     pub messages: Vec<Value>,
+    /// P7 滚动摘要（跨任务延续；无摘要时缺省）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// 列表条目（不携带消息体）。
@@ -67,15 +70,16 @@ impl SessionManager {
     }
 
     /// 落盘（原子写）：已存在则保留 created_at 与标题，否则标题取首条用户消息。
-    pub fn save(&self, id: &str, messages: &[Value]) -> anyhow::Result<()> {
+    /// summary 传 Some 才更新（None 保留旧值）。
+    pub fn save(&self, id: &str, messages: &[Value], summary: Option<&str>) -> anyhow::Result<()> {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let (title, created_at) = match self.get(id) {
-            Some(old) => (old.title, old.created_at),
-            None => (first_user_title(messages), now.clone()),
+        let (title, created_at, old_summary) = match self.get(id) {
+            Some(old) => (old.title, old.created_at, old.summary),
+            None => (first_user_title(messages), now.clone(), None),
         };
         let file = SessionFile {
             id: id.to_string(),
@@ -83,6 +87,7 @@ impl SessionManager {
             created_at,
             updated_at: now,
             messages: messages.to_vec(),
+            summary: summary.map(|s| s.to_string()).or(old_summary),
         };
         let tmp = self.path(id).with_extension("json.tmp");
         let text = serde_json::to_string(&file).context("会话序列化失败")?;
@@ -203,21 +208,30 @@ mod tests {
         let a = m.new_id();
         let b = m.new_id();
         assert_ne!(a, b);
-        m.save(&a, &[json!({"role":"user","content":"帮我修编译错误，这是会话A的开头"})]).unwrap();
-        m.save(&b, &[json!({"role":"user","content":"第二条会话"})]).unwrap();
+        m.save(&a, &[json!({"role":"user","content":"帮我修编译错误，这是会话A的开头"})], None).unwrap();
+        m.save(&b, &[json!({"role":"user","content":"第二条会话"})], None).unwrap();
         let list = m.list();
         assert_eq!(list.len(), 2);
         assert!(list.iter().any(|s| s.id == a && s.title.contains("会话A")));
         assert!(list.iter().any(|s| s.id == b));
 
-        // 更新 A：标题与 created_at 保留，消息数变化
-        m.save(&a, &[
-            json!({"role":"user","content":"帮我修编译错误，这是会话A的开头"}),
-            json!({"role":"assistant","content":"好的"}),
-        ]).unwrap();
+        // 更新 A：标题与 created_at 保留，消息数变化；P7 摘要随存
+        m.save(
+            &a,
+            &[
+                json!({"role":"user","content":"帮我修编译错误，这是会话A的开头"}),
+                json!({"role":"assistant","content":"好的"}),
+            ],
+            Some("任务目标：修编译错误；已定位到 main.rs"),
+        )
+        .unwrap();
         let fa = m.get(&a).unwrap();
         assert_eq!(fa.messages.len(), 2);
         assert_eq!(fa.title, "帮我修编译错误，这是会话A的开头");
+        assert!(fa.summary.as_deref().unwrap_or("").contains("main.rs"), "P7 摘要应持久化");
+        // summary 传 None 时保留旧值
+        m.save(&a, &fa.messages, None).unwrap();
+        assert!(m.get(&a).unwrap().summary.is_some());
 
         // 删除 A，B 仍在
         m.delete(&a).unwrap();
@@ -235,7 +249,7 @@ mod tests {
             format!("session-test-{}", uuid::Uuid::new_v4()),
         );
         let (_d, m) = mgr("badid");
-        assert!(m.save("../evil", &[]).is_err());
+        assert!(m.save("../evil", &[], None).is_err());
         assert!(m.get("../evil").is_none());
         assert!(m.delete("../evil").is_err());
         assert!(m.get("不存在的会话").is_none());

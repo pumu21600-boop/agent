@@ -124,6 +124,8 @@ pub struct CompactStats {
     pub folded_messages: usize,
     pub tokens_before: u64,
     pub tokens_after: u64,
+    /// P7：被折叠掉的原始消息（供滚动摘要；不折叠时为空）
+    pub folded: Vec<Value>,
 }
 
 /// 历史裁剪。messages[0] 视为 system 永不裁。
@@ -196,6 +198,11 @@ pub fn compact_messages(messages: &[Value], cfg: &CompactConfig) -> (Vec<Value>,
         }
         if !folded_ranges.is_empty() {
             let folded_count: usize = folded_ranges.iter().map(|(s, e)| e - s).sum();
+            // P7：把被折叠的原始消息带出来，供滚动摘要压缩
+            stats.folded = folded_ranges
+                .iter()
+                .flat_map(|(s, e)| out[*s..*e].to_vec())
+                .collect();
             let kept: Vec<Value> = out
                 .iter()
                 .enumerate()
@@ -287,8 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_folds_whole_rounds_when_still_over() {
-        let long_result = "r".repeat(6000);
+    fn compact_folds_whole_rounds_when_still_over() {        let long_result = "r".repeat(6000);
         let mut messages = vec![json!({ "role": "system", "content": "sys" })];
         for i in 0..8 {
             messages.push(user_msg(&format!("问题{i}")));
@@ -307,6 +313,27 @@ mod tests {
         assert_eq!(out.last().unwrap()["content"], "最后问题");
         // 折到无可折为止：保护区（最近 2 个工具结果）本身可能超预算，此时不强求达标
         assert!(stats.tokens_after < stats.tokens_before);
+    }
+
+    #[test]
+    fn compact_returns_folded_messages_for_summary() {
+        // P7：折叠发生时，被折叠的原始消息要带出来供滚动摘要
+        let long_result = "r".repeat(6000);
+        let mut messages = vec![json!({ "role": "system", "content": "sys" })];
+        for i in 0..8 {
+            messages.push(user_msg(&format!("问题{i}")));
+            messages.push(asst_msg());
+            messages.push(tool_msg(&long_result));
+        }
+        messages.push(user_msg("最后问题"));
+        let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 2 };
+        let (out, stats) = compact_messages(&messages, &cfg);
+        assert!(stats.folded_messages > 0);
+        assert!(!stats.folded.is_empty(), "折叠的原始消息必须带出");
+        // 带出的内容含被折叠轮次的 user 消息原文
+        assert!(stats.folded.iter().any(|m| m.get("content").and_then(Value::as_str) == Some("问题0")));
+        // 折叠后 out 里不再有这些原文（占位符替代）
+        assert!(!out.iter().any(|m| m.get("content").and_then(Value::as_str) == Some("问题0")));
     }
 
     #[test]

@@ -157,6 +157,45 @@ impl Gateway {
         Ok(ids)
     }
 
+    /// 非流式单轮补全（P7 滚动摘要用）：返回 choices[0].message.content。
+    /// 不查取消标志（摘要失败由调用方降级），超时走客户端全局 600s。
+    pub async fn complete(
+        &self,
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+        messages: &Value,
+        max_tokens: u64,
+    ) -> anyhow::Result<String> {
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("API key 未设置，无法生成摘要"));
+        }
+        let url = Self::chat_url(base_url);
+        let body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "max_tokens": max_tokens,
+        });
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "summary" }));
+        let response = self
+            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
+            .await
+            .with_context(|| format!("请求渠道失败: {url}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("渠道返回 {status}: {text}"));
+        }
+        let data: Value = response.json().await.context("解析摘要响应失败")?;
+        let content = data
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Ok(content)
+    }
+
     /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
     /// 1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
     /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。

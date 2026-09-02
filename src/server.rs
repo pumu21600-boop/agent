@@ -47,6 +47,8 @@ pub struct AppState {
     pub system_prompt: Arc<String>,
     /// 会话落盘（P6.1 多会话）：Snapshot 事件按 session_id 写入
     pub session: Arc<crate::session::SessionManager>,
+    /// P7 记忆层（events.log / AGENTS.md / index；开关在 [memory]）
+    pub memory: Arc<crate::memory::Memory>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
@@ -391,8 +393,11 @@ async fn chat(
     };
     let max_output = s.max_output_tokens;
     let prompt = state.system_prompt.clone();
+    // P7 AGENTS.md 双层注入（全局在前、项目在后）
+    let agents_md = state.memory.agents_md();
     let approvals = state.approvals.clone();
     let session = state.session.clone();
+    let mem = state.memory.clone();
     let rec_cfg = (*state.recovery_cfg).clone();
     // P6.1 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
     let session_id = {
@@ -402,6 +407,8 @@ async fn chat(
             && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
         if valid { sid } else { session.new_id() }
     };
+    // P7 滚动摘要：从会话文件带出旧摘要继续压
+    let prior_summary = session.get(&session_id).and_then(|f| f.summary);
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就回退 auto 并告知前端。
     let norm = |m: &str| -> String {
@@ -435,6 +442,9 @@ async fn chat(
         let send = |payload: Value| {
             let _ = tx.send(Ok(json_event(payload)));
         };
+        // P7 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
+        let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(prior_summary.clone()));
         if history.is_empty() {
             send(json!({ "error": "消息为空" }));
             return;
@@ -456,7 +466,7 @@ async fn chat(
             &api_key,
             // 把后端知道的模型名作为事实注入（模型自己不知道中转渠道里它叫什么）
             &format!(
-                "{prompt}\n\n（系统注入的事实：你此刻运行的底层模型是「{model}」，经渠道 {base_url} 调用。被问是什么模型时，直接照实回答这个名字，不要说不知道。）"
+                "{prompt}{agents_md}\n\n（系统注入的事实：你此刻运行的底层模型是「{model}」，经渠道 {base_url} 调用。被问是什么模型时，直接照实回答这个名字，不要说不知道。）"
             ),
             &history,
             &cancel,
@@ -464,6 +474,8 @@ async fn chat(
             &sandbox_cfg,
             &ctx_cfg,
             &rec_cfg,
+            &mem,
+            prior_summary,
             max_output,
             &ChatGate {
                 mode: state.approval_mode.clone(),
@@ -500,7 +512,8 @@ async fn chat(
                 }
                 // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                 AgentEvent::Snapshot { messages } => {
-                    match session.save(&session_id, &messages) {
+                    let cur_summary = summary_slot.lock().unwrap().clone();
+                    match session.save(&session_id, &messages, cur_summary.as_deref()) {
                         Ok(()) => observability::event(
                             EventType::State,
                             json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
@@ -510,6 +523,11 @@ async fn chat(
                             json!({ "message": format!("会话落盘失败: {e}") }),
                         ),
                     }
+                }
+                // P7 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
+                AgentEvent::Summary(s) => {
+                    *summary_slot.lock().unwrap() = Some(s);
+                    send(json!({ "summary": true }))
                 }
                 // P6.1 改动统计条：撤销按钮恢复到任务起点基线
                 AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
@@ -672,7 +690,7 @@ async fn get_session(State(state): State<AppState>, axum::extract::Query(q): axu
         None => state.session.latest(),
     };
     match f {
-        Some(f) => (StatusCode::OK, Json(json!({ "id": f.id, "title": f.title, "updated_at": f.updated_at, "messages": f.messages }))),
+        Some(f) => (StatusCode::OK, Json(json!({ "id": f.id, "title": f.title, "updated_at": f.updated_at, "summary": f.summary, "messages": f.messages }))),
         None => (StatusCode::OK, Json(json!({ "messages": [] }))),
     }
 }
