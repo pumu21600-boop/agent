@@ -13,6 +13,11 @@
   let settingsMsg = '';
   let settingsOpen = false;
   let modelMenuOpen = false;
+  let keyScopes = {}; // 归一化 base_url → 已存 key 尾号
+
+  // 当前 Base URL 对应的已存 key 尾号（实时）
+  $: keyScopeUrl = (baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+  $: savedKeyHint = keyScopeUrl ? keyScopes[keyScopeUrl] || '' : '';
 
   // —— 配置方案 ——
   let profiles = [];
@@ -56,6 +61,8 @@
     savedModels = s.models || [];
     hasKey = !!s.has_key;
     keyHint = s.key_hint || '';
+    keyScopes = {};
+    for (const sc of s.key_scopes || []) keyScopes[sc.url] = sc.hint;
     profiles = s.profiles || [];
     profileSel = s.active_profile_id || '';
     if (!baseUrl) applyDefault();
@@ -72,14 +79,7 @@
       settingsMsg = `方案操作失败: ${d.error}`;
       return;
     }
-    profiles = d.profiles || [];
-    profileSel = d.active_profile_id || '';
-    providerId = d.provider_id;
-    baseUrl = d.base_url;
-    model = d.model;
-    savedModels = d.models || [];
-    hasKey = !!d.has_key;
-    keyHint = d.key_hint || '';
+    await loadSettings(); // 重拉一次：字段、key 尾号、方案全部同步
   }
 
   function saveAsProfile() {
@@ -223,9 +223,8 @@
       settingsMsg = `保存失败: ${d.error}`;
       return;
     }
-    hasKey = !!d.has_key;
-    keyHint = d.key_hint || '';
     apiKey = '';
+    await loadSettings(); // 刷新 key 尾号提示（按当前 URL）
     settingsMsg = '已保存';
   }
 
@@ -459,11 +458,13 @@
         <input bind:value={baseUrl} placeholder="留空用预设默认" />
       </div>
       <div class="field">
-        <label>API Key</label>
+        <label>API Key（按 Base URL 独立保存，换地址互不串用）</label>
         <input
           bind:value={apiKey}
           type="password"
-          placeholder={hasKey ? `已保存(…${keyHint})，留空不修改` : 'sk-...'}
+          placeholder={savedKeyHint
+            ? `该地址已保存(…${savedKeyHint})，留空不修改`
+            : '此地址还没有 key，填写后保存'}
         />
       </div>
       <div class="field">

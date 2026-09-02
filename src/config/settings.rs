@@ -73,9 +73,14 @@ impl Default for Settings {
     }
 }
 
+/// key 存储作用域归一化：小写、去首尾空白与尾部 '/'。
+pub fn normalize_base(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_lowercase()
+}
+
 impl Settings {
     /// 读取；不存在时用 config.toml 的 gateway 节做种子（保留施工单 001 的换渠道能力）。
-    /// v1 的 key_cipher 自动迁移到 keys[provider_id]，不丢已存 key。
+    /// v1 的 key_cipher、以及旧的"按 provider 存 key"，都自动迁移到按归一化 base_url 存。
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {
         let path = Self::path();
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -98,6 +103,12 @@ impl Settings {
                         models: s.models.clone(),
                     });
                     s.active_profile_id = Some(DEFAULT_PROFILE_ID.into());
+                    let _ = s.save();
+                }
+                // v2.1 → v2.2 迁移：key 从"按 provider 存"改为"按 base_url 存"。
+                // 归位顺序：同 provider 方案的 base_url > 预设默认 > 当前生效地址。
+                let migrated = s.migrate_provider_keys_to_urls();
+                if migrated {
                     let _ = s.save();
                 }
                 return s;
@@ -147,9 +158,51 @@ impl Settings {
         }
     }
 
-    /// 解密取出指定 provider 的 key（仅内存）。
-    pub fn get_key(&self, provider_id: &str) -> Option<String> {
-        let cipher = self.keys.get(provider_id)?;
+    /// 把遗留的"按 provider 存"的 key 迁移到"按 base_url 存"。
+    /// 目标地址优先级：同 provider 方案的 base_url > 预设默认 > 当前生效地址。
+    fn migrate_provider_keys_to_urls(&mut self) -> bool {
+        let mut moved = Vec::new();
+        let mut added = Vec::new();
+        for (slot, cipher) in &self.keys {
+            if slot.contains("://") {
+                continue; // 已是 url 作用域
+            }
+            let target = self
+                .profiles
+                .iter()
+                .rev()
+                .find(|p| p.provider_id == *slot)
+                .map(|p| p.base_url.clone())
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| providers::find(slot).map(|p| p.default_base_url.clone()))
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| {
+                    if slot == &self.provider_id {
+                        Some(self.effective_base_url())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|u| !u.trim().is_empty())
+                .map(|u| normalize_base(&u));
+            let Some(url) = target else { continue };
+            if !self.keys.contains_key(&url) {
+                added.push((url, cipher.clone()));
+            }
+            moved.push(slot.clone());
+        }
+        for slot in &moved {
+            self.keys.remove(slot);
+        }
+        for (url, cipher) in added {
+            self.keys.insert(url, cipher);
+        }
+        !moved.is_empty()
+    }
+
+    /// 按归一化 base_url 解密取出 key（仅内存）。
+    pub fn get_key(&self, base_url: &str) -> Option<String> {
+        let cipher = self.keys.get(&normalize_base(base_url))?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(cipher).ok()?;
         let input = CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
@@ -173,8 +226,8 @@ impl Settings {
         String::from_utf8(plain).ok()
     }
 
-    /// DPAPI 加密并按 provider 保存。
-    pub fn set_key(&mut self, provider_id: &str, key: &str) -> anyhow::Result<()> {
+    /// DPAPI 加密并按 base_url 保存。
+    pub fn set_key(&mut self, base_url: &str, key: &str) -> anyhow::Result<()> {
         let data = key.as_bytes();
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
@@ -196,12 +249,12 @@ impl Settings {
         let cipher = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
         unsafe { LocalFree(output.pbData as *mut _) };
         self.keys
-            .insert(provider_id.to_string(), base64::engine::general_purpose::STANDARD.encode(cipher));
+            .insert(normalize_base(base_url), base64::engine::general_purpose::STANDARD.encode(cipher));
         self.save()
     }
 
-    pub fn clear_key(&mut self, provider_id: &str) -> anyhow::Result<()> {
-        self.keys.remove(provider_id);
+    pub fn clear_key(&mut self, base_url: &str) -> anyhow::Result<()> {
+        self.keys.remove(&normalize_base(base_url));
         self.save()
     }
 }
