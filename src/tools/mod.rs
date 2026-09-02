@@ -463,7 +463,7 @@ async fn shell(args: &str, cfg: &ExecConfig) -> Result<String, String> {
 }
 
 /// git.exe 绝对路径（父进程 PATH 里找一次；沙箱 PATH 虽也含它，给 application 显式路径更稳）。
-fn git_exe() -> Result<PathBuf, String> {
+pub(crate) fn git_exe() -> Result<PathBuf, String> {
     static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
     GIT.get_or_init(|| {
         use std::process::{Command, Stdio};
