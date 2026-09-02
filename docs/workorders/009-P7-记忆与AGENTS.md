@@ -34,7 +34,9 @@
 ## 任务 D：AGENTS.md（src/config/ 或 memory/）
 1. 双层读取：`~/.agent/AGENTS.md`（全局）+ `<workspace>/AGENTS.md`（项目）；
    都存在则都注入（全局在前、项目在后=优先级更高），只注入一次进 system prompt。
-2. 开箱即用：项目根无 AGENTS.md 时首次启动生成模板（构建命令/约定/已知坑占位，可手改）。
+2. 开箱即用：项目根无 AGENTS.md 时首次启动生成**空白模板**（仅标题+自填提示注释）。
+   定位纠正（P7.3）：AGENTS.md 是用户给每个项目自填设定的文件，产品不预置任何内容；
+   我们仓库的开发知识只进 ROADMAP，绝不写进 AGENTS.md。
 3. v1 只读注入；agent 自动沉淀经验进 AGENTS.md 留口（P7.1 或 P8）。
 
 ## 验收标准（全过才算完）

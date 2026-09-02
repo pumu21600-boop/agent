@@ -49,4 +49,4 @@
 10. **沙箱内存上限探针别用 powershell**：受限 token 下 .NET 启动即 0xC0000142；且 PS 里 `New-Object byte[]` 分配失败会当非终止错误吞掉继续跑，结论不可信。用原生 hog（src/bin/sandbox_hog.rs）做差分。
 11. **Git Bash PATH 污染对照组**：测试进程 PATH 里的 Git usr/bin 会让 `cmd /C whoami` 解析到 GNU whoami；沙箱内没事（环境是白名单重建的），不经沙箱的对照组要写绝对路径。
 12. **影子仓库回滚绝不整树 reset**（P6.1 教训）：`reset --hard <旧基线>` 会把基线之后**用户自己**的提交/改动一并刷回旧快照（真实发生过：点旧检查点回滚把已提交的文档刷回 P5 状态）。restore 必须按 `diff --name-status 基线..HEAD` 逐文件回退 agent 实际改过的文件；改动统计条的基线也必须是**任务起点当场拍的快照**，不能拿影子 HEAD 凑数（会把历史漂移算进条里）。
-13. **提示词保持最小，不注入身份/模型名**（P7.1→P7.2 用户拍板）：渠道模型被问"你是谁"会自造产品名（实测 qwen3.8-flash 自称"khy/Kai-Code"）——这是模型自带先验，**用户明确选择不修**：system prompt 只留 `prompts/system.md`（"用中文简洁回答"）+ AGENTS.md 仓库事实，不注入模型名/渠道/角色设定。AGENTS.md 等注入物严禁带"负责/助手/开工"类角色措辞（只写事实）。
+13. **提示词保持最小 + AGENTS.md 归用户**（P7.1→P7.3 用户拍板）：system prompt 只留 `prompts/system.md`（"用中文简洁回答"）+ AGENTS.md，**不注入模型名/渠道/身份设定**——模型被问是谁会自造产品名（实测自称"khy/Kai-Code"），用户明确选择不修。**AGENTS.md 是用户给每个项目自填的设定文件，模板必须近乎空白**；我们做的是 agent 产品，不是"造这个产品"项目的自用工具——本仓库的开发知识（红线/坑/规范）只进 ROADMAP，绝不写进 AGENTS.md 或任何运行时注入物。

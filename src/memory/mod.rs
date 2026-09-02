@@ -178,7 +178,7 @@ impl Memory {
         out
     }
 
-    /// 项目根无 AGENTS.md 时生成模板（开箱即用，可手改）。
+    /// 项目根无 AGENTS.md 时生成空白模板（开箱即用；内容由用户自填，留空=不注入）。
     pub fn ensure_agents_template(&self, ws: &Path) {
         if !self.enabled {
             return;
@@ -187,19 +187,9 @@ impl Memory {
         if path.exists() {
             return;
         }
-        let template = format!(
-            "# AGENTS.md —— 项目工作记忆\n\n\
-             > agent 每次开工自动读本文件（全局层 `~/.agent/AGENTS.md` 同读，项目层优先级更高）。\n\
-             > 这是给 agent 看的标准答案：约定、命令、坑写在这里，少一次试错。\n\n\
-             ## 构建与测试\n\n\
-             - 构建：`cargo build`\n\
-             - 测试：`cargo test`\n\
-             - 前端：`cd web && npm run build`\n\n\
-             ## 约定\n\n\
-             - （提交规范、代码风格、目录约定等，按需补充）\n\n\
-             ## 已知坑\n\n\
-             - （环境/工具链/渠道等踩过的坑，按需补充）\n"
-        );
+        let template = "# AGENTS.md\n\n\
+            <!-- 项目设定（用户自填）：你希望 agent 每次开工都知道的事——构建命令、代码约定、禁区。\n\
+            　　　留空即不注入任何内容。 -->\n";
         if let Err(e) = std::fs::write(&path, template) {
             crate::observability::debug(&format!("[memory] 生成 AGENTS.md 模板失败: {e}"));
         }
@@ -355,7 +345,9 @@ mod tests {
         let mem = Memory::open_at(&tmp, &MemoryConfig::default(), gtmp.clone());
         mem.ensure_agents_template(&tmp);
         let text = std::fs::read_to_string(tmp.join("AGENTS.md")).unwrap();
-        assert!(text.contains("AGENTS.md") && text.contains("构建"));
+        // 模板必须近乎空白：只有标题与自填提示，不含任何预置项目知识
+        assert!(text.contains("# AGENTS.md"), "应有标题");
+        assert!(!text.contains("cargo") && !text.contains("构建："), "模板不得预填内容: {text}");
         // 已存在时不覆盖
         std::fs::write(tmp.join("AGENTS.md"), "我的约定").unwrap();
         mem.ensure_agents_template(&tmp);
