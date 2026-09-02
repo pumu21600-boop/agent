@@ -34,7 +34,8 @@ pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
 
 /// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
 pub trait ApprovalGate: Send + Sync {
-    fn mode(&self) -> &str;
+    /// 当前档位下该危险等级是否要审批（档位可被侧栏即时切换，实现方读活值）
+    fn needs_approval(&self, danger_level: u8) -> bool;
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }
@@ -170,7 +171,7 @@ pub async fn run_task(
             // 审批三档：按档位与工具危险等级决定是否等用户点头
             // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
             let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
-            let (content, ok) = if needs_approval(gate.mode(), danger) {
+            let (content, ok) = if gate.needs_approval(danger) {
                 let approved = gate.ask(&call.name, &call.arguments).await;
                 if !approved {
                     ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)

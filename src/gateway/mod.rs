@@ -213,13 +213,20 @@ impl Gateway {
         }
 
         // —— SSE 解析：按行切，data: 前缀取 JSON，[DONE] 结束；聚合 content/reasoning/tool_calls ——
+        // 分片间 120s 无数据即报错（渠道/代理断流时不再干等总超时 600s）
+        const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut chunk_count: u64 = 0;
         let mut done = false;
         let mut turn = AssistantTurn::default();
         let mut calls: Vec<ToolCall> = Vec::new();
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => anyhow::bail!("模型流超时：120 秒无新数据（渠道或代理可能断流，可重试）"),
+            };
+            let Some(item) = item else { break };
             let bytes = item.context("读流失败")?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
             while let Some(pos) = buf.find('\n') {

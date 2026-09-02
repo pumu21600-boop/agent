@@ -45,6 +45,8 @@ pub struct AppState {
     pub system_prompt: Arc<String>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
+    pub approval_mode: Arc<std::sync::RwLock<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +105,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/models", post(list_models))
         .route("/api/configs", post(manage_configs))
         .route("/api/approvals", post(decide_approval))
+        .route("/api/approval-mode", post(set_approval_mode))
         .route("/api/chat", post(chat))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
@@ -352,11 +355,14 @@ async fn chat(
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
-    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit
+    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit。写入共享档位供 gate 活读
     let mode = match req.approval_mode.trim() {
         m @ ("suggest" | "auto-edit" | "full-auto") => m.to_string(),
         _ => cfg.default_approval.clone(),
     };
+    if let Ok(mut m) = state.approval_mode.write() {
+        *m = mode;
+    }
 
     // 新一轮开始：复位取消标志
     cancel.clear();
@@ -390,7 +396,12 @@ async fn chat(
             &cancel,
             &cfg,
             &sandbox_cfg,
-            &ChatGate { mode, pending: approvals, tx: tx.clone(), cancel: cancel.clone() },
+            &ChatGate {
+                mode: state.approval_mode.clone(),
+                pending: approvals,
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+            },
             |ev| match ev {
                 AgentEvent::Content(c) => send(json!({ "content": c })),
                 AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
@@ -431,16 +442,18 @@ async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
 
 /// 审批门（施工单 005）：SSE 发审批请求，oneshot 等用户决定；
 /// 120 秒不决定视为拒绝；用户点「停止」（取消标志）立即按拒绝返回。
+/// 档位读共享状态：侧栏切档即时生效（含进行中的请求）。
 struct ChatGate {
-    mode: String,
+    mode: Arc<std::sync::RwLock<String>>,
     pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     cancel: Arc<CancelFlag>,
 }
 
 impl agent::ApprovalGate for ChatGate {
-    fn mode(&self) -> &str {
-        &self.mode
+    fn needs_approval(&self, danger_level: u8) -> bool {
+        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        agent::needs_approval(&mode, danger_level)
     }
 
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
@@ -480,6 +493,24 @@ impl agent::ApprovalGate for ChatGate {
             decision
         })
     }
+}
+
+/// POST /api/approval-mode —— 侧栏切档即时生效（含进行中的请求）。
+async fn set_approval_mode(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let Some(mode) = req.get("mode").and_then(Value::as_str) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 mode" })));
+    };
+    if !matches!(mode, "suggest" | "auto-edit" | "full-auto") {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未知档位" })));
+    }
+    if let Ok(mut m) = state.approval_mode.write() {
+        *m = mode.to_string();
+    }
+    observability::event(EventType::State, json!({ "kind": "approval.mode", "mode": mode }));
+    (StatusCode::OK, Json(json!({ "ok": true, "mode": mode })))
 }
 
 /// POST /api/approvals —— 用户对审批请求的决定。

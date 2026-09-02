@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         ));
         "用中文简洁回答。".to_string()
     });
+    let approval_default = config.agent.default_approval.clone();
     let state = server::AppState {
         gateway,
         cancel,
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         sandbox_cfg: Arc::new(config.sandbox),
         system_prompt: Arc::new(system_prompt),
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
     };
     let app = server::router(state, manifest.join("web").join("dist"));
 

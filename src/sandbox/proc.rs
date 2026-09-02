@@ -182,7 +182,7 @@ impl SandboxChild {
                 (Some(code), true)
             }
         };
-        let (stdout, stderr) = self.join_readers();
+        let (stdout, stderr) = self.join_readers_bounded();
         self.close_handles();
         observability::event(
             EventType::State,
@@ -198,15 +198,25 @@ impl SandboxChild {
         Ok(SandboxOutput { exit_code, timed_out, stdout, stderr })
     }
 
-    fn join_readers(&mut self) -> (String, String) {
-        match self.readers.take() {
-            Some((so, se)) => {
-                let stdout = so.join().unwrap_or_default();
-                let stderr = se.join().unwrap_or_default();
-                (stdout, stderr)
-            }
-            None => (String::new(), String::new()),
+    /// 收割读管道线程。主进程退出后写端可能仍被残留孙进程握着（EOF 不来），
+    /// 有限等待后整树击杀兜底——绝不无限等，这是「工具结束后卡死」的防线上。
+    fn join_readers_bounded(&mut self) -> (String, String) {
+        use std::time::{Duration, Instant};
+        let Some((so, se)) = self.readers.take() else {
+            return (String::new(), String::new());
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!so.is_finished() || !se.is_finished()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
         }
+        if !so.is_finished() || !se.is_finished() {
+            self.job.terminate();
+        }
+        (so.join().unwrap_or_default(), se.join().unwrap_or_default())
+    }
+
+    fn join_readers(&mut self) -> (String, String) {
+        self.join_readers_bounded()
     }
 
     fn close_handles(&mut self) {

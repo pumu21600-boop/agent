@@ -304,6 +304,10 @@
       if (e.name !== 'AbortError') {
         messages = [...messages, { id: nextId(), role: 'error', content: `[连接错误] ${e}` }];
       }
+      // 停止后把还挂着的审批框标为失效，避免界面停在「等待决定」
+      messages = messages.map((m) =>
+        m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m
+      );
       patch((m) => ({ ...m, streaming: false }));
     } finally {
       streaming = false;
@@ -350,7 +354,15 @@
       <label class="side-label">审批档位</label>
       <select
         bind:value={approvalMode}
-        on:change={() => localStorage.setItem('approvalMode', approvalMode)}
+        on:change={() => {
+          localStorage.setItem('approvalMode', approvalMode);
+          // 即时同步到后端：进行中的请求下一次工具调用就按新档位走
+          fetch('/api/approval-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: approvalMode }),
+          });
+        }}
       >
         <option value="suggest">建议（写/执行都要批）</option>
         <option value="auto-edit">自动编辑（只批命令）</option>
@@ -396,6 +408,7 @@
                     <div class="approval-actions">
                       <button class="btn" on:click={() => decideApproval(m.approval.id, true)}>允许</button>
                       <button class="btn ghost" on:click={() => decideApproval(m.approval.id, false)}>拒绝</button>
+                      <span class="approval-hint">等你的决定，120 秒不选自动拒绝</span>
                     </div>
                   {:else}
                     <div class="approval-state">{m.approval.decided ? '✓ 已允许' : '✕ 已拒绝'}</div>
@@ -736,6 +749,11 @@
     margin-top: 6px;
     color: #9aa0ae;
     font-size: 12px;
+  }
+  .approval-hint {
+    color: #6f7686;
+    font-size: 11px;
+    align-self: center;
   }
   .side-approval {
     display: flex;
