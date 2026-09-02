@@ -159,6 +159,8 @@ async fn put_settings(
     Json(req): Json<SettingsUpdate>,
 ) -> (StatusCode, Json<Value>) {
     let mut s = state.settings.write().unwrap().clone();
+    // 渠道地址变更检测：换渠道后旧渠道的模型清单/当前模型作废（重新获取重新勾选）
+    let url_before = crate::config::settings::normalize_base(&s.effective_base_url());
     if let Some(v) = &req.name {
         s.set_active_name(v);
     }
@@ -179,6 +181,14 @@ async fn put_settings(
         list.sort();
         list.dedup();
         s.models = list;
+    }
+    if url_before != crate::config::settings::normalize_base(&s.effective_base_url()) {
+        s.models.clear();
+        s.model.clear();
+        observability::event(
+            EventType::State,
+            json!({ "kind": "settings.channel_changed", "base_url": s.effective_base_url() }),
+        );
     }
     if req.clear_key == Some(true) {
         if let Err(e) = s.clear_key() {

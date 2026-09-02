@@ -290,7 +290,8 @@ impl Settings {
         true
     }
 
-    /// 新建一套配置（复制当前镜像值作起点）并激活。
+    /// 新建一套配置并激活：供应商/Base URL 复制当前作起点，模型清单和 key 一律从零
+    /// （用户预期：新配置获取模型后是全不勾选状态，不继承旧渠道的模型）。
     pub fn new_config(&mut self) -> String {
         let id = new_config_id();
         let name = format!("配置 {}", self.next_name_seq());
@@ -299,8 +300,8 @@ impl Settings {
             name,
             provider_id: self.provider_id.clone(),
             base_url: self.base_url.clone(),
-            model: self.model.clone(),
-            models: self.models.clone(),
+            model: String::new(),
+            models: Vec::new(),
             key_cipher: None,
         });
         self.active_config_id = Some(id.clone());
