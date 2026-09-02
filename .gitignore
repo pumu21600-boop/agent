@@ -3,3 +3,4 @@
 /web/node_modules/
 /web/dist/
 /settings.json
+_check*.ps1
