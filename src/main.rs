@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
             "警告: 读 {} 失败，使用兜底提示词",
             prompt_path.display()
         ));
-        "你是一个运行在 Windows 本地的自主编码 Agent，需要文件内容时调用 read_file 工具。".to_string()
+        "用中文简洁回答。".to_string()
     });
     let state = server::AppState {
         gateway,
@@ -84,3 +84,4 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
+

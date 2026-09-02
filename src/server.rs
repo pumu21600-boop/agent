@@ -369,7 +369,10 @@ async fn chat(
             &base_url,
             &model,
             &api_key,
-            &prompt,
+            // 把后端知道的模型名作为事实注入（模型自己不知道中转渠道里它叫什么）
+            &format!(
+                "{prompt}\n\n（系统注入的事实：你此刻运行的底层模型是「{model}」，经渠道 {base_url} 调用。被问是什么模型时，直接照实回答这个名字，不要说不知道。）"
+            ),
             &history,
             &cancel,
             &cfg,
