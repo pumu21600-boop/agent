@@ -1,37 +1,29 @@
 <script>
   import { onMount, afterUpdate } from 'svelte';
 
-  // —— 设置 ——
+  // —— 配置（改动即自动保存即时生效）——
   let providers = [];
+  let configs = [];
+  let activeConfigId = '';
   let providerId = 'deepseek';
   let baseUrl = '';
   let model = '';
   let apiKey = '';
-  let hasKey = false;
-  let keyHint = '';
   let savedModels = [];
+  let savedKeyUrl = '';   // 当前生效 url 的已存 key 尾号
+  let urlKeyHints = {};   // 归一化 url → 尾号
   let settingsMsg = '';
   let settingsOpen = false;
-  let modelMenuOpen = false;
-  let keyScopes = {}; // 归一化 base_url → 已存 key 尾号
-
-  // 当前 Base URL 对应的已存 key 尾号（实时）
-  $: keyScopeUrl = (baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
-  $: savedKeyHint = keyScopeUrl ? keyScopes[keyScopeUrl] || '' : '';
-
-  // —— 配置方案 ——
-  let profiles = [];
-  let profileSel = '';
-  let profileName = '';
+  let autoSaveTimer = null;
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
   let fetchedModels = [];
-  let picked = new Set();
+
+  // —— 模型快选（输入栏）——
+  let modelMenuOpen = false;
 
   // —— 对话 ——
-  // 消息骨架：{id, role: 'user'|'assistant'|'error'|'system', content, thinking, streaming}
-  // thought / tool 事件（P2 核心循环）将作为新 role 并入此结构。
   let messages = [];
   let input = '';
   let streaming = false;
@@ -48,6 +40,10 @@
     if (chatBody) chatBody.scrollTop = chatBody.scrollHeight;
   });
 
+  function norm(url) {
+    return (url || '').trim().replace(/\/+$/, '').toLowerCase();
+  }
+
   async function loadProviders() {
     const r = await fetch('/api/providers').then((r) => r.json());
     providers = r.providers || [];
@@ -55,97 +51,107 @@
 
   async function loadSettings() {
     const s = await fetch('/api/settings').then((r) => r.json());
+    applyState(s);
+  }
+
+  function applyState(s) {
     providerId = s.provider_id || 'deepseek';
     baseUrl = s.base_url || '';
     model = s.model || '';
     savedModels = s.models || [];
-    hasKey = !!s.has_key;
-    keyHint = s.key_hint || '';
-    keyScopes = {};
-    for (const sc of s.key_scopes || []) keyScopes[sc.url] = sc.hint;
-    profiles = s.profiles || [];
-    profileSel = s.active_profile_id || '';
-    if (!baseUrl) applyDefault();
+    configs = s.configs || [];
+    activeConfigId = s.active_config_id || '';
+    savedKeyUrl = s.key_hint || '';
+    urlKeyHints = {};
+    for (const c of configs) if (c.key_hint) urlKeyHints[norm(c.base_url)] = c.key_hint;
+    urlKeyHints[norm(s.effective_base_url)] = s.key_hint || urlKeyHints[norm(s.effective_base_url)] || '';
   }
 
-  async function manageProfiles(body) {
-    const r = await fetch('/api/profiles', {
+  // 当前输入中的 url 是否已有 key（实时）
+  $: typingHint = urlKeyHints[norm(baseUrl)] || (norm(baseUrl) === norm(currentEffectiveUrl()) ? savedKeyUrl : '');
+  function currentEffectiveUrl() {
+    if (baseUrl) return baseUrl;
+    const p = providers.find((x) => x.id === providerId);
+    return p ? p.default_base_url : '';
+  }
+
+  function flashSaved() {
+    settingsMsg = '已自动保存 ' + new Date().toTimeString().slice(0, 8);
+  }
+
+  // 防抖自动保存设置字段
+  function autoSave(fields, delay = 500) {
+    clearTimeout(autoSaveTimer);
+    autoSaveTimer = setTimeout(async () => {
+      const body = { ...fields };
+      if (apiKey.trim()) {
+        body.api_key = apiKey.trim();
+      }
+      await sendSettings(body);
+    }, delay);
+  }
+
+  async function sendSettings(body) {
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (d.error) {
+        settingsMsg = `保存失败: ${d.error}`;
+        return;
+      }
+      apiKey = '';
+      await loadSettings();
+      flashSaved();
+    } catch (e) {
+      settingsMsg = `保存失败: ${e}`;
+    }
+  }
+
+  // —— 配置切换 / 新建 / 删除 ——
+  async function manageConfig(action, id) {
+    const r = await fetch('/api/configs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ action, id }),
     });
     const d = await r.json();
     if (d.error) {
-      settingsMsg = `方案操作失败: ${d.error}`;
+      settingsMsg = `操作失败: ${d.error}`;
       return;
     }
-    await loadSettings(); // 重拉一次：字段、key 尾号、方案全部同步
+    applyState(d);
+    flashSaved();
   }
 
-  function saveAsProfile() {
-    const name = profileName.trim();
-    if (!name) {
-      settingsMsg = '先填方案名称';
+  function newConfig() {
+    manageConfig('new');
+  }
+
+  function deleteConfig() {
+    if (configs.length <= 1) {
+      settingsMsg = '至少保留一套配置';
       return;
     }
-    manageProfiles({ action: 'save', name });
-    profileName = '';
-    settingsMsg = '已另存为方案';
+    manageConfig('delete', activeConfigId);
   }
 
-  function overwriteProfile() {
-    const name = profileName.trim();
-    if (!name) {
-      settingsMsg = '先填方案名称';
-      return;
-    }
-    manageProfiles({ action: 'save', id: profileSel, name });
-    settingsMsg = '已覆盖方案';
-  }
-
-  function applyProfile() {
-    if (!profileSel) return;
-    manageProfiles({ action: 'apply', id: profileSel });
-    settingsMsg = '已切换配置方案';
-  }
-
-  function deleteProfile() {
-    if (!profileSel) return;
-    manageProfiles({ action: 'delete', id: profileSel });
-    settingsMsg = '已删除方案（当前配置保持不变）';
-  }
-
-  function applyDefault() {
-    const p = providers.find((x) => x.id === providerId);
-    if (p) {
-      if (!baseUrl) baseUrl = p.default_base_url || '';
-      if (!model) model = p.default_model || '';
-    }
+  function configLabel(c) {
+    const p = providers.find((x) => x.id === c.provider_id);
+    const prov = p ? p.name.split('（')[0] : c.provider_id;
+    const host = norm(c.base_url).replace(/^https?:\/\//, '').slice(0, 18);
+    return `${prov} · ${c.model || host || '未配置'}`;
   }
 
   function onProviderChange() {
-    const p = providers.find((x) => x.id === providerId);
-    if (p) {
-      baseUrl = p.default_base_url || '';
-      model = p.default_model || '';
-    }
+    providerId = providerId; // bind 已更新
+    autoSave({ provider_id: providerId });
   }
 
-  async function pickModel(m) {
-    model = m;
-    modelMenuOpen = false;
-    await fetch('/api/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: m }),
-    });
-  }
-
-  function nextId() {
-    return ++seq;
-  }
-
-  // —— 获取模型弹窗 ——
+  // —— 获取模型 ——
   async function fetchModels() {
     settingsMsg = '获取模型中…';
     try {
@@ -157,75 +163,44 @@
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       fetchedModels = d.models || [];
-      picked = new Set(fetchedModels.filter((m) => savedModels.includes(m)));
       modelModalOpen = true;
       settingsMsg = '';
     } catch (e) {
-      settingsMsg = `失败: ${e.message}`;
+      settingsMsg = `获取模型失败: ${e.message}`;
     }
   }
 
-  function toggleModel(m) {
-    if (picked.has(m)) picked.delete(m);
-    else picked.add(m);
-    picked = picked;
+  function isChecked(m) {
+    return savedModels.includes(m);
   }
 
-  function selectAll() {
-    picked = new Set(fetchedModels);
+  async function toggleModel(m) {
+    const list = savedModels.includes(m)
+      ? savedModels.filter((x) => x !== m)
+      : [...savedModels, m].sort();
+    savedModels = list; // 乐观更新
+    if (list.length && !list.includes(model)) model = list[0];
+    await sendSettings({ models: list, model, api_key: apiKey.trim() || undefined });
   }
 
-  function selectNone() {
-    picked = new Set();
-  }
-
-  async function saveModels() {
-    const list = [...picked].sort();
-    if (!list.includes(model) && list.length) model = list[0];
-    const r = await fetch('/api/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider_id: providerId,
-        base_url: baseUrl,
-        model,
-        models: list,
-        api_key: apiKey.trim(),
-      }),
-    });
-    const d = await r.json();
-    if (d.error) {
-      settingsMsg = `保存失败: ${d.error}`;
-      return;
-    }
+  async function selectAllModels() {
+    const list = [...fetchedModels].sort();
     savedModels = list;
-    hasKey = !!d.has_key;
-    keyHint = d.key_hint || '';
-    apiKey = '';
-    modelModalOpen = false;
-    settingsMsg = `已保存 ${list.length} 个模型`;
+    if (!list.includes(model) && list.length) model = list[0];
+    await sendSettings({ models: list, model });
   }
 
-  async function saveSettings() {
-    const r = await fetch('/api/settings', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        provider_id: providerId,
-        base_url: baseUrl,
-        model,
-        models: savedModels,
-        api_key: apiKey.trim(),
-      }),
-    });
-    const d = await r.json();
-    if (d.error) {
-      settingsMsg = `保存失败: ${d.error}`;
-      return;
-    }
-    apiKey = '';
-    await loadSettings(); // 刷新 key 尾号提示（按当前 URL）
-    settingsMsg = '已保存';
+  async function selectNoModels() {
+    savedModels = [];
+    model = '';
+    await sendSettings({ models: [], model: '' });
+  }
+
+  // —— 模型快选 ——
+  async function pickModel(m) {
+    model = m;
+    modelMenuOpen = false;
+    await sendSettings({ model: m });
   }
 
   // —— 对话 ——
@@ -234,7 +209,6 @@
     if (!msg || streaming) return;
     streaming = true;
     controller = new AbortController();
-    // 历史消息（P2：服务端无状态，前端带 user/assistant 历史；刷新即清，P6 才落盘）
     const history = messages
       .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
       .map((m) => ({ role: m.role, content: m.content }));
@@ -253,7 +227,6 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // 带上当前选择的模型/base_url：下拉框改了立即生效，不必先点保存
         body: JSON.stringify({ messages: history, model, base_url: baseUrl }),
         signal: controller.signal,
       });
@@ -325,6 +298,10 @@
     if (controller) controller.abort();
   }
 
+  function nextId() {
+    return ++seq;
+  }
+
   function onKey(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -355,9 +332,7 @@
       {/if}
       {#each messages as m (m.id)}
         {#if m.role === 'user'}
-          <div class="msg user">
-            <div class="bubble user-bubble">{m.content}</div>
-          </div>
+          <div class="msg user"><div class="bubble user-bubble">{m.content}</div></div>
         {:else if m.role === 'assistant'}
           <div class="msg assistant">
             <div class="bubble asst-bubble">
@@ -390,13 +365,9 @@
             </div>
           </div>
         {:else if m.role === 'error'}
-          <div class="msg system">
-            <div class="bubble error-bubble">{m.content}</div>
-          </div>
+          <div class="msg system"><div class="bubble error-bubble">{m.content}</div></div>
         {:else}
-          <div class="msg system">
-            <div class="sys-text">{m.content}</div>
-          </div>
+          <div class="msg system"><div class="sys-text">{m.content}</div></div>
         {/if}
       {/each}
     </div>
@@ -409,7 +380,7 @@
         {#if modelMenuOpen}
           <div class="model-menu">
             {#if savedModels.length === 0}
-              <div class="menu-empty">暂无已保存模型</div>
+              <div class="menu-empty">暂无模型，先到设置里获取</div>
             {/if}
             {#each savedModels as m}
               <button class="menu-item" class:active={m === model} on:click={() => pickModel(m)}>
@@ -440,11 +411,30 @@
 
 {#if settingsOpen}
   <div class="modal-backdrop" on:click={() => (settingsOpen = false)}>
-    <div class="modal settings-modal" on:click|stopPropagation>
+    <div class="modal" on:click|stopPropagation>
       <div class="modal-head">
         <b>模型设置</b>
+        <span class="hint">{settingsMsg}</span>
         <button class="btn ghost" on:click={() => (settingsOpen = false)}>关闭</button>
       </div>
+
+      <div class="field">
+        <label>配置（点一下切换，改动自动保存即时生效）</label>
+        <div class="chips">
+          {#each configs as c}
+            <button
+              class="chip"
+              class:active={c.id === activeConfigId}
+              on:click={() => manageConfig('apply', c.id)}
+            >
+              {configLabel(c)}{#if c.has_key} · {c.key_hint}{/if}
+            </button>
+          {/each}
+          <button class="chip add" on:click={newConfig}>＋ 新建配置</button>
+          <button class="chip del" on:click={deleteConfig}>✕ 删除当前</button>
+        </div>
+      </div>
+
       <div class="field">
         <label>供应商</label>
         <select bind:value={providerId} on:change={onProviderChange}>
@@ -453,56 +443,48 @@
           {/each}
         </select>
       </div>
+
       <div class="field">
         <label>Base URL</label>
-        <input bind:value={baseUrl} placeholder="留空用预设默认" />
+        <input
+          bind:value={baseUrl}
+          placeholder="留空用预设默认"
+          on:input={() => autoSave({ base_url: baseUrl })}
+        />
       </div>
+
       <div class="field">
-        <label>API Key（按 Base URL 独立保存，换地址互不串用）</label>
+        <label>API Key（按 Base URL 独立保存）</label>
         <input
           bind:value={apiKey}
           type="password"
-          placeholder={savedKeyHint
-            ? `该地址已保存(…${savedKeyHint})，留空不修改`
-            : '此地址还没有 key，填写后保存'}
+          placeholder={typingHint
+            ? `该地址已保存(…${typingHint})，重新输入即覆盖`
+            : '此地址还没有 key，填入即自动保存'}
+          on:blur={() => apiKey.trim() && autoSave({})}
+          on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
         />
       </div>
+
       <div class="field">
         <label>模型</label>
-        <select bind:value={model}>
-          {#if !savedModels.includes(model) && model}
-            <option value={model}>{model}</option>
-          {/if}
-          {#each savedModels as m}
-            <option value={m}>{m}</option>
-          {/each}
-          {#if !model && !savedModels.length}
-            <option value="">（先获取模型）</option>
-          {/if}
-        </select>
-      </div>
-      <div class="field">
-        <label>配置方案（保存多套供应商+模型组合，一键切换；key 按供应商独立保存，不受方案影响）</label>
         <div class="sub-row">
-          <select bind:value={profileSel}>
-            <option value="">（当前配置未关联方案）</option>
-            {#each profiles as p}
-              <option value={p.id}>{p.name}</option>
+          <select
+            bind:value={model}
+            on:change={() => autoSave({ model }, 0)}
+          >
+            {#if !savedModels.includes(model) && model}
+              <option value={model}>{model}</option>
+            {/if}
+            {#each savedModels as m}
+              <option value={m}>{m}</option>
             {/each}
+            {#if !model && !savedModels.length}
+              <option value="">（点右侧获取模型）</option>
+            {/if}
           </select>
-          <button class="btn" on:click={applyProfile} disabled={!profileSel}>应用</button>
-          <button class="btn" on:click={overwriteProfile} disabled={!profileSel}>覆盖</button>
-          <button class="btn" on:click={deleteProfile} disabled={!profileSel}>删除</button>
+          <button class="btn primary" on:click={fetchModels}>获取模型</button>
         </div>
-        <div class="sub-row">
-          <input bind:value={profileName} placeholder="方案名称，如：商汤主力 / DS官方" />
-          <button class="btn primary" on:click={saveAsProfile}>另存当前为方案</button>
-        </div>
-      </div>
-      <div class="modal-foot">
-        <span class="msg">{settingsMsg}</span>
-        <button class="btn" on:click={fetchModels}>获取模型</button>
-        <button class="btn primary" on:click={saveSettings}>保存</button>
       </div>
     </div>
   </div>
@@ -512,12 +494,11 @@
   <div class="modal-backdrop" on:click={() => (modelModalOpen = false)}>
     <div class="modal" on:click|stopPropagation>
       <div class="modal-head">
-        <b>获取到的模型（{fetchedModels.length} 个）</b>
+        <b>获取到的模型（{fetchedModels.length} 个，勾选即加入）</b>
         <div class="modal-actions">
-          <button class="btn" on:click={selectAll}>全选</button>
-          <button class="btn" on:click={selectNone}>全不选</button>
-          <button class="btn primary" on:click={saveModels}>保存</button>
-          <button class="btn ghost" on:click={() => (modelModalOpen = false)}>关闭</button>
+          <button class="btn" on:click={selectAllModels}>全选</button>
+          <button class="btn" on:click={selectNoModels}>全不选</button>
+          <button class="btn ghost" on:click={() => (modelModalOpen = false)}>完成</button>
         </div>
       </div>
       <div class="model-list">
@@ -526,7 +507,7 @@
         {/if}
         {#each fetchedModels as m}
           <label class="model-item">
-            <input type="checkbox" checked={picked.has(m)} on:change={() => toggleModel(m)} />
+            <input type="checkbox" checked={isChecked(m)} on:change={() => toggleModel(m)} />
             {m}
           </label>
         {/each}
@@ -550,35 +531,17 @@
     height: 100vh;
   }
   .sidebar {
-    width: 220px;
+    width: 200px;
     background: #1d1f26;
     border-right: 1px solid #2a2d37;
     display: flex;
     flex-direction: column;
     padding: 14px 12px;
-    gap: 16px;
   }
   .brand {
     font-size: 18px;
     font-weight: 600;
     letter-spacing: 1px;
-  }
-  .side-status {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .side-label {
-    font-size: 11px;
-    color: #8b8f9c;
-  }
-  .side-value {
-    font-size: 13px;
-  }
-  .side-sub {
-    font-size: 12px;
-    color: #8b8f9c;
-    word-break: break-all;
   }
   .side-foot {
     margin-top: auto;
@@ -743,6 +706,15 @@
     border-top: 1px solid #2a2d37;
     background: #1b1d23;
   }
+  .chat-input input {
+    flex: 1;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: 1px solid #333742;
+    background: #23252d;
+    color: #e6e6eb;
+    font-size: 14px;
+  }
   .model-pick {
     position: relative;
   }
@@ -791,15 +763,6 @@
     font-size: 12px;
     padding: 8px 10px;
   }
-  .chat-input input {
-    flex: 1;
-    padding: 9px 12px;
-    border-radius: 8px;
-    border: 1px solid #333742;
-    background: #23252d;
-    color: #e6e6eb;
-    font-size: 14px;
-  }
   .btn {
     padding: 7px 14px;
     border-radius: 8px;
@@ -836,7 +799,7 @@
     background: #23252d;
     border: 1px solid #333742;
     border-radius: 10px;
-    width: 520px;
+    width: 560px;
     max-height: 85vh;
     display: flex;
     flex-direction: column;
@@ -847,20 +810,17 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 10px;
+  }
+  .modal-head .hint {
+    flex: 1;
+    text-align: right;
+    font-size: 12px;
+    color: #8b8f9c;
   }
   .modal-actions {
     display: flex;
     gap: 6px;
-  }
-  .modal-foot {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  .modal-foot .msg {
-    flex: 1;
-    font-size: 12px;
-    color: #8b8f9c;
   }
   .field {
     display: flex;
@@ -886,15 +846,32 @@
     align-items: center;
     flex-wrap: wrap;
   }
-  .sub-row input {
-    flex: 1;
-    min-width: 140px;
-    padding: 8px 10px;
-    border-radius: 8px;
+  .chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .chip {
+    padding: 5px 10px;
+    border-radius: 14px;
     border: 1px solid #333742;
     background: #1b1d23;
-    color: #e6e6eb;
-    font-size: 13px;
+    color: #b8bdc9;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .chip.active {
+    background: #2f5fd0;
+    border-color: #2f5fd0;
+    color: #fff;
+  }
+  .chip.add {
+    color: #9fdcae;
+    border-color: #2f4d3a;
+  }
+  .chip.del {
+    color: #e0a3a3;
+    border-color: #4d2f2f;
   }
   .model-list {
     overflow-y: auto;
