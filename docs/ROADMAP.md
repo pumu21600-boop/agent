@@ -12,7 +12,7 @@
 | P2 核心循环 v1 | 任务解析→调工具→回填→判定→终止；步数/超时上限；thought/tool_call/tool_result/model_chunk 进日志和 UI；取消贯通；配 1 个安全工具（文件读） | ✅ 已完成（tag v0.3-p2） |
 | P3 执行沙箱 v1 | Job Objects + 受限 token（壳先于 shell） | ✅ 已完成（tag v0.4-p3） |
 | P4 工具第一批 + 审批三档 | shell（入沙箱）、文件写、ripgrep、web 抓取、git；注册表；suggest/auto-edit/full-auto | ✅ 已完成（tag v0.5-p4） |
-| P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ⏳ |
+| P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ✅ 已完成（tag v0.6-p5） |
 | P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ⏳ |
 | P7 记忆 v1 + AGENTS.md | events.log + 滚动摘要、双层存储（~/.agent + 项目 .agent）、index.json | ⏳ |
 | P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补 OpenRouter/Gemini/LMStudio/MNN/llama.cpp | ⏳ |
