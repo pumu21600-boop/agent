@@ -60,10 +60,20 @@ async fn main() -> anyhow::Result<()> {
 
     let gateway = Arc::new(gateway::Gateway::new());
     let cancel = Arc::new(core::cancel::CancelFlag::new());
+    let prompt_path = manifest.join("prompts").join("system.md");
+    let system_prompt = std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
+        observability::debug(&format!(
+            "警告: 读 {} 失败，使用兜底提示词",
+            prompt_path.display()
+        ));
+        "你是一个运行在 Windows 本地的自主编码 Agent，需要文件内容时调用 read_file 工具。".to_string()
+    });
     let state = server::AppState {
         gateway,
         cancel,
         settings: Arc::new(std::sync::RwLock::new(user_settings)),
+        agent_cfg: Arc::new(config.agent),
+        system_prompt: Arc::new(system_prompt),
     };
     let app = server::router(state, manifest.join("web").join("dist"));
 

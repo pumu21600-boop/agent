@@ -1,7 +1,16 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：P1 完成（结构模块化 + 聊天 UI 骨架），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P2 完成**（核心循环 v1 + 工具调用闭环），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P2 核心循环（模型驱动 agentic loop）
+
+- 模型带 `tools` 决策：返回 `tool_calls` → 本地执行 → 结果回填 → 继续，直到纯文本回答
+- 内置工具 `read_file`（只读、限工作目录内、路径穿越拒绝、超长截断）
+- 硬护栏：`config.toml [agent] max_steps`（默认 8）步数上限；每步与每个流式分片检查取消标志，「停止」立即中断
+- system prompt 外置于 `prompts/system.md`（数据驱动）
+- SSE 事件：`content` / `reasoning` / `tool_call` / `tool_result` / `step_limit`；工具卡片在聊天界面内渲染
+- 多轮对话：前端携带历史 messages（user/assistant），服务端无状态；刷新即清空（P6 会话落盘前如此）
 
 ## 目录结构
 

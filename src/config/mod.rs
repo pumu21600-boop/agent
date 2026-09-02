@@ -18,6 +18,19 @@ pub struct Config {
     pub gateway: GatewayConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
+}
+
+/// 核心循环参数（施工单 003）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// 单次任务最大循环步数（防失控）
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+    /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
+    #[serde(default = "default_tool_result_max_chars")]
+    pub tool_result_max_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +76,12 @@ fn default_log_dir() -> String {
 fn default_log_file() -> String {
     "agent.jsonl".to_string()
 }
+fn default_max_steps() -> u32 {
+    8
+}
+fn default_tool_result_max_chars() -> usize {
+    8000
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -79,12 +98,18 @@ impl Default for LoggingConfig {
         Self { dir: default_log_dir(), file: default_log_file() }
     }
 }
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self { max_steps: default_max_steps(), tool_result_max_chars: default_tool_result_max_chars() }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
             gateway: GatewayConfig::default(),
             logging: LoggingConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }
