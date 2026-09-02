@@ -33,7 +33,7 @@ use crate::{
 };
 
 use crate::config::AgentConfig;
-use crate::config::settings::Profile;
+use crate::config::settings::Config;
 use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 #[derive(Clone)]
@@ -93,7 +93,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/providers", get(list_providers))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models", post(list_models))
-        .route("/api/profiles", post(manage_profiles))
+        .route("/api/configs", post(manage_configs))
         .route("/api/chat", post(chat))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
@@ -144,27 +144,20 @@ fn key_hint_of(key: Option<String>) -> String {
 
 async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap().clone();
-    let saved_key = s.get_key(&s.effective_base_url());
-    let has_key = saved_key.is_some();
-    Json(json!({
-        "provider_id": s.provider_id,
-        "base_url": s.base_url,
-        "effective_base_url": s.effective_base_url(),
-        "model": s.model,
-        "effective_model": s.effective_model(),
-        "models": s.models,
-        "profiles": s.profiles,
-        "active_profile_id": s.active_profile_id,
-        "has_key": has_key,
-        "key_hint": key_hint_of(saved_key),
-        "key_scopes": s
-            .keys
-            .iter()
-            .map(|(u, _)| json!({ "url": u, "hint": key_hint_of(s.get_key(u)) }))
-            .filter(|v| v["hint"].as_str().map(|h| !h.is_empty()).unwrap_or(false))
-            .collect::<Vec<Value>>(),
-        "env_key": std::env::var("DEEPSEEK_API_KEY").is_ok(),
-    }))
+    let mut v = config_state_json(&s);
+    v["env_key"] = json!(std::env::var("DEEPSEEK_API_KEY").is_ok());
+    Json(v)
+}
+
+/// 配置的生效 base_url（自定义 > 预设默认）。
+fn effective_of(s: &Settings, c: &Config) -> String {
+    if !c.base_url.trim().is_empty() {
+        c.base_url.trim().to_string()
+    } else {
+        gateway::providers::find(&c.provider_id)
+            .map(|p| p.default_base_url.clone())
+            .unwrap_or_else(|| s.effective_base_url())
+    }
 }
 
 /// 保存设置。api_key 非空则 DPAPI 加密持久化；clear_key=true 则清除。
@@ -203,6 +196,8 @@ async fn put_settings(
             }
         }
     }
+    // 改动即时回写激活配置（配置即生效，无"保存"概念）
+    s.sync_config_from_mirror();
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
@@ -245,67 +240,36 @@ async fn list_models(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ProfileRequest {
-    /// save（另存/覆盖当前配置为方案，带 id 则覆盖）| apply（切换生效）| delete
+pub struct ConfigRequest {
+    /// new（新建并激活，起点复制当前配置）| delete | apply（切换激活）
     pub action: String,
     #[serde(default)]
     pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
 }
 
-/// 配置方案管理：save / apply / delete。key 不动（按 provider 存）。
-async fn manage_profiles(
+/// 配置管理：new / delete / apply。改动即时生效（顶层字段即激活配置镜像）。
+async fn manage_configs(
     State(state): State<AppState>,
-    Json(req): Json<ProfileRequest>,
+    Json(req): Json<ConfigRequest>,
 ) -> (StatusCode, Json<Value>) {
     let mut s = state.settings.write().unwrap().clone();
-    let err = |m: &str| {
-        (StatusCode::BAD_REQUEST, Json(json!({ "error": m })))
-    };
+    let err =
+        |m: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     match req.action.as_str() {
-        "save" => {
-            let Some(name) = req.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) else {
-                return err("缺少方案名称");
-            };
-            let id = match req.id {
-                Some(id) => {
-                    if !s.profiles.iter().any(|p| p.id == id) {
-                        return err("方案不存在");
-                    }
-                    id
-                }
-                // 同名即更新，避免另存为产生重复档案
-                None => match s.profiles.iter().find(|p| p.name == name) {
-                    Some(existing) => existing.id.clone(),
-                    None => format!("p{}", uuid::Uuid::new_v4().simple()),
-                },
-            };
-            let profile = settings_profile(&s, &id, &name);
-            match s.profiles.iter_mut().find(|p| p.id == id) {
-                Some(old) => *old = profile,
-                None => s.profiles.push(profile),
-            }
-            if s.active_profile_id.is_none() {
-                s.active_profile_id = Some(id.clone());
+        "new" => {
+            s.sync_config_from_mirror();
+            s.new_config();
+        }
+        "delete" => {
+            let Some(id) = req.id else { return err("缺少配置 id") };
+            if !s.delete_config(&id) {
+                return err("配置不存在");
             }
         }
         "apply" => {
-            let Some(id) = req.id else { return err("缺少方案 id") };
-            let Some(p) = s.profiles.iter().find(|p| p.id == id).cloned() else {
-                return err("方案不存在");
-            };
-            s.provider_id = p.provider_id;
-            s.base_url = p.base_url;
-            s.model = p.model;
-            s.models = p.models;
-            s.active_profile_id = Some(id);
-        }
-        "delete" => {
-            let Some(id) = req.id else { return err("缺少方案 id") };
-            s.profiles.retain(|p| p.id != id);
-            if s.active_profile_id.as_deref() == Some(id.as_str()) {
-                s.active_profile_id = None;
+            let Some(id) = req.id else { return err("缺少配置 id") };
+            if !s.activate(&id) {
+                return err("配置不存在");
             }
         }
         other => return err(&format!("未知操作: {other}")),
@@ -316,37 +280,36 @@ async fn manage_profiles(
     *state.settings.write().unwrap() = s.clone();
     observability::event(
         EventType::State,
-        json!({ "kind": "profile.updated", "action": req.action, "provider_id": s.provider_id, "model": s.model }),
+        json!({ "kind": "config.changed", "action": req.action, "provider_id": s.provider_id, "model": s.model }),
     );
-    (
-        StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "profiles": s.profiles,
-            "active_profile_id": s.active_profile_id,
-            "provider_id": s.provider_id,
-            "base_url": s.base_url,
-            "model": s.model,
-            "models": s.models,
-            "has_key": s.get_key(&s.effective_base_url()).is_some(),
-            "key_hint": key_hint_of(s.get_key(&s.effective_base_url())),
-        })),
-    )
+    (StatusCode::OK, Json(config_state_json(&s)))
 }
 
-fn settings_profile(
-    s: &Settings,
-    id: &str,
-    name: &str,
-) -> Profile {
-    Profile {
-        id: id.to_string(),
-        name: name.to_string(),
-        provider_id: s.provider_id.clone(),
-        base_url: s.base_url.clone(),
-        model: s.model.clone(),
-        models: s.models.clone(),
-    }
+/// 配置快照（含各配置 key 状态），供前端全量刷新。
+fn config_state_json(s: &Settings) -> Value {
+    json!({
+        "ok": true,
+        "configs": s.configs.iter().map(|c| {
+            let key = s.get_key(&effective_of(s, c));
+            json!({
+                "id": c.id,
+                "provider_id": c.provider_id,
+                "base_url": c.base_url.clone(),
+                "model": c.model.clone(),
+                "models": c.models.clone(),
+                "has_key": key.is_some(),
+                "key_hint": key_hint_of(key),
+            })
+        }).collect::<Vec<Value>>(),
+        "active_config_id": s.active_config_id,
+        "provider_id": s.provider_id,
+        "base_url": s.base_url,
+        "effective_base_url": s.effective_base_url(),
+        "model": s.model,
+        "models": s.models,
+        "has_key": s.get_key(&s.effective_base_url()).is_some(),
+        "key_hint": key_hint_of(s.get_key(&s.effective_base_url())),
+    })
 }
 
 /// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
