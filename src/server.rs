@@ -26,11 +26,10 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
-    cancel::CancelFlag,
-    gateway::{Gateway, StreamOutcome},
-    logging::{self, EventType},
-    providers,
-    settings::Settings,
+    config::settings::Settings,
+    core::cancel::CancelFlag,
+    gateway::{self, Gateway, StreamOutcome},
+    observability::{self, EventType},
 };
 
 #[derive(Clone)]
@@ -93,8 +92,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     if index.exists() {
         app = app.fallback_service(ServeDir::new(dist_dir).fallback(ServeFile::new(index)));
     } else {
-        logging::debug(
-            "未找到 frontend/dist/index.html，使用内置冒烟页（cd frontend && npm run build 后切换为 Svelte 页）",
+        observability::debug(
+            "未找到 web/dist/index.html，使用内置冒烟页（cd web && npm run build 后切换为 Svelte 页）",
         );
         app = app.route("/", get(embedded_index));
     }
@@ -105,9 +104,9 @@ fn json_event(payload: Value) -> Event {
     Event::default().json_data(payload).expect("SSE 事件序列化失败")
 }
 
-/// 供应商预设列表（id/名称/默认 base_url/默认模型）。
+/// 供应商预设列表（数据驱动自 providers.json）。
 async fn list_providers() -> Json<Value> {
-    let list: Vec<Value> = providers::PROVIDERS
+    let list: Vec<Value> = gateway::providers::list()
         .iter()
         .map(|p| {
             json!({
@@ -133,7 +132,7 @@ fn key_hint_of(key: Option<String>) -> String {
 
 async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap().clone();
-    let saved_key = s.get_key();
+    let saved_key = s.get_key(&s.provider_id);
     let has_key = saved_key.is_some();
     Json(json!({
         "provider_id": s.provider_id,
@@ -172,13 +171,14 @@ async fn put_settings(
         list.dedup();
         s.models = list;
     }
+    let provider_id = s.provider_id.clone();
     if req.clear_key == Some(true) {
-        if let Err(e) = s.clear_key() {
+        if let Err(e) = s.clear_key(&provider_id) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
         }
     } else if let Some(k) = &req.api_key {
         if !k.trim().is_empty() {
-            if let Err(e) = s.set_key(k.trim()) {
+            if let Err(e) = s.set_key(&provider_id, k.trim()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
             }
         }
@@ -187,13 +187,13 @@ async fn put_settings(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
-    logging::event(
+    observability::event(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": s.provider_id, "model": s.effective_model() }),
     );
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "has_key": s.get_key().is_some(), "key_hint": key_hint_of(s.get_key()) })),
+        Json(json!({ "ok": true, "has_key": s.get_key(&s.provider_id).is_some(), "key_hint": key_hint_of(s.get_key(&s.provider_id)) })),
     )
 }
 
@@ -207,7 +207,7 @@ async fn list_models(
     let api_key = if !req.api_key.trim().is_empty() {
         req.api_key.trim().to_string()
     } else {
-        s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+        s.get_key(&s.provider_id).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
     };
     if base_url.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url 为空" })));
@@ -218,7 +218,7 @@ async fn list_models(
     match state.gateway.list_models(&base_url, &api_key).await {
         Ok(models) => (StatusCode::OK, Json(json!({ "models": models }))),
         Err(e) => {
-            logging::event(EventType::Error, json!({ "message": e.to_string() }));
+            observability::event(EventType::Error, json!({ "message": e.to_string() }));
             (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() })))
         }
     }
@@ -255,7 +255,7 @@ async fn chat(
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
-            s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+            s.get_key(&s.provider_id).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
         let outcome = gateway
             .stream_chat(&base_url, &model, &api_key, &message, &cancel, |chunk| {
@@ -281,7 +281,7 @@ async fn chat(
             Ok(StreamOutcome::Done) => send(json!({ "done": true })),
             Ok(StreamOutcome::Cancelled) => send(json!({ "cancelled": true })),
             Err(e) => {
-                logging::event(EventType::Error, json!({ "message": e.to_string() }));
+                observability::event(EventType::Error, json!({ "message": e.to_string() }));
                 send(json!({ "error": e.to_string() }));
             }
         }
@@ -293,7 +293,7 @@ async fn chat(
 /// POST /cancel —— 置位全局取消标志。
 async fn cancel(State(state): State<AppState>) -> Json<Value> {
     state.cancel.set();
-    logging::event(EventType::State, json!({ "kind": "cancel", "flag": true }));
+    observability::event(EventType::State, json!({ "kind": "cancel", "flag": true }));
     Json(json!({ "cancelled": true }))
 }
 

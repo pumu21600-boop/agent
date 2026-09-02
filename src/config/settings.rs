@@ -1,11 +1,11 @@
 //! 用户设置持久化 —— settings.json（工程根目录）。
 //!
-//! - provider_id / base_url（覆盖预设）/ model：明文存 settings.json，重启保留。
-//! - api_key：用 Windows DPAPI（CryptProtectData，用户账户绑定）加密成 base64 存进
-//!   settings.json 的 key_cipher 字段。本机同账户才能解密；文件里不出现明文 key。
+//! - provider_id / base_url（覆盖预设）/ model / models：明文存 settings.json，重启保留。
+//! - api_key：用 Windows DPAPI（CryptProtectData，用户账户绑定）加密成 base64，
+//!   按 provider_id 存进 `keys` 映射（schema v2）。本机同账户才能解密；文件里不出现明文 key。
 //!   （同账户进程理论上能解——DPAPI 的语义就是"本用户的数据保险箱"，与浏览器保存密码同级）
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
@@ -17,7 +17,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::providers;
+use crate::gateway::providers;
 
 const ENTROPY: &[u8] = b"agent-gateway-settings-v1";
 
@@ -30,8 +30,11 @@ pub struct Settings {
     /// 用户从弹窗勾选保存的模型列表（多选）
     #[serde(default)]
     pub models: Vec<String>,
-    /// DPAPI 加密后的 key（base64）；空 = 未设置
+    /// schema v2：provider_id → DPAPI 加密后的 key（base64）
     #[serde(default)]
+    pub keys: BTreeMap<String, String>,
+    /// v1 遗留：单把 key 密文，load 时自动迁移进 keys 后置空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_cipher: Option<String>,
 }
 
@@ -42,6 +45,7 @@ impl Default for Settings {
             base_url: String::new(),
             model: "deepseek-chat".to_string(),
             models: Vec::new(),
+            keys: BTreeMap::new(),
             key_cipher: None,
         }
     }
@@ -49,10 +53,18 @@ impl Default for Settings {
 
 impl Settings {
     /// 读取；不存在时用 config.toml 的 gateway 节做种子（保留施工单 001 的换渠道能力）。
+    /// v1 的 key_cipher 自动迁移到 keys[provider_id]，不丢已存 key。
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {
         let path = Self::path();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(s) = serde_json::from_str::<Settings>(&text) {
+            if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
+                // v1 → v2 迁移：key_cipher 移进 keys[provider_id]，并落盘
+                if s.keys.is_empty() {
+                    if let Some(cipher) = s.key_cipher.take() {
+                        s.keys.insert(s.provider_id.clone(), cipher);
+                        let _ = s.save();
+                    }
+                }
                 return s;
             }
             eprintln!("[settings] 解析失败，重建默认设置");
@@ -82,7 +94,7 @@ impl Settings {
             self.base_url.trim().to_string()
         } else {
             providers::find(&self.provider_id)
-                .map(|p| p.default_base_url.to_string())
+                .map(|p| p.default_base_url.clone())
                 .unwrap_or_default()
         }
     }
@@ -95,14 +107,14 @@ impl Settings {
             first.clone()
         } else {
             providers::find(&self.provider_id)
-                .map(|p| p.default_model.to_string())
+                .map(|p| p.default_model.clone())
                 .unwrap_or_default()
         }
     }
 
-    /// 解密取出 key（仅内存）。
-    pub fn get_key(&self) -> Option<String> {
-        let cipher = self.key_cipher.as_ref()?;
+    /// 解密取出指定 provider 的 key（仅内存）。
+    pub fn get_key(&self, provider_id: &str) -> Option<String> {
+        let cipher = self.keys.get(provider_id)?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(cipher).ok()?;
         let input = CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
@@ -126,8 +138,8 @@ impl Settings {
         String::from_utf8(plain).ok()
     }
 
-    /// DPAPI 加密 key 并保存。
-    pub fn set_key(&mut self, key: &str) -> anyhow::Result<()> {
+    /// DPAPI 加密并按 provider 保存。
+    pub fn set_key(&mut self, provider_id: &str, key: &str) -> anyhow::Result<()> {
         let data = key.as_bytes();
         let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
         let entropy = CRYPT_INTEGER_BLOB { cbData: ENTROPY.len() as u32, pbData: ENTROPY.as_ptr() as *mut u8 };
@@ -148,13 +160,13 @@ impl Settings {
         }
         let cipher = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
         unsafe { LocalFree(output.pbData as *mut _) };
-        self.key_cipher =
-            Some(base64::engine::general_purpose::STANDARD.encode(cipher));
+        self.keys
+            .insert(provider_id.to_string(), base64::engine::general_purpose::STANDARD.encode(cipher));
         self.save()
     }
 
-    pub fn clear_key(&mut self) -> anyhow::Result<()> {
-        self.key_cipher = None;
+    pub fn clear_key(&mut self, provider_id: &str) -> anyhow::Result<()> {
+        self.keys.remove(provider_id);
         self.save()
     }
 }

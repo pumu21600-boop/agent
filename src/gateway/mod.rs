@@ -9,8 +9,10 @@ use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::cancel::CancelFlag;
-use crate::logging::{self, EventType};
+use crate::core::cancel::CancelFlag;
+use crate::observability::{self, EventType};
+
+pub mod providers;
 
 pub struct Gateway {
     client: reqwest::Client,
@@ -54,8 +56,8 @@ impl Gateway {
     /// GET {base}/models → 模型 id 列表（OpenAI 兼容）。
     pub async fn list_models(&self, base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
         let url = Self::models_url(base_url);
-        logging::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": json!(null) }));
-        logging::debug(&format!("[gateway] GET {url}"));
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": json!(null) }));
+        observability::debug(&format!("[gateway] GET {url}"));
 
         let response = self
             .client
@@ -66,10 +68,10 @@ impl Gateway {
             .with_context(|| format!("请求渠道失败: {url}"))?;
 
         let status = response.status();
-        logging::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
+        observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            logging::event(
+            observability::event(
                 EventType::Error,
                 json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
             );
@@ -88,7 +90,7 @@ impl Gateway {
             .unwrap_or_default();
         ids.sort();
         ids.dedup();
-        logging::debug(&format!("[gateway] models: {ids:?}"));
+        observability::debug(&format!("[gateway] models: {ids:?}"));
         Ok(ids)
     }
 
@@ -106,13 +108,13 @@ impl Gateway {
     ) -> anyhow::Result<StreamOutcome> {
         if api_key.trim().is_empty() {
             let msg = "API key 未设置：请在设置面板填写并保存（或设环境变量 DEEPSEEK_API_KEY）";
-            logging::event(EventType::Error, json!({ "message": msg }));
+            observability::event(EventType::Error, json!({ "message": msg }));
             return Err(anyhow!(msg));
         }
 
         // 每轮模型决策前先查取消标志
         if cancel.is_set() {
-            logging::event(EventType::State, json!({ "kind": "cancel", "phase": "before_request" }));
+            observability::event(EventType::State, json!({ "kind": "cancel", "phase": "before_request" }));
             return Ok(StreamOutcome::Cancelled);
         }
 
@@ -124,9 +126,9 @@ impl Gateway {
         });
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
-        logging::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body }));
-        logging::debug(&format!("[gateway] POST {url}"));
-        logging::debug(&format!("[gateway] request body: {body}"));
+        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body }));
+        observability::debug(&format!("[gateway] POST {url}"));
+        observability::debug(&format!("[gateway] request body: {body}"));
 
         let response = self
             .client
@@ -138,11 +140,11 @@ impl Gateway {
             .with_context(|| format!("请求渠道失败: {url}"))?;
 
         let status = response.status();
-        logging::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
-        logging::debug(&format!("[gateway] response status: {status}"));
+        observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
+        observability::debug(&format!("[gateway] response status: {status}"));
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            logging::event(
+            observability::event(
                 EventType::Error,
                 json!({ "kind": "gateway.error", "status": status.as_u16(), "body": text }),
             );
@@ -175,7 +177,7 @@ impl Gateway {
                     let chunk: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
                         Err(e) => {
-                            logging::event(
+                            observability::event(
                                 EventType::Error,
                                 json!({ "message": format!("解析 SSE 分片失败: {e}"), "raw": data }),
                             );
@@ -184,7 +186,7 @@ impl Gateway {
                     };
                     // 每个分片前查取消标志
                     if cancel.is_set() {
-                        logging::event(
+                        observability::event(
                             EventType::State,
                             json!({ "kind": "cancel", "phase": "streaming", "chunks": chunk_count }),
                         );
@@ -198,8 +200,8 @@ impl Gateway {
                     if let Some(f) = &delta.finish {
                         payload["finish_reason"] = json!(f);
                     }
-                    logging::event(EventType::ModelChunk, payload);
-                    logging::debug(&format!("[gateway] sse: {data}"));
+                    observability::event(EventType::ModelChunk, payload);
+                    observability::debug(&format!("[gateway] sse: {data}"));
                     chunk_count += 1;
                     on_chunk(&chunk);
                 }
@@ -208,7 +210,7 @@ impl Gateway {
                 break;
             }
         }
-        logging::event(
+        observability::event(
             EventType::State,
             json!({ "kind": "gateway.stream_end", "chunks": chunk_count, "done": done }),
         );
