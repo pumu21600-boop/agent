@@ -23,6 +23,7 @@
     return map[saved] || saved || 'auto';
   })(); // 审批三档：read-only / auto / full-access
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
+  let ctxUsage = { tokens: 0, budget: 0 }; // 上下文占用（P5 圆环）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -302,6 +303,8 @@
                 );
               else if (d.notice)
                 messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
+              else if (d.context_usage)
+                ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget };
               else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
@@ -399,8 +402,34 @@
     <header class="chat-head">
       <div>
         <div class="chat-title">对话</div>
-        <div class="chat-sub">P4 工具 + 审批三档 · 历史不跨刷新（P6 落盘）</div>
+        <div class="chat-sub">P5 上下文工程 · 历史不跨刷新（P6 落盘）</div>
       </div>
+      {#if ctxUsage.budget > 0}
+        {@const pct = Math.min(100, Math.round((ctxUsage.tokens / ctxUsage.budget) * 100))}
+        {@const r = 15.9}
+        {@const circ = 2 * Math.PI * r}
+        {@const color = pct >= 85 ? '#f87171' : pct >= 60 ? '#facc15' : '#4ade80'}
+        <div
+          class="ctx-ring"
+          title={`上下文占用约 ${ctxUsage.tokens} / ${ctxUsage.budget} tokens（估算值），超过预算自动裁剪历史`}
+        >
+          <svg viewBox="0 0 36 36" width="42" height="42">
+            <circle cx="18" cy="18" {r} fill="none" stroke="#2f323c" stroke-width="3.6" />
+            <circle
+              cx="18"
+              cy="18"
+              {r}
+              fill="none"
+              stroke={color}
+              stroke-width="3.6"
+              stroke-linecap="round"
+              stroke-dasharray={`${(circ * pct) / 100} ${circ}`}
+              transform="rotate(-90 18 18)"
+            />
+          </svg>
+          <span class="ctx-pct" style:color={color}>{pct}%</span>
+        </div>
+      {/if}
     </header>
 
     <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
@@ -678,6 +707,21 @@
   }
   .jump-bottom:hover {
     border-color: #5a6070;
+  }
+  .ctx-ring {
+    position: relative;
+    width: 42px;
+    height: 42px;
+    margin-left: auto;
+  }
+  .ctx-pct {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
   }
   .chat-head {
     display: flex;
