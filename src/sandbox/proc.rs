@@ -288,9 +288,13 @@ fn build_env_block() -> Vec<u16> {
         ("PROMPT".into(), "$P$G".into()),
         (
             "PATH".into(),
-            format!(
-                "{sys_root}\\System32;{sys_root};{sys_root}\\System32\\Wbem;{sys_root}\\System32\\WindowsPowerShell\\v1.0;{sys_root}\\System32\\downlevel"
-            ),
+            // P4 起 shell/git 工具要能用用户装的工具链（git/cargo/node…），
+            // PATH 不是密钥，继承父进程；父进程没有再退回系统目录集
+            std::env::var("PATH").unwrap_or_else(|_| {
+                format!(
+                    "{sys_root}\\System32;{sys_root};{sys_root}\\System32\\Wbem;{sys_root}\\System32\\WindowsPowerShell\\v1.0;{sys_root}\\System32\\downlevel"
+                )
+            }),
         ),
         ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".into()),
         ("NUMBER_OF_PROCESSORS".into(), std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_else(|_| "1".into())),
