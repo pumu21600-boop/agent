@@ -40,6 +40,21 @@ pub struct Index {
     pub projects: Vec<ProjectEntry>,
 }
 
+/// 空白模板：未改动的模板视为"留空"，不注入任何内容。
+pub const AGENTS_TEMPLATE: &str = "# AGENTS.md\n\n\
+    <!-- 项目设定（用户自填）：你希望 agent 每次开工都知道的事——构建命令、代码约定、禁区。\n\
+    　　　留空即不注入任何内容。 -->\n";
+
+/// 读一份 AGENTS.md；缺失、空白或仍是未改动模板时返回空串（不注入）。
+fn agents_text(label: &str, path: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else { return String::new() };
+    let t = text.trim();
+    if t.is_empty() || t == AGENTS_TEMPLATE.trim() {
+        return String::new();
+    }
+    format!("\n\n【{label} AGENTS.md】\n{t}")
+}
+
 /// 打开的记忆层（持有路径与开关，核心循环/server 共享一个实例）。
 pub struct Memory {
     pub enabled: bool,
@@ -161,20 +176,10 @@ impl Memory {
     }
 
     /// 双层 AGENTS.md：全局在前、项目在后（项目优先级更高，靠后覆盖语义）。
-    /// 都缺失返回空串。
     pub fn agents_md(&self) -> String {
         let mut out = String::new();
-        for (label, path) in [
-            ("全局约定", self.global_dir.join("AGENTS.md")),
-            ("项目约定", self.ws.join("AGENTS.md")),
-        ] {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let t = text.trim();
-                if !t.is_empty() {
-                    out.push_str(&format!("\n\n【{label} AGENTS.md】\n{t}"));
-                }
-            }
-        }
+        out.push_str(&agents_text("全局约定", &self.global_dir.join("AGENTS.md")));
+        out.push_str(&agents_text("项目约定", &self.ws.join("AGENTS.md")));
         out
     }
 
@@ -187,10 +192,7 @@ impl Memory {
         if path.exists() {
             return;
         }
-        let template = "# AGENTS.md\n\n\
-            <!-- 项目设定（用户自填）：你希望 agent 每次开工都知道的事——构建命令、代码约定、禁区。\n\
-            　　　留空即不注入任何内容。 -->\n";
-        if let Err(e) = std::fs::write(&path, template) {
+        if let Err(e) = std::fs::write(&path, AGENTS_TEMPLATE) {
             crate::observability::debug(&format!("[memory] 生成 AGENTS.md 模板失败: {e}"));
         }
     }
@@ -352,6 +354,11 @@ mod tests {
         std::fs::write(tmp.join("AGENTS.md"), "我的约定").unwrap();
         mem.ensure_agents_template(&tmp);
         assert_eq!(std::fs::read_to_string(tmp.join("AGENTS.md")).unwrap(), "我的约定");
+        // 未改动的空白模板 = 不注入；用户填了才注入
+        std::fs::write(tmp.join("AGENTS.md"), AGENTS_TEMPLATE).unwrap();
+        assert!(!mem.agents_md().contains("AGENTS.md"), "空白模板不应注入: {:?}", mem.agents_md());
+        std::fs::write(tmp.join("AGENTS.md"), "构建用 make build").unwrap();
+        assert!(mem.agents_md().contains("make build"), "用户设定应注入");
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
     }
