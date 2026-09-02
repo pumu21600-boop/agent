@@ -16,6 +16,7 @@
   let settingsOpen = false;
   let autoSaveTimer = null;
   let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
+  let approvalMode = localStorage.getItem('approvalMode') || 'auto-edit'; // 审批三档
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -233,7 +234,7 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: history, model, base_url: baseUrl }),
+        body: JSON.stringify({ messages: history, model, base_url: baseUrl, approval_mode: approvalMode }),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -270,6 +271,17 @@
                   }
                   return { ...m, tools };
                 });
+              else if (d.approval_request)
+                patch((m) => ({
+                  ...m,
+                  approval: { id: d.approval_request.id, tool: d.approval_request.tool, args: d.approval_request.args, decided: null },
+                }));
+              else if (d.approval_decided)
+                patch((m) =>
+                  m.approval && m.approval.id === d.approval_decided.id
+                    ? { ...m, approval: { ...m.approval, decided: d.approval_decided.approved } }
+                    : m
+                );
               else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
@@ -304,6 +316,21 @@
     if (controller) controller.abort();
   }
 
+  // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）
+  async function decideApproval(id, approved) {
+    patchMessageApproval(id, approved);
+    await fetch('/api/approvals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, approved }),
+    });
+  }
+  function patchMessageApproval(id, approved) {
+    messages = messages.map((m) =>
+      m.approval && m.approval.id === id ? { ...m, approval: { ...m.approval, decided: approved } } : m
+    );
+  }
+
   function nextId() {
     return ++seq;
   }
@@ -319,6 +346,17 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand">Agent</div>
+    <div class="side-approval">
+      <label class="side-label">审批档位</label>
+      <select
+        bind:value={approvalMode}
+        on:change={() => localStorage.setItem('approvalMode', approvalMode)}
+      >
+        <option value="suggest">建议（写/执行都要批）</option>
+        <option value="auto-edit">自动编辑（只批命令）</option>
+        <option value="full-auto">全自动</option>
+      </select>
+    </div>
     <div class="side-foot">
       <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
     </div>
@@ -328,7 +366,7 @@
     <header class="chat-head">
       <div>
         <div class="chat-title">对话</div>
-        <div class="chat-sub">P2 核心循环 · 历史不跨刷新（P6 落盘）</div>
+        <div class="chat-sub">P4 工具 + 审批三档 · 历史不跨刷新（P6 落盘）</div>
       </div>
     </header>
 
@@ -347,6 +385,22 @@
                   <summary>思考过程</summary>
                   <div class="thinking-body">{m.thinking}</div>
                 </details>
+              {/if}
+              {#if m.approval}
+                <div class="approval-box">
+                  <div class="approval-head">
+                    ⚠️ 请求执行：<b>{m.approval.tool}</b>
+                    <span class="tool-args" title={m.approval.args}>{m.approval.args}</span>
+                  </div>
+                  {#if m.approval.decided === null}
+                    <div class="approval-actions">
+                      <button class="btn" on:click={() => decideApproval(m.approval.id, true)}>允许</button>
+                      <button class="btn ghost" on:click={() => decideApproval(m.approval.id, false)}>拒绝</button>
+                    </div>
+                  {:else}
+                    <div class="approval-state">{m.approval.decided ? '✓ 已允许' : '✕ 已拒绝'}</div>
+                  {/if}
+                </div>
               {/if}
               {#if m.tools && m.tools.length}
                 {#each m.tools as t}
@@ -657,6 +711,49 @@
     border: 1px solid #2f323c;
     border-radius: 8px;
     padding: 6px 8px;
+  }
+  .approval-box {
+    margin-bottom: 8px;
+    background: #241f14;
+    border: 1px solid #6b5a24;
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 13px;
+  }
+  .approval-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    color: #e8d9a0;
+  }
+  .approval-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .approval-state {
+    margin-top: 6px;
+    color: #9aa0ae;
+    font-size: 12px;
+  }
+  .side-approval {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 0 12px;
+  }
+  .side-label {
+    font-size: 11px;
+    color: #9aa0ae;
+  }
+  .side-approval select {
+    background: #1b1d23;
+    color: #cdd2dd;
+    border: 1px solid #2f323c;
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
   }
   .tool-head {
     display: flex;
