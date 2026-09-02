@@ -15,3 +15,8 @@ model = "deepseek-chat"
 [logging]
 dir = "logs"
 file = "agent.jsonl"
+
+[agent]
+# 核心循环（施工单 003）
+max_steps = 8
+tool_result_max_chars = 8000

@@ -25,13 +25,13 @@
 
 ## 3. event_type 枚举（定死 6 类）
 
-| event_type | 含义 | 本单状态 |
+| event_type | 含义 | 状态 |
 | --- | --- | --- |
-| `thought` | 模型思考 / 推理内容 | 预留（核心循环接入后使用） |
-| `tool_call` | 工具调用 | 预留（本单无工具） |
-| `tool_result` | 工具结果 | 预留（本单无工具） |
+| `thought` | 模型思考 / 推理内容（完整段落） | 已使用（P2） |
+| `tool_call` | 工具调用 | 已使用（P2） |
+| `tool_result` | 工具结果 | 已使用（P2） |
 | `model_chunk` | 模型流式分片 | 已使用 |
-| `state` | 状态快照（启动、网关请求/响应、取消、流结束等） | 已使用 |
+| `state` | 状态快照（启动、网关请求/响应、循环、取消等） | 已使用 |
 | `error` | 错误 | 已使用 |
 
 ## 4. payload 子结构
@@ -47,17 +47,32 @@
 }
 ```
 
-### 4.2 state —— 状态快照（用 `kind` 区分）
+### 4.2 tool_call / tool_result —— 工具调用与结果（P2 核心循环）
+
+```json
+{ "step": 0, "id": "call-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }
+{ "step": 0, "id": "call-1", "name": "read_file", "ok": true, "chars": 1234, "preview": "前 300 字符…" }
+```
+
+### 4.3 thought —— 完整思考段落（P2 起）
+
+```json
+{ "step": 0, "text": "该轮模型返回的完整 reasoning_content" }
+```
+
+### 4.4 state —— 状态快照（用 `kind` 区分）
 
 | kind | 说明 | 关键字段 |
 | --- | --- | --- |
 | `startup` | 进程启动 | `base_url`（真实渠道地址）、`model`、`host`、`port`、`session_id` |
-| `gateway.request` | 网关请求 | `url`（真实 base_url + /chat/completions）、`body`（完整请求体） |
+| `gateway.request` | 网关请求 | `url`（真实 base_url + /chat/completions）、`body`（完整请求体：model + messages 历史 + tools，不含 key） |
 | `gateway.response` | 网关响应头 | `status` |
-| `gateway.stream_end` | 流结束 | `chunks`（分片数）、`done` |
-| `cancel` | 取消事件 | `flag`（置位）、或 `phase`（`before_request`/`streaming`） |
+| `gateway.stream_end` | 流结束 | `chunks`（分片数）、`done`、`tool_calls`（本轮聚合工具调用数） |
+| `loop.finish` | 核心循环终止（模型给出纯文本） | `step`、`content_chars` |
+| `settings.updated` | 设置保存 | `provider_id`、`model` |
+| `cancel` | 取消事件 | `flag`（置位）、或 `phase`（`before_request`/`streaming`/`tool`/`loop`） |
 
-### 4.3 error —— 错误
+### 4.5 error —— 错误
 
 ```json
 { "message": "错误描述", "status": 401, "body": "渠道返回体（仅网关错误）" }

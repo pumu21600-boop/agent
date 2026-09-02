@@ -9,7 +9,7 @@
 |---|---|---|
 | P0 地基 | JSONL 日志定死、网关单渠道冒烟、取消标志、供应商预设 + 设置持久化 | ✅ 已完成（tag v0.1-p0） |
 | P1 结构 + UI 骨架 | 目录按总架构 17 节模块化；providers 数据化；key 按 provider 存；聊天经典布局 + 消息事件渲染骨架 | ✅ 已完成（tag v0.2-p1） |
-| P2 核心循环 v1 | 任务解析→调工具→回填→判定→终止；步数/超时上限；thought/tool_call/tool_result/model_chunk 进日志和 UI；取消贯通；配 1 个安全工具（文件读） | ⏳ |
+| P2 核心循环 v1 | 任务解析→调工具→回填→判定→终止；步数/超时上限；thought/tool_call/tool_result/model_chunk 进日志和 UI；取消贯通；配 1 个安全工具（文件读） | ✅ 已完成（tag v0.3-p2） |
 | P3 执行沙箱 v1 | Job Objects + 受限 token（壳先于 shell） | ⏳ |
 | P4 工具第一批 + 审批三档 | shell（入沙箱）、文件写、ripgrep、web 抓取、git；注册表；suggest/auto-edit/full-auto | ⏳ |
 | P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ⏳ |

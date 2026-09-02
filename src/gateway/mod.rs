@@ -25,6 +25,26 @@ pub enum StreamOutcome {
     Cancelled,
 }
 
+/// 聚合后的模型回复（P2 核心循环用）：正文 / 思考 / 工具调用。
+#[derive(Debug, Clone, Default)]
+pub struct AssistantTurn {
+    pub content: String,
+    pub reasoning: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+pub enum ChatOutcome {
+    Done(AssistantTurn),
+    Cancelled,
+}
+
 impl Gateway {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
@@ -94,18 +114,20 @@ impl Gateway {
         Ok(ids)
     }
 
-    /// 单轮对话 → 流式输出。每个模型分片：
+    /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
     /// 1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
-    /// 开始前与每个分片前都检查取消标志。
+    /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat(
         self: &Arc<Self>,
         base_url: &str,
         model: &str,
         api_key: &str,
-        message: &str,
+        messages: &Value,
+        tools: Option<&Value>,
         cancel: &CancelFlag,
         on_chunk: impl Fn(&Value),
-    ) -> anyhow::Result<StreamOutcome> {
+    ) -> anyhow::Result<ChatOutcome> {
         if api_key.trim().is_empty() {
             let msg = "API key 未设置：请在设置面板填写并保存（或设环境变量 DEEPSEEK_API_KEY）";
             observability::event(EventType::Error, json!({ "message": msg }));
@@ -115,15 +137,18 @@ impl Gateway {
         // 每轮模型决策前先查取消标志
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "before_request" }));
-            return Ok(StreamOutcome::Cancelled);
+            return Ok(ChatOutcome::Cancelled);
         }
 
         let url = Self::chat_url(base_url);
-        let body = json!({
+        let mut body = json!({
             "model": model,
-            "messages": [{ "role": "user", "content": message }],
+            "messages": messages,
             "stream": true,
         });
+        if let Some(t) = tools {
+            body["tools"] = t.clone();
+        }
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body }));
@@ -151,11 +176,13 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
 
-        // —— SSE 解析：按行切，data: 前缀取 JSON，[DONE] 结束 ——
+        // —— SSE 解析：按行切，data: 前缀取 JSON，[DONE] 结束；聚合 content/reasoning/tool_calls ——
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
         let mut chunk_count: u64 = 0;
         let mut done = false;
+        let mut turn = AssistantTurn::default();
+        let mut calls: Vec<ToolCall> = Vec::new();
         while let Some(item) = stream.next().await {
             let bytes = item.context("读流失败")?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -190,7 +217,7 @@ impl Gateway {
                             EventType::State,
                             json!({ "kind": "cancel", "phase": "streaming", "chunks": chunk_count }),
                         );
-                        return Ok(StreamOutcome::Cancelled);
+                        return Ok(ChatOutcome::Cancelled);
                     }
                     let delta = extract_delta(&chunk);
                     let mut payload = json!({ "raw": data, "content": delta.content });
@@ -199,6 +226,18 @@ impl Gateway {
                     }
                     if let Some(f) = &delta.finish {
                         payload["finish_reason"] = json!(f);
+                    }
+                    let tc_arr = chunk
+                        .pointer("/choices/0/delta/tool_calls")
+                        .and_then(Value::as_array)
+                        .cloned();
+                    if let Some(arr) = &tc_arr {
+                        payload["tool_calls"] = json!(arr);
+                        accumulate_tool_calls(arr, &mut calls);
+                    }
+                    turn.content.push_str(&delta.content);
+                    if let Some(r) = &delta.reasoning {
+                        turn.reasoning.push_str(r);
                     }
                     observability::event(EventType::ModelChunk, payload);
                     observability::debug(&format!("[gateway] sse: {data}"));
@@ -210,11 +249,32 @@ impl Gateway {
                 break;
             }
         }
+        turn.tool_calls = calls;
         observability::event(
             EventType::State,
-            json!({ "kind": "gateway.stream_end", "chunks": chunk_count, "done": done }),
+            json!({ "kind": "gateway.stream_end", "chunks": chunk_count, "done": done, "tool_calls": turn.tool_calls.len() }),
         );
-        Ok(StreamOutcome::Done)
+        Ok(ChatOutcome::Done(turn))
+    }
+}
+
+/// 按 index 合并流式 tool_calls 分片（OpenAI 兼容增量格式）。
+fn accumulate_tool_calls(arr: &[Value], calls: &mut Vec<ToolCall>) {
+    for entry in arr {
+        let index = entry.get("index").and_then(Value::as_i64).unwrap_or(0) as usize;
+        while calls.len() <= index {
+            calls.push(ToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+        }
+        let call = &mut calls[index];
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            call.id.push_str(id);
+        }
+        if let Some(name) = entry.pointer("/function/name").and_then(Value::as_str) {
+            call.name.push_str(name);
+        }
+        if let Some(args) = entry.pointer("/function/arguments").and_then(Value::as_str) {
+            call.arguments.push_str(args);
+        }
     }
 }
 

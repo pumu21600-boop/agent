@@ -28,20 +28,30 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::{
     config::settings::Settings,
     core::cancel::CancelFlag,
-    gateway::{self, Gateway, StreamOutcome},
+    gateway::{self, Gateway},
     observability::{self, EventType},
 };
+
+use crate::config::AgentConfig;
+use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: Arc<Gateway>,
     pub cancel: Arc<CancelFlag>,
     pub settings: Arc<std::sync::RwLock<Settings>>,
+    pub agent_cfg: Arc<AgentConfig>,
+    pub system_prompt: Arc<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
+    /// 单轮消息（messages 为空时使用，兼容内置回退页）
+    #[serde(default)]
     pub message: String,
+    /// P2：完整消息数组（role: user/assistant/tool），非空则优先
+    #[serde(default)]
+    pub messages: Option<Vec<Value>>,
     /// 请求级覆盖：非空优先于已保存设置（页面当前选择即时生效）
     #[serde(default)]
     pub model: String,
@@ -233,10 +243,22 @@ async fn chat(
     let req_model = req.model.trim().to_string();
     let req_base_url = req.base_url.trim().to_string();
     let req_api_key = req.api_key.trim().to_string();
+    let history: Vec<Value> = match &req.messages {
+        Some(m) if !m.is_empty() => m.clone(),
+        _ => {
+            if message.is_empty() {
+                vec![]
+            } else {
+                vec![json!({ "role": "user", "content": message })]
+            }
+        }
+    };
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let gateway = state.gateway.clone();
     let cancel = state.cancel.clone();
     let s = state.settings.read().unwrap().clone();
+    let cfg = (*state.agent_cfg).clone();
+    let prompt = state.system_prompt.clone();
 
     // 新一轮开始：复位取消标志
     cancel.clear();
@@ -245,7 +267,7 @@ async fn chat(
         let send = |payload: Value| {
             let _ = tx.send(Ok(json_event(payload)));
         };
-        if message.is_empty() {
+        if history.is_empty() {
             send(json!({ "error": "消息为空" }));
             return;
         }
@@ -257,29 +279,31 @@ async fn chat(
         } else {
             s.get_key(&s.provider_id).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
-        let outcome = gateway
-            .stream_chat(&base_url, &model, &api_key, &message, &cancel, |chunk| {
-                let delta = crate::gateway::extract_delta(chunk);
-                if !delta.content.is_empty() {
-                    let tx = tx.clone();
-                    let content = delta.content;
-                    tokio::spawn(async move {
-                        let _ = tx.send(Ok(json_event(json!({ "content": content }))));
-                    });
+        let outcome = agent::run_task(
+            &gateway,
+            &base_url,
+            &model,
+            &api_key,
+            &prompt,
+            &history,
+            &cancel,
+            &cfg,
+            |ev| match ev {
+                AgentEvent::Content(c) => send(json!({ "content": c })),
+                AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
+                AgentEvent::ToolCall { name, args } => {
+                    send(json!({ "tool_call": { "name": name, "args": args } }))
                 }
-                if let Some(r) = delta.reasoning {
-                    if !r.is_empty() {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let _ = tx.send(Ok(json_event(json!({ "reasoning": r }))));
-                        });
-                    }
+                AgentEvent::ToolResult { name, ok, preview } => {
+                    send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
                 }
-            })
-            .await;
+                AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
+            },
+        )
+        .await;
         match outcome {
-            Ok(StreamOutcome::Done) => send(json!({ "done": true })),
-            Ok(StreamOutcome::Cancelled) => send(json!({ "cancelled": true })),
+            Ok(LoopOutcome::Done) => send(json!({ "done": true })),
+            Ok(LoopOutcome::Cancelled) => send(json!({ "cancelled": true })),
             Err(e) => {
                 observability::event(EventType::Error, json!({ "message": e.to_string() }));
                 send(json!({ "error": e.to_string() }));

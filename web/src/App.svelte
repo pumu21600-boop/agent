@@ -174,10 +174,15 @@
     if (!msg || streaming) return;
     streaming = true;
     controller = new AbortController();
+    // 历史消息（P2：服务端无状态，前端带 user/assistant 历史；刷新即清，P6 才落盘）
+    const history = messages
+      .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
+      .map((m) => ({ role: m.role, content: m.content }));
+    history.push({ role: 'user', content: msg });
     messages = [
       ...messages,
       { id: nextId(), role: 'user', content: msg },
-      { id: nextId(), role: 'assistant', content: '', thinking: '', streaming: true },
+      { id: nextId(), role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
     ];
     input = '';
     const asstId = seq;
@@ -189,7 +194,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // 带上当前选择的模型/base_url：下拉框改了立即生效，不必先点保存
-        body: JSON.stringify({ message: msg, model, base_url: baseUrl }),
+        body: JSON.stringify({ messages: history, model, base_url: baseUrl }),
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -210,7 +215,26 @@
               const d = JSON.parse(line.slice(6));
               if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
-              else if (d.error) {
+              else if (d.tool_call)
+                patch((m) => ({
+                  ...m,
+                  tools: [...(m.tools || []), { name: d.tool_call.name, args: d.tool_call.args, status: 'running' }],
+                }));
+              else if (d.tool_result)
+                patch((m) => {
+                  const tools = [...(m.tools || [])];
+                  for (let i = tools.length - 1; i >= 0; i--) {
+                    if (tools[i].name === d.tool_result.name && tools[i].status === 'running') {
+                      tools[i] = { ...tools[i], status: d.tool_result.ok ? 'ok' : 'fail', preview: d.tool_result.preview };
+                      break;
+                    }
+                  }
+                  return { ...m, tools };
+                });
+              else if (d.step_limit) {
+                patch((m) => ({ ...m, streaming: false }));
+                messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
+              } else if (d.error) {
                 patch((m) => ({ ...m, streaming: false }));
                 messages = [...messages, { id: nextId(), role: 'error', content: d.error }];
               } else if (d.cancelled) {
@@ -261,7 +285,7 @@
     <header class="chat-head">
       <div>
         <div class="chat-title">对话</div>
-        <div class="chat-sub">P1 冒烟 · 单轮无历史</div>
+        <div class="chat-sub">P2 核心循环 · 历史不跨刷新（P6 落盘）</div>
       </div>
     </header>
 
@@ -282,6 +306,20 @@
                   <summary>思考过程</summary>
                   <div class="thinking-body">{m.thinking}</div>
                 </details>
+              {/if}
+              {#if m.tools && m.tools.length}
+                {#each m.tools as t}
+                  <div class="tool-card">
+                    <div class="tool-head">
+                      <span class="tool-badge {t.status}">{t.status === 'running' ? '执行中' : t.status === 'ok' ? '完成' : '失败'}</span>
+                      <span class="tool-name">{t.name}</span>
+                      <span class="tool-args" title={t.args}>{t.args}</span>
+                    </div>
+                    {#if t.preview}
+                      <pre class="tool-preview">{t.preview}</pre>
+                    {/if}
+                  </div>
+                {/each}
               {/if}
               {#if m.content}
                 <div class="content">{m.content}</div>
@@ -553,6 +591,58 @@
     font-size: 13px;
     color: #9aa0ae;
     white-space: pre-wrap;
+  }
+  .tool-card {
+    margin-bottom: 8px;
+    background: #1b1d23;
+    border: 1px solid #2f323c;
+    border-radius: 8px;
+    padding: 6px 8px;
+  }
+  .tool-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+  }
+  .tool-badge {
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
+  .tool-badge.running {
+    background: #3a3f4d;
+    color: #cdd2dd;
+  }
+  .tool-badge.ok {
+    background: #234d2c;
+    color: #9fdcae;
+  }
+  .tool-badge.fail {
+    background: #4d2323;
+    color: #e0a3a3;
+  }
+  .tool-name {
+    font-family: Consolas, monospace;
+    color: #cdd2dd;
+  }
+  .tool-args {
+    color: #6b707c;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 320px;
+  }
+  .tool-preview {
+    margin: 6px 0 0;
+    padding: 6px 8px;
+    background: #17181c;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #9aa0ae;
+    white-space: pre-wrap;
+    max-height: 160px;
+    overflow-y: auto;
   }
   .cursor {
     animation: blink 1s step-start infinite;
