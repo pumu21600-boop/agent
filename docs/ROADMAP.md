@@ -13,7 +13,7 @@
 | P3 执行沙箱 v1 | Job Objects + 受限 token（壳先于 shell） | ✅ 已完成（tag v0.4-p3） |
 | P4 工具第一批 + 审批三档 | shell（入沙箱）、文件写、ripgrep、web 抓取、git；注册表；suggest/auto-edit/full-auto | ✅ 已完成（tag v0.5-p4） |
 | P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ✅ 已完成（tag v0.6-p5） |
-| P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ⏳ |
+| P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ✅ 已完成（tag v0.7-p6） |
 | P7 记忆 v1 + AGENTS.md | events.log + 滚动摘要、双层存储（~/.agent + 项目 .agent）、index.json | ⏳ |
 | P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补 OpenRouter/Gemini/LMStudio/MNN/llama.cpp | ⏳ |
 | P9 Plan 模式 + 审批规则引擎 | 留口转正式 | ⏳ |
