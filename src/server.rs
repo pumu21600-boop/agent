@@ -144,7 +144,7 @@ fn key_hint_of(key: Option<String>) -> String {
 
 async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap().clone();
-    let saved_key = s.get_key(&s.provider_id);
+    let saved_key = s.get_key(&s.effective_base_url());
     let has_key = saved_key.is_some();
     Json(json!({
         "provider_id": s.provider_id,
@@ -157,6 +157,12 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         "active_profile_id": s.active_profile_id,
         "has_key": has_key,
         "key_hint": key_hint_of(saved_key),
+        "key_scopes": s
+            .keys
+            .iter()
+            .map(|(u, _)| json!({ "url": u, "hint": key_hint_of(s.get_key(u)) }))
+            .filter(|v| v["hint"].as_str().map(|h| !h.is_empty()).unwrap_or(false))
+            .collect::<Vec<Value>>(),
         "env_key": std::env::var("DEEPSEEK_API_KEY").is_ok(),
     }))
 }
@@ -185,14 +191,14 @@ async fn put_settings(
         list.dedup();
         s.models = list;
     }
-    let provider_id = s.provider_id.clone();
+    let key_scope = s.effective_base_url();
     if req.clear_key == Some(true) {
-        if let Err(e) = s.clear_key(&provider_id) {
+        if let Err(e) = s.clear_key(&key_scope) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
         }
     } else if let Some(k) = &req.api_key {
         if !k.trim().is_empty() {
-            if let Err(e) = s.set_key(&provider_id, k.trim()) {
+            if let Err(e) = s.set_key(&key_scope, k.trim()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
             }
         }
@@ -207,7 +213,7 @@ async fn put_settings(
     );
     (
         StatusCode::OK,
-        Json(json!({ "ok": true, "has_key": s.get_key(&s.provider_id).is_some(), "key_hint": key_hint_of(s.get_key(&s.provider_id)) })),
+        Json(json!({ "ok": true, "has_key": s.get_key(&s.effective_base_url()).is_some(), "key_hint": key_hint_of(s.get_key(&s.effective_base_url())) })),
     )
 }
 
@@ -221,7 +227,7 @@ async fn list_models(
     let api_key = if !req.api_key.trim().is_empty() {
         req.api_key.trim().to_string()
     } else {
-        s.get_key(&s.provider_id).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+        s.get_key(&base_url).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
     };
     if base_url.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url 为空" })));
@@ -322,8 +328,8 @@ async fn manage_profiles(
             "base_url": s.base_url,
             "model": s.model,
             "models": s.models,
-            "has_key": s.get_key(&s.provider_id).is_some(),
-            "key_hint": key_hint_of(s.get_key(&s.provider_id)),
+            "has_key": s.get_key(&s.effective_base_url()).is_some(),
+            "key_hint": key_hint_of(s.get_key(&s.effective_base_url())),
         })),
     )
 }
@@ -386,7 +392,7 @@ async fn chat(
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
-            s.get_key(&s.provider_id).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+            s.get_key(&base_url).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
         let outcome = agent::run_task(
             &gateway,
