@@ -51,7 +51,7 @@
 
 ```json
 { "step": 0, "id": "call-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }
-{ "step": 0, "id": "call-1", "name": "read_file", "ok": true, "chars": 1234, "preview": "前 300 字符…" }
+{ "step": 0, "id": "call-1", "name": "read_file", "ok": true, "chars": 1234, "truncated": false, "preview": "前 300 字符…" }
 ```
 
 ### 4.3 thought —— 完整思考段落（P2 起）
@@ -78,6 +78,7 @@
 | `settings.channel_changed` | 配置渠道地址变更，模型清单作废 | `base_url` |
 | `approval.requested` | 工具调用待审批（P4） | `id`、`tool` |
 | `approval.decided` | 审批决定（P4） | `id`、`approved` |
+| `context.compacted` | 上下文超预算触发裁剪（P5） | `step`、`archived_tools`、`folded_messages`、`tokens_before`、`tokens_after` |
 
 ### 4.5 error —— 错误
 

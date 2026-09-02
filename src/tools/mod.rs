@@ -77,6 +77,20 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 0,
         },
         ToolSpec {
+            name: "read_page",
+            description: "按页读取工作目录内的大文本文件（默认 200 行/页）。大文件优先用本工具翻页，不要一次读全。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "文件路径（相对工作目录）" },
+                    "page": { "type": "integer", "description": "页码，从 1 开始" },
+                    "page_size": { "type": "integer", "description": "可选：每页行数（默认 200，上限 1000）" }
+                },
+                "required": ["path", "page"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
             name: "write_file",
             description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。",
             parameters: json!({
@@ -147,6 +161,7 @@ pub fn definitions() -> Vec<Value> {
 pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String, String> {
     match name {
         "read_file" => read_file(args, cfg.max_chars),
+        "read_page" => read_page(args, cfg.max_chars),
         "write_file" => write_file(args),
         "search" => search(args, cfg.max_chars),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
@@ -157,12 +172,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
 }
 
 fn cap(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let head: String = s.chars().take(max).collect();
-        format!("{head}\n……[已截断，仅显示前 {max} 字符]")
-    } else {
-        s.to_string()
-    }
+    // P5 起工具结果统一走头尾压缩（替代旧的单向硬截断）
+    crate::context::compress(s, max)
 }
 
 /// 解析相对路径并做工作目录穿越校验，返回 canonicalize 后的绝对路径。
@@ -191,8 +202,7 @@ fn resolve_in_workspace(rel: &str, must_exist: bool) -> Result<PathBuf, String> 
     }
 }
 
-fn read_file(args: &str, max_chars: usize) -> Result<String, String> {
-    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+fn read_file(args: &str, max_chars: usize) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let full = resolve_in_workspace(rel, true)?;
     let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
@@ -201,6 +211,40 @@ fn read_file(args: &str, max_chars: usize) -> Result<String, String> {
     }
     let text = std::fs::read_to_string(&full).map_err(|e| format!("读文件失败（可能非 UTF-8）: {e}"))?;
     Ok(cap(&text, max_chars))
+}
+
+/// 分页读取大文件（P5）：按行分页，页码越界自动钳到最后/第一页。
+fn read_page(args: &str, max_chars: usize) -> Result<String, String> {
+    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+    let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
+    let page = v.get("page").and_then(Value::as_u64).ok_or("缺少 page 参数")?;
+    if page == 0 {
+        return Err("page 从 1 开始".to_string());
+    }
+    let page_size = v.get("page_size").and_then(Value::as_u64).unwrap_or(200).clamp(10, 1000) as usize;
+    let full = resolve_in_workspace(rel, true)?;
+    if full.metadata().map_err(|e| format!("读取失败: {e}"))?.is_dir() {
+        return Err("目标是目录，不是文件".to_string());
+    }
+    let text = std::fs::read_to_string(&full).map_err(|e| format!("读文件失败（可能非 UTF-8）: {e}"))?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return Ok(format!("{rel} 是空文件"));
+    }
+    let pages = lines.len().div_ceil(page_size);
+    let page = (page as usize).min(pages);
+    let start = (page - 1) * page_size;
+    let end = (start + page_size).min(lines.len());
+    let body = lines[start..end].join("\n");
+    let out = format!(
+        "{} 第 {page}/{pages} 页（共 {} 行，本页 {}-{} 行）\n{}",
+        rel,
+        lines.len(),
+        start + 1,
+        end,
+        body
+    );
+    Ok(cap(&out, max_chars))
 }
 
 fn write_file(args: &str) -> Result<String, String> {
@@ -518,6 +562,25 @@ mod tests {
         assert!(r.unwrap().contains("git version"));
         let r = execute(&cfg(), "git", r#"{"args":"push origin main"}"#).await;
         assert!(r.is_err() && r.unwrap_err().contains("push"), "push 应被工具层直接拒绝");
+    }
+
+    #[tokio::test]
+    async fn read_page_paging_and_bounds() {
+        init_logger();
+        let dir = workspace_root().join(".p5-test-page");
+        std::fs::create_dir_all(&dir).ok();
+        let body: String = (1..=250).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(dir.join("big.txt"), &body).ok();
+        // 第 1 页：200 行
+        let r = execute(&cfg(), "read_page", r#"{"path":".p5-test-page/big.txt","page":1}"#).await.unwrap();
+        assert!(r.contains("1/2 页") && r.contains("line-1") && r.contains("line-200"));
+        // 第 2 页：50 行
+        let r = execute(&cfg(), "read_page", r#"{"path":".p5-test-page/big.txt","page":2}"#).await.unwrap();
+        assert!(r.contains("2/2 页") && r.contains("line-201") && r.contains("line-250"));
+        // 页码越界钳到最后页
+        let r = execute(&cfg(), "read_page", r#"{"path":".p5-test-page/big.txt","page":99}"#).await.unwrap();
+        assert!(r.contains("2/2 页"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

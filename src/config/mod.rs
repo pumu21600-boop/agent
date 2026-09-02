@@ -22,6 +22,8 @@ pub struct Config {
     pub agent: AgentConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 /// 核心循环参数（施工单 003 / 005）。
@@ -56,6 +58,17 @@ pub struct SandboxConfig {
     /// 进程树内活跃进程数上限
     #[serde(default = "default_sandbox_active_processes")]
     pub active_processes: u32,
+}
+
+/// 上下文工程参数（施工单 006）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextConfig {
+    /// 全 messages 的 token 预算（估算值），超出触发裁剪；给回复留足余量
+    #[serde(default = "default_budget_tokens")]
+    pub budget_tokens: u64,
+    /// 最近 N 个工具结果完整保留，更早的归档
+    #[serde(default = "default_recent_kept")]
+    pub recent_tool_results_kept: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +132,12 @@ fn default_sandbox_memory_mb() -> u32 {
 fn default_sandbox_active_processes() -> u32 {
     64
 }
+fn default_budget_tokens() -> u64 {
+    96_000
+}
+fn default_recent_kept() -> usize {
+    6
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -155,6 +174,14 @@ impl Default for SandboxConfig {
         }
     }
 }
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            budget_tokens: default_budget_tokens(),
+            recent_tool_results_kept: default_recent_kept(),
+        }
+    }
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -163,6 +190,7 @@ impl Default for Config {
             logging: LoggingConfig::default(),
             agent: AgentConfig::default(),
             sandbox: SandboxConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 }
