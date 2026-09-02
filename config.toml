@@ -37,3 +37,9 @@ recent_tool_results_kept = 6
 checkpoint_enabled = true
 # 上下文占用达预算该比例时自动生成交接文档 HANDOFF.md（每任务一次）
 handoff_token_ratio = 0.8
+
+[memory]
+# P7 记忆 v1：总开关（false 时 events.log/index/AGENTS.md 注入/滚动摘要全停）
+enabled = true
+# 敏感落盘：false（默认）时 events.log 里的 sk-/Bearer/api_key 打码后才写
+persist_sensitive = false

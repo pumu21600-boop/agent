@@ -25,6 +25,19 @@ pub struct Checkpoint {
     pub reason: String,
 }
 
+/// 真仓库 origin remote url（无 remote/非仓库返回 None）。记忆系统项目身份用。
+pub fn remote_url(ws: &Path) -> Option<String> {
+    let bin = git_bin().ok()?;
+    git_ok(&bin, None, ws, &["remote", "get-url", "origin"]).ok().filter(|s| !s.is_empty())
+}
+
+/// 真仓库根目录（非 git 仓库返回 None）。
+pub fn root_path(ws: &Path) -> Option<PathBuf> {
+    let bin = git_bin().ok()?;
+    let out = git_ok(&bin, None, ws, &["rev-parse", "--show-toplevel"]).ok()?;
+    if out.is_empty() { None } else { Some(PathBuf::from(out)) }
+}
+
 /// 影子仓库 git dir（workspace/.agent/shadow/.git）。
 fn shadow_gitdir(ws: &Path) -> PathBuf {
     ws.join(".agent").join("shadow").join(".git")

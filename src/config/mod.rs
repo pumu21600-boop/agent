@@ -26,6 +26,29 @@ pub struct Config {
     pub context: ContextConfig,
     #[serde(default)]
     pub recovery: RecoveryConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// 记忆系统参数（施工单 009）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// 总开关：false 时 events.log / index / AGENTS.md 注入 / 滚动摘要全停
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+    /// 敏感落盘：false（默认）时 events.log 里的 key/token 打码后才写
+    #[serde(default)]
+    pub persist_sensitive: bool,
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { enabled: default_memory_enabled(), persist_sensitive: false }
+    }
 }
 
 /// 恢复与续命参数（施工单 007）。
@@ -218,6 +241,7 @@ impl Default for Config {
             sandbox: SandboxConfig::default(),
             context: ContextConfig::default(),
             recovery: RecoveryConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
