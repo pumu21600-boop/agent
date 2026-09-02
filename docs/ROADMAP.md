@@ -15,7 +15,7 @@
 | P5 上下文工程 | 工具结果截断/压缩/分页、token 预算 | ✅ 已完成（tag v0.6-p5） |
 | P6 恢复与续命 | git shadow repo checkpoint、会话落盘+恢复、HANDOFF 交接 | ✅ 已完成（tag v0.7-p6；P6.1 多会话+改动条 v0.7.1-p6） |
 | P7 记忆 v1 + AGENTS.md | events.log + 滚动摘要、双层存储（~/.agent + 项目 .agent）、index.json | ✅ 已完成（tag v0.8-p7） |
-| P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补 OpenRouter/Gemini/LMStudio/MNN/llama.cpp；**思考参数按厂商适配**（providers.json 数据字段：reasoning_style=reasoning_content/thinking_param/effort_param/in_content（反代把 `<think>` 当正文吐，需剥离）/ thinking_budget_param / reasoning_counts_in_max_tokens——各家不同：Qwen 官方思考不占 max_tokens 有独立 thinking_budget，OpenAI/DeepSeek/Claude 占；免费反代端点行为≠官方，别拿代理实测下官方结论） | ⏳ |
+| P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补齐官方网关（用户拍板：**移除第三方中转/聚合**——商汤/百炼/千帆/星火/硅基流动/Groq/OpenRouter，只留大模型厂商官方 + 本地推理；补 MiniMax/Claude/豆包/混元）；**思考参数按厂商适配**（providers.json 数据字段：reasoning_style=reasoning_content/thinking_param/effort_param/in_content（反代把 `<think>` 当正文吐，需剥离）/ thinking_budget_param / reasoning_counts_in_max_tokens——各家不同：GLM 实测思考占 max_tokens，OpenAI/DeepSeek/Claude 占；MiniMax/Claude/豆包/混元端点待真实 key 验证） | ✅ 已完成（tag v0.9-p8） |
 | P9 Plan 模式 + 审批规则引擎 | 留口转正式 | ⏳ |
 | P10（第二个月） | 多开会话 + trace 时间线视图 + eval 体系 | ⏳（多开会话 v1 已于 P6.1 提前落地；工作区切换仍在本单） |
 | P11 | MCP client + WASM 插件 + 双总线 | ⏳ |
