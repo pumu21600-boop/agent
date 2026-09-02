@@ -3,7 +3,7 @@
 //! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
 //! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, anyhow};
 use futures_util::StreamExt;
@@ -15,7 +15,18 @@ use crate::observability::{self, EventType};
 pub mod providers;
 
 pub struct Gateway {
-    client: reqwest::Client,
+    /// 热可重建的 HTTP 客户端：reqwest 在构建时固化系统代理设置，
+    /// 之后 Clash 开/关/换节点不会自动跟进。网络层失败时 rebuild_client()
+    /// 重新读系统代理，服务不用重启就能自愈。
+    client: RwLock<reqwest::Client>,
+}
+
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("构建 HTTP 客户端失败")
 }
 
 /// 流式请求的结局。
@@ -47,12 +58,44 @@ pub enum ChatOutcome {
 
 impl Gateway {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()
-            .expect("构建 HTTP 客户端失败");
-        Self { client }
+        Self { client: RwLock::new(build_client()) }
+    }
+
+    /// 重建 HTTP 客户端（重新读系统代理）。网络层失败时由 send() 路径调用；
+    /// 集成测试（tests/gateway_retry.rs）也直接调它来驱动阶段切换。
+    pub fn rebuild_client_for_test(&self) -> reqwest::Client {
+        let fresh = build_client();
+        if let Ok(mut slot) = self.client.write() {
+            *slot = fresh.clone();
+        }
+        fresh
+    }
+
+    fn rebuild_client(&self) -> reqwest::Client {
+        let fresh = self.rebuild_client_for_test();
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.client_rebuild", "note": "网络层失败后重建 HTTP 客户端（重读系统代理）" }),
+        );
+        fresh
+    }
+
+    /// 发请求；网络层失败（连接/超时类，非渠道业务错误）先重建客户端重试一次。
+    /// connect/timeout 错误覆盖：DNS 解析失败、代理拒连、TLS 握手失败、连接超时——
+    /// 正是 Clash 开关切换会触发的那些。
+    async fn send(
+        &self,
+        build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        let client = self.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client);
+        match build(client).send().await {
+            Ok(r) => Ok(r),
+            Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
+                let fresh = self.rebuild_client();
+                build(fresh).send().await.map_err(|e| anyhow!(e.to_string()))
+            }
+            Err(e) => Err(anyhow!(e.to_string())),
+        }
     }
 
     fn chat_url(base_url: &str) -> String {
@@ -80,12 +123,9 @@ impl Gateway {
         observability::debug(&format!("[gateway] GET {url}"));
 
         let response = self
-            .client
-            .get(&url)
-            .bearer_auth(api_key)
-            .send()
+            .send(|c| c.get(&url).bearer_auth(api_key))
             .await
-            .with_context(|| format!("请求渠道失败: {url}"))?;
+            .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
 
         let status = response.status();
         observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
@@ -156,13 +196,9 @@ impl Gateway {
         observability::debug(&format!("[gateway] request body: {body}"));
 
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
+            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
             .await
-            .with_context(|| format!("请求渠道失败: {url}"))?;
+            .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
 
         let status = response.status();
         observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
@@ -292,5 +328,49 @@ pub fn extract_delta(chunk: &Value) -> Delta {
         content: delta.pointer("/content").and_then(Value::as_str).unwrap_or("").to_string(),
         reasoning: delta.pointer("/reasoning_content").and_then(Value::as_str).map(String::from),
         finish: choice.pointer("/finish_reason").and_then(Value::as_str).map(String::from),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 客户端热重建机制验证：死代理 → 失败 → 环境恢复 + rebuild → 同一实例恢复连通。
+    //! （bin crate 的 tests/ 目录拿不到内部符号，机制测试放这里）
+    use super::*;
+
+    fn init_logger() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir = std::env::temp_dir().join("agent-test-logs");
+            let _ = crate::observability::init(&dir, "gw.jsonl", format!("gw-{}", uuid::Uuid::new_v4()));
+        });
+    }
+
+    #[tokio::test]
+    async fn client_rebuild_picks_up_new_proxy_config() {
+        init_logger();
+        let g = Gateway::new();
+
+        // 阶段1：代理指向死端口 → 必须失败（is_connect 分支）
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
+            std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
+        }
+        g.rebuild_client_for_test();
+        let r1 = g.list_models("https://api.deepseek.com/v1", "sk-dummy").await;
+        assert!(r1.is_err(), "死代理下应失败，实际 {:?}", r1.map(|v| v.len()));
+
+        // 阶段2：清掉死代理 → rebuild → 同一 Gateway 实例应拿到渠道业务响应
+        // （401 = 网络层已通，渠道在拒绝假 key——这正是"网络层恢复"的证据）
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+            std::env::remove_var("HTTP_PROXY");
+        }
+        g.rebuild_client_for_test();
+        let r2 = g.list_models("https://api.deepseek.com/v1", "sk-dummy").await;
+        let msg = r2.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("401") && !msg.contains("请求渠道失败"),
+            "重建后应拿到渠道 401（网络层恢复），实际: {msg}"
+        );
     }
 }
