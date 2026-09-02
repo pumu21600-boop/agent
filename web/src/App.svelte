@@ -12,6 +12,7 @@
   let savedModels = [];
   let settingsMsg = '';
   let settingsOpen = false;
+  let modelMenuOpen = false;
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -61,17 +62,22 @@
     }
   }
 
-  function providerName() {
-    const p = providers.find((x) => x.id === providerId);
-    return p ? p.name : providerId;
-  }
-
   function onProviderChange() {
     const p = providers.find((x) => x.id === providerId);
     if (p) {
       baseUrl = p.default_base_url || '';
       model = p.default_model || '';
     }
+  }
+
+  async function pickModel(m) {
+    model = m;
+    modelMenuOpen = false;
+    await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: m }),
+    });
   }
 
   function nextId() {
@@ -246,13 +252,8 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand">Agent</div>
-    <div class="side-status">
-      <div class="side-label">当前渠道</div>
-      <div class="side-value" title={baseUrl}>{providerName()}</div>
-      <div class="side-sub">{model || '未选模型'}</div>
-    </div>
     <div class="side-foot">
-      <button class="btn ghost" on:click={() => (settingsOpen = true)}>模型设置</button>
+      <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
     </div>
   </aside>
 
@@ -262,7 +263,6 @@
         <div class="chat-title">对话</div>
         <div class="chat-sub">P1 冒烟 · 单轮无历史</div>
       </div>
-      <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
     </header>
 
     <div class="chat-body" bind:this={chatBody}>
@@ -304,6 +304,27 @@
     </div>
 
     <footer class="chat-input">
+      <div class="model-pick">
+        <button class="btn" on:click={() => (modelMenuOpen = !modelMenuOpen)}>
+          模型：{model || '未选'} ▾
+        </button>
+        {#if modelMenuOpen}
+          <div class="model-menu">
+            {#if savedModels.length === 0}
+              <div class="menu-empty">暂无已保存模型</div>
+            {/if}
+            {#each savedModels as m}
+              <button class="menu-item" class:active={m === model} on:click={() => pickModel(m)}>
+                {m}
+              </button>
+            {/each}
+            <div class="menu-sep"></div>
+            <button class="menu-item" on:click={() => { modelMenuOpen = false; settingsOpen = true; }}>
+              管理模型…
+            </button>
+          </div>
+        {/if}
+      </div>
       <input
         bind:value={input}
         placeholder="输入消息，Enter 发送"
@@ -547,9 +568,58 @@
   .chat-input {
     display: flex;
     gap: 8px;
+    align-items: center;
     padding: 12px 16px;
     border-top: 1px solid #2a2d37;
     background: #1b1d23;
+  }
+  .model-pick {
+    position: relative;
+  }
+  .model-menu {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    min-width: 240px;
+    max-height: 320px;
+    overflow-y: auto;
+    background: #23252d;
+    border: 1px solid #333742;
+    border-radius: 8px;
+    padding: 4px;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+  }
+  .menu-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 7px 10px;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    color: #e6e6eb;
+    font-family: Consolas, monospace;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .menu-item:hover {
+    background: #2a2d37;
+  }
+  .menu-item.active {
+    background: #2f5fd0;
+    color: #fff;
+  }
+  .menu-sep {
+    height: 1px;
+    background: #2f323c;
+    margin: 4px 2px;
+  }
+  .menu-empty {
+    color: #6b707c;
+    font-size: 12px;
+    padding: 8px 10px;
   }
   .chat-input input {
     flex: 1;
