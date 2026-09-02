@@ -16,7 +16,13 @@
   let settingsOpen = false;
   let autoSaveTimer = null;
   let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
-  let approvalMode = localStorage.getItem('approvalMode') || 'auto-edit'; // 审批三档
+  let approvalMode = (() => {
+    // Codex 式三档；旧档名自动迁移
+    const map = { suggest: 'read-only', 'auto-edit': 'auto', 'full-auto': 'auto', local: 'full-access' };
+    const saved = localStorage.getItem('approvalMode');
+    return map[saved] || saved || 'auto';
+  })(); // 审批三档：read-only / auto / full-access
+  let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -39,8 +45,20 @@
   });
 
   afterUpdate(() => {
-    if (chatBody) chatBody.scrollTop = chatBody.scrollHeight;
+    // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断
+    if (chatPinned && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
   });
+
+  function onChatScroll() {
+    if (!chatBody) return;
+    chatPinned = chatBody.scrollTop + chatBody.clientHeight >= chatBody.scrollHeight - 60;
+  }
+
+  function scrollToBottom() {
+    if (!chatBody) return;
+    chatPinned = true;
+    chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
+  }
 
   function norm(url) {
     return (url || '').trim().replace(/\/+$/, '').toLowerCase();
@@ -355,7 +373,7 @@
     <div class="side-approval">
       <label class="side-label">审批档位</label>
       <select
-        class:danger={approvalMode === 'local'}
+        class:danger={approvalMode === 'full-access'}
         bind:value={approvalMode}
         on:change={() => {
           localStorage.setItem('approvalMode', approvalMode);
@@ -367,10 +385,9 @@
           });
         }}
       >
-        <option value="suggest">建议（写/执行都要批）</option>
-        <option value="auto-edit">自动编辑（只批命令）</option>
-        <option value="full-auto">全自动（沙箱内）</option>
-        <option value="local">本机直跑（脱沙箱！）</option>
+        <option value="read-only">只读（改动要批）</option>
+        <option value="auto">自动（沙箱内全自动）</option>
+        <option value="full-access">完全访问（脱沙箱！）</option>
       </select>
     </div>
     <div class="side-foot">
@@ -386,7 +403,7 @@
       </div>
     </header>
 
-    <div class="chat-body" bind:this={chatBody}>
+    <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
       {#if messages.length === 0}
         <div class="empty-hint">输入消息开始对话（Enter 发送）</div>
       {/if}
@@ -448,6 +465,10 @@
         {/if}
       {/each}
     </div>
+
+    {#if !chatPinned}
+      <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">↓ 最新消息</button>
+    {/if}
 
     <footer class="chat-input">
       <div class="model-pick">
@@ -638,6 +659,25 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+    position: relative;
+  }
+  .jump-bottom {
+    position: absolute;
+    bottom: 78px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 6;
+    padding: 6px 14px;
+    border-radius: 16px;
+    border: 1px solid #3d4150;
+    background: #1b1d23;
+    color: #cdd2dd;
+    font-size: 12px;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+  .jump-bottom:hover {
+    border-color: #5a6070;
   }
   .chat-head {
     display: flex;

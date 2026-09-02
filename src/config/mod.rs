@@ -108,7 +108,7 @@ fn default_tool_result_max_chars() -> usize {
     8000
 }
 fn default_approval() -> String {
-    "auto-edit".to_string()
+    "auto".to_string()
 }
 fn default_sandbox_timeout_ms() -> u32 {
     10_000

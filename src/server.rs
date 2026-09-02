@@ -355,17 +355,26 @@ async fn chat(
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
-    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit。写入共享档位供 gate 活读。
-    // local（本机直跑）需 config 总开关，没开就回退 full-auto 并告知前端。
-    let allow_unsandboxed = cfg.allow_unsandboxed;
-    let mut mode = match req.approval_mode.trim() {
-        m @ ("suggest" | "auto-edit" | "full-auto" | "local") => m.to_string(),
-        _ => cfg.default_approval.clone(),
+    // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
+    // full-access 需 config 总开关，没开就回退 auto 并告知前端。
+    let norm = |m: &str| -> String {
+        match m.trim() {
+            "suggest" => "read-only".into(),
+            "auto-edit" | "full-auto" => "auto".into(),
+            "local" | "full-access" => "full-access".into(),
+            other @ ("read-only" | "auto") => other.to_string(),
+            _ => "auto".into(),
+        }
     };
-    if mode == "local" && !allow_unsandboxed {
-        mode = "full-auto".to_string();
+    let allow_unsandboxed = cfg.allow_unsandboxed;
+    let mode = if req.approval_mode.trim().is_empty() {
+        norm(&cfg.default_approval)
+    } else {
+        norm(&req.approval_mode)
+    };
+    if mode == "full-access" && !allow_unsandboxed {
         let _ = tx.send(Ok(json_event(json!({
-            "notice": "本机直跑未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为沙箱内全自动"
+            "notice": "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为沙箱内自动"
         }))));
     }
     if let Ok(mut m) = state.approval_mode.write() {
@@ -465,7 +474,8 @@ struct ChatGate {
 impl agent::ApprovalGate for ChatGate {
     fn needs_approval(&self, danger_level: u8) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
-        if mode == "local" && self.unsandboxed_approval {
+        // 完全访问档默认免审批；unsandboxed_approval=true 时执行类仍要批
+        if (mode == "full-access" || mode == "local") && self.unsandboxed_approval {
             return danger_level >= 2;
         }
         agent::needs_approval(&mode, danger_level)
@@ -473,7 +483,7 @@ impl agent::ApprovalGate for ChatGate {
 
     fn sandbox_enabled(&self) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
-        !(mode == "local" && self.allow_unsandboxed)
+        !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
     }
 
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
@@ -523,9 +533,15 @@ async fn set_approval_mode(
     let Some(mode) = req.get("mode").and_then(Value::as_str) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 mode" })));
     };
-    if !matches!(mode, "suggest" | "auto-edit" | "full-auto" | "local") {
+    if !matches!(mode, "read-only" | "auto" | "full-access" | "suggest" | "auto-edit" | "full-auto" | "local") {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未知档位" })));
     }
+    let mode = match mode {
+        "suggest" => "read-only",
+        "auto-edit" | "full-auto" => "auto",
+        "local" => "full-access",
+        other => other,
+    };
     if let Ok(mut m) = state.approval_mode.write() {
         *m = mode.to_string();
     }

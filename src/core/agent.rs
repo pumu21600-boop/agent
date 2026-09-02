@@ -23,13 +23,16 @@ pub enum AgentEvent {
     StepLimit(u32),
 }
 
-/// 审批三档判定（施工单 005）：suggest=写/执行都要批；auto-edit=只批执行；full-auto=全自动。
-/// local（本机直跑）的审批策略由 gate 按 unsandboxed_approval 配置决定。
+/// 审批三档判定（Codex 式，施工单 005/006）：
+/// - read-only（只读）：查询类自动，写文件/执行命令要批
+/// - auto（自动）：沙箱内全自动（等效 Codex workspace-write）
+/// - full-access（完全访问）：脱沙箱全自动（审批策略由 gate 按 unsandboxed_approval 决定）
+/// 旧档位名 suggest/auto-edit/full-auto/local 在 server 层归一化后映射进来。
 pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
     match mode {
-        "full-auto" | "local" => false,
+        "auto" | "full-access" | "full-auto" | "local" => false,
         "auto-edit" => danger_level >= 2,
-        _ => danger_level >= 1, // suggest（默认兜底）
+        _ => danger_level >= 1, // read-only / suggest（默认兜底）
     }
 }
 
