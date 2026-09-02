@@ -8,11 +8,12 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde_json::{Value, json};
 
-use crate::config::{AgentConfig, ContextConfig, SandboxConfig};
+use crate::config::{AgentConfig, ContextConfig, RecoveryConfig, SandboxConfig};
 use crate::context;
 use crate::core::cancel::CancelFlag;
 use crate::gateway::{ChatOutcome, Gateway, extract_delta};
 use crate::observability::{self, EventType};
+use crate::recovery;
 use crate::tools::{self, ExecConfig};
 
 /// 循环向外发的结构化事件（SSE 转发用）。
@@ -26,6 +27,10 @@ pub enum AgentEvent {
     ContextUsage { tokens: u64, budget: u64, breakdown: context::Breakdown },
     /// 渠道返回的真实用量（P5：缓存命中率展示）
     ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
+    /// 会话快照（P6）：当前全量消息（不含 system），server 收到即落盘
+    Snapshot { messages: Vec<Value> },
+    /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
+    Notice(String),
 }
 
 /// 审批三档判定（Codex 式，施工单 005/006）：
@@ -57,6 +62,12 @@ pub enum LoopOutcome {
     Cancelled,
 }
 
+/// 工具参数压成一行短 reason（写文件等大参数只留头部）。
+fn short_args(args: &str, max_chars: usize) -> String {
+    let flat: String = args.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    flat.chars().take(max_chars).collect()
+}
+
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
 pub async fn run_task(
     gateway: &Arc<Gateway>,
@@ -69,6 +80,7 @@ pub async fn run_task(
     cfg: &AgentConfig,
     sandbox_cfg: &SandboxConfig,
     ctx_cfg: &ContextConfig,
+    rec_cfg: &RecoveryConfig,
     max_output_tokens: Option<u64>,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent),
@@ -76,6 +88,10 @@ pub async fn run_task(
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
     msgs.extend(messages.iter().cloned());
+    // P6 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
+    on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
+    // P6 自动交接：本任务内只触发一次
+    let mut handoff_done = false;
 
     let tools_def = Value::Array(tools::definitions());
     let mut prev_tool_sigs: Vec<String> = Vec::new();
@@ -84,6 +100,7 @@ pub async fn run_task(
         // 每轮模型决策前查取消标志（核心循环刚性检查点）
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
+            on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
             return Ok(LoopOutcome::Cancelled);
         }
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
@@ -105,13 +122,55 @@ pub async fn run_task(
             }
         }
         // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
-        {
-            let breakdown = context::estimate_breakdown(&msgs);
-            on_event(AgentEvent::ContextUsage {
-                tokens: breakdown.total(),
-                budget: ctx_cfg.budget_tokens,
-                breakdown,
-            });
+        let breakdown = context::estimate_breakdown(&msgs);
+        let used = breakdown.total();
+        on_event(AgentEvent::ContextUsage {
+            tokens: used,
+            budget: ctx_cfg.budget_tokens,
+            breakdown,
+        });
+        // P6 自动交接：占用过阈值 → 生成交接文档（每任务一次），下一会话可接续
+        if !handoff_done && used > 0 {
+            let ratio = rec_cfg.handoff_token_ratio.clamp(0.05, 1.0);
+            let threshold = (ctx_cfg.budget_tokens as f32 * ratio) as u64;
+            if threshold > 0 && used >= threshold {
+                handoff_done = true;
+                let pct = ((used as f32 / ctx_cfg.budget_tokens as f32) * 100.0).round() as u64;
+                let ws = tools::workspace_root().to_path_buf();
+                let session_id = observability::get().session_id().to_string();
+                let trigger =
+                    format!("自动：上下文占用 {pct}%（阈值 {}%）", (ratio * 100.0).round() as u64);
+                let task_msgs = msgs[1..].to_vec();
+                let res = tokio::task::spawn_blocking(move || {
+                    recovery::write_handoff(
+                        &ws,
+                        &recovery::HandoffInput {
+                            trigger,
+                            session_id,
+                            messages: Some(task_msgs),
+                        },
+                    )
+                })
+                .await;
+                match res {
+                    Ok(Ok(path)) => {
+                        observability::event(
+                            EventType::State,
+                            json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "auto", "context_pct": pct }),
+                        );
+                        on_event(AgentEvent::Notice(format!(
+                            "上下文占用 {pct}%，已自动生成交接文档 {}",
+                            path.display()
+                        )));
+                    }
+                    Ok(Err(e)) => {
+                        observability::event(EventType::Error, json!({ "message": format!("自动 HANDOFF 生成失败: {e}") }))
+                    }
+                    Err(e) => {
+                        observability::event(EventType::Error, json!({ "message": format!("自动 HANDOFF 任务失败: {e}") }))
+                    }
+                }
+            }
         }
         observability::debug(&format!("[loop] step {step} 调用模型 {model}"));
 
@@ -156,13 +215,19 @@ pub async fn run_task(
         // 没有工具调用 → 纯文本即最终回答（已流式转发），终止
         if turn.tool_calls.is_empty() {
             // 兜底：弱模型/免费模型常只给 reasoning 不给 content，避免前端空回答
-            if turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty() {
+            let final_text = if turn.content.trim().is_empty() && !turn.reasoning.trim().is_empty() {
                 observability::event(
                     EventType::Error,
                     json!({ "message": "模型未输出正文，回退展示思考内容" }),
                 );
                 on_event(AgentEvent::Content(turn.reasoning.clone()));
-            }
+                turn.reasoning.clone()
+            } else {
+                turn.content.clone()
+            };
+            // P6：最终回答写入会话并落盘（与前端看到的一致）
+            msgs.push(json!({ "role": "assistant", "content": final_text }));
+            on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
@@ -209,6 +274,7 @@ pub async fn run_task(
         for call in turn.tool_calls {
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
+                on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
                 return Ok(LoopOutcome::Cancelled);
             }
             observability::event(
@@ -221,17 +287,34 @@ pub async fn run_task(
             // 审批三档：按档位与工具危险等级决定是否等用户点头
             // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
             let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
-            let (content, ok) = if gate.needs_approval(danger) {
-                let approved = gate.ask(&call.name, &call.arguments).await;
-                if !approved {
-                    ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
-                } else {
-                    match tools::execute(&exec_cfg, &call.name, &call.arguments).await {
-                        Ok(s) => (s, true),
-                        Err(e) => (format!("工具执行失败: {e}"), false),
+            let approved = if gate.needs_approval(danger) {
+                gate.ask(&call.name, &call.arguments).await
+            } else {
+                true
+            };
+            let (content, ok) = if !approved {
+                ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
+            } else {
+                // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断
+                if rec_cfg.checkpoint_enabled && danger >= 1 {
+                    let reason = format!("{} {}", call.name, short_args(&call.arguments, 100));
+                    let ws = tools::workspace_root().to_path_buf();
+                    match tokio::task::spawn_blocking(move || recovery::checkpoint(&ws, &reason)).await {
+                        Ok(Ok(Some(cp))) => observability::event(
+                            EventType::State,
+                            json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason }),
+                        ),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => observability::event(
+                            EventType::State,
+                            json!({ "kind": "checkpoint.skipped", "reason": e.to_string() }),
+                        ),
+                        Err(e) => observability::event(
+                            EventType::State,
+                            json!({ "kind": "checkpoint.skipped", "reason": format!("任务失败: {e}") }),
+                        ),
                     }
                 }
-            } else {
                 match tools::execute(&exec_cfg, &call.name, &call.arguments).await {
                     Ok(s) => (s, true),
                     Err(e) => (format!("工具执行失败: {e}"), false),
@@ -247,6 +330,8 @@ pub async fn run_task(
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
             msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));
         }
+        // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
+        on_event(AgentEvent::Snapshot { messages: msgs[1..].to_vec() });
     }
 
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));

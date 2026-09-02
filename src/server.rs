@@ -43,7 +43,10 @@ pub struct AppState {
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
     pub context_cfg: Arc<crate::config::ContextConfig>,
+    pub recovery_cfg: Arc<crate::config::RecoveryConfig>,
     pub system_prompt: Arc<String>,
+    /// 会话落盘（P6）：Snapshot 事件写入，GET/DELETE /api/session 读写
+    pub session: Arc<crate::session::Store>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
@@ -113,6 +116,10 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/approvals", post(decide_approval))
         .route("/api/approval-mode", post(set_approval_mode))
         .route("/api/chat", post(chat))
+        .route("/api/session", get(get_session).delete(clear_session))
+        .route("/api/handoff", post(make_handoff))
+        .route("/api/checkpoints", get(list_checkpoints))
+        .route("/api/checkpoints/restore", post(restore_checkpoint))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
@@ -381,6 +388,8 @@ async fn chat(
     let max_output = s.max_output_tokens;
     let prompt = state.system_prompt.clone();
     let approvals = state.approvals.clone();
+    let session = state.session.clone();
+    let rec_cfg = (*state.recovery_cfg).clone();
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就回退 auto 并告知前端。
     let norm = |m: &str| -> String {
@@ -440,6 +449,7 @@ async fn chat(
             &cfg,
             &sandbox_cfg,
             &ctx_cfg,
+            &rec_cfg,
             max_output,
             &ChatGate {
                 mode: state.approval_mode.clone(),
@@ -474,6 +484,21 @@ async fn chat(
                 AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                     send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                 }
+                // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
+                AgentEvent::Snapshot { messages } => {
+                    let session_id = observability::get().session_id().to_string();
+                    match session.save(&session_id, &messages) {
+                        Ok(()) => observability::event(
+                            EventType::State,
+                            json!({ "kind": "session.saved", "messages": messages.len() }),
+                        ),
+                        Err(e) => observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("会话落盘失败: {e}") }),
+                        ),
+                    }
+                }
+                AgentEvent::Notice(n) => send(json!({ "notice": n }))
             },
         )
         .await;
@@ -611,6 +636,84 @@ async fn decide_approval(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "审批不存在或已过期" })),
         ),
+    }
+}
+
+/// GET /api/session —— 恢复落盘会话（前端启动时拉取重建对话视图）。
+async fn get_session(State(state): State<AppState>) -> Json<Value> {
+    match state.session.load() {
+        Some(f) => Json(json!({ "id": f.id, "updated_at": f.updated_at, "messages": f.messages })),
+        None => Json(json!({ "messages": [] })),
+    }
+}
+
+/// DELETE /api/session —— 新会话（清盘）。
+async fn clear_session(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    match state.session.clear() {
+        Ok(()) => {
+            observability::event(EventType::State, json!({ "kind": "session.cleared" }));
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /api/handoff —— 手动生成交接文档（消息取自会话落盘）。
+async fn make_handoff(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let session_id = observability::get().session_id().to_string();
+    let messages = state.session.load().map(|f| f.messages);
+    let input = crate::recovery::HandoffInput {
+        trigger: "手动（用户请求）".to_string(),
+        session_id,
+        messages,
+    };
+    let res = tokio::task::spawn_blocking(move || crate::recovery::write_handoff(&ws, &input)).await;
+    match res {
+        Ok(Ok(path)) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "manual" }),
+            );
+            (StatusCode::OK, Json(json!({ "ok": true, "path": path.display().to_string() })))
+        }
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// GET /api/checkpoints —— 影子仓库检查点列表（新→旧，最多 20 个）。
+async fn list_checkpoints(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let _ = &state;
+    let ws = crate::tools::workspace_root().to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::recovery::list(&ws, 20)).await {
+        Ok(Ok(list)) => (StatusCode::OK, Json(json!({ "checkpoints": list }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /api/checkpoints/restore —— 工作树回滚到指定检查点（shell 副作用不可回滚）。
+async fn restore_checkpoint(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let _ = &state;
+    let Some(id) = req.get("id").and_then(Value::as_str) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
+    };
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let id = id.to_string();
+    match tokio::task::spawn_blocking(move || crate::recovery::restore(&ws, &id)).await {
+        Ok(Ok(())) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "checkpoint.restored", "id": req.get("id").and_then(Value::as_str).unwrap_or_default() }),
+            );
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
 }
 

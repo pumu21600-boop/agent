@@ -43,9 +43,14 @@
   let seq = 0;
   let chatBody;
 
+  // —— P6 恢复与续命 ——
+  let checkpoints = []; // 影子仓库检查点（新→旧）
+
   onMount(async () => {
     await loadProviders();
     await loadSettings();
+    await restoreSession();
+    loadCheckpoints();
   });
 
   afterUpdate(() => {
@@ -374,6 +379,119 @@
     if (controller) controller.abort();
   }
 
+  // —— P6 恢复与续命 ——
+  function contentText(c) {
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.map((p) => p.text || '').join('');
+    return '';
+  }
+
+  // 启动时拉取落盘会话，重建对话视图（assistant 的 tool_calls + tool 结果配对成工具卡）
+  async function restoreSession() {
+    try {
+      const r = await fetch('/api/session').then((r) => r.json());
+      const msgs = r.messages || [];
+      if (msgs.length) messages = rebuildFromSession(msgs);
+    } catch (e) {
+      // 恢复失败不阻塞使用
+    }
+  }
+
+  function rebuildFromSession(msgs) {
+    const out = [];
+    for (const m of msgs) {
+      if (m.role === 'user') {
+        out.push({ id: nextId(), role: 'user', content: contentText(m.content) });
+      } else if (m.role === 'assistant') {
+        const asst = {
+          id: nextId(),
+          role: 'assistant',
+          content: contentText(m.content),
+          thinking: '',
+          tools: (m.tool_calls || []).map((tc) => ({
+            id: tc.id,
+            name: tc.function?.name || '?',
+            args: tc.function?.arguments || '',
+            status: 'ok',
+            preview: '',
+          })),
+          streaming: false,
+        };
+        out.push(asst);
+      } else if (m.role === 'tool') {
+        const asst = [...out].reverse().find(
+          (x) => x.role === 'assistant' && (x.tools || []).some((t) => t.id === m.tool_call_id)
+        );
+        const t = asst && asst.tools.find((t) => t.id === m.tool_call_id);
+        if (t) t.preview = contentText(m.content).slice(0, 300);
+      }
+    }
+    return out;
+  }
+
+  async function newSession() {
+    if (messages.length && !confirm('清空当前会话？落盘的对话消息会一并删除')) return;
+    await fetch('/api/session', { method: 'DELETE' });
+    messages = [];
+    ctxUsage = { tokens: 0, budget: 0, breakdown: null };
+    apiTotals = { prompt: 0, cached: 0 };
+    checkpoints = [];
+  }
+
+  async function makeHandoff() {
+    try {
+      const r = await fetch('/api/handoff', { method: 'POST' });
+      const d = await r.json();
+      messages = [
+        ...messages,
+        {
+          id: nextId(),
+          role: 'system',
+          content: d.ok ? `📄 交接文档已生成：${d.path}` : `⚠️ HANDOFF 生成失败：${d.error}`,
+        },
+      ];
+    } catch (e) {
+      messages = [...messages, { id: nextId(), role: 'error', content: `[HANDOFF 请求失败] ${e}` }];
+    }
+  }
+
+  async function loadCheckpoints() {
+    try {
+      const r = await fetch('/api/checkpoints').then((r) => r.json());
+      checkpoints = r.checkpoints || [];
+    } catch (e) {
+      checkpoints = [];
+    }
+  }
+
+  async function restoreCheckpoint(cp) {
+    if (
+      !confirm(
+        `回滚到检查点 ${cp.id.slice(0, 7)}？\n此后对已跟踪文件的改动会被覆盖（含删除其后新建的文件）。\nshell 副作用不可回滚。`
+      )
+    )
+      return;
+    try {
+      const r = await fetch('/api/checkpoints/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: cp.id }),
+      });
+      const d = await r.json();
+      messages = [
+        ...messages,
+        {
+          id: nextId(),
+          role: 'system',
+          content: d.ok ? `⏪ 已回滚到检查点 ${cp.id.slice(0, 7)}（${cp.reason}）` : `⚠️ 回滚失败：${d.error}`,
+        },
+      ];
+      loadCheckpoints();
+    } catch (e) {
+      messages = [...messages, { id: nextId(), role: 'error', content: `[回滚请求失败] ${e}` }];
+    }
+  }
+
   // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）
   async function decideApproval(id, approved) {
     patchMessageApproval(id, approved);
@@ -424,6 +542,27 @@
         <option value="full-access">完全访问（脱沙箱！）</option>
       </select>
     </div>
+    <div class="side-p6">
+      <label class="side-label">恢复与续命</label>
+      <div class="side-actions">
+        <button class="btn ghost" on:click={newSession} disabled={streaming}>新会话</button>
+        <button class="btn ghost" on:click={makeHandoff}>生成 HANDOFF</button>
+      </div>
+      {#if checkpoints.length}
+        <label class="side-label">检查点（可回滚）</label>
+        <div class="cp-list">
+          {#each checkpoints as cp (cp.id)}
+            <div class="cp-item">
+              <div class="cp-meta">
+                <span class="cp-hash">{cp.id.slice(0, 7)}</span>
+                <span class="cp-reason" title={cp.reason}>{cp.reason}</span>
+              </div>
+              <button class="cp-btn" on:click={() => restoreCheckpoint(cp)}>回滚</button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
     <div class="side-foot">
       <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
     </div>
@@ -433,7 +572,7 @@
     <header class="chat-head">
       <div>
         <div class="chat-title">对话</div>
-        <div class="chat-sub">P5 上下文工程 · 历史不跨刷新（P6 落盘）</div>
+        <div class="chat-sub">P6 恢复与续命 · 会话落盘可恢复 · 改动前自动检查点</div>
       </div>
     </header>
 
@@ -1018,6 +1157,68 @@
     font-size: 12px;
   }
   .side-approval select.danger {
+    border-color: #b3403a;
+    color: #ff7b72;
+  }
+  .side-p6 {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 14px 12px 0;
+  }
+  .side-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .side-actions .btn {
+    flex: 1;
+    font-size: 12px;
+    padding: 5px 4px;
+  }
+  .cp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .cp-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    background: #1b1d23;
+    border: 1px solid #2f323c;
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+  .cp-meta {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .cp-hash {
+    font-family: monospace;
+    color: #cdd2dd;
+  }
+  .cp-reason {
+    color: #9aa0ae;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cp-btn {
+    flex-shrink: 0;
+    background: transparent;
+    border: 1px solid #3d4150;
+    color: #cdd2dd;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .cp-btn:hover {
     border-color: #b3403a;
     color: #ff7b72;
   }
