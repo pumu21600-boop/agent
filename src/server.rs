@@ -7,7 +7,7 @@
 //! - /api/chat          按已保存设置流式对话
 //! - /cancel /api/cancel 取消标志
 
-use std::{convert::Infallible, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, path::PathBuf, pin::Pin, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -43,6 +43,8 @@ pub struct AppState {
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
     pub system_prompt: Arc<String>,
+    /// 挂起的工具审批：approval id → 决定通道（施工单 005）
+    pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,9 @@ pub struct ChatRequest {
     /// 可选的请求级 key 覆盖（仅内存）；为空则用已保存设置
     #[serde(default)]
     pub api_key: String,
+    /// 审批档位覆盖：suggest / auto-edit / full-auto（缺省用配置默认）
+    #[serde(default)]
+    pub approval_mode: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +102,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/models", post(list_models))
         .route("/api/configs", post(manage_configs))
+        .route("/api/approvals", post(decide_approval))
         .route("/api/chat", post(chat))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
@@ -343,7 +349,14 @@ async fn chat(
     let cancel = state.cancel.clone();
     let s = state.settings.read().unwrap().clone();
     let cfg = (*state.agent_cfg).clone();
+    let sandbox_cfg = (*state.sandbox_cfg).clone();
     let prompt = state.system_prompt.clone();
+    let approvals = state.approvals.clone();
+    // 审批档位：请求级覆盖 > 配置默认；未知值回落 auto-edit
+    let mode = match req.approval_mode.trim() {
+        m @ ("suggest" | "auto-edit" | "full-auto") => m.to_string(),
+        _ => cfg.default_approval.clone(),
+    };
 
     // 新一轮开始：复位取消标志
     cancel.clear();
@@ -376,6 +389,8 @@ async fn chat(
             &history,
             &cancel,
             &cfg,
+            &sandbox_cfg,
+            &ChatGate { mode, pending: approvals, tx: tx.clone(), cancel: cancel.clone() },
             |ev| match ev {
                 AgentEvent::Content(c) => send(json!({ "content": c })),
                 AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
@@ -412,6 +427,81 @@ async fn cancel(State(state): State<AppState>) -> Json<Value> {
 /// GET /api/cancel —— 查询取消标志当前状态。
 async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "cancelled": state.cancel.is_set() }))
+}
+
+/// 审批门（施工单 005）：SSE 发审批请求，oneshot 等用户决定；
+/// 120 秒不决定视为拒绝；用户点「停止」（取消标志）立即按拒绝返回。
+struct ChatGate {
+    mode: String,
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
+    cancel: Arc<CancelFlag>,
+}
+
+impl agent::ApprovalGate for ChatGate {
+    fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
+        self.pending.lock().unwrap().insert(id.clone(), otx);
+        observability::event(
+            EventType::State,
+            json!({ "kind": "approval.requested", "id": id, "tool": tool }),
+        );
+        let _ = self.tx.send(Ok(json_event(json!({
+            "approval_request": { "id": id, "tool": tool, "args": args }
+        }))));
+        let pending = self.pending.clone();
+        let tx = self.tx.clone();
+        let cancel = self.cancel.clone();
+        Box::pin(async move {
+            async fn wait_cancelled(flag: Arc<CancelFlag>) {
+                loop {
+                    if flag.is_set() {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            let decision = tokio::select! {
+                r = orx => r.unwrap_or(false),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
+                _ = wait_cancelled(cancel) => false,
+            };
+            pending.lock().unwrap().remove(&id);
+            observability::event(
+                EventType::State,
+                json!({ "kind": "approval.decided", "id": id, "approved": decision }),
+            );
+            let _ = tx.send(Ok(json_event(json!({ "approval_decided": { "id": id, "approved": decision } }))));
+            decision
+        })
+    }
+}
+
+/// POST /api/approvals —— 用户对审批请求的决定。
+async fn decide_approval(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let Some(id) = req.get("id").and_then(Value::as_str) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
+    };
+    let approved = req.get("approved").and_then(Value::as_bool).unwrap_or(false);
+    let sender = state.approvals.lock().unwrap().remove(id);
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(approved);
+            (StatusCode::OK, Json(json!({ "ok": true })))
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "审批不存在或已过期" })),
+        ),
+    }
 }
 
 /// GET /api/sandbox/selftest —— 跑快速探针（真实拉起受限进程），逐项返回结果。

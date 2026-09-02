@@ -4,15 +4,15 @@
 //! 硬约束：步数上限（cfg.max_steps）；每步开始与每个流式分片前查取消标志。
 //! thought / tool_call / tool_result 全量落 JSONL；on_event 把结构化事件转给前端。
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde_json::{Value, json};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, SandboxConfig};
 use crate::core::cancel::CancelFlag;
 use crate::gateway::{ChatOutcome, Gateway, extract_delta};
 use crate::observability::{self, EventType};
-use crate::tools;
+use crate::tools::{self, ExecConfig};
 
 /// 循环向外发的结构化事件（SSE 转发用）。
 pub enum AgentEvent {
@@ -21,6 +21,22 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     ToolResult { name: String, ok: bool, preview: String },
     StepLimit(u32),
+}
+
+/// 审批三档判定（施工单 005）：suggest=写/执行都要批；auto-edit=只批执行；full-auto=全自动。
+pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
+    match mode {
+        "full-auto" => false,
+        "auto-edit" => danger_level >= 2,
+        _ => danger_level >= 1, // suggest（默认兜底）
+    }
+}
+
+/// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
+pub trait ApprovalGate: Send + Sync {
+    fn mode(&self) -> &str;
+    /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
+    fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +55,8 @@ pub async fn run_task(
     messages: &[Value],
     cancel: &CancelFlag,
     cfg: &AgentConfig,
+    sandbox_cfg: &SandboxConfig,
+    gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent),
 ) -> anyhow::Result<LoopOutcome> {
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
@@ -136,6 +154,7 @@ pub async fn run_task(
         }));
 
         // 逐个执行工具
+        let exec_cfg = ExecConfig { sandbox: sandbox_cfg.clone(), max_chars: cfg.tool_result_max_chars };
         for call in turn.tool_calls {
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
@@ -148,10 +167,26 @@ pub async fn run_task(
             on_event(AgentEvent::ToolCall { name: call.name.clone(), args: call.arguments.clone() });
             observability::debug(&format!("[loop] 工具 {} 参数 {}", call.name, call.arguments));
 
-            let (content, ok) = match tools::execute(&call.name, &call.arguments, cfg.tool_result_max_chars) {
-                Ok(s) => (s, true),
-                Err(e) => (format!("工具执行失败: {e}"), false),
+            // 审批三档：按档位与工具危险等级决定是否等用户点头
+            // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
+            let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
+            let (content, ok) = if needs_approval(gate.mode(), danger) {
+                let approved = gate.ask(&call.name, &call.arguments).await;
+                if !approved {
+                    ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
+                } else {
+                    match tools::execute(&exec_cfg, &call.name, &call.arguments).await {
+                        Ok(s) => (s, true),
+                        Err(e) => (format!("工具执行失败: {e}"), false),
+                    }
+                }
+            } else {
+                match tools::execute(&exec_cfg, &call.name, &call.arguments).await {
+                    Ok(s) => (s, true),
+                    Err(e) => (format!("工具执行失败: {e}"), false),
+                }
             };
+
             let preview: String = content.chars().take(300).collect();
             observability::event(
                 EventType::ToolResult,
