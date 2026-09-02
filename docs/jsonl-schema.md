@@ -79,6 +79,12 @@
 | `approval.requested` | 工具调用待审批（P4） | `id`、`tool` |
 | `approval.decided` | 审批决定（P4） | `id`、`approved` |
 | `context.compacted` | 上下文超预算触发裁剪（P5） | `step`、`archived_tools`、`folded_messages`、`tokens_before`、`tokens_after` |
+| `checkpoint.created` | 影子仓库检查点已提交（P6） | `id`、`ts`、`reason`（工具名+参数头） |
+| `checkpoint.restored` | 工作树回滚到检查点（P6） | `id` |
+| `checkpoint.skipped` | 检查点失败/停用，不阻断工具（P6） | `reason` |
+| `session.saved` | 会话消息落盘（P6，每步/终止时） | `messages`（条数） |
+| `session.cleared` | 新会话清盘（P6） | 无 |
+| `handoff.written` | 交接文档已生成（P6） | `path`、`trigger`（auto/manual）、`context_pct`（auto 时） |
 
 ### 4.5 error —— 错误
 

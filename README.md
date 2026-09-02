@@ -1,7 +1,21 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P5 完成**（上下文工程 v1），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+当前进度：**P6 完成**（恢复与续命），排产见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
+## P6 恢复与续命
+
+- **影子仓库检查点**：danger≥1 工具（write_file/shell/git）审批通过后、执行前，把真仓库已跟踪文件
+  提交进 `<workspace>/.agent/shadow`（独立 git dir，只跟踪 `git ls-files` + 排除目录 + 10MB 上限，
+  pathspec 走文件防命令行超长）；失败只记日志绝不阻断工具。
+- **回滚**：GET /api/checkpoints 列表、POST /api/checkpoints/restore 恢复工作树到检查点
+  （`reset --hard`，含删除其后新建的已跟踪文件）；shell 副作用不可回滚，绝不碰真仓库 HEAD。
+- **会话落盘**：核心循环任务开始/每步工具回填完/终止时发 `Snapshot` 事件 → `logs/session.json`
+  原子写；前端启动拉 GET /api/session 重建对话（含工具卡片）；「新会话」= DELETE /api/session。
+- **HANDOFF 交接**：手动（侧栏按钮 / POST /api/handoff）或自动（上下文占用 ≥
+  `[recovery].handoff_token_ratio` 默认 80% 时每任务一次）生成 `<workspace>/HANDOFF.md`，
+  头部强制项目名/git remote/commit/时间戳，正文含最近请求、最后回答摘要、工具计数。
+- 配置：`config.toml [recovery]`（checkpoint_enabled / handoff_token_ratio）
 
 ## P5 上下文工程 v1
 
@@ -40,7 +54,7 @@
 - 硬护栏：`config.toml [agent] max_steps`（默认 8）步数上限；每步与每个流式分片检查取消标志，「停止」立即中断
 - system prompt 外置于 `prompts/system.md`（数据驱动）
 - SSE 事件：`content` / `reasoning` / `tool_call` / `tool_result` / `step_limit`；工具卡片在聊天界面内渲染
-- 多轮对话：前端携带历史 messages（user/assistant），服务端无状态；刷新即清空（P6 会话落盘前如此）
+- 多轮对话：前端携带历史 messages（user/assistant）；P6 起服务端同时落盘 `logs/session.json`，刷新/重启可恢复
 
 ## 目录结构
 
@@ -54,7 +68,10 @@ agent/
 │   ├── config/           # config.toml + settings 持久化（DPAPI 存 key）
 │   ├── observability/    # JSONL 日志（6 类事件）
 │   ├── sandbox/          # 执行沙箱（P3：Job Objects + 受限 token + 探针）
-│   └── tools/ plugin/ memory/ session/ recovery/ context/  # 占位，后续单实现
+│   ├── context/          # 上下文工程（P5：token 估算/压缩/裁剪）
+│   ├── recovery/         # 恢复与续命（P6：影子仓库检查点 + HANDOFF）
+│   ├── session/          # 会话管理（P6：落盘 + 恢复）
+│   └── tools/ plugin/ memory/  # 工具系统（P4）/ MCP+插件（占位）/ 记忆（P7 占位）
 ├── web/                  # Svelte + Vite 聊天界面（侧栏 + 对话 + 设置弹窗）
 ├── providers.json        # 供应商预设（数据驱动）
 ├── docs/                 # jsonl-schema.md / ROADMAP.md / workorders/
@@ -107,6 +124,11 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/cancel` | 置位全局取消标志 |
 | GET | `/api/cancel` | 查询取消标志（`{"cancelled":bool}`） |
 | GET | `/api/health` | 健康检查 |
+| GET | `/api/session` | 恢复落盘会话（`{id, updated_at, messages}`） |
+| DELETE | `/api/session` | 新会话（清盘） |
+| POST | `/api/handoff` | 手动生成交接文档 HANDOFF.md |
+| GET | `/api/checkpoints` | 影子仓库检查点列表（新→旧，≤20） |
+| POST | `/api/checkpoints/restore` | 工作树回滚到指定检查点（body: `{id}`） |
 
 ## 无 key 冒烟（可选）
 
