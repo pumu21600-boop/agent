@@ -353,6 +353,17 @@ pub async fn run_task(
             on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
         }
 
+        // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入
+        if turn.finish_reason.as_deref() == Some("length") {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "model.truncated", "step": step, "max_output_tokens": max_output_tokens }),
+            );
+            on_event(AgentEvent::Notice(
+                "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。".to_string(),
+            ));
+        }
+
         // 思考完整段落落 thought（分片级已记 model_chunk）
         if !turn.reasoning.is_empty() {
             observability::event(EventType::Thought, json!({ "step": step, "text": turn.reasoning }));

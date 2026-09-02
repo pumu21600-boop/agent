@@ -88,6 +88,8 @@
 | `handoff.written` | 交接文档已生成（P6） | `path`、`trigger`（auto/manual）、`context_pct`（auto 时） |
 | `memory.summarized` | 滚动摘要已生成并注入（P7） | `step`、`chars` |
 | `memory.summary_skipped` | 摘要调用失败，降级保留占位符（P7） | `step`、`note` |
+| `model.truncated` | 模型输出被 max_tokens 截断（P7.6），SSE 已提示用户 | `step`、`max_output_tokens` |
+| `gateway.retry_429` | 渠道 429 退避重试中（P7.5） | `attempt`、`wait_ms` |
 
 ### 4.5 error —— 错误
 

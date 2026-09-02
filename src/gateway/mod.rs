@@ -45,6 +45,8 @@ pub struct AssistantTurn {
     /// 渠道返回的用量（P5：缓存命中率展示用）
     pub prompt_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// 结束原因（P7.6："length"=输出被 max_tokens 截断，核心循环据此提示用户）
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +358,7 @@ impl Gateway {
                     }
                     if let Some(f) = &delta.finish {
                         payload["finish_reason"] = json!(f);
+                        turn.finish_reason = Some(f.clone());
                     }
                     let tc_arr = chunk
                         .pointer("/choices/0/delta/tool_calls")
