@@ -8,6 +8,7 @@
   let model = '';
   let apiKey = '';
   let hasKey = false;
+  let keyHint = '';
   let savedModels = [];
   let settingsMsg = '';
 
@@ -39,6 +40,7 @@
     model = s.model || '';
     savedModels = s.models || [];
     hasKey = !!s.has_key;
+    keyHint = s.key_hint || '';
     if (!baseUrl) applyDefault();
   }
 
@@ -114,6 +116,7 @@
     }
     savedModels = list;
     hasKey = !!d.has_key;
+    keyHint = d.key_hint || '';
     apiKey = '';
     modalOpen = false;
     settingsMsg = `已保存 ${list.length} 个模型`;
@@ -137,6 +140,7 @@
       return;
     }
     hasKey = !!d.has_key;
+    keyHint = d.key_hint || '';
     apiKey = '';
     settingsMsg = '已保存';
   }
@@ -227,7 +231,7 @@
         <input
           bind:value={apiKey}
           type="password"
-          placeholder={hasKey ? '已保存（留空不修改）' : 'sk-...'}
+          placeholder={hasKey ? `已保存(…${keyHint})，留空不修改` : 'sk-...'}
         />
       </label>
       <label>

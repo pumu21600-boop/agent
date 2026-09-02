@@ -121,9 +121,20 @@ async fn list_providers() -> Json<Value> {
     Json(json!({ "providers": list }))
 }
 
+/// 已保存 key 的尾 4 位提示（完整 key 不出内存、不落日志）。
+fn key_hint_of(key: Option<String>) -> String {
+    key.as_ref()
+        .map(|k| {
+            let n = k.chars().count();
+            if n > 4 { k.chars().skip(n - 4).collect::<String>() } else { k.clone() }
+        })
+        .unwrap_or_default()
+}
+
 async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap().clone();
-    let has_key = s.get_key().is_some();
+    let saved_key = s.get_key();
+    let has_key = saved_key.is_some();
     Json(json!({
         "provider_id": s.provider_id,
         "base_url": s.base_url,
@@ -132,6 +143,7 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
         "effective_model": s.effective_model(),
         "models": s.models,
         "has_key": has_key,
+        "key_hint": key_hint_of(saved_key),
         "env_key": std::env::var("DEEPSEEK_API_KEY").is_ok(),
     }))
 }
@@ -179,7 +191,10 @@ async fn put_settings(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": s.provider_id, "model": s.effective_model() }),
     );
-    (StatusCode::OK, Json(json!({ "ok": true, "has_key": s.get_key().is_some() })))
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "has_key": s.get_key().is_some(), "key_hint": key_hint_of(s.get_key()) })),
+    )
 }
 
 /// 拉取渠道模型列表。请求里没给 base_url/key 就用已保存设置。
@@ -383,7 +398,9 @@ async function loadSettings() {
   $('baseUrl').value = s.base_url || $('provider').selectedOptions[0].dataset.base || '';
   savedModels = s.models || [];
   setModelSelect(savedModels, s.model || '');
-  $('key').placeholder = s.has_key ? '已保存（留空不修改）' : 'sk-...';
+  $('key').placeholder = s.has_key
+    ? '已保存(…' + (s.key_hint || '') + ')，留空不修改'
+    : 'sk-...';
 }
 
 let fetchedModels = [];
