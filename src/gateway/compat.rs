@@ -166,12 +166,12 @@ pub fn resolve(
         };
     }
 
-    // 端点归属判定（上游同款：只看 provider/域名，不看模型 id——
-    // 中转挂 deepseek 官方模型不改变端点契约，想要 deepseek 形态须显式覆盖）
-    let is_deepseek = class == "native" && (provider_id == Some("deepseek") || host_has(base_url.unwrap_or(""), "deepseek.com"));
+    // 端点归属判定：选了什么供应商就用什么规范（用户定调）
+    // 无论 Base URL 是否是中转代理，只要供应商选定了，端点契约严格对齐该供应商！
+    let is_deepseek = provider_id == Some("deepseek") || (class == "native" && host_has(base_url.unwrap_or(""), "deepseek.com"));
     let is_xiaomi = class == "native" && host_has(base_url.unwrap_or(""), "xiaomi");
-    let is_zai = class == "native" && (provider_id == Some("zhipu") || host_has(base_url.unwrap_or(""), "bigmodel.cn"));
-    let is_qwen = class == "native" && (provider_id == Some("qwen") || host_has(base_url.unwrap_or(""), "aliyuncs.com"));
+    let is_zai = provider_id == Some("zhipu") || provider_id == Some("doubao") || (class == "native" && (host_has(base_url.unwrap_or(""), "bigmodel.cn") || host_has(base_url.unwrap_or(""), "volces.com")));
+    let is_qwen = provider_id == Some("qwen") || provider_id == Some("hunyuan") || (class == "native" && (host_has(base_url.unwrap_or(""), "aliyuncs.com") || host_has(base_url.unwrap_or(""), "tencent.com")));
 
     let thinking_format = if is_deepseek || is_xiaomi {
         ThinkingFormat::Deepseek
@@ -260,11 +260,17 @@ mod tests {
     }
 
     #[test]
-    fn doubao_needs_preset_override() {
-        // volces.com 在官方域名表里 → native，但火山方舟的思考形态靠预设 zai 覆盖
+    fn doubao_and_provider_dictate_protocol() {
+        // 豆包供应商直接识别为 Zai 形态
         let c = resolve(Some("doubao"), Some("https://ark.cn-beijing.volces.com/api/v3"), "doubao-seed-1.6", None);
-        assert_eq!(c.thinking_format, ThinkingFormat::Openai, "探测不出 → openai");
-        let c = resolve(Some("doubao"), Some("https://ark.cn-beijing.volces.com/api/v3"), "doubao-seed-1.6", Some(ThinkingFormat::Zai));
         assert_eq!(c.thinking_format, ThinkingFormat::Zai);
+
+        // 选了什么供应商就用什么规范：即便地址是第三方中转，只要选了 deepseek，就走 deepseek 契约
+        let c = resolve(Some("deepseek"), Some("https://token.sensenova.cn/v1"), "deepseek-v4-flash", None);
+        assert_eq!(c.thinking_format, ThinkingFormat::Deepseek);
+        assert!(c.requires_reasoning_content_replay);
+
+        let c = resolve(Some("qwen"), Some("https://relay.custom.io/v1"), "qwen-max", None);
+        assert_eq!(c.thinking_format, ThinkingFormat::Qwen);
     }
 }

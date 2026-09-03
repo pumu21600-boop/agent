@@ -378,17 +378,6 @@
     };
   }
 
-  function inferProtocol(mId) {
-    const id = (mId || '').toLowerCase();
-    if (id.includes('deepseek') || id.includes('r1')) return 'deepseek';
-    if (id.includes('qwen') || id.includes('hunyuan')) return 'qwen';
-    if (id.includes('glm') || id.includes('doubao')) return 'zai';
-    if (id.includes('gpt-5') || id.includes('o1') || id.includes('o3') || id.includes('o4')) return 'openai';
-    if (id.includes('claude')) return 'claude';
-    if (id.includes('kimi') || id.includes('moonshot')) return 'moonshot';
-    return null;
-  }
-
   function isChecked(m) {
     return savedModels.includes(m);
   }
@@ -435,15 +424,7 @@
     modelMenuOpen = false;
     const caps = inferCapabilities(m);
     capabilities = caps;
-    const payload = { model: m, capabilities: caps };
-    if (!thinkingStyleOverride) {
-      const proto = inferProtocol(m);
-      if (proto) {
-        payload.thinking_style = proto;
-        thinkingStyleOverride = proto;
-      }
-    }
-    await sendSettings(payload);
+    await sendSettings({ model: m, capabilities: caps });
   }
 
   // —— 对话 ——
@@ -865,8 +846,7 @@
                 on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
                 title="审批档位：控制工具执行要不要先问你"
               >
-                <span class="pill-icon">{approvalMode === 'full-access' ? '🛡' : '🛡'}</span>
-                {APPROVAL_LABELS[approvalMode] || approvalMode}
+                <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalMode] || approvalMode}
                 <span class="caret">▾</span>
               </button>
               {#if approvalMenuOpen}
@@ -956,8 +936,7 @@
                 on:click={() => (thinkMenuOpen = !thinkMenuOpen)}
                 title={thinkHint}
               >
-                <span class="pill-icon">🧠</span>
-                {THINK_LABELS[thinking] || '默认'}
+                <span class="pill-label">思考:</span> {THINK_LABELS[thinking] || '默认'}
                 <span class="caret">▾</span>
               </button>
               {#if thinkMenuOpen}
@@ -1143,42 +1122,6 @@
       </div>
 
       <div class="field">
-        <label>参数与思考协议规范（中转渠道可在此一键对齐官方规范）</label>
-        <div class="sub-row">
-          <select
-            bind:value={thinkingStyleOverride}
-            on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
-          >
-            <option value={null}>自动探测（Auto，按端点域名与模型名自动推导）</option>
-            <option value="deepseek">🐳 DeepSeek 规范：thinking 对象 + 保留 reasoning_content 回放</option>
-            <option value="qwen">🔷 通义千问 (Qwen) 规范：enable_thinking 布尔 + 过滤空消息</option>
-            <option value="zai">🟣 智谱 GLM / 豆包 规范：thinking 对象参数</option>
-            <option value="openai">🟢 OpenAI / GPT-5 规范：reasoning_effort 档位 + max_completion_tokens</option>
-            <option value="claude">🟧 Claude 兼容规范：保证 max_tokens 必填 + thinking budget</option>
-            <option value="moonshot">🌙 Moonshot (Kimi) 规范：长文本与思考回放白名单</option>
-            <option value="qwen-chat-template">💻 本地模板规范：chat_template_kwargs.enable_thinking</option>
-            <option value="none">⚪ 纯净极简规范 (None)：不发任何扩展思考参数（防止中转报错）</option>
-          </select>
-        </div>
-        <div class="param-hint">
-          当前生效协议：<strong>{thinkingStyle}</strong>。
-          {#if thinkingStyle === 'openai'}
-            OpenAI 规范：档位经网关按模型 id 解析，gpt-5 无 "none"，gpt-5.1+ 关闭发 "none"，新模型自动使用 max_completion_tokens
-          {:else if thinkingStyle === 'deepseek'}
-            DeepSeek 规范：发送 thinking: enabled/disabled 对象，历史消息自动保留带回 reasoning_content
-          {:else if thinkingStyle === 'qwen'}
-            通义千问规范：发送 enable_thinking 布尔，自动过滤空 content 消息
-          {:else if thinkingStyle === 'zai'}
-            GLM/豆包规范：发送 thinking: enabled/disabled 对象
-          {:else if thinkingStyle === 'none'}
-            极简模式：不发任何额外思考参数，由渠道模型自身行为决定
-          {:else if thinkingStyle === 'auto'}
-            端点自适应：官方域名自动识别；若是第三方中转，强烈建议在上面手动选择对应的官方规范
-          {/if}
-        </div>
-      </div>
-
-      <div class="field">
         <label>模型能力标记（多模态转接与工具调用依据）</label>
         <div class="caps-row">
           <label class="cap-check">
@@ -1187,7 +1130,7 @@
               bind:checked={capabilities.tools}
               on:change={() => autoSave({ capabilities }, 0)}
             />
-            🛠️ 工具调用
+            工具调用
           </label>
           <label class="cap-check">
             <input
@@ -1195,7 +1138,7 @@
               bind:checked={capabilities.vision}
               on:change={() => autoSave({ capabilities }, 0)}
             />
-            👁️ 图片解析
+            图片解析
           </label>
           <label class="cap-check">
             <input
@@ -1203,7 +1146,7 @@
               bind:checked={capabilities.video}
               on:change={() => autoSave({ capabilities }, 0)}
             />
-            🎥 视频解析
+            视频解析
           </label>
           <label class="cap-check">
             <input
@@ -1211,7 +1154,7 @@
               bind:checked={capabilities.audio}
               on:change={() => autoSave({ capabilities }, 0)}
             />
-            🎙️ 音频解析
+            音频解析
           </label>
         </div>
         <div class="param-hint">
@@ -1223,7 +1166,7 @@
         <label>角色分工与多模态转接（专职专家席位）</label>
         <div class="roles-grid">
           <div class="role-item">
-            <span class="role-name">📝 会话摘要 (Summary)</span>
+            <span class="role-name">会话摘要 (Summary)</span>
             <select
               bind:value={roles.summary}
               on:change={() => autoSave({ roles }, 0)}
@@ -1235,7 +1178,7 @@
             </select>
           </div>
           <div class="role-item">
-            <span class="role-name">🏷️ 标题生成 (Title)</span>
+            <span class="role-name">标题生成 (Title)</span>
             <select
               bind:value={roles.title}
               on:change={() => autoSave({ roles }, 0)}
@@ -1247,7 +1190,7 @@
             </select>
           </div>
           <div class="role-item">
-            <span class="role-name">👁️ 图片理解专家 (Vision)</span>
+            <span class="role-name">图片理解专家 (Vision)</span>
             <select
               bind:value={roles.vision}
               on:change={() => autoSave({ roles }, 0)}
@@ -1259,7 +1202,7 @@
             </select>
           </div>
           <div class="role-item">
-            <span class="role-name">🎥 视频理解专家 (Video)</span>
+            <span class="role-name">视频理解专家 (Video)</span>
             <select
               bind:value={roles.video}
               on:change={() => autoSave({ roles }, 0)}
@@ -1271,7 +1214,7 @@
             </select>
           </div>
           <div class="role-item">
-            <span class="role-name">🎙️ 音频理解专家 (Audio)</span>
+            <span class="role-name">音频理解专家 (Audio)</span>
             <select
               bind:value={roles.audio}
               on:change={() => autoSave({ roles }, 0)}
@@ -1345,9 +1288,9 @@
             <input type="checkbox" checked={isChecked(m)} on:change={() => toggleModel(m)} />
             <span class="m-name">{m}</span>
             <span class="m-caps">
-              {#if caps.vision}<span class="m-tag" title="支持图片理解">👁️图片</span>{/if}
-              {#if caps.video}<span class="m-tag" title="支持视频理解">🎥视频</span>{/if}
-              {#if caps.audio}<span class="m-tag" title="支持音频理解">🎙️音频</span>{/if}
+              {#if caps.vision}<span class="m-tag" title="支持图片理解">图片</span>{/if}
+              {#if caps.video}<span class="m-tag" title="支持视频理解">视频</span>{/if}
+              {#if caps.audio}<span class="m-tag" title="支持音频理解">音频</span>{/if}
             </span>
           </label>
         {/each}
