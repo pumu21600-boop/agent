@@ -12,6 +12,8 @@ use super::effort;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingFormat {
+    /// 极简/禁用：绝不向端点发送任何思考相关参数
+    None,
     /// OpenAI 原生：reasoning_effort 档位（经 effort::resolve 按模型降级；无法表达"关"时不发）
     #[default]
     Openai,
@@ -29,6 +31,7 @@ pub enum ThinkingFormat {
 impl ThinkingFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ThinkingFormat::None => "none",
             ThinkingFormat::Openai => "openai",
             ThinkingFormat::Deepseek => "deepseek",
             ThinkingFormat::Zai => "zai",
@@ -38,6 +41,7 @@ impl ThinkingFormat {
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
+            "none" => Some(Self::None),
             "openai" => Some(Self::Openai),
             "deepseek" => Some(Self::Deepseek),
             "zai" => Some(Self::Zai),

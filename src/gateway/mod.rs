@@ -117,8 +117,15 @@ pub fn build_body_with_compat(
     }
 
     // —— 思考参数：按 thinkingFormat 分支（对齐 OpenClaw buildOpenAICompletionsParams）——
-    let requested = params.thinking.as_deref();
+    // 关键保底：默认档位（None 或空串）绝不向任何网关发送任何思考字段，坚决尊重渠道自身行为
+    let requested = params
+        .thinking
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match compat.thinking_format {
+        // 极简模式：不向端点发送任何思考相关参数
+        ThinkingFormat::None => {}
         // zai（智谱 GLM/豆包 Seed）：{type:enabled|disabled}
         ThinkingFormat::Zai => {
             if let Some(t) = requested {
@@ -856,9 +863,23 @@ mod tests {
         p.thinking = Some("high".into());
         let b = build_body("mystery-model", &msgs, true, &p, None);
         assert_eq!(b["reasoning_effort"], json!("high"));
-        // 默认不发任何思考参数
-        let b = build_body("deepseek-chat", &msgs, true, &ChatParams::default(), None);
-        assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none() && b.get("enable_thinking").is_none());
+        // 默认不发任何思考参数（无论 None、空串、全空格，全网关均不产生任何思考字段）
+        for empty in [None, Some("".to_string()), Some("   ".to_string())] {
+            let mut p = ChatParams::from_preset(crate::gateway::providers::find("deepseek").unwrap());
+            p.thinking = empty.clone();
+            let b = build_body("deepseek-v4-flash", &msgs, true, &p, None);
+            assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none(), "DeepSeek 默认不注入参数");
+
+            let mut p = ChatParams::from_preset(crate::gateway::providers::find("qwen").unwrap());
+            p.thinking = empty.clone();
+            let b = build_body("qwen3.8-flash", &msgs, true, &p, None);
+            assert!(b.get("enable_thinking").is_none() && b.get("thinking").is_none(), "Qwen 默认不注入参数");
+
+            let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
+            p.thinking = empty.clone();
+            let b = build_body("glm-5.2", &msgs, true, &p, None);
+            assert!(b.get("thinking").is_none(), "Zai 默认不注入参数");
+        }
         // 采样参数：有值才发
         let mut p = ChatParams::default();
         p.temperature = Some(0.3);

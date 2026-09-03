@@ -198,7 +198,7 @@ fn build_chat_params(
 fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
     use gateway::compat::ThinkingFormat as TF;
     match style {
-        Some("none") => p.thinking_format = Some(TF::Openai),
+        Some("none") => p.thinking_format = Some(TF::None),
         // 旧词表别名（P8.3 设置残留）：thinking_object=GLM 式对象 → zai；
         // reasoning_effort=档位 → openai；enable_thinking（_budget）=布尔 → qwen
         Some("thinking_object") => p.thinking_format = Some(TF::Zai),
