@@ -50,7 +50,22 @@ fn first_user_title(messages: &[Value]) -> String {
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
         .filter_map(|m| m.get("content").and_then(Value::as_str))
         .find(|s| !s.trim().is_empty())
-        .map(|s| s.chars().take(30).collect::<String>())
+        .map(|s| {
+            let mut s = s.trim();
+            // 剥离形如 [Audio understanding...] 或 [audio omitted...] 的前置投影块
+            while s.starts_with('[') {
+                if let Some(end_idx) = s.find(']') {
+                    s = s[end_idx + 1..].trim();
+                } else {
+                    break;
+                }
+            }
+            if s.is_empty() {
+                "媒体理解对话".to_string()
+            } else {
+                s.chars().take(30).collect::<String>()
+            }
+        })
         .unwrap_or_else(|| "新对话".to_string())
 }
 

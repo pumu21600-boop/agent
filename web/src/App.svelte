@@ -56,6 +56,148 @@
   let seq = 0;
   let chatBody;
 
+  // —— P8.5 多模态媒体附件与大图预览 ——
+  let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
+  let fileInput; // 隐藏文件选择器引用
+  let previewImageModal = null; // 放大预览的图片 dataUrl
+
+  function fmtBytes(b) {
+    if (!b) return '0B';
+    if (b < 1024) return `${b}B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)}KB`;
+    return `${(b / (1024 * 1024)).toFixed(1)}MB`;
+  }
+
+  function onFileSelect(e) {
+    const files = e.target.files;
+    if (!files || !files.length) return;
+    for (let i = 0; i < files.length; i++) {
+      addAttachmentFile(files[i]);
+    }
+    e.target.value = '';
+  }
+
+  function addAttachmentFile(file) {
+    if (file.size > 25 * 1024 * 1024) {
+      alert(`文件「${file.name}」超过 25MB 上限`);
+      return;
+    }
+    // 对图片附件进行前端等比缩放与优质压缩（最长边 1536px，符合各大视觉模型规范且规避反代请求体体积限制）
+    if (file.type && file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const rawData = ev.target.result;
+        const img = new Image();
+        img.onload = () => {
+          const maxDim = 1536;
+          let w = img.width;
+          let h = img.height;
+          if (w > maxDim || h > maxDim) {
+            if (w > h) {
+              h = Math.round((h * maxDim) / w);
+              w = maxDim;
+            } else {
+              w = Math.round((w * maxDim) / h);
+              h = maxDim;
+            }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          // 转为 0.85 压缩率的 jpeg，体积极小（百KB量级）且画质清晰
+          const compressedData = canvas.toDataURL('image/jpeg', 0.85);
+          pendingAttachments = [
+            ...pendingAttachments,
+            {
+              name: file.name,
+              mime: 'image/jpeg',
+              data: compressedData,
+              size: Math.round(compressedData.length * 0.75),
+            },
+          ];
+        };
+        img.src = rawData;
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    // 非图片文件（视频/音频/其他）走标准直读
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      let mime = file.type || '';
+      if (!mime || mime === 'application/octet-stream') {
+        const n = file.name.toLowerCase();
+        if (n.endsWith('.mp3')) mime = 'audio/mp3';
+        else if (n.endsWith('.wav')) mime = 'audio/wav';
+        else if (n.endsWith('.ogg')) mime = 'audio/ogg';
+        else if (n.endsWith('.m4a')) mime = 'audio/m4a';
+        else if (n.endsWith('.aac')) mime = 'audio/aac';
+        else if (n.endsWith('.flac')) mime = 'audio/flac';
+        else if (n.endsWith('.mp4')) mime = 'video/mp4';
+        else if (n.endsWith('.webm')) mime = 'video/webm';
+        else if (n.endsWith('.mov')) mime = 'video/quicktime';
+        else mime = 'application/octet-stream';
+      }
+      pendingAttachments = [
+        ...pendingAttachments,
+        {
+          name: file.name,
+          mime,
+          data: ev.target.result,
+          size: file.size,
+        },
+      ];
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function removeAttachment(index) {
+    pendingAttachments = pendingAttachments.filter((_, i) => i !== index);
+  }
+
+  function handlePaste(e) {
+    const files = e.clipboardData && e.clipboardData.files;
+    if (files && files.length > 0) {
+      let hasMedia = false;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.type.startsWith('image/') || file.type.startsWith('video/') || file.type.startsWith('audio/') || file.size > 0) {
+          hasMedia = true;
+          addAttachmentFile(file);
+        }
+      }
+      if (hasMedia) {
+        e.preventDefault();
+        return;
+      }
+    }
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const type = items[i].type || '';
+      if (type.startsWith('image/') || type.startsWith('video/') || type.startsWith('audio/') || items[i].kind === 'file') {
+        const file = items[i].getAsFile();
+        if (file) {
+          e.preventDefault();
+          addAttachmentFile(file);
+        }
+      }
+    }
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (files && files.length) {
+      for (let i = 0; i < files.length; i++) {
+        addAttachmentFile(files[i]);
+      }
+    }
+  }
+
   // —— P6 恢复与续命 / P6.1 多会话 ——
   let sessions = []; // 会话列表（新→旧）
   let currentSessionId = null; // 当前会话（null=下次发送自动新建）
@@ -372,9 +514,9 @@
     const id = (mId || '').toLowerCase();
     return {
       tools: true,
-      vision: id.includes('vl') || id.includes('vision') || id.includes('gemini') || id.includes('gpt-4o') || id.includes('claude-3') || id.includes('omni'),
-      video: id.includes('video') || id.includes('gemini-2'),
-      audio: id.includes('audio') || id.includes('realtime') || id.includes('whisper'),
+      vision: id.includes('vl') || id.includes('vision') || id.includes('gemini') || id.includes('gpt-4o') || id.includes('claude-3') || id.includes('omni') || id.includes('mimo'),
+      video: id.includes('video') || id.includes('gemini-2') || id.includes('omni') || id.includes('mimo'),
+      audio: id.includes('audio') || id.includes('realtime') || id.includes('whisper') || id.includes('omni') || id.includes('gemini') || id.includes('mimo'),
     };
   }
 
@@ -430,16 +572,19 @@
   // —— 对话 ——
   async function send() {
     const msg = input.trim();
-    if (!msg || streaming) return;
+    if ((!msg && pendingAttachments.length === 0) || streaming) return;
     streaming = true;
     controller = new AbortController();
+    const effectiveMsg = msg || (pendingAttachments.length > 0 ? '请查看分析附带的媒体文件' : '');
+    const sendingAttachments = [...pendingAttachments];
+    pendingAttachments = [];
     const history = messages
       .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
       .map((m) => ({ role: m.role, content: m.content }));
-    history.push({ role: 'user', content: msg });
+    history.push({ role: 'user', content: effectiveMsg });
     messages = [
       ...messages,
-      { id: nextId(), role: 'user', content: msg },
+      { id: nextId(), role: 'user', content: effectiveMsg, attachments: sendingAttachments },
       { id: nextId(), role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
     ];
     input = '';
@@ -453,6 +598,8 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: history,
+          message: effectiveMsg,
+          attachments: sendingAttachments.length > 0 ? sendingAttachments.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
           model,
           base_url: baseUrl,
           approval_mode: approvalMode,
@@ -499,7 +646,14 @@
               else if (d.approval_request)
                 patch((m) => ({
                   ...m,
-                  approval: { id: d.approval_request.id, tool: d.approval_request.tool, args: d.approval_request.args, decided: null },
+                  approval: {
+                    id: d.approval_request.id,
+                    tool: d.approval_request.tool,
+                    args: d.approval_request.args,
+                    risk: d.approval_request.risk ?? 1,
+                    reason: d.approval_request.reason || '',
+                    decided: null,
+                  },
                 }));
               else if (d.approval_decided)
                 patch((m) =>
@@ -757,7 +911,36 @@
       {/if}
       {#each messages as m (m.id)}
         {#if m.role === 'user'}
-          <div class="msg user"><div class="bubble user-bubble">{m.content}</div></div>
+          <div class="msg user">
+            <div class="bubble user-bubble">
+              {#if m.attachments && m.attachments.length > 0}
+                <div class="msg-attachments">
+                  {#each m.attachments as a}
+                    {#if a.mime && a.mime.startsWith('image/')}
+                      <img
+                        class="msg-att-img"
+                        src={a.data}
+                        alt={a.name}
+                        title="点击查看原图"
+                        on:click={() => (previewImageModal = a.data)}
+                      />
+                    {:else if a.mime && a.mime.startsWith('video/')}
+                      <video class="msg-att-video" controls src={a.data}>
+                        <track kind="captions" />
+                      </video>
+                    {:else if a.mime && a.mime.startsWith('audio/')}
+                      <audio class="msg-att-audio" controls src={a.data}></audio>
+                    {:else}
+                      <div class="msg-att-file">📎 {a.name}</div>
+                    {/if}
+                  {/each}
+                </div>
+              {/if}
+              {#if m.content}
+                <div class="user-text">{m.content}</div>
+              {/if}
+            </div>
+          </div>
         {:else if m.role === 'assistant'}
           <div class="msg assistant">
             <div class="bubble asst-bubble">
@@ -768,9 +951,12 @@
                 </details>
               {/if}
               {#if m.approval}
-                <div class="approval-box">
+                <div class="approval-box" class:danger={m.approval.risk >= 2}>
                   <div class="approval-head">
-                    ⚠️ 请求执行：<b>{m.approval.tool}</b>
+                    <span class="approval-title">⚠️ 请求执行：<b>{m.approval.tool}</b></span>
+                    {#if m.approval.reason}
+                      <span class="approval-reason" class:danger={m.approval.risk >= 2}>{m.approval.reason}</span>
+                    {/if}
                     <span class="tool-args" title={m.approval.args}>{m.approval.args}</span>
                   </div>
                   {#if m.approval.decided === null}
@@ -827,18 +1013,57 @@
 
     <footer class="chat-input">
       <div class="composer">
+        {#if pendingAttachments.length > 0}
+          <div class="composer-attachments">
+            {#each pendingAttachments as att, idx}
+              <div class="att-chip" title={`${att.name} (${fmtBytes(att.size)})`}>
+                {#if att.mime.startsWith('image/')}
+                  <img class="att-thumb" src={att.data} alt={att.name} />
+                {:else if att.mime.startsWith('video/')}
+                  <span class="att-badge">🎬</span>
+                {:else if att.mime.startsWith('audio/')}
+                  <span class="att-badge">🎵</span>
+                {:else}
+                  <span class="att-badge">📎</span>
+                {/if}
+                <span class="att-name">{att.name}</span>
+                <span class="att-size">{fmtBytes(att.size)}</span>
+                <button class="att-del" on:click={() => removeAttachment(idx)} title="移除">✕</button>
+              </div>
+            {/each}
+          </div>
+        {/if}
         <textarea
           class="composer-input"
           rows="1"
           bind:value={input}
-          placeholder="提出后续修改要求"
+          placeholder="提出后续修改要求（支持粘贴图片截图、拖拽文件或点 📎 附件）"
           on:keydown={handleKey}
           on:input={autoRows}
+          on:paste={handlePaste}
+          on:dragover|preventDefault
+          on:drop={handleDrop}
           disabled={streaming}
         ></textarea>
         <div class="composer-bar">
           <div class="composer-left">
             <button class="icon-btn" title="新建对话" on:click={startNewSession} disabled={streaming}>＋</button>
+            <input
+              type="file"
+              bind:this={fileInput}
+              multiple
+              accept="image/*,video/*,audio/*"
+              style="display:none"
+              on:change={onFileSelect}
+            />
+            <button
+              class="icon-btn"
+              title="添加多模态媒体附件（图片/视频/音频）"
+              on:click={() => fileInput && fileInput.click()}
+              disabled={streaming}
+            >
+              📎
+            </button>
             <div class="bar-menu">
               <button
                 class="pill"
@@ -1243,7 +1468,7 @@
               bind:value={roles.audio}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（默认跟随当前主力渠道）</option>
+              <option value={null}>（未配置，跳过并提示占位）</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
@@ -1319,6 +1544,15 @@
           </label>
         {/each}
       </div>
+    </div>
+  </div>
+{/if}
+
+{#if previewImageModal}
+  <div class="modal-backdrop" on:click={() => (previewImageModal = null)}>
+    <div class="image-modal" on:click|stopPropagation>
+      <img src={previewImageModal} alt="大图预览" />
+      <button class="image-modal-close" on:click={() => (previewImageModal = null)}>✕</button>
     </div>
   </div>
 {/if}
@@ -1582,12 +1816,28 @@
     padding: 8px;
     font-size: 13px;
   }
+  .approval-box.danger {
+    background: #2b1717;
+    border-color: #8c3131;
+  }
   .approval-head {
     display: flex;
     gap: 8px;
     align-items: center;
     flex-wrap: wrap;
     color: #e8d9a0;
+  }
+  .approval-reason {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #4a3e1b;
+    color: #fae17d;
+    font-size: 11px;
+  }
+  .approval-reason.danger {
+    background: #541d1d;
+    color: #ff9b9b;
   }
   .approval-actions {
     display: flex;
@@ -1603,6 +1853,125 @@
     color: #6f7686;
     font-size: 11px;
     align-self: center;
+  }
+
+  /* 待发送附件条 */
+  .composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px 4px;
+    border-bottom: 1px solid #2a2d37;
+  }
+  .att-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #232630;
+    border: 1px solid #363a45;
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 12px;
+    color: #cdd2dd;
+    max-width: 240px;
+  }
+  .att-thumb {
+    width: 22px;
+    height: 22px;
+    object-fit: cover;
+    border-radius: 4px;
+  }
+  .att-badge {
+    font-size: 13px;
+  }
+  .att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 120px;
+  }
+  .att-size {
+    font-size: 10.5px;
+    color: #6f7686;
+  }
+  .att-del {
+    background: transparent;
+    border: none;
+    color: #9aa0ae;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0 2px;
+    line-height: 1;
+  }
+  .att-del:hover {
+    color: #ff7b72;
+  }
+
+  /* 气泡内的附件渲染 */
+  .msg-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .msg-att-img {
+    max-width: 280px;
+    max-height: 200px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    cursor: zoom-in;
+    object-fit: contain;
+    background: #000;
+  }
+  .msg-att-video {
+    max-width: 320px;
+    max-height: 220px;
+    border-radius: 6px;
+  }
+  .msg-att-audio {
+    max-width: 320px;
+    height: 38px;
+    border-radius: 6px;
+  }
+  .msg-att-file {
+    font-size: 12px;
+    color: #8bb2ff;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 4px;
+  }
+
+  /* 图片预览模态框 */
+  .image-modal {
+    position: relative;
+    max-width: 90vw;
+    max-height: 90vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .image-modal img {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+  }
+  .image-modal-close {
+    position: absolute;
+    top: -12px;
+    right: -12px;
+    width: 28px;
+    height: 28px;
+    background: #2a2d37;
+    border: 1px solid #484f58;
+    color: #fff;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .side-approval {
     display: flex;

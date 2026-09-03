@@ -19,7 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -62,6 +62,108 @@ pub struct AppState {
     pub gateway_cfg: Arc<crate::config::GatewayConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaAttachment {
+    pub name: String,
+    pub mime: String,
+    pub data: String,
+}
+
+impl MediaAttachment {
+    pub fn is_audio(&self) -> bool {
+        let n = self.name.to_lowercase();
+        self.mime.starts_with("audio/")
+            || n.ends_with(".mp3")
+            || n.ends_with(".wav")
+            || n.ends_with(".m4a")
+            || n.ends_with(".ogg")
+            || n.ends_with(".flac")
+            || n.ends_with(".aac")
+            || n.ends_with(".wma")
+    }
+
+    pub fn is_video(&self) -> bool {
+        let n = self.name.to_lowercase();
+        self.mime.starts_with("video/")
+            || n.ends_with(".mp4")
+            || n.ends_with(".webm")
+            || n.ends_with(".mov")
+            || n.ends_with(".avi")
+            || n.ends_with(".mkv")
+            || n.ends_with(".flv")
+    }
+
+    pub fn is_image(&self) -> bool {
+        let n = self.name.to_lowercase();
+        self.mime.starts_with("image/")
+            || n.ends_with(".png")
+            || n.ends_with(".jpg")
+            || n.ends_with(".jpeg")
+            || n.ends_with(".webp")
+            || n.ends_with(".gif")
+            || n.ends_with(".bmp")
+            || n.ends_with(".svg")
+            || (!self.is_audio() && !self.is_video())
+    }
+
+    pub fn audio_format(&self) -> String {
+        let n = self.name.to_lowercase();
+        if n.ends_with(".wav") || self.mime.contains("wav") {
+            "wav".into()
+        } else if n.ends_with(".ogg") || self.mime.contains("ogg") {
+            "ogg".into()
+        } else if n.ends_with(".m4a") || self.mime.contains("m4a") {
+            "m4a".into()
+        } else if n.ends_with(".flac") || self.mime.contains("flac") {
+            "flac".into()
+        } else if n.ends_with(".aac") || self.mime.contains("aac") {
+            "aac".into()
+        } else {
+            "mp3".into()
+        }
+    }
+
+    pub fn raw_base64(&self) -> String {
+        if let Some(idx) = self.data.find(";base64,") {
+            self.data[idx + 8..].to_string()
+        } else if self.data.starts_with("data:") {
+            if let Some(idx) = self.data.find(',') {
+                self.data[idx + 1..].to_string()
+            } else {
+                self.data.clone()
+            }
+        } else {
+            self.data.clone()
+        }
+    }
+
+    pub fn data_url(&self) -> String {
+        if self.data.starts_with("data:") {
+            self.data.clone()
+        } else {
+            format!("data:{};base64,{}", self.effective_mime(), self.data)
+        }
+    }
+
+    pub fn effective_mime(&self) -> String {
+        if !self.mime.is_empty() && self.mime != "application/octet-stream" {
+            return self.mime.clone();
+        }
+        let n = self.name.to_lowercase();
+        if n.ends_with(".mp3") { "audio/mp3".into() }
+        else if n.ends_with(".wav") { "audio/wav".into() }
+        else if n.ends_with(".m4a") { "audio/m4a".into() }
+        else if n.ends_with(".ogg") { "audio/ogg".into() }
+        else if n.ends_with(".mp4") { "video/mp4".into() }
+        else if n.ends_with(".webm") { "video/webm".into() }
+        else if n.ends_with(".mov") { "video/quicktime".into() }
+        else if n.ends_with(".png") { "image/png".into() }
+        else if n.ends_with(".jpg") || n.ends_with(".jpeg") { "image/jpeg".into() }
+        else if n.ends_with(".webp") { "image/webp".into() }
+        else { "application/octet-stream".into() }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     /// 单轮消息（messages 为空时使用，兼容内置回退页）
@@ -70,6 +172,9 @@ pub struct ChatRequest {
     /// P2：完整消息数组（role: user/assistant/tool），非空则优先
     #[serde(default)]
     pub messages: Option<Vec<Value>>,
+    /// P8.5 多模态媒体附件（图片、视频、音频）
+    #[serde(default)]
+    pub attachments: Option<Vec<MediaAttachment>>,
     /// 请求级覆盖：非空优先于已保存设置（页面当前选择即时生效）
     #[serde(default)]
     pub model: String,
@@ -224,6 +329,17 @@ fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
     let params = build_chat_params(c, preset);
     let key = s.config_key(c).unwrap_or_default();
     Some(gateway::Channel::new(&base_url, &model, &key, params))
+}
+
+/// 检查模型是否具备指定模态的输入能力（对齐 DSH acceptsMedia 门禁规范）
+fn accepts_modality(model: &str, kind: &str) -> bool {
+    let caps = crate::config::settings::ModelCapabilities::infer_from_model_id(model);
+    match kind {
+        "audio" => caps.audio,
+        "video" => caps.video,
+        "image" => caps.vision,
+        _ => false,
+    }
 }
 
 /// 供应商预设列表（数据驱动自 providers.json）。
@@ -589,6 +705,7 @@ async fn chat(
     let req_model = req.model.trim().to_string();
     let req_base_url = req.base_url.trim().to_string();
     let req_api_key = req.api_key.trim().to_string();
+    let attachments = req.attachments.unwrap_or_default();
     let history: Vec<Value> = match &req.messages {
         Some(m) if !m.is_empty() => m.clone(),
         _ => {
@@ -673,6 +790,319 @@ async fn chat(
         }
         // P6.1：先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
+
+        // P8.5 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
+        let mut history = history;
+        if !attachments.is_empty() {
+            let roles = s.roles.as_ref();
+            let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut forward_attachments: Vec<&MediaAttachment> = Vec::new();
+
+            for att in &attachments {
+                let is_vid = att.is_video();
+                let is_aud = att.is_audio();
+                let is_img = att.is_image();
+
+                let supports_natively = (is_img && active_cfg.capabilities.vision)
+                    || (is_vid && active_cfg.capabilities.video)
+                    || (is_aud && active_cfg.capabilities.audio);
+
+                if supports_natively {
+                    native_attachments.push(att);
+                } else {
+                    forward_attachments.push(att);
+                }
+            }
+
+            // 1. 对于主模型原生支持的媒体类型，挂载原生多模态结构
+            if !native_attachments.is_empty() {
+                if let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                    let mut parts = Vec::new();
+                    if let Some(txt) = last_msg["content"].as_str() {
+                        parts.push(json!({ "type": "text", "text": txt }));
+                    }
+                    for att in native_attachments {
+                        if att.is_audio() {
+                            parts.push(json!({
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": att.raw_base64(),
+                                    "format": att.audio_format()
+                                }
+                            }));
+                        } else {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": att.data_url() }
+                            }));
+                        }
+                    }
+                    last_msg["content"] = json!(parts);
+                }
+            }
+
+            // 2. 对于主模型不支持的媒体类型，走专职转接与确定性文本投影（对齐 DSH media-understanding 规范）
+            if !forward_attachments.is_empty() {
+                let mut projections = Vec::new();
+
+                for att in forward_attachments {
+                    let is_vid = att.is_video();
+                    let is_aud = att.is_audio();
+                    let kind = if is_vid { "video" } else if is_aud { "audio" } else { "image" };
+                    let kind_cn = if is_vid { "视频" } else if is_aud { "音频" } else { "图片" };
+                    let success_label = if is_vid { "Video understanding" } else if is_aud { "Audio understanding" } else { "Image understanding" };
+
+                    // 持久化附件到工作区 .attachments/ 便于主模型与工具查阅
+                    let ws = crate::tools::workspace_root();
+                    let att_dir = ws.join(".attachments");
+                    let _ = std::fs::create_dir_all(&att_dir);
+                    let safe_name = std::path::Path::new(&att.name)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment");
+                    let target_file = att_dir.join(safe_name);
+                    use base64::Engine;
+                    let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
+                    let unpadded = clean.trim_end_matches('=');
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&clean)
+                        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded));
+                    if let Ok(bytes) = decoded {
+                        let _ = std::fs::write(&target_file, bytes);
+                    }
+
+                    // 1) 专属路由解析（对齐 DSH）：严格隔离，仅使用用户在 roles 中针对该模态显式配置的渠道，严禁自动跨渠道降级
+                    let role_target = if is_vid {
+                        roles.and_then(|r| r.video.as_deref())
+                    } else if is_aud {
+                        roles.and_then(|r| r.audio.as_deref())
+                    } else {
+                        roles.and_then(|r| r.vision.as_deref())
+                    };
+
+                    let mut candidates: Vec<gateway::Channel> = Vec::new();
+                    if let Some(n) = role_target.filter(|n| !n.trim().is_empty()) {
+                        if let Some(ch) = find_channel(&s, n) {
+                            candidates.push(ch);
+                        }
+                    }
+
+                    // 2) 若该模态未配置路由或无可用候选：对齐 DSH 替换为确定性占位文本（deterministic placeholder），绝不发起注定失败的请求
+                    if candidates.is_empty() {
+                        let placeholder = format!(
+                            "[{kind} omitted because no {kind}-understanding model is configured; 附件「{}」已跳过并保存至工作区 .attachments/{}。当前未在“设置 → 角色分工”中配置{}理解专家 ({})，请在设置中指定具备{}能力的多模态模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
+                            att.name,
+                            safe_name,
+                            kind_cn,
+                            if is_aud { "Audio" } else if is_vid { "Video" } else { "Vision" },
+                            kind_cn
+                        );
+                        projections.push(placeholder);
+                        continue;
+                    }
+
+                    // 3) 能力预检（对齐 DSH acceptsMedia 门禁规范）：
+                    // 如果用户配置的渠道模型明确不具备该模态能力（如把 mimo-v2.5 错配给音频），拦截并替换为指导提示，绝对不发起注定失败的调用
+                    let first_ch = &candidates[0];
+                    let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("custom");
+                    let first_model = &first_ch.model;
+
+                    if !accepts_modality(first_model, kind) {
+                        let text = format!(
+                            "[{} not run: model {}/{} does not accept {} input. The {} was NOT shown to you. 当前配置的{}模型「{}/{}」不支持{}输入，该{}未展示给主模型。请在“设置 → 角色分工”中为“{}理解专家”指定支持{}的模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
+                            success_label, first_provider, first_model, kind, kind,
+                            kind_cn, first_provider, first_model, kind_cn, kind_cn,
+                            kind_cn, kind_cn
+                        );
+                        projections.push(text);
+                        continue;
+                    }
+
+                    send(json!({
+                        "content": format!("*（📸 后台正在通过{}理解模型「{}/{}」解析「{}」，随后交由「{}」深度回答...）*\n\n", kind_cn, first_provider, first_model, att.name, active_cfg.model)
+                    }));
+
+                    let candidate_prompts: Vec<Value> = if is_aud {
+                        vec![
+                            // 格式 1（标准 OpenAI input_audio：媒体块在前，提示词在后）
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_audio",
+                                            "input_audio": {
+                                                "data": att.raw_base64(),
+                                                "format": att.audio_format()
+                                            }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Transcribe and describe this audio in detail. Cover spoken content and notable non-speech sounds in order. 请仔细倾听并详细转录该音频内容：逐字转录全部语音对话内容（ASR），提取说话人语调与关键要点，并记录环境背景声音。"
+                                        }
+                                    ]
+                                }
+                            ]),
+                            // 格式 2（备选 audio_url）
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "audio_url",
+                                            "audio_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Transcribe and describe this audio in detail. Cover spoken content and notable non-speech sounds in order."
+                                        }
+                                    ]
+                                }
+                            ]),
+                        ]
+                    } else if is_vid {
+                        vec![
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "video_url",
+                                            "video_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order. 请按时间顺序详细描述该视频：视频中发生了什么，包括画面视觉内容、任何语音旁白或字幕。"
+                                        }
+                                    ]
+                                }
+                            ]),
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this video in detail: what happens across it, including visual content and any speech or captions, in chronological order."
+                                        }
+                                    ]
+                                }
+                            ]),
+                        ]
+                    } else {
+                        vec![
+                            json!([
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": { "url": att.data_url() }
+                                        },
+                                        {
+                                            "type": "text",
+                                            "text": "Describe this image in detail. Cover every element that would matter to someone who cannot see it, in the order a reader would need. 请详细观察并深度解析该图片内容：涵盖所有对看不见该图片的人至关重要的元素，逐字提取画面中的所有可见文本、代码片段、图表与数值数据。"
+                                        }
+                                    ]
+                                }
+                            ])
+                        ]
+                    };
+
+                    let mut desc_result = None;
+                    let mut last_route = (first_provider.to_string(), first_model.clone());
+                    let mut last_error_msg = String::new();
+
+                    for vch in &candidates {
+                        let provider = vch.params.provider_id.as_deref().unwrap_or("custom");
+                        last_route = (provider.to_string(), vch.model.clone());
+
+                        let mut params = vch.params.clone();
+                        // DSH 规范：上限 1500 tokens，清空思考参数
+                        params.max_tokens = Some(params.max_tokens.unwrap_or(1500).min(1500));
+                        params.thinking = None;
+
+                        let mut call_err = None;
+                        for prompt_variant in &candidate_prompts {
+                            match gateway.complete(&vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params).await {
+                                Ok(text) if !text.trim().is_empty() => {
+                                    let is_refusal = text.contains("没有能力听音频")
+                                        || text.contains("无法听音频")
+                                        || text.contains("无法识别音频")
+                                        || text.contains("无法处理音频")
+                                        || text.contains("无法解析音频")
+                                        || text.contains("我是纯文本")
+                                        || text.contains("不支持音频")
+                                        || text.contains("未附带音频")
+                                        || text.contains("没看到音频")
+                                        || text.contains("don't have the ability to listen")
+                                        || text.contains("cannot process audio")
+                                        || text.contains("text-based AI assistant")
+                                        || text.contains("no audio file was attached")
+                                        || text.contains("don't see any audio file")
+                                        || text.contains("looks like no audio");
+                                    if is_refusal {
+                                        call_err = Some(format!("上游网关或模型声明未收到/无法解析该音频: {}", text.trim()));
+                                    } else {
+                                        desc_result = Some(text.trim().to_string());
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {
+                                    call_err = Some("模型返回空内容".to_string());
+                                }
+                                Err(e) => {
+                                    observability::event(
+                                        EventType::Error,
+                                        json!({ "kind": "media.error", "modality": kind, "model": vch.model, "url": vch.base_url, "error": format!("{e:#}") }),
+                                    );
+                                    call_err = Some(format!("{e}"));
+                                }
+                            }
+                        }
+
+                        if desc_result.is_some() {
+                            break;
+                        }
+                        if let Some(err) = call_err {
+                            last_error_msg = err;
+                        }
+                    }
+
+                    // 4) 投影格式化（DSH 规范）
+                    let substituted_text = if let Some(text) = desc_result {
+                        format!("[{} ({}/{}):\n{}]", success_label, last_route.0, last_route.1, text)
+                    } else {
+                        format!("[{} failed ({}/{}): {}]", success_label, last_route.0, last_route.1, last_error_msg)
+                    };
+                    projections.push(substituted_text);
+                }
+
+                // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型
+                if !projections.is_empty() {
+                    if let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                        let orig = match &last_msg["content"] {
+                            Value::String(s) => s.clone(),
+                            Value::Array(arr) => {
+                                arr.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
+                            }
+                            _ => "".to_string(),
+                        };
+                        let combined = if orig.trim().is_empty() {
+                            projections.join("\n\n")
+                        } else {
+                            format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
+                        };
+                        last_msg["content"] = json!(combined);
+                    }
+                }
+            }
+        }
         // 请求级覆盖优先：页面当前选择即时生效，不等保存
         let base_url = if !req_base_url.is_empty() { req_base_url } else { active_cfg.effective_base_url() };
         let model = if !req_model.is_empty() { req_model } else { active_cfg.effective_model() };
@@ -833,6 +1263,17 @@ impl agent::ApprovalGate for ChatGate {
         agent::needs_approval(&mode, danger_level)
     }
 
+    fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool {
+        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        let ws = crate::tools::workspace_root();
+        let val: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
+        let (risk, _reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
+        if (mode == "full-access" || mode == "local") && self.unsandboxed_approval {
+            return risk >= crate::core::rules::RiskLevel::Dangerous;
+        }
+        crate::core::rules::should_ask_approval(&mode, risk)
+    }
+
     fn sandbox_enabled(&self) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
         !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
@@ -842,12 +1283,15 @@ impl agent::ApprovalGate for ChatGate {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
         self.pending.lock().unwrap().insert(id.clone(), otx);
+        let ws = crate::tools::workspace_root();
+        let val: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+        let (risk, reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
         observability::event(
             EventType::State,
-            json!({ "kind": "approval.requested", "id": id, "tool": tool }),
+            json!({ "kind": "approval.requested", "id": id, "tool": tool, "risk": risk.as_u8(), "reason": reason }),
         );
         let _ = self.tx.send(Ok(json_event(json!({
-            "approval_request": { "id": id, "tool": tool, "args": args }
+            "approval_request": { "id": id, "tool": tool, "args": args, "risk": risk.as_u8(), "reason": reason }
         }))));
         let pending = self.pending.clone();
         let tx = self.tx.clone();
@@ -1400,5 +1844,24 @@ mod tests {
             let p = build_chat_params(&c, gateway::providers::find("openai"));
             assert_eq!(p.thinking.as_deref(), Some(lvl));
         }
+    }
+
+    #[test]
+    fn attachment_save_and_decode() {
+        let att = MediaAttachment {
+            name: "test.mp3".into(),
+            mime: "audio/mp3".into(),
+            data: "data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAA==".into(),
+        };
+        assert_eq!(att.raw_base64(), "//uQxAAAAAAAAAAAAAAAAAAAAAA==");
+        use base64::Engine;
+        let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
+        let unpadded = clean.trim_end_matches('=');
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&clean)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
+            .unwrap();
+        assert!(!bytes.is_empty());
     }
 }

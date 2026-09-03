@@ -58,10 +58,13 @@ impl ModelCapabilities {
             || id.contains("vision")
             || id.contains("gemini")
             || id.contains("gpt-4o")
+            || id.contains("gpt-5")
             || id.contains("claude-3")
-            || id.contains("omni");
-        let is_video = id.contains("video") || id.contains("gemini-2");
-        let is_audio = id.contains("audio") || id.contains("realtime") || id.contains("whisper");
+            || id.contains("omni")
+            || id.contains("mimo")
+            || id.contains("sensenova");
+        let is_video = id.contains("video") || id.contains("gemini-2") || id.contains("omni") || id.contains("mimo");
+        let is_audio = id.contains("audio") || id.contains("realtime") || id.contains("whisper") || id.contains("omni") || id.contains("gemini") || id.contains("mimo");
         Self {
             tools: true,
             vision: is_vision,
@@ -677,6 +680,9 @@ mod tests {
         assert!(!c_text.vision);
         assert!(!c_text.video);
         assert!(c_text.tools);
+
+        let c_v4 = ModelCapabilities::infer_from_model_id("deepseek-v4-flash");
+        assert!(!c_v4.vision);
 
         let c_gemini = ModelCapabilities::infer_from_model_id("gemini-2.0-flash");
         assert!(c_gemini.vision);

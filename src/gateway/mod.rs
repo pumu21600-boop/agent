@@ -437,6 +437,10 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
         let data: Value = response.json().await.context("解析补全响应失败")?;
+        if let Some(err) = data.get("error") {
+            let msg = err.get("message").and_then(Value::as_str).unwrap_or_default();
+            return Err(anyhow!("渠道业务错误: {msg} (raw: {err})"));
+        }
         let raw = data
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)

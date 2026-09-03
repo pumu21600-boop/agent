@@ -188,8 +188,10 @@ pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
 
 /// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
 pub trait ApprovalGate: Send + Sync {
-    /// 当前档位下该危险等级是否要审批（档位可被侧栏即时切换，实现方读活值）
+    /// 当前档位下该危险等级是否要审批（保留兼容）
     fn needs_approval(&self, danger_level: u8) -> bool;
+    /// P9 细粒度审批：结合工具名与具体参数进行风险研判
+    fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool;
     /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）
     fn sandbox_enabled(&self) -> bool;
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
@@ -518,10 +520,10 @@ pub async fn run_task(
             on_event(AgentEvent::ToolCall { name: call.name.clone(), args: call.arguments.clone() });
             observability::debug(&format!("[loop] 工具 {} 参数 {}", call.name, call.arguments));
 
-            // 审批三档：按档位与工具危险等级决定是否等用户点头
+            // P9 细粒度审批规则引擎：按工具名及具体参数动态评估风险，替代“一刀切”
             // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
             let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
-            let approved = if gate.needs_approval(danger) {
+            let approved = if gate.needs_approval_for(&call.name, &call.arguments) {
                 gate.ask(&call.name, &call.arguments).await
             } else {
                 true
