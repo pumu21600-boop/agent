@@ -49,16 +49,13 @@ pub struct Config {
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    /// 思考开关（P8）："on"/"off"；None=渠道默认。参数形态由 providers.json 的
-    /// reasoning_style/enable_thinking_param 按厂商适配
+    /// 思考开关/档位（P9）："on"/"off"/low/medium/high/xhigh/max/minimal；None=渠道默认。
+    /// 参数形态由端点探测（OpenClaw thinkingFormat）决定，预设/渠道可覆盖
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
-    /// 思考预算（P8；Qwen 系 thinking_budget，厂商适配字段指定参数名）
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_budget: Option<u64>,
-    /// 思考参数形态覆盖（P8.3）：auto/none/thinking_object/reasoning_effort/
-    /// enable_thinking/enable_thinking_budget；None=auto 跟供应商预设。
-    /// 自定义/中转渠道（provider=custom）预设拿不准时，用它显式指定
+    /// 思考参数形态覆盖（P9，OpenClaw thinkingFormat 词表）：auto/none/openai/deepseek/
+    /// zai/qwen/qwen-chat-template；None=auto 端点探测。P8.3 旧值自动映射。
+    /// 自定义/中转渠道（provider=custom）探测认不出时，用它显式指定
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_style: Option<String>,
 }
@@ -83,9 +80,7 @@ pub struct Settings {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub thinking: Option<String>,
-    #[serde(default)]
-    pub thinking_budget: Option<u64>,
-    /// 镜像：思考参数形态覆盖（P8.3）
+    /// 镜像：思考参数形态覆盖（P9，OpenClaw thinkingFormat 词表）
     #[serde(default)]
     pub thinking_style: Option<String>,
     /// 归一化 base_url → DPAPI 加密后的 key（base64）
@@ -120,7 +115,6 @@ impl Default for Settings {
             temperature: None,
             top_p: None,
             thinking: None,
-            thinking_budget: None,
             thinking_style: None,
             keys: BTreeMap::new(),
             key_cipher: None,
@@ -265,7 +259,6 @@ impl Settings {
                 temperature: None,
                 top_p: None,
                 thinking: None,
-                thinking_budget: None,
                 thinking_style: None,
             });
         }
@@ -332,7 +325,6 @@ impl Settings {
             self.temperature,
             self.top_p,
             self.thinking.clone(),
-            self.thinking_budget,
             self.thinking_style.clone(),
         );
         if let Some(c) = self.active_mut_() {
@@ -345,8 +337,7 @@ impl Settings {
             c.temperature = snap.6;
             c.top_p = snap.7;
             c.thinking = snap.8;
-            c.thinking_budget = snap.9;
-            c.thinking_style = snap.10;
+            c.thinking_style = snap.9;
         }
     }
 
@@ -367,7 +358,6 @@ impl Settings {
         self.temperature = c.temperature;
         self.top_p = c.top_p;
         self.thinking = c.thinking;
-        self.thinking_budget = c.thinking_budget;
         self.thinking_style = c.thinking_style;
         self.active_config_id = Some(id.to_string());
         true
@@ -391,7 +381,6 @@ impl Settings {
             temperature: None,
             top_p: None,
             thinking: None,
-            thinking_budget: None,
             thinking_style: None,
         });
         self.active_config_id = Some(id.clone());
@@ -418,7 +407,6 @@ impl Settings {
                 self.temperature = c.temperature;
                 self.top_p = c.top_p;
                 self.thinking = c.thinking;
-                self.thinking_budget = c.thinking_budget;
                 self.thinking_style = c.thinking_style;
             }
         }

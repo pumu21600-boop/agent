@@ -29,10 +29,7 @@
   let temperature = null; // 采样温度（null=渠道默认）
   let topP = null; // 核采样（null=渠道默认）
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
-  let thinkingBudget = 0; // 思考预算（0=不设；Qwen 系）
-  let reasoningStyle = 'reasoning_content'; // 当前供应商思考接线方式（P8）
-  let thinkingBudgetParam = null; // 供应商思考预算参数名（有才显示预算输入）
-  let thinkingStyle = 'auto'; // 生效的思考参数形态（P8.3：覆盖 > 预设）
+  let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
   let thinkingStyleOverride = null; // 配置里的形态覆盖值（设置面板回显）
   // —— P8.2 工作区 ——
   let workspace = '';
@@ -153,18 +150,18 @@
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
   const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低', medium: '中', high: '高' };
-  // 提示按「生效形态」给（覆盖 > 预设），auto/无参数渠道给可操作指引
+  // 提示按「生效形态」给（覆盖 > 端点探测），auto/无参数渠道给可操作指引
   $: thinkHint =
-    thinkingStyle === 'in_content'
-      ? '该渠道思考混在正文，自动剥离展示'
-      : thinkingStyle === 'reasoning_effort'
-        ? 'OpenAI 风格 reasoning_effort 档位'
-        : thinkingStyle === 'thinking_object'
-          ? 'GLM/豆包 thinking 参数'
-          : thinkingStyle === 'enable_thinking'
-            ? 'Qwen 系 enable_thinking 布尔'
-            : thinkingStyle === 'enable_thinking_budget'
-              ? 'Qwen 系布尔开关 + 思考预算'
+    thinkingStyle === 'zai'
+      ? 'GLM/豆包 thinking 对象参数'
+      : thinkingStyle === 'deepseek'
+        ? 'DeepSeek thinking 对象参数'
+        : thinkingStyle === 'qwen'
+          ? 'Qwen 系 enable_thinking 布尔'
+          : thinkingStyle === 'qwen-chat-template'
+            ? '本地推理服务 chat_template_kwargs（Qwen3 系模板）'
+            : thinkingStyle === 'openai'
+              ? 'OpenAI 风格 reasoning_effort 档位'
               : thinkingStyle === 'none'
                 ? '形态=不发参数，思考由渠道决定'
                 : '该渠道无标准开关参数——关不掉到设置改「思考参数形态」';
@@ -232,9 +229,6 @@
     temperature = s.temperature ?? null;
     topP = s.top_p ?? null;
     thinking = s.thinking || '';
-    thinkingBudget = s.thinking_budget || 0;
-    reasoningStyle = s.reasoning_style || 'reasoning_content';
-    thinkingBudgetParam = s.thinking_budget_param || null;
     thinkingStyle = s.thinking_style || 'auto';
     thinkingStyleOverride = s.thinking_style_override || null;
     workspace = s.workspace || '';
@@ -910,8 +904,8 @@
                   <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
                     默认<span class="bar-item-hint">跟渠道自身行为走</span>
                   </button>
-                  {#if thinkingStyle === 'reasoning_effort'}
-                    <!-- OpenAI 风格：思考分档 -->
+                  {#if thinkingStyle === 'openai'}
+                    <!-- OpenAI 风格：思考分档（档位经网关按模型解析降级） -->
                     <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
                       低<span class="bar-item-hint">reasoning_effort: low</span>
                     </button>
@@ -922,7 +916,7 @@
                       高<span class="bar-item-hint">reasoning_effort: high</span>
                     </button>
                     <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭<span class="bar-item-hint">o 系无可靠关参数，不发</span>
+                      关闭<span class="bar-item-hint">模型不支持显式关档时不发参数</span>
                     </button>
                   {:else}
                     <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
@@ -1088,30 +1082,23 @@
             bind:value={thinkingStyleOverride}
             on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
           >
-            <option value={null}>自动（按供应商预设）</option>
+            <option value={null}>自动（按端点探测）</option>
             <option value="none">不发思考参数（思考关不掉/渠道不认参数）</option>
-            <option value="thinking_object">thinking 对象（GLM/豆包）</option>
-            <option value="reasoning_effort">reasoning_effort 档位（OpenAI/Claude/Gemini）</option>
-            <option value="enable_thinking">enable_thinking 布尔（Qwen 系）</option>
-            <option value="enable_thinking_budget">enable_thinking + thinking_budget（Qwen 带预算）</option>
+            <option value="openai">openai：reasoning_effort 档位</option>
+            <option value="zai">zai：thinking 对象（智谱 GLM）</option>
+            <option value="deepseek">deepseek：thinking 对象（DeepSeek/小米）</option>
+            <option value="qwen">qwen：enable_thinking 布尔（百炼/混元）</option>
+            <option value="qwen-chat-template">qwen-chat-template：chat_template_kwargs（本地 vLLM/llama.cpp）</option>
           </select>
-          {#if thinkingStyle === 'enable_thinking_budget' || thinkingStyle === 'enable_thinking'}
-            <input
-              class="num-input"
-              type="number" min="0"
-              placeholder="思考预算"
-              bind:value={thinkingBudget}
-              title="thinking_budget：思考阶段 token 预算，0=不设"
-              on:change={() => autoSave({ thinking_budget: Number(thinkingBudget) || 0 }, 0)}
-            />
-          {/if}
         </div>
         <div class="param-hint">
           当前生效：{thinkingStyle}。
-          {#if thinkingStyle === 'auto' || thinkingStyle === 'reasoning_content'}
-            该渠道无标准思考开关参数——若「关闭」后模型仍思考，把形态改为 enable_thinking 布尔（Qwen 系中转常见）或 thinking 对象（GLM 系）
+          {#if thinkingStyle === 'openai'}
+            档位经网关按模型 id 解析：gpt-5 无 "none"（关闭=不发），gpt-5.1+ 关闭发 "none"
           {:else if thinkingStyle === 'none'}
             形态=不发参数：思考开/关都不会发，由渠道决定
+          {:else if thinkingStyle === 'auto'}
+            该渠道按 OpenAI 标准探测——若「关闭」后模型仍思考，改形态为 deepseek/zai（thinking 对象）或 qwen（布尔，中转常见）
           {/if}
         </div>
       </div>

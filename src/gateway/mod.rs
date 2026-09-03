@@ -2,8 +2,11 @@
 //!
 //! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
 //! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
-//! P8：请求参数结构化（采样/思考按厂商适配，数据来自 providers.json）、本地限流（max_rpm）、
-//! embeddings 接口（EMBEDDING 角色预留）。
+//! P8：采样参数、本地限流（max_rpm）、embeddings 接口。
+//! P9（OpenClaw 对齐）：思考参数按「端点探测（compat）+ reasoning_effort 档位解析（effort）」
+//! 组装，词表与规则移植自 OpenClaw v2026.8.2 packages/ai；响应端支持
+//! reasoning_content/reasoning/reasoning_text/reasoning_details 四字段 + 14 种思考标签剥离；
+//! 发送前按端点契约净化历史（回放字段/developer 角色/空消息过滤）。
 
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -15,9 +18,15 @@ use serde_json::{Value, json};
 use crate::core::cancel::CancelFlag;
 use crate::observability::{self, EventType};
 
+pub mod compat;
+pub mod effort;
 pub mod providers;
+pub mod replay;
+pub mod tags;
 
-use providers::{ProviderPreset, ReasoningStyle};
+use compat::{Compat, ThinkingFormat};
+use providers::ProviderPreset;
+use tags::TagSplit;
 
 pub struct Gateway {
     /// 热可重建的 HTTP 客户端：reqwest 在构建时固化系统代理设置，
@@ -28,66 +37,36 @@ pub struct Gateway {
     throttle: Option<Throttle>,
 }
 
-/// 请求参数（P8）：全部可选，None=不发字段走渠道默认。
-/// 思考字段来自「每配置用户设置 + providers.json 厂商适配」的组合。
+/// 请求参数（P9）：全部可选，None=不发字段走渠道默认。
+/// 思考接线不再自带厂商字段——由 compat 按端点探测；用户设置只有开/关 + 档位。
 #[derive(Debug, Clone, Default)]
 pub struct ChatParams {
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
-    /// 思考开关：Some("on")/Some("off")；None=渠道默认（不发参数）
+    /// 思考档位请求：Some("on")/Some("off")/Some("low"|"medium"|"high"|"xhigh"|"max"|"minimal")；
+    /// None=渠道默认（不发思考参数）。on 在 effort 侧解析为 medium，布尔/对象侧一律开。
     pub thinking: Option<String>,
-    /// 思考预算（thinking_budget_param 指定的参数值，Qwen 系）
-    pub thinking_budget: Option<u64>,
-    /// 思考接线方式（providers.json reasoning_style）
-    pub reasoning_style: ReasoningStyle,
-    /// 布尔思考开关参数名（Qwen 系 enable_thinking）
-    pub enable_thinking_param: Option<String>,
-    /// 思考预算参数名（Qwen 系 thinking_budget）
-    pub thinking_budget_param: Option<String>,
-    /// 思考是否计入 max_tokens（GLM 实测占；仅记日志供截断排查，不改语义）
-    pub reasoning_counts_in_max_tokens: bool,
-    /// 思考模式为独立模型的厂商（DeepSeek 官方）：thinking=on 时模型名换成它
-    pub thinking_model: Option<String>,
+    /// 渠道配置的 thinking_format 覆盖（providers.json 预设或设置面板）；None=端点探测。
+    pub thinking_format: Option<ThinkingFormat>,
+    /// 端点探测线索：渠道预设 id 与实际 base_url（build_body 内部探测用）。
+    pub provider_id: Option<String>,
+    pub base_url: Option<String>,
 }
 
 impl ChatParams {
-    /// 从供应商预设取厂商适配字段（用户设置字段由调用方另行填入）。
+    /// 从供应商预设取覆盖字段（用户设置字段由调用方另行填入）。
     pub fn from_preset(p: &ProviderPreset) -> Self {
         Self {
-            reasoning_style: p.reasoning_style,
-            enable_thinking_param: p.enable_thinking_param.clone(),
-            thinking_budget_param: p.thinking_budget_param.clone(),
-            reasoning_counts_in_max_tokens: p.reasoning_counts_in_max_tokens,
-            thinking_model: p.thinking_model.clone(),
+            thinking_format: p.thinking_format,
+            provider_id: Some(p.id.clone()),
             ..Default::default()
         }
     }
-
-    /// 思考模式为独立模型的厂商（DeepSeek 官方无思考开关参数，思考=换 reasoner 模型）：
-    /// thinking=on 且配了 thinking_model 时返回要换用的模型名，否则 None（沿用原模型）。
-    pub fn apply_thinking_model<'a>(&self, model: &'a str) -> Option<String> {
-        if self.thinking.as_deref() == Some("on") {
-            if let Some(tm) = &self.thinking_model {
-                if model != tm {
-                    return Some(tm.clone());
-                }
-            }
-        }
-        None
-    }
-
-    fn describe_reasoning(&self) -> Value {
-        json!({
-            "reasoning_style": self.reasoning_style.as_str(),
-            "thinking": self.thinking,
-            "reasoning_counts_in_max_tokens": self.reasoning_counts_in_max_tokens,
-        })
-    }
 }
 
-/// 组装 /chat/completions 请求体（纯函数，单测覆盖各厂商样式）。
-/// 硬约束：不含 api_key；思考参数按 reasoning_style 适配而非按 provider id 分支。
+/// 组装 /chat/completions 请求体（纯函数，单测覆盖各端点样式）。
+/// 硬约束：不含 api_key；思考参数按端点 compat 适配而非按 provider id 分支。
 pub fn build_body(
     model: &str,
     messages: &Value,
@@ -95,53 +74,91 @@ pub fn build_body(
     params: &ChatParams,
     tools: Option<&Value>,
 ) -> Value {
+    let compat = compat::resolve(
+        params.provider_id.as_deref(),
+        params.base_url.as_deref(),
+        model,
+        params.thinking_format,
+    );
+    build_body_with_compat(model, messages, stream, params, tools, &compat)
+}
+
+/// 带 compat 的组装（供网关在发送前先做历史净化时复用同一次探测）。
+pub fn build_body_with_compat(
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    params: &ChatParams,
+    tools: Option<&Value>,
+    compat: &Compat,
+) -> Value {
     let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": stream,
     });
-    if stream {
-        // 流式末尾带回 usage（OpenAI 兼容渠道普遍支持；不支持的渠道会忽略）
+    if stream && compat.supports_usage_in_streaming {
+        // 流式末尾带回 usage（非标端点不收 stream_options，按 compat 跳过）
         body["stream_options"] = json!({ "include_usage": true });
     }
     if let Some(t) = tools {
         body["tools"] = t.clone();
     }
     if let Some(mt) = params.max_tokens {
-        body["max_tokens"] = json!(mt);
+        body[compat.max_tokens_field] = json!(mt);
     }
     if let Some(t) = params.temperature {
-        body["temperature"] = json!(t);
+        if compat.supports_temperature {
+            body["temperature"] = json!(t);
+        }
     }
     if let Some(t) = params.top_p {
         body["top_p"] = json!(t);
     }
-    match params.reasoning_style {
-        // GLM：{"thinking":{"type":"enabled|disabled"}}（档位对 GLM 无意义，一律 enabled）
-        ReasoningStyle::ThinkingParam => {
-            if let Some(t) = params.thinking.as_deref() {
+
+    // —— 思考参数：按 thinkingFormat 分支（对齐 OpenClaw buildOpenAICompletionsParams）——
+    let requested = params.thinking.as_deref();
+    match compat.thinking_format {
+        // zai（智谱 GLM/豆包 Seed）：{type:enabled|disabled}；档位无意义，非 off 一律 enabled
+        ThinkingFormat::Zai => {
+            if let Some(t) = requested {
                 body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
             }
         }
-        // OpenAI 风格：on→medium，low/medium/high→对应档；off 不发（o 系无可靠"关"参数）
-        ReasoningStyle::EffortParam => {
-            let effort = match params.thinking.as_deref() {
-                Some("on") => Some("medium"),
-                Some(v @ ("low" | "medium" | "high")) => Some(v),
-                _ => None,
-            };
-            if let Some(e) = effort {
-                body["reasoning_effort"] = json!(e);
+        // deepseek/小米：thinking 对象（官方无档位/开关参数，仅此对象形态）
+        ThinkingFormat::Deepseek => {
+            if let Some(t) = requested {
+                body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
             }
         }
-        _ => {}
-    }
-    // Qwen 系布尔开关（enable_thinking）与预算参数（thinking_budget）独立于样式生效
-    if let (Some(name), Some(t)) = (&params.enable_thinking_param, params.thinking.as_deref()) {
-        body[name.as_str()] = json!(t != "off");
-    }
-    if let (Some(name), Some(b)) = (&params.thinking_budget_param, params.thinking_budget) {
-        body[name.as_str()] = json!(b);
+        // qwen（百炼/混元）：顶层布尔 enable_thinking
+        ThinkingFormat::Qwen => {
+            if let Some(t) = requested {
+                body["enable_thinking"] = json!(t != "off");
+            }
+        }
+        // 本地推理服务聊天模板：chat_template_kwargs.enable_thinking（vLLM/llama.cpp Qwen3 系）
+        ThinkingFormat::QwenChatTemplate => {
+            if let Some(t) = requested {
+                let kwargs = body
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("chat_template_kwargs")
+                    .or_insert_with(|| json!({}));
+                kwargs["enable_thinking"] = json!(t != "off");
+            }
+        }
+        // openai：reasoning_effort 档位，经 effort::resolve 按模型降级；无法表达"关"时不发
+        ThinkingFormat::Openai => {
+            let level = match requested {
+                Some("on") => Some("medium".to_string()),
+                Some(v) => effort::resolve_effort(model, v, None),
+                None => None,
+            };
+            if let Some(level) = level {
+                body["reasoning_effort"] = json!(level);
+            }
+        }
     }
     body
 }
@@ -378,9 +395,15 @@ impl Gateway {
         params: &ChatParams,
     ) -> anyhow::Result<String> {
         let url = Self::chat_url(base_url);
-        let effective_model = params.apply_thinking_model(model);
-        let model: &str = effective_model.as_deref().unwrap_or(model);
-        let body = build_body(model, messages, false, params, None);
+        let compat = compat::resolve(
+            params.provider_id.as_deref(),
+            params.base_url.as_deref().or(Some(base_url.trim())),
+            model,
+            params.thinking_format,
+        );
+        let mut outgoing = messages.clone();
+        replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
+        let body = build_body_with_compat(model, &outgoing, false, params, None, &compat);
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "aux" }));
         let response = self
             .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
@@ -398,7 +421,7 @@ impl Gateway {
             .unwrap_or("")
             .to_string();
         // 反代 <think> 当正文吐：剥离标签，摘要只要正文
-        let mut ts = ThinkSplit::default();
+        let mut ts = TagSplit::default();
         let (_, mut clean) = ts.feed(&raw);
         let (_, mut tail) = ts.finish();
         clean.push_str(&tail);
@@ -499,15 +522,23 @@ impl Gateway {
         }
 
         let url = Self::chat_url(base_url);
-        // 思考=独立模型的厂商（DeepSeek 官方）：on 时换 reasoner 模型
-        let effective_model = channel.params.apply_thinking_model(model);
-        let model: &str = effective_model.as_deref().unwrap_or(model);
-        let body = build_body(model, messages, true, &channel.params, tools);
+        let compat = compat::resolve(
+            channel.params.provider_id.as_deref(),
+            Some(base_url.trim()),
+            &channel.model,
+            channel.params.thinking_format,
+        );
+        let mut outgoing = messages.clone();
+        replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
+        let body = build_body_with_compat(model, &outgoing, true, &channel.params, tools, &compat);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
         observability::event(
             EventType::State,
-            json!({ "kind": "gateway.request", "url": url, "body": body, "reasoning": channel.params.describe_reasoning() }),
+            json!({ "kind": "gateway.request", "url": url, "body": body, "reasoning": {
+                "thinking_format": compat.thinking_format.as_str(),
+                "thinking": channel.params.thinking,
+            } }),
         );
         observability::debug(&format!("[gateway] POST {url}"));
         observability::debug(&format!("[gateway] request body: {body}"));
@@ -538,8 +569,8 @@ impl Gateway {
         let mut done = false;
         let mut turn = AssistantTurn::default();
         let mut calls: Vec<ToolCall> = Vec::new();
-        // 反代 <think> 剥离状态机（跨分片标签靠 hold 拼接）
-        let mut think_split = ThinkSplit::default();
+        // 反代把思考当正文吐（14 种标签，对齐 OpenClaw REASONING_TAG_NAMES）：剥离状态机
+        let mut think_split = TagSplit::default();
         loop {
             let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
                 Ok(item) => item,
@@ -593,7 +624,7 @@ impl Gateway {
                         }
                     }
                     let mut delta = extract_delta(&chunk);
-                    // 反代 <think> 剥离：标签内文字改道思考通道；
+                    // 反代思考标签剥离：标签内文字改道思考通道；
                     // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
                     if !delta.content.is_empty() {
                         let (think, clean) = think_split.feed(&delta.content);
@@ -656,76 +687,6 @@ impl Gateway {
     }
 }
 
-/// 反代端点 `<think>` 标签剥离状态机（P7.7）。
-/// 有些免费反代不写 reasoning_content 字段，把思考当正文吐（带 `<think>` 标签）——
-/// 标签内文字走思考通道：不进正文、不进历史、前端折叠显示。标签可跨分片断裂，
-/// 用 hold 缓冲半截标签。
-#[derive(Default)]
-struct ThinkSplit {
-    in_think: bool,
-    hold: String,
-}
-
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
-
-impl ThinkSplit {
-    /// 喂入一段增量，返回 (思考文本, 正文文本)。
-    fn feed(&mut self, text: &str) -> (String, String) {
-        let mut think = String::new();
-        let mut content = String::new();
-        for ch in text.chars() {
-            self.hold.push(ch);
-            if self.hold.ends_with(THINK_OPEN) {
-                self.hold.truncate(self.hold.len() - THINK_OPEN.len());
-                self.flush_before_tag(&mut think, &mut content);
-                self.in_think = true;
-                self.hold.clear();
-            } else if self.hold.ends_with(THINK_CLOSE) {
-                self.hold.truncate(self.hold.len() - THINK_CLOSE.len());
-                self.flush_before_tag(&mut think, &mut content);
-                if self.in_think {
-                    self.in_think = false; // 正常闭合
-                }
-                // 流落在正文里的孤立 </think>：当普通文本（flush_before_tag 已带出）
-                self.hold.clear();
-            } else if !THINK_OPEN.starts_with(self.hold.as_str())
-                && !THINK_CLOSE.starts_with(self.hold.as_str())
-            {
-                // 不可能凑成标签了：整段 hold 落入当前通道
-                self.flush_before_tag(&mut think, &mut content);
-            }
-            // 否则 hold 还是某个标签的前缀，留给下一片
-        }
-        (think, content)
-    }
-
-    fn flush_before_tag(&mut self, think: &mut String, content: &mut String) {
-        let s = std::mem::take(&mut self.hold);
-        if s.is_empty() {
-            return;
-        }
-        if self.in_think {
-            think.push_str(&s);
-        } else {
-            content.push_str(&s);
-        }
-    }
-
-    /// 流结束：hold 里剩下的半截标签不是标签，归入当前通道。
-    fn finish(&mut self) -> (String, String) {
-        let s = std::mem::take(&mut self.hold);
-        if s.is_empty() {
-            return (String::new(), String::new());
-        }
-        if self.in_think {
-            (s, String::new())
-        } else {
-            (String::new(), s)
-        }
-    }
-}
-
 /// 按 index 合并流式 tool_calls 分片（OpenAI 兼容增量格式）。
 fn accumulate_tool_calls(arr: &[Value], calls: &mut Vec<ToolCall>) {
     for entry in arr {
@@ -752,15 +713,43 @@ pub struct Delta {
     pub finish: Option<String>,
 }
 
-/// 从分片里提取增量内容与思考内容（reasoning_content，DeepSeek 思考模式）。
+/// 从分片里提取增量内容与思考内容。
+/// 思考字段全量对齐 OpenClaw OPENAI_COMPLETIONS_REASONING_FIELDS +
+/// OpenRouter reasoning_details（type=reasoning.text）：四字段按序取第一个非空。
 pub fn extract_delta(chunk: &Value) -> Delta {
     let choice = chunk.pointer("/choices/0").cloned().unwrap_or(Value::Null);
     let delta = choice.pointer("/delta").cloned().unwrap_or(Value::Null);
     Delta {
         content: delta.pointer("/content").and_then(Value::as_str).unwrap_or("").to_string(),
-        reasoning: delta.pointer("/reasoning_content").and_then(Value::as_str).map(String::from),
+        reasoning: extract_reasoning(&delta),
         finish: choice.pointer("/finish_reason").and_then(Value::as_str).map(String::from),
     }
+}
+
+/// OpenAI Completions 系思考字段（上游 OPENAI_COMPLETIONS_REASONING_FIELDS 顺序）。
+fn extract_reasoning(delta: &Value) -> Option<String> {
+    for field in ["reasoning_content", "reasoning", "reasoning_text"] {
+        if let Some(s) = delta.get(field).and_then(Value::as_str) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    // OpenRouter：delta.reasoning_details 数组里的 reasoning.text 块
+    if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+        let mut buf = String::new();
+        for d in details {
+            if d.get("type").and_then(Value::as_str) == Some("reasoning.text") {
+                if let Some(t) = d.get("text").and_then(Value::as_str) {
+                    buf.push_str(t);
+                }
+            }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -778,28 +767,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_model_switch() {
-        let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
-        // DeepSeek：思考=独立模型（官方无开关参数），on 时换 deepseek-reasoner
-        let mut ds = ChatParams::from_preset(crate::gateway::providers::find("deepseek").unwrap());
-        assert_eq!(ds.apply_thinking_model("deepseek-chat"), None, "默认（不发开关）不换模型");
-        ds.thinking = Some("on".into());
-        assert_eq!(ds.apply_thinking_model("deepseek-chat").as_deref(), Some("deepseek-reasoner"));
-        let mut off = ds.clone();
-        off.thinking = Some("off".into());
-        assert_eq!(off.apply_thinking_model("deepseek-chat"), None);
-        let none = ChatParams::default();
-        assert_eq!(none.apply_thinking_model("deepseek-chat"), None);
-        // 已是思考模型则不重复换
-        assert_eq!(ds.apply_thinking_model("deepseek-reasoner"), None);
-    }
-
-    #[test]
     fn build_body_vendor_styles() {
         // REGISTRY 是进程级 OnceLock：测试进程里手动加载一次（幂等）
         let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
         let msgs = json!([{"role":"user","content":"hi"}]);
-        // GLM（thinking_param）：on/off 对象形态；思考占 max_tokens 只影响日志
+        // 智谱（zai 格式，端点探测出）：on/off 对象形态；档位无意义，非 off 一律 enabled
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
         p.thinking = Some("on".into());
         p.max_tokens = Some(2048);
@@ -810,19 +782,30 @@ mod tests {
         p.thinking = Some("off".into());
         let b = build_body("glm-4.6", &msgs, true, &p, None);
         assert_eq!(b["thinking"], json!({"type":"disabled"}));
-        // 布尔开关（enable_thinking，腾讯混元样式）：on/off 映射 true/false；预算参数独立生效
+        p.thinking = Some("high".into());
+        let b = build_body("glm-4.6", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"enabled"}), "档位对对象格式无意义");
+        // 豆包（预设 zai 覆盖）：ark 域名探测不出，靠 providers.json 兜底
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("doubao").unwrap());
+        p.thinking = Some("on".into());
+        let b = build_body("doubao-seed-1.6", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"enabled"}));
+        // 混元（预设 qwen 覆盖）：顶层布尔
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("hunyuan").unwrap());
         p.thinking = Some("off".into());
-        p.thinking_budget = Some(512);
-        p.thinking_budget_param = Some("thinking_budget".into());
         let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(false));
-        assert_eq!(b["thinking_budget"], json!(512));
-        assert!(b.get("thinking").is_none(), "reasoning_content 样式不发 thinking 对象");
+        assert!(b.get("thinking").is_none(), "qwen 格式不发 thinking 对象");
         p.thinking = Some("on".into());
         let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(true));
-        // OpenAI（effort_param）：on 发 medium，low/medium/high 发对应档，off 不发
+        // DeepSeek（deepseek 格式，端点探测）：thinking 对象；官方 reasoner 不收 effort
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("deepseek").unwrap());
+        p.thinking = Some("on".into());
+        let b = build_body("deepseek-reasoner", &msgs, true, &p, None);
+        assert_eq!(b["thinking"], json!({"type":"enabled"}));
+        assert!(b.get("reasoning_effort").is_none(), "deepseek 格式 supports_reasoning_effort=false");
+        // OpenAI（openai 格式）：on→medium；low/medium/high 原样；off 不发（o 系无可靠关参数）
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap());
         p.thinking = Some("on".into());
         let b = build_body("gpt-5", &msgs, true, &p, None);
@@ -830,19 +813,37 @@ mod tests {
         for lvl in ["low", "medium", "high"] {
             p.thinking = Some(lvl.into());
             let b = build_body("gpt-5", &msgs, true, &p, None);
-            assert_eq!(b["reasoning_effort"], json!(lvl), "档位 {lvl} 应原样发出");
+            assert_eq!(b["reasoning_effort"], json!(lvl), "档位 {lvl} 应解析后发出");
         }
+        p.thinking = Some("xhigh".into());
+        let b = build_body("gpt-5", &msgs, true, &p, None);
+        assert_eq!(b["reasoning_effort"], json!("high"), "xhigh 在 gpt-5 上降级为 high");
         p.thinking = Some("off".into());
         let b = build_body("gpt-5", &msgs, true, &p, None);
-        assert!(b.get("reasoning_effort").is_none(), "o 系无可靠关参数，off 不发");
-        // GLM（thinking_param）：档位无意义，非 off 一律 enabled
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
+        assert!(b.get("reasoning_effort").is_none(), "off 无参数可发时不发");
+        // GPT-5 新系 max_tokens 字段切换
+        let p = ChatParams { max_tokens: Some(1024), ..ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap()) };
+        let b = build_body("gpt-5", &msgs, true, &p, None);
+        assert!(b.get("max_tokens").is_none() && b["max_completion_tokens"] == json!(1024));
+        let b = build_body("gpt-4o-mini", &msgs, true, &p, None);
+        assert_eq!(b["max_tokens"], json!(1024));
+        // 本地（qwen-chat-template）：chat_template_kwargs.enable_thinking
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("ollama").unwrap());
+        p.thinking = Some("on".into());
+        let b = build_body("qwen3:8b", &msgs, true, &p, None);
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(true));
+        p.thinking = Some("off".into());
+        let b = build_body("qwen3:8b", &msgs, true, &p, None);
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(false));
+        // 自定义中转（端点认不出 → openai 格式）
+        let p = ChatParams::from_preset(crate::gateway::providers::find("custom").unwrap());
+        let mut p = p;
         p.thinking = Some("high".into());
-        let b = build_body("glm-4.6", &msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"enabled"}));
-        // 默认（reasoning_content）：完全不带思考参数
+        let b = build_body("mystery-model", &msgs, true, &p, None);
+        assert_eq!(b["reasoning_effort"], json!("high"));
+        // 默认不发任何思考参数
         let b = build_body("deepseek-chat", &msgs, true, &ChatParams::default(), None);
-        assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none());
+        assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none() && b.get("enable_thinking").is_none());
         // 采样参数：有值才发
         let mut p = ChatParams::default();
         p.temperature = Some(0.3);
@@ -855,6 +856,24 @@ mod tests {
         // 非流式不带 stream_options
         let b = build_body("m", &msgs, false, &ChatParams::default(), None);
         assert!(b.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn extract_delta_reasoning_fields() {
+        // DeepSeek 式 reasoning_content
+        let d = extract_delta(&json!({"choices":[{"delta":{"reasoning_content":"想"}}]}));
+        assert_eq!(d.reasoning.as_deref(), Some("想"));
+        // 兼容字段 reasoning / reasoning_text
+        let d = extract_delta(&json!({"choices":[{"delta":{"reasoning":"R"}}]}));
+        assert_eq!(d.reasoning.as_deref(), Some("R"));
+        let d = extract_delta(&json!({"choices":[{"delta":{"reasoning_text":"T"}}]}));
+        assert_eq!(d.reasoning.as_deref(), Some("T"));
+        // OpenRouter reasoning_details
+        let d = extract_delta(&json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"OR"}]}}]}));
+        assert_eq!(d.reasoning.as_deref(), Some("OR"));
+        // 空串不触发
+        let d = extract_delta(&json!({"choices":[{"delta":{"reasoning_content":""}}]}));
+        assert_eq!(d.reasoning, None);
     }
 
     #[tokio::test]
@@ -872,13 +891,13 @@ mod tests {
     #[test]
     fn think_split_variants() {
         // 无标签：原样走正文
-        let mut ts = ThinkSplit::default();
+        let mut ts = TagSplit::default();
         assert_eq!(ts.feed("普通回答"), ("".into(), "普通回答".into()));
         // 标签整段：思考与正文分离
-        let mut ts = ThinkSplit::default();
+        let mut ts = TagSplit::default();
         assert_eq!(ts.feed("<think>先想想</think>答案"), ("先想想".into(), "答案".into()));
-        // 标签跨分片断裂："<thi|nk>AB</thi|nk>CD"
-        let mut ts = ThinkSplit::default();
+        // 跨分片断裂："<thi|nk>AB</thi|nk>CD"
+        let mut ts = TagSplit::default();
         let (t1, c1) = ts.feed("<thi");
         assert_eq!((t1.as_str(), c1.as_str()), ("", ""));
         let (t2, c2) = ts.feed("nk>AB</thi");
@@ -888,19 +907,20 @@ mod tests {
         let (t4, c4) = ts.finish();
         assert_eq!((t4.as_str(), c4.as_str()), ("", ""));
         // 未闭合 <think>（流在思考中被截断）：全部走思考
-        let mut ts = ThinkSplit::default();
+        let mut ts = TagSplit::default();
         let (t, c) = ts.feed("<think>还没想完");
         assert_eq!((t.as_str(), c.as_str()), ("还没想完", ""));
-        // 正文里出现 "<thinking" 这类伪前缀：不误伤
-        let mut ts = ThinkSplit::default();
-        let (t, c) = ts.feed("a<thinking>b");
-        assert_eq!((t.as_str(), c.as_str()), ("", "a<thinking>b"));
+        // 正文里出现 "<thinking" 这类伪前缀：不误伤（'a' 即时归正文，伪标签流尾归位）
+        let mut ts = TagSplit::default();
+        let (t, c) = ts.feed("a<thinking");
+        assert_eq!((t.as_str(), c.as_str()), ("", "a"));
+        let (t2, c2) = ts.finish();
+        assert_eq!((t2.as_str(), c2.as_str()), ("", "<thinking"));
         // 孤立 </think>（不在思考态）：当普通文本
-        let mut ts = ThinkSplit::default();
-        let (t, c) = ts.feed("x</think>y");
-        assert_eq!((t.as_str(), c.as_str()), ("", "xy"));
+        let mut ts = TagSplit::default();
+        assert_eq!(ts.feed("x</think>y"), ("".into(), "xy".into()));
         // 截断在半截标签：finish 归位正文
-        let mut ts = ThinkSplit::default();
+        let mut ts = TagSplit::default();
         let (t, c) = ts.feed("尾<thi");
         assert_eq!((t.as_str(), c.as_str()), ("", "尾"));
         let (t2, c2) = ts.finish();

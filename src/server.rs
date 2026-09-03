@@ -122,14 +122,11 @@ pub struct SettingsUpdate {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub top_p: Option<f64>,
-    /// 思考开关（P8）："on"/"off"/""（空=清除走渠道默认）
+    /// 思考开关（P9）："on"/"off"/档位（low/medium/high/xhigh/max/minimal）/""（空=清除走渠道默认）
     #[serde(default)]
     pub thinking: Option<String>,
-    /// 思考预算（P8；0=清除）
-    #[serde(default)]
-    pub thinking_budget: Option<u64>,
-    /// 思考参数形态覆盖（P8.3）："auto" 或 ""=跟预设；none/thinking_object/reasoning_effort/
-    /// enable_thinking/enable_thinking_budget
+    /// 思考参数形态覆盖（P9，OpenClaw thinkingFormat 词表）："auto"/""=端点探测；
+    /// none/openai/deepseek/zai/qwen/qwen-chat-template；P8.3 旧值自动映射
     #[serde(default)]
     pub thinking_style: Option<String>,
 }
@@ -171,7 +168,7 @@ fn json_event(payload: Value) -> Event {
     Event::default().json_data(payload).expect("SSE 事件序列化失败")
 }
 
-/// P8：从设置镜像 + 供应商预设组装请求参数（采样/思考/厂商适配）。
+/// P8/P9：从设置镜像 + 供应商预设组装请求参数（采样/思考/端点探测线索）。
 fn build_chat_params(
     s: &Settings,
     preset: Option<&gateway::providers::ProviderPreset>,
@@ -184,42 +181,25 @@ fn build_chat_params(
     p.temperature = s.temperature;
     p.top_p = s.top_p;
     p.thinking = s.thinking.clone();
-    p.thinking_budget = s.thinking_budget;
+    p.base_url = Some(s.effective_base_url());
     apply_thinking_style(&mut p, s.thinking_style.as_deref());
     p
 }
 
-/// P8.3：思考参数形态覆盖——自定义/中转渠道预设拿不准时显式指定。
-/// none=不发任何思考参数；其余按形态重设 reasoning_style/参数名。
+/// P9：思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定。
+/// 词表与 OpenClaw thinkingFormat 对齐；P8.3 旧值做别名映射。
+/// none=不发任何思考参数。
 fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
-    use gateway::providers::ReasoningStyle as RS;
+    use gateway::compat::ThinkingFormat as TF;
     match style {
-        Some("none") => {
-            p.reasoning_style = RS::ReasoningContent;
-            p.enable_thinking_param = None;
-            p.thinking_budget_param = None;
-        }
-        Some("thinking_object") => {
-            p.reasoning_style = RS::ThinkingParam;
-            p.enable_thinking_param = None;
-            p.thinking_budget_param = None;
-        }
-        Some("reasoning_effort") => {
-            p.reasoning_style = RS::EffortParam;
-            p.enable_thinking_param = None;
-            p.thinking_budget_param = None;
-        }
-        Some("enable_thinking") => {
-            p.reasoning_style = RS::ReasoningContent;
-            p.enable_thinking_param = Some("enable_thinking".into());
-            p.thinking_budget_param = None;
-        }
-        Some("enable_thinking_budget") => {
-            p.reasoning_style = RS::ReasoningContent;
-            p.enable_thinking_param = Some("enable_thinking".into());
-            p.thinking_budget_param = Some("thinking_budget".into());
-        }
-        _ => {} // auto/未知：跟预设
+        Some("none") => p.thinking_format = Some(TF::Openai),
+        // 旧词表别名（P8.3 设置残留）：thinking_object=GLM 式对象 → zai；
+        // reasoning_effort=档位 → openai；enable_thinking（_budget）=布尔 → qwen
+        Some("thinking_object") => p.thinking_format = Some(TF::Zai),
+        Some("reasoning_effort") => p.thinking_format = Some(TF::Openai),
+        Some("enable_thinking" | "enable_thinking_budget") => p.thinking_format = Some(TF::Qwen),
+        Some(v) => p.thinking_format = TF::parse(v),
+        None => {} // auto/未知：跟端点探测
     }
 }
 
@@ -253,6 +233,8 @@ fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
     // 角色/降级渠道用自己的 max_output_tokens（若该配置单独设置过）与思考形态覆盖
     params.max_tokens = c.max_output_tokens;
     apply_thinking_style(&mut params, c.thinking_style.as_deref());
+    // 端点探测以本渠道实际地址为准（角色映射可能落到不同渠道）
+    params.base_url = Some(base_url.clone());
     Some(gateway::Channel::new(&base_url, &model, &s.config_key(c).unwrap_or_default(), params))
 }
 
@@ -266,11 +248,8 @@ async fn list_providers() -> Json<Value> {
                 "name": p.name,
                 "default_base_url": p.default_base_url,
                 "default_model": p.default_model,
-                // P8 行为字段：前端按它决定思考开关是否可用/如何提示
-                "reasoning_style": p.reasoning_style.as_str(),
-                "enable_thinking_param": p.enable_thinking_param,
-                "thinking_budget_param": p.thinking_budget_param,
-                "reasoning_counts_in_max_tokens": p.reasoning_counts_in_max_tokens,
+                // P9：预设的思考形态覆盖（多数官方域名可探测，仅豆包/混元带值）
+                "thinking_format": p.thinking_format.map(|f| f.as_str()),
                 "key_optional": p.key_optional,
             })
         })
@@ -339,13 +318,12 @@ async fn put_settings(
     }
     if let Some(v) = req.thinking {
         let v = v.trim().to_lowercase();
+        // P9：接受开/关 + effort 档位（输入栏 🧠 菜单按生效形态发档位）；
+        // 不认识的值一律回渠道默认（不发思考参数）
         s.thinking = match v.as_str() {
-            "on" | "off" => Some(v),
+            "on" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(v),
             _ => None,
         };
-    }
-    if let Some(v) = req.thinking_budget {
-        s.thinking_budget = if v == 0 { None } else { Some(v) };
     }
     if let Some(v) = req.thinking_style {
         let v = v.trim().to_lowercase();
@@ -543,7 +521,6 @@ fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思�
                 "temperature": c.temperature,
                 "top_p": c.top_p,
                 "thinking": c.thinking,
-                "thinking_budget": c.thinking_budget,
                 "thinking_style": c.thinking_style,
             })
         }).collect::<Vec<Value>>(),
@@ -559,13 +536,9 @@ fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思�
         "temperature": s.temperature,
         "top_p": s.top_p,
         "thinking": s.thinking,
-        "thinking_budget": s.thinking_budget,
         "has_key": s.get_key().is_some(),
         "key_hint": key_hint_of(s.get_key()),
-        "reasoning_style": preset.map(|p| p.reasoning_style.as_str()),
-        "thinking_budget_param": preset.and_then(|p| p.thinking_budget_param.clone()),
-        "reasoning_counts_in_max_tokens": preset.map(|p| p.reasoning_counts_in_max_tokens),
-        // P8.2 工作区 + P8.3 思考参数形态覆盖（前端按它渲染档位菜单）
+        // P8.2 工作区 + P9 思考参数形态覆盖（前端按它渲染档位菜单）
         "workspace": crate::tools::workspace_root().display().to_string(),
         "recent_workspaces": s.recent_workspaces,
         "thinking_style_override": s.thinking_style,
@@ -573,32 +546,29 @@ fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思�
     })
 }
 
-/// 生效的思考参数形态（P8.3）：配置覆盖 > 供应商预设推导。
-/// 值：none | thinking_object | reasoning_effort | enable_thinking | enable_thinking_budget | auto
+/// 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）：渠道覆盖 > 端点探测。
+/// 值：none | openai | deepseek | zai | qwen | qwen-chat-template | auto
 fn effective_thinking_style(
     s: &Settings,
     preset: Option<&gateway::providers::ProviderPreset>,
 ) -> &'static str {
+    use gateway::compat::ThinkingFormat as TF;
     match s.thinking_style.as_deref() {
         Some("none") => "none",
-        Some("thinking_object") => "thinking_object",
-        Some("reasoning_effort") => "reasoning_effort",
-        Some("enable_thinking") => "enable_thinking",
-        Some("enable_thinking_budget") => "enable_thinking_budget",
-        _ => match preset.map(|p| p.reasoning_style) {
-            Some(gateway::providers::ReasoningStyle::ThinkingParam) => "thinking_object",
-            Some(gateway::providers::ReasoningStyle::EffortParam) => "reasoning_effort",
-            Some(gateway::providers::ReasoningStyle::InContent) => "in_content",
-            _ => {
-                if preset.is_some_and(|p| p.thinking_budget_param.is_some()) {
-                    "enable_thinking_budget"
-                } else if preset.is_some_and(|p| p.enable_thinking_param.is_some()) {
-                    "enable_thinking"
-                } else {
-                    "auto"
-                }
-            }
-        },
+        // P8.3 旧词表别名 → 新词表
+        Some("thinking_object") => TF::Zai.as_str(),
+        Some("reasoning_effort") => TF::Openai.as_str(),
+        Some("enable_thinking" | "enable_thinking_budget") => TF::Qwen.as_str(),
+        Some(v) => TF::parse(v).map(|f| f.as_str()).unwrap_or("auto"),
+        // auto：端点探测（预设 thinking_format 是探测认不出时的兜底）
+        _ => gateway::compat::resolve(
+            Some(s.provider_id.as_str()),
+            Some(&s.effective_base_url()),
+            &s.model,
+            preset.and_then(|p| p.thinking_format),
+        )
+        .thinking_format
+        .as_str(),
     }
 }
 
@@ -1306,34 +1276,39 @@ loadProviders().then(loadSettings);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway::providers::ReasoningStyle;
 
     #[test]
     fn thinking_style_override() {
         let _ = gateway::providers::init(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
         );
-        // 自定义渠道（custom=in_content）拿不准参数形态 → 覆盖为 enable_thinking 布尔
+        // 自定义中转端点探测认不出 → 覆盖为 qwen 布尔形态
         let preset = gateway::providers::find("custom");
         let mut s = Settings::default();
         s.provider_id = "custom".into();
         s.thinking = Some("off".into());
-        s.thinking_style = Some("enable_thinking".into());
+        s.thinking_style = Some("qwen".into());
         let p = build_chat_params(&s, preset);
-        assert_eq!(p.enable_thinking_param.as_deref(), Some("enable_thinking"));
-        assert_eq!(p.reasoning_style, ReasoningStyle::ReasoningContent);
+        assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Qwen));
         // 覆盖后 off 真的会发 enable_thinking:false
         let body = gateway::build_body("m", &json!([]), true, &p, None);
         assert_eq!(body["enable_thinking"], json!(false));
-        // none：任何思考参数都不发
+        // P8.3 旧设置值自动映射：thinking_object → zai
+        s.thinking_style = Some("thinking_object".into());
+        let p = build_chat_params(&s, preset);
+        assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Zai));
+        // none：任何思考参数都不发（none 用 openai 形态但不发档位=零思考字段）
         s.thinking_style = Some("none".into());
         let p = build_chat_params(&s, gateway::providers::find("zhipu"));
-        let body = gateway::build_body("m", &json!([]), true, &p, None);
+        let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
         assert!(body.get("thinking").is_none() && body.get("enable_thinking").is_none());
-        // auto：跟预设（zhipu=thinking_object）
+        // auto：端点探测（zhipu 官方域名 → zai 形态）
         s.thinking_style = None;
+        s.thinking = Some("on".into());
         let p = build_chat_params(&s, gateway::providers::find("zhipu"));
-        assert_eq!(p.reasoning_style, ReasoningStyle::ThinkingParam);
+        let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
+        assert_eq!(p.thinking_format, None, "auto 不写覆盖，探测说了算");
+        assert_eq!(body["thinking"], json!({"type":"enabled"}), "探测出 zai 形态后 on 生效");
     }
 
     #[test]
@@ -1342,11 +1317,32 @@ mod tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
         );
         let mut s = Settings::default();
+        // 自定义中转（空地址探测不出）→ openai 形态兜底
         s.provider_id = "custom".into();
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("custom")), "in_content");
-        s.provider_id = "openai".into();
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("openai")), "reasoning_effort");
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("custom")), "openai");
+        // 智谱官方域名探测 → zai
+        s.provider_id = "zhipu".into();
+        s.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "zai");
+        // 覆盖优先，旧词表也映射
         s.thinking_style = Some("enable_thinking_budget".into());
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("openai")), "enable_thinking_budget");
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "qwen");
+        s.thinking_style = Some("none".into());
+        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "none");
+    }
+
+    #[test]
+    fn thinking_accepts_effort_levels() {
+        let _ = gateway::providers::init(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
+        );
+        let mut s = Settings::default();
+        s.provider_id = "openai".into();
+        // 输入栏 🧠 菜单发的档位要能持久化（P8.3 期间被 put_settings 吞掉的老问题）
+        for lvl in ["low", "medium", "high", "on", "off"] {
+            s.thinking = Some(lvl.into());
+            let p = build_chat_params(&s, gateway::providers::find("openai"));
+            assert_eq!(p.thinking.as_deref(), Some(lvl));
+        }
     }
 }

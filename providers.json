@@ -4,112 +4,87 @@
       "id": "deepseek",
       "name": "DeepSeek（深度求索）",
       "default_base_url": "https://api.deepseek.com",
-      "default_model": "deepseek-chat",
-      "reasoning_style": "reasoning_content",
-      "reasoning_counts_in_max_tokens": true,
-      "thinking_model": "deepseek-reasoner"
+      "default_model": "deepseek-chat"
     },
     {
       "id": "qwen",
       "name": "通义千问（Qwen·百炼）",
       "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      "default_model": "qwen-plus",
-      "reasoning_style": "reasoning_content",
-      "enable_thinking_param": "enable_thinking",
-      "thinking_budget_param": "thinking_budget",
-      "reasoning_counts_in_max_tokens": false
+      "default_model": "qwen-plus"
     },
     {
       "id": "ernie",
       "name": "百度文心（千帆 API）",
       "default_base_url": "https://qianfan.baidubce.com/v2",
-      "default_model": "ernie-4.0-8k",
-      "reasoning_style": "reasoning_content"
+      "default_model": "ernie-4.0-8k"
     },
     {
       "id": "spark",
       "name": "讯飞星火",
       "default_base_url": "https://spark-api-open.xf-yun.com/v1",
-      "default_model": "generalv3.5",
-      "reasoning_style": "reasoning_content"
+      "default_model": "generalv3.5"
     },
     {
       "id": "moonshot",
       "name": "Moonshot（Kimi）",
       "default_base_url": "https://api.moonshot.cn/v1",
-      "default_model": "kimi-k2-thinking",
-      "reasoning_style": "reasoning_content"
+      "default_model": "kimi-k2-thinking"
     },
     {
       "id": "zhipu",
       "name": "智谱 AI（GLM）",
       "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
-      "default_model": "glm-4-flash",
-      "reasoning_style": "thinking_param",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": "glm-4-flash"
     },
     {
       "id": "minimax",
       "name": "MiniMax",
       "default_base_url": "https://api.minimaxi.com/v1",
-      "default_model": "MiniMax-M2",
-      "reasoning_style": "in_content",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": "MiniMax-M2"
     },
     {
       "id": "doubao",
       "name": "字节跳动（豆包·火山方舟）",
       "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
       "default_model": "doubao-seed-1.6",
-      "reasoning_style": "thinking_param",
-      "reasoning_counts_in_max_tokens": true
+      "thinking_format": "zai"
     },
     {
       "id": "hunyuan",
       "name": "腾讯混元",
       "default_base_url": "https://api.hunyuan.cloud.tencent.com/v1",
       "default_model": "hunyuan-turbos-latest",
-      "reasoning_style": "reasoning_content",
-      "enable_thinking_param": "enable_thinking"
+      "thinking_format": "qwen"
     },
     {
       "id": "openai",
       "name": "OpenAI",
       "default_base_url": "https://api.openai.com/v1",
-      "default_model": "gpt-4o-mini",
-      "reasoning_style": "effort_param",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": "gpt-4o-mini"
     },
     {
       "id": "anthropic",
       "name": "Anthropic（Claude·OpenAI 兼容层）",
       "default_base_url": "https://api.anthropic.com/v1",
-      "default_model": "claude-sonnet-4-5",
-      "reasoning_style": "effort_param",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": ""
     },
     {
       "id": "gemini",
       "name": "Google Gemini（OpenAI 兼容层）",
       "default_base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-      "default_model": "gemini-2.0-flash",
-      "reasoning_style": "effort_param",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": "gemini-2.0-flash"
     },
     {
       "id": "xai",
       "name": "xAI（Grok）",
       "default_base_url": "https://api.x.ai/v1",
-      "default_model": "grok-4",
-      "reasoning_style": "effort_param",
-      "reasoning_counts_in_max_tokens": true
+      "default_model": "grok-4"
     },
     {
       "id": "ollama",
       "name": "Ollama（本地）",
       "default_base_url": "http://localhost:11434/v1",
       "default_model": "qwen2.5:7b",
-      "reasoning_style": "reasoning_content",
       "key_optional": true
     },
     {
@@ -117,7 +92,6 @@
       "name": "LM Studio（本地）",
       "default_base_url": "http://localhost:1234/v1",
       "default_model": "",
-      "reasoning_style": "in_content",
       "key_optional": true
     },
     {
@@ -125,7 +99,6 @@
       "name": "MNN LLM（本地）",
       "default_base_url": "http://localhost:8080/v1",
       "default_model": "",
-      "reasoning_style": "in_content",
       "key_optional": true
     },
     {
@@ -133,7 +106,6 @@
       "name": "llama.cpp server（本地）",
       "default_base_url": "http://localhost:8081/v1",
       "default_model": "",
-      "reasoning_style": "in_content",
       "key_optional": true
     },
     {
@@ -141,7 +113,6 @@
       "name": "OpenAI 兼容（自定义）",
       "default_base_url": "",
       "default_model": "",
-      "reasoning_style": "in_content",
       "key_optional": true
     }
   ]
