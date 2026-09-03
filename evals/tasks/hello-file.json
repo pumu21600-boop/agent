@@ -1,0 +1,13 @@
+{
+  "name": "hello-file",
+  "prompt": "在工作区创建文件 hello.txt，内容为一行文本：hello eval",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {},
+  "assertions": [
+    { "type": "file_exists", "path": "hello.txt" },
+    { "type": "file_contains", "path": "hello.txt", "needle": "hello eval" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

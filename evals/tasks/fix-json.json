@@ -1,0 +1,15 @@
+{
+  "name": "fix-json",
+  "prompt": "工作区里的 broken.json 是坏掉的 JSON。请修复它，使其成为合法 JSON 且解析结果为 {\"ok\": true}。直接改好即可。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {
+    "broken.json": "{ \"ok\": true,, }"
+  },
+  "assertions": [
+    { "type": "file_contains", "path": "broken.json", "needle": "\"ok\"" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

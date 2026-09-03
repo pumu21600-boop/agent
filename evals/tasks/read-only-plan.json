@@ -1,0 +1,15 @@
+{
+  "name": "read-only-plan",
+  "prompt": "查看工作区下的 AGENTS.md（如果存在则读它），然后用一段话总结这个项目应该怎么对待你。最后输出一份「给这个项目写一份贡献指南」的执行计划，不要真正创建或修改任何文件。",
+  "plan_mode": true,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {
+    "AGENTS.md": "本仓库是一个 Windows 原生自主编码 Agent 的实验项目。请保持改动最小、遵守窄而刚原则。"
+  },
+  "assertions": [
+    { "type": "sse_event", "event": "plan_proposal" },
+    { "type": "sse_event", "event": "done" },
+    { "type": "no_new_files" }
+  ]
+}
