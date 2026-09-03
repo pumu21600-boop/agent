@@ -1,9 +1,18 @@
-//! 细粒度审批规则引擎（P9）
+//! 细粒度审批规则引擎（P9，v1 转正）
 //!
 //! 替代“一刀切”的审批机制：
 //! - Safe (0): 只读安全操作、查看代码、单元测试、只读 Git，完全静默放行；
 //! - Normal (1): 工作区内的正常代码创建与修改，按常规放行并记录改动；
 //! - Dangerous (2): 文件删除、工作区外部篡改、git 破坏性操作与高危命令，强制拦截卡点弹窗。
+//!
+//! v1 相对 v0（P8.5 提前落地的初版）修正的判定缺陷：
+//! 1. shell 命令不再整体前缀匹配——先按命令分隔符拆成多条子命令，逐条判定取最高风险，
+//!    堵住 `cargo test && del /f x` 这类串联绕过；
+//! 2. 高危/安全名单改按「程序名 token」精确匹配，不再用子串——
+//!    `echo "del x"` 不再误判高危，`dirname` 不再因 `dir` 前缀被误判安全；
+//! 3. shell 里跑 git 时复用 git 子命令判定（`git push` 不再是常规）；
+//! 4. write_file 敏感清单扩展（.env / 密钥文件 / .agent 记忆层等）；
+//! 5. 工作区越界判定在 Windows 上大小写不敏感（盘符/目录名大小写差异不再误判）。
 
 use std::path::Path;
 use serde::{Deserialize, Serialize};
@@ -24,7 +33,85 @@ impl RiskLevel {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// 前端展示用的档位名（中文，审批卡显示判定依据时一并使用）
+    pub fn label(self) -> &'static str {
+        match self {
+            RiskLevel::Safe => "安全",
+            RiskLevel::Normal => "常规改动",
+            RiskLevel::Dangerous => "高危操作",
+        }
+    }
 }
+
+/// 已知工具登记表。
+///
+/// **锚点**：与 `src/tools/mod.rs` 的注册表保持一致——那边新增工具，这边必须同步登记，
+/// 否则未登记工具会走 Dangerous 默认策略（见 `evaluate_risk` 末尾分支）。
+/// P11 的 MCP 工具接入时同样在此登记。
+const KNOWN_TOOLS: &[&str] = &[
+    "read_file", "read_page", "search", "web_fetch", "write_file", "shell", "git",
+];
+
+/// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
+/// 覆盖删除、磁盘、注册表、账号、服务、进程终止等不可逆操作。
+const DANGEROUS_PROGRAMS: &[&str] = &[
+    "del", "erase", "rm", "rmdir", "rd", "format", "diskpart", "cipher",
+    "reg", "net", "shutdown", "taskkill", "remove-item", "ri", "del-item", "rm-item",
+    "takeown", "icacls", "bcdedit", "schtasks", "sc", "wmic", "mklink", "attrib",
+];
+
+/// 只读/诊断类程序（无论参数如何都判 Safe）。
+/// 注意是精确匹配：`dirname` 不会因 `dir` 而被误判安全。
+const SAFE_PROGRAMS: &[&str] = &[
+    "dir", "ls", "type", "cat", "echo", "pwd", "where", "which", "head", "tail",
+    "findstr", "grep", "wc", "sort", "tree", "hostname", "whoami", "date", "time",
+    "ver", "python", "python3", "pytest", "npx",
+];
+
+/// 需要看子命令才能判安全的程序（程序 + 第二个 token 精确匹配）。
+/// 不在表内的同程序命令（如 `cargo build`、`npm run build`）保持 Normal。
+const SAFE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("cargo", "check"),
+    ("cargo", "test"),
+    ("cargo", "fmt"),
+    ("cargo", "clippy"),
+    ("cargo", "--version"),
+    ("cargo", "-v"),
+    ("npm", "test"),
+    ("npm", "--version"),
+    ("npm", "-v"),
+    ("node", "-v"),
+    ("node", "--version"),
+    ("rustc", "--version"),
+    ("rustc", "-v"),
+    ("rustup", "--version"),
+    ("python", "-v"),
+    ("python", "--version"),
+];
+
+/// 三段式安全组合（程序 + 子命令 + 参数），用于 `npm run test` 这类。
+const SAFE_TRIPLES: &[(&str, &str, &str)] = &[("npm", "run", "test"), ("npm", "run", "test:")];
+
+/// write_file 敏感路径特征（命中即 Dangerous，小写匹配）。
+const SENSITIVE_PATTERNS: &[&str] = &[
+    ".git/",
+    ".agent/",
+    ".ssh/",
+    ".aws/",
+    "settings.json",
+    ".env",
+    ".npmrc",
+    ".netrc",
+    "credentials",
+    ".htpasswd",
+    "id_rsa",
+    "id_ed25519",
+    ".keystore",
+];
+
+/// write_file 敏感后缀（密钥/证书类）。
+const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".ppk"];
 
 /// 评估具体工具调用的风险等级并给出判定依据。
 pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
@@ -35,103 +122,257 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         }
 
         // 写文件：区分工作区内/越界/敏感文件
-        "write_file" => {
-            let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            if path_str.is_empty() {
-                return (RiskLevel::Normal, "写入路径为空".into());
-            }
-
-            // 检查敏感关键文件
-            let lower = path_str.to_lowercase().replace('\\', "/");
-            if lower.contains(".git/") || lower.ends_with(".git") || lower == "settings.json" {
-                return (RiskLevel::Dangerous, format!("试图修改系统核心或版本库元数据: {path_str}"));
-            }
-
-            // 检查是否越界
-            let target_path = workspace_root.join(path_str);
-            if path_str.starts_with("..") || path_str.contains("/../") || path_str.contains("\\..\\") {
-                return (RiskLevel::Dangerous, format!("检测到跨级路径遍历: {path_str}"));
-            }
-
-            // 绝对路径检查：如果以盘符开头且不在工作区内
-            if let Ok(canon_target) = target_path.canonicalize() {
-                if let Ok(canon_root) = workspace_root.canonicalize() {
-                    if !canon_target.starts_with(&canon_root) {
-                        return (RiskLevel::Dangerous, format!("试图修改工作区外部文件: {path_str}"));
-                    }
-                }
-            }
-
-            (RiskLevel::Normal, format!("项目工作区文件改写: {path_str}"))
-        }
+        "write_file" => risk_write_file(args, workspace_root),
 
         // Git 操作：区分只读、常规提交与破坏性命令
         "git" => {
             let cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let subcmd = cmd_args.split_whitespace().next().unwrap_or("").to_lowercase();
-
-            // 破坏性 / 强推 / 硬重置
-            if cmd_args.contains("--hard")
-                || cmd_args.contains("-f")
-                || cmd_args.contains("--force")
-                || subcmd == "push"
-                || subcmd == "clean"
-                || (subcmd == "reset" && cmd_args.contains("hard"))
-                || (subcmd == "branch" && cmd_args.contains("-D"))
-            {
-                return (RiskLevel::Dangerous, format!("Git 破坏性/强推操作: git {cmd_args}"));
-            }
-
-            // 只读子命令
-            if matches!(
-                subcmd.as_str(),
-                "status" | "diff" | "log" | "show" | "branch" | "describe" | "rev-parse" | "tag"
-            ) {
-                return (RiskLevel::Safe, format!("Git 只读状态查询: git {subcmd}"));
-            }
-
-            // 其他常规 Git 命令（如 add, commit, stash, checkout 等）
-            (RiskLevel::Normal, format!("Git 常规本地操作: git {subcmd}"))
+            risk_git(cmd_args)
         }
 
-        // Shell 命令行：区分只读诊断命令与破坏性/系统命令
+        // Shell 命令行：拆分后逐条判定，取最高风险
         "shell" => {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let lower = command.to_lowercase();
-
-            // 高危破坏性关键词
-            let dangerous_keywords = [
-                "del ", "del/", "del\\", "rmdir", "rd ", "rm -rf", "rm -r", "format ", "diskpart",
-                "reg add", "reg delete", "net user", "net localgroup", "shutdown",
-                "taskkill", "drop table", "drop database", "remove-item",
-            ];
-
-            for kw in dangerous_keywords {
-                if lower.contains(kw) {
-                    return (RiskLevel::Dangerous, format!("检测到高危系统/删除命令: {command}"));
-                }
-            }
-
-            // 安全只读与常规测试构建命令
-            let safe_prefixes = [
-                "dir", "ls", "type ", "cat ", "echo ", "pwd", "where ", "which ",
-                "cargo check", "cargo test", "npm test", "npm run test", "pytest",
-                "node -v", "npm -v", "cargo --version", "rustc -v", "git status", "git diff", "git log"
-            ];
-
-            for pfx in safe_prefixes {
-                if lower == pfx || lower.starts_with(&format!("{pfx} ")) || lower.starts_with(pfx) {
-                    return (RiskLevel::Safe, format!("安全只读或自动化测试命令: {command}"));
-                }
-            }
-
-            // 常规命令
-            (RiskLevel::Normal, format!("沙箱命令执行: {command}"))
+            risk_shell(command)
         }
 
-        // 其他未知工具
+        // 已登记但暂无专门规则的工具：按常规改动保守处理
+        other if KNOWN_TOOLS.contains(&other) => {
+            (RiskLevel::Normal, format!("已登记工具无专门规则，按常规处理: {other}"))
+        }
+
+        // 未登记工具：一律高危，防止新型/伪造工具名静默执行
         unknown => (RiskLevel::Dangerous, format!("未登记工具调用: {unknown}")),
     }
+}
+
+/// write_file 风险判定：敏感文件 > 路径遍历 > 越界 > 常规。
+fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
+    let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if path_str.is_empty() {
+        return (RiskLevel::Normal, "写入路径为空".into());
+    }
+
+    let lower = path_str.to_lowercase().replace('\\', "/");
+
+    // 1) 敏感关键文件（版本库元数据 / 密钥 / 记忆层 / 凭据）
+    if SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p))
+        || SENSITIVE_SUFFIXES.iter().any(|s| lower.ends_with(s))
+    {
+        return (RiskLevel::Dangerous, format!("试图修改敏感或系统关键文件: {path_str}"));
+    }
+
+    // 2) 跨级路径遍历
+    if path_str.starts_with("..") || lower.contains("/../") || path_str.contains("\\..\\") {
+        return (RiskLevel::Dangerous, format!("检测到跨级路径遍历: {path_str}"));
+    }
+
+    // 3) 绝对路径越界（Windows 大小写不敏感比较，避免盘符/目录名大小写差异误判）
+    let target_path = workspace_root.join(path_str);
+    if let Ok(canon_target) = target_path.canonicalize() {
+        if let Ok(canon_root) = workspace_root.canonicalize() {
+            if !is_within_root(&canon_root, &canon_target) {
+                return (RiskLevel::Dangerous, format!("试图修改工作区外部文件: {path_str}"));
+            }
+        }
+    }
+
+    (RiskLevel::Normal, format!("项目工作区文件改写: {path_str}"))
+}
+
+/// git 子命令风险判定（工具参数与 shell 里的 git 命令共用同一套语义）。
+fn risk_git(cmd_args: &str) -> (RiskLevel, String) {
+    let cmd_args = cmd_args.trim();
+    let mut it = cmd_args.split_whitespace();
+    let subcmd = it.next().unwrap_or("").to_lowercase();
+    let second = it.next().unwrap_or("").to_lowercase();
+    let lower = cmd_args.to_lowercase();
+
+    // 1) 破坏性 / 强推 / 硬重置 / 丢弃改动
+    if lower.contains("--hard")
+        || lower.contains(" -f ")
+        || lower.contains("--force")
+        || subcmd == "push"
+        || subcmd == "clean"
+        || (subcmd == "reset" && lower.contains("hard"))
+        || (subcmd == "branch" && (lower.contains("-d") || lower.contains("--delete")))
+        || subcmd == "rebase"
+        || (subcmd == "stash" && (second == "drop" || second == "clear"))
+        || (subcmd == "checkout" && (second == "." || second == "--" || second == "-f"))
+        || (subcmd == "remote" && second == "remove")
+    {
+        return (RiskLevel::Dangerous, format!("Git 破坏性/强推操作: git {cmd_args}"));
+    }
+
+    // 2) 只读子命令
+    if matches!(
+        subcmd.as_str(),
+        "status" | "diff" | "log" | "show" | "branch" | "describe" | "rev-parse" | "tag" | "remote"
+    ) && second != "-v"
+        || (subcmd == "branch" && second.is_empty())
+        || (subcmd == "remote" && second == "-v")
+    {
+        return (RiskLevel::Safe, format!("Git 只读状态查询: git {subcmd}"));
+    }
+
+    // 3) 其他常规 Git 命令（add / commit / stash / checkout 分支等）
+    (RiskLevel::Normal, format!("Git 常规本地操作: git {subcmd}"))
+}
+
+/// shell 命令风险判定：按分隔符拆成子命令，逐条判定取最高风险。
+fn risk_shell(command: &str) -> (RiskLevel, String) {
+    if command.trim().is_empty() {
+        return (RiskLevel::Safe, "空命令".into());
+    }
+
+    let parts = split_commands(command);
+    let mut worst = RiskLevel::Safe;
+    let mut worst_reason = String::from("沙箱命令执行");
+
+    for p in parts {
+        let (risk, reason) = risk_simple_command(&p);
+        if risk > worst {
+            worst = risk;
+            worst_reason = reason;
+        }
+        if worst == RiskLevel::Dangerous {
+            break; // 已到顶，无需再看
+        }
+    }
+
+    (worst, format!("{worst_reason}: {command}"))
+}
+
+/// 单条子命令的风险判定（不含串联分隔符）。
+fn risk_simple_command(cmd: &str) -> (RiskLevel, String) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return (RiskLevel::Safe, "空子命令".into());
+    }
+    let lower = trimmed.to_lowercase();
+    let prog = program_name(trimmed);
+    let rest: Vec<&str> = trimmed.split_whitespace().collect();
+    let second = rest.get(1).copied().unwrap_or("").to_lowercase();
+    let third_token = rest.get(2).copied().unwrap_or("").to_lowercase();
+
+    // 1) shell 里跑 git：复用 git 子命令语义（git push 不能算常规）
+    if prog == "git" {
+        let git_args: String = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
+        return risk_git(&git_args);
+    }
+
+    // 2) 高危程序（精确 token 匹配，避免正文/参数里的同名子串误伤）
+    if DANGEROUS_PROGRAMS.contains(&prog.as_str()) {
+        return (RiskLevel::Dangerous, format!("检测到高危系统/删除命令"));
+    }
+
+    // 3) SQL 类破坏性语句（非程序名场景，保留子串兜底）
+    if lower.contains("drop table") || lower.contains("drop database") {
+        return (RiskLevel::Dangerous, format!("检测到高危数据库删除语句"));
+    }
+
+    // 4) 重定向/管道写文件：即便程序只读也算常规改动（可能覆盖文件）
+    let writes = lower.contains('>') || lower.contains("| out-file") || lower.contains("tee ");
+
+    // 5) 安全程序（精确匹配，且无写文件副作用）
+    let safe = SAFE_PROGRAMS.contains(&prog.as_str())
+        || SAFE_SUBCOMMANDS.contains(&(prog.as_str(), second.as_str()))
+        || SAFE_TRIPLES
+            .iter()
+            .any(|(p, s, t)| prog == *p && second == *s && third_token.starts_with(t));
+
+    if safe && !writes {
+        return (RiskLevel::Safe, format!("安全只读或自动化测试命令"));
+    }
+
+    // 6) 其余命令（含安全程序带重定向、cargo build 等）
+    (RiskLevel::Normal, format!("沙箱命令执行"))
+}
+
+/// 取子命令的程序名：剥离路径与扩展名，小写。
+/// `C:\Tools\Del.EXE /f x` → `del`；`del/f x` → `del`；`dirname x` → `dirname`。
+fn program_name(cmd: &str) -> String {
+    let tok = cmd
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .trim_matches('\'');
+    // 剥离目录路径
+    let file = tok.rsplit(['\\', '/']).next().unwrap_or(tok);
+    // 剥离 `程序/参数` 紧邻写法（如 del/f）
+    let file = file.split('/').next().unwrap_or(file);
+    let lower = file.to_lowercase();
+    // 剥离可执行文件扩展名
+    for ext in [".exe", ".cmd", ".bat", ".ps1", ".com"] {
+        if let Some(stripped) = lower.strip_suffix(ext) {
+            return stripped.to_string();
+        }
+    }
+    lower
+}
+
+/// 按命令分隔符拆分（`&&` `||` `;` `|` 换行），引号内的分隔符不拆。
+fn split_commands(cmd: &str) -> Vec<String> {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+        if !in_single && !in_double {
+            let two = if i + 1 < chars.len() {
+                format!("{c}{}", chars[i + 1])
+            } else {
+                String::new()
+            };
+            if two == "&&" || two == "||" {
+                if !cur.trim().is_empty() {
+                    out.push(cur.clone());
+                }
+                cur.clear();
+                i += 2;
+                continue;
+            }
+            if c == ';' || c == '|' || c == '\n' {
+                if !cur.trim().is_empty() {
+                    out.push(cur.clone());
+                }
+                cur.clear();
+                i += 1;
+                continue;
+            }
+        }
+        cur.push(c);
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(cmd.to_string());
+    }
+    out
+}
+
+/// target 是否位于 root 之内（Windows 上大小写不敏感，避免盘符/目录名差异误判）。
+fn is_within_root(root: &Path, target: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let r = norm(root);
+    let t = norm(target);
+    if r.is_empty() {
+        return true; // 无工作区约束时不判越界
+    }
+    t == r || t.starts_with(&format!("{r}/"))
 }
 
 /// 判定当前审批模式下该风险等级是否需要向用户请求审批。
@@ -154,42 +395,136 @@ mod tests {
     use std::path::PathBuf;
     use serde_json::json;
 
+    fn ws() -> PathBuf {
+        PathBuf::from("C:/test/ws")
+    }
+
     #[test]
     fn test_safe_tools_always_safe() {
-        let root = PathBuf::from("C:/test/ws");
-        assert_eq!(evaluate_risk("read_file", &json!({"path": "src/main.rs"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("search", &json!({"query": "foo"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("web_fetch", &json!({"url": "https://example.com"}), &root).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("read_file", &json!({"path": "src/main.rs"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("search", &json!({"query": "foo"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("web_fetch", &json!({"url": "https://example.com"}), &ws()).0, RiskLevel::Safe);
     }
 
     #[test]
     fn test_git_readonly_vs_destructive() {
-        let root = PathBuf::from("C:/test/ws");
-        assert_eq!(evaluate_risk("git", &json!({"args": "status"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("git", &json!({"args": "diff"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("git", &json!({"args": "log --oneline -5"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("git", &json!({"args": "add ."}), &root).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("git", &json!({"args": "commit -m 'feat'"}), &root).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("git", &json!({"args": "reset --hard HEAD~1"}), &root).0, RiskLevel::Dangerous);
-        assert_eq!(evaluate_risk("git", &json!({"args": "push origin master -f"}), &root).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "status"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "diff"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "log --oneline -5"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "branch"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "remote -v"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "add ."}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("git", &json!({"args": "commit -m 'feat'"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("git", &json!({"args": "reset --hard HEAD~1"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "push origin master -f"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— v1 新增：git 破坏性补充场景 ——
+    #[test]
+    fn test_git_extra_destructive_cases() {
+        // rebase 改写历史、stash 丢弃、checkout 丢弃工作区改动、删除分支
+        assert_eq!(evaluate_risk("git", &json!({"args": "rebase main"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "stash drop"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "checkout ."}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "branch -d old"}), &ws()).0, RiskLevel::Dangerous);
+        // 常规操作不受影响
+        assert_eq!(evaluate_risk("git", &json!({"args": "checkout feature/x"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("git", &json!({"args": "stash list"}), &ws()).0, RiskLevel::Normal);
     }
 
     #[test]
     fn test_shell_safe_vs_dangerous() {
-        let root = PathBuf::from("C:/test/ws");
-        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo test"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("shell", &json!({"command": "dir"}), &root).0, RiskLevel::Safe);
-        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo build"}), &root).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("shell", &json!({"command": "del /f main.rs"}), &root).0, RiskLevel::Dangerous);
-        assert_eq!(evaluate_risk("shell", &json!({"command": "rmdir /s /q src"}), &root).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo test"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "npm run test"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo build"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "del /f main.rs"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "rmdir /s /q src"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— v1 修复 1：串联命令不得绕过（v0 下 `cargo test && del /f x` 被判 Safe）——
+    #[test]
+    fn test_shell_chained_command_not_bypassed() {
+        let r = evaluate_risk("shell", &json!({"command": "cargo test && del /f main.rs"}), &ws());
+        assert_eq!(r.0, RiskLevel::Dangerous, "串联删除不得因首条安全命令被放行: {}", r.1);
+        // 管道与分号同理
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir | del /f x"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo hi; rm -rf src"}), &ws()).0, RiskLevel::Dangerous);
+        // 全安全串联仍为 Safe
+        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo test && cargo fmt"}), &ws()).0, RiskLevel::Safe);
+        // 含 Normal 的串联取较高档
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir && cargo build"}), &ws()).0, RiskLevel::Normal);
+    }
+
+    // —— v1 修复 2：正文/参数里的高危字样不得误伤 ——
+    #[test]
+    fn test_shell_quoted_text_not_false_positive() {
+        let r = evaluate_risk("shell", &json!({"command": "echo \"del x\""}), &ws());
+        assert_eq!(r.0, RiskLevel::Safe, "echo 一段含 del 的文本不应判高危: {}", r.1);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo taskkill not really"}), &ws()).0, RiskLevel::Safe);
+        // 真删除仍然高危
+        assert_eq!(evaluate_risk("shell", &json!({"command": "del x"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— v1 修复 3：程序名精确匹配，`dirname` 不因 `dir` 前缀被误判安全 ——
+    #[test]
+    fn test_shell_program_prefix_not_confused() {
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dirname src/main.rs"}), &ws()).0, RiskLevel::Normal);
+        // 带路径与扩展名的删除命令同样识别
+        assert_eq!(evaluate_risk("shell", &json!({"command": "C:\\Tools\\Del.EXE /f x"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— v1 修复 4：shell 里跑 git push 复用 git 语义 ——
+    #[test]
+    fn test_shell_git_push_is_dangerous() {
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git push origin main"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git status"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git commit -m x"}), &ws()).0, RiskLevel::Normal);
+    }
+
+    // —— v1 修复 5：重定向写文件降级为常规改动 ——
+    #[test]
+    fn test_shell_redirect_is_normal() {
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo hi > out.txt"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir > list.txt"}), &ws()).0, RiskLevel::Normal);
     }
 
     #[test]
     fn test_write_file_path_traversal() {
-        let root = PathBuf::from("C:/test/ws");
-        assert_eq!(evaluate_risk("write_file", &json!({"path": "src/lib.rs", "content": "..."}), &root).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("write_file", &json!({"path": "../secret.txt", "content": "..."}), &root).0, RiskLevel::Dangerous);
-        assert_eq!(evaluate_risk("write_file", &json!({"path": ".git/config", "content": "..."}), &root).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("write_file", &json!({"path": "src/lib.rs", "content": "..."}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("write_file", &json!({"path": "../secret.txt", "content": "..."}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("write_file", &json!({"path": ".git/config", "content": "..."}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— v1 修复 6：write_file 敏感清单扩展 ——
+    #[test]
+    fn test_write_file_sensitive_expanded() {
+        for p in [".env", "config/.env.local", ".agent/index.json", "deploy/key.pem", "server.key", "settings.json"] {
+            let r = evaluate_risk("write_file", &json!({"path": p, "content": "x"}), &ws());
+            assert_eq!(r.0, RiskLevel::Dangerous, "{p} 应判高危: {}", r.1);
+        }
+        // 普通文件不受影响
+        assert_eq!(evaluate_risk("write_file", &json!({"path": "src/env_util.rs", "content": "x"}), &ws()).0, RiskLevel::Normal);
+    }
+
+    // —— v1 修复 7：Windows 路径大小写差异不得造成越界误判 ——
+    #[test]
+    fn test_is_within_root_case_insensitive() {
+        use std::path::Path;
+        let root = Path::new("C:/Test/WS");
+        assert!(is_within_root(root, Path::new("c:/test/ws/src/main.rs")));
+        assert!(is_within_root(root, Path::new("C:/TEST/WS/README.md")));
+        assert!(!is_within_root(root, Path::new("C:/test/other/x.rs")));
+    }
+
+    // —— v1 修复 8：工具登记表——已登记按常规，未登记一律高危 ——
+    #[test]
+    fn test_tool_registry_default_policy() {
+        assert_eq!(evaluate_risk("mystery_tool", &json!({}), &ws()).0, RiskLevel::Dangerous);
+        // 已登记但无专门规则的工具（登记表里存在）按常规处理，不再一律高危
+        assert!(KNOWN_TOOLS.contains(&"write_file"));
+        assert_eq!(KNOWN_TOOLS.len(), 7, "新增内置工具须同步登记到 KNOWN_TOOLS");
     }
 
     #[test]
@@ -208,5 +543,12 @@ mod tests {
         assert!(!should_ask_approval("full-access", RiskLevel::Safe));
         assert!(!should_ask_approval("full-access", RiskLevel::Normal));
         assert!(!should_ask_approval("full-access", RiskLevel::Dangerous));
+    }
+
+    #[test]
+    fn test_risk_level_label() {
+        assert_eq!(RiskLevel::Safe.label(), "安全");
+        assert_eq!(RiskLevel::Normal.label(), "常规改动");
+        assert_eq!(RiskLevel::Dangerous.label(), "高危操作");
     }
 }
