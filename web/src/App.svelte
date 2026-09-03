@@ -946,11 +946,14 @@
                   </button>
 
                   {#if thinkingStyle === 'deepseek'}
-                    <!-- DeepSeek-V4 官方思考档位：低、高、最大、关闭 -->
+                    <!-- DeepSeek-V4：默认 -> 低 -> 中 -> 高 -> 最大 -> 关闭 -->
                     <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
                       低
                     </button>
-                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('high')}>
+                    <button class="bar-item" class:active={thinking === 'medium'} on:click={() => pickThinking('medium')}>
+                      中
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'on'} on:click={() => pickThinking('high')}>
                       高
                     </button>
                     <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
@@ -959,36 +962,8 @@
                     <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
                       关闭
                     </button>
-                  {:else if thinkingStyle === 'qwen'}
-                    <!-- 通义千问 (Qwen) 百炼官方思考档位：低、高、最大、关闭 -->
-                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                      低
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('high')}>
-                      高
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
-                      最大
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
-                    </button>
-                  {:else if thinkingStyle === 'zai'}
-                    <!-- 智谱 GLM-5 官方思考档位：低、高、最大、关闭 -->
-                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                      低
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('high')}>
-                      高
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
-                      最大
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
-                    </button>
-                  {:else if thinkingStyle === 'openai' || providerId === 'doubao'}
-                    <!-- OpenAI (GPT-5/o系) 与 字节豆包 官方思考档位：低、中、高、关闭 -->
+                  {:else if thinkingStyle === 'openai'}
+                    <!-- OpenAI (o1/o3/GPT-5)：默认 -> 低 -> 中 -> 高 -> 关闭 -->
                     <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
                       低
                     </button>
@@ -1007,7 +982,7 @@
                       关闭
                     </button>
                   {:else}
-                    <!-- 本地推理服务聊天模板及其他：开启 / 关闭 -->
+                    <!-- 通义千问 (Qwen)、智谱 GLM、字节豆包、本地服务及通用渠道：官方原生开关 开启 / 关闭 -->
                     <button class="bar-item" class:active={thinking === 'on' || thinking === 'high' || thinking === 'medium' || thinking === 'low' || thinking === 'max'} on:click={() => pickThinking('on')}>
                       开启
                     </button>
