@@ -1170,6 +1170,57 @@
     applyTheme(theme === 'dark' ? 'light' : 'dark');
   }
   applyTheme(theme); // 首屏即应用（组件初始化阶段，早于首帧渲染）
+
+  // —— P10.5 设置分区（左侧导航）——
+  let settingsTab = localStorage.getItem('settingsTab') || 'model';
+  function pickSettingsTab(t) {
+    settingsTab = t;
+    localStorage.setItem('settingsTab', t);
+    if (t === 'memory' && !memData) loadMemory();
+  }
+
+  // —— P10.5 记忆分区（双层 AGENTS.md 编辑 + 状态）——
+  let memData = null;
+  let memTab = 'project';
+  let memText = '';
+  let memSaving = false;
+  let memMsg = '';
+  async function loadMemory() {
+    memData = null;
+    try {
+      const r = await fetch('/api/memory').then((r) => r.json());
+      memData = r;
+      memText = memTab === 'global' ? r.agents_global || '' : r.agents_project || '';
+    } catch (e) {
+      memMsg = `读取失败: ${e.message || e}`;
+    }
+  }
+  function pickMemTab(t) {
+    if (!memData || memTab === t) return;
+    memTab = t;
+    memText = t === 'global' ? memData.agents_global || '' : memData.agents_project || '';
+    memMsg = '';
+  }
+  async function saveAgents() {
+    memSaving = true;
+    memMsg = '';
+    try {
+      const r = await fetch('/api/memory/agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: memTab, content: memText }),
+      }).then((r) => r.json());
+      memMsg = r.ok ? `已保存到 ${r.path}` : `保存失败: ${r.error}`;
+      if (r.ok && memData) {
+        if (memTab === 'global') memData.agents_global = memText;
+        else memData.agents_project = memText;
+      }
+    } catch (e) {
+      memMsg = `保存失败: ${e.message || e}`;
+    } finally {
+      memSaving = false;
+    }
+  }
   // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
   function riskLabelFor(risk) {
     return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
@@ -1806,12 +1857,41 @@
 
 {#if settingsOpen}
   <div class="modal-backdrop" on:click={() => (settingsOpen = false)}>
-    <div class="modal" on:click|stopPropagation>
+    <div class="modal settings-modal" on:click|stopPropagation>
       <div class="modal-head">
-        <b>模型设置</b>
+        <b>设置</b>
         <span class="hint">{settingsMsg}</span>
         <button class="btn ghost" on:click={() => (settingsOpen = false)}>关闭</button>
       </div>
+      <div class="settings-body">
+        <div class="settings-nav">
+          <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}>🎨 外观</button>
+          <button class:active={settingsTab === 'model'} on:click={() => pickSettingsTab('model')}>🔌 模型配置</button>
+          <button class:active={settingsTab === 'params'} on:click={() => pickSettingsTab('params')}>🎛 模型参数</button>
+          <button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}>👥 角色分工</button>
+          <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}>🧠 记忆</button>
+          <button class:active={settingsTab === 'workspace'} on:click={() => pickSettingsTab('workspace')}>📁 工作区</button>
+        </div>
+        <div class="settings-content">
+        {#if settingsTab === 'appearance'}
+          <div class="field">
+            <label>主题</label>
+            <div class="theme-cards">
+              <button class="theme-card" class:active={theme === 'dark'} on:click={() => applyTheme('dark')}>
+                <span class="theme-preview dark-preview"></span>
+                <span>深色</span>
+                <span class="theme-desc">暗夜工作模式（默认）</span>
+              </button>
+              <button class="theme-card" class:active={theme === 'light'} on:click={() => applyTheme('light')}>
+                <span class="theme-preview light-preview"></span>
+                <span>浅色</span>
+                <span class="theme-desc">日间高对比</span>
+              </button>
+            </div>
+            <div class="param-hint">主题即时生效并记住选择；侧栏顶部 ☀/🌙 按钮可随时切换</div>
+          </div>
+        {/if}
+        {#if settingsTab === 'model'}
 
       <div class="field">
         <label>配置（点一下切换，改动自动保存即时生效）</label>
@@ -1898,6 +1978,8 @@
         </div>
       </div>
 
+      {/if}
+      {#if settingsTab === 'params'}
       <div class="field">
         <label>模型参数（tokens，0=恢复默认）</label>
         <div class="sub-row">
@@ -2010,6 +2092,8 @@
         </div>
       </div>
 
+      {/if}
+      {#if settingsTab === 'roles'}
       <div class="field roles-section">
         <label>角色分工与多模态转接（专职专家席位）</label>
         <div class="roles-grid">
@@ -2087,6 +2171,61 @@
           </div>
         </div>
         <div class="param-hint">摘要/标题未配置=主力代跑；多模态专家仅主力不支持该媒体时启用，未配置则注入占位提示</div>
+      </div>
+      {/if}
+      {#if settingsTab === 'memory'}
+        {#if memData}
+          <div class="field">
+            <label>记忆层状态（{memData.enabled ? '已启用' : '未启用'}）</label>
+            <div class="mem-stats">
+              <div>· 全局层 <code>{memData.global_dir}</code> · 已登记 {memData.projects_registered} 个项目</div>
+              <div>· 项目层 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
+            </div>
+            <div class="param-hint">记忆随工作区切换而重开：events.log 沉淀任务/工具/交接流水，滚动摘要注入上下文，index.json 登记项目身份防串</div>
+          </div>
+          <div class="field">
+            <label>AGENTS.md（每次任务注入 system 的设定文件；留空白模板 = 不注入）</label>
+            <div class="chips">
+              <button class="chip" class:active={memTab === 'project'} on:click={() => pickMemTab('project')}>项目约定（当前工作区根）</button>
+              <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定（所有项目共用）</button>
+            </div>
+            <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText}></textarea>
+            <div class="sub-row">
+              <button class="btn primary" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
+              <span class="hint">{memMsg}</span>
+            </div>
+          </div>
+        {:else}
+          <div class="trace-empty">加载中…</div>
+        {/if}
+      {/if}
+      {#if settingsTab === 'workspace'}
+      <div class="field">
+        <label>当前工作区</label>
+        <div class="ws-current" title={workspace}>{workspace || '（工程根）'}</div>
+      </div>
+      <div class="field">
+        <label>本地文件夹路径（agent 的文件读写/命令执行/影子仓库都在这里，与 agent 自身目录隔离）</label>
+        <div class="sub-row">
+          <input bind:value={wsPath} placeholder="如 D://projects//demo 或 C://Users//你//test" />
+          <button class="btn primary" on:click={() => applyWorkspace(wsPath)} disabled={!wsPath.trim()}>应用</button>
+        </div>
+      </div>
+      {#if recentWorkspaces.length}
+        <div class="field">
+          <label>最近使用</label>
+          <div class="ws-recent">
+            {#each recentWorkspaces as w}
+              <button class="ws-chip" class:active={w === workspace} title={w} on:click={() => applyWorkspace(w)}>
+                {w.split(/[\\/]/).filter(Boolean).pop()}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      <div class="param-hint">切换后：会话列表/记忆层（.agent、AGENTS.md）按新工作区重开；进行中的任务不受影响</div>
+      {/if}
+        </div>
       </div>
     </div>
   </div>
@@ -2240,8 +2379,8 @@
 {/if}
 
 <style>
-:root,
-  [data-theme="dark"] {
+:global(:root),
+  :global([data-theme="dark"]) {
 /* P10.5 主题系统：变量由聚类脚本生成；dark=原视觉，light=翻转 */
   --g0: #151517;
   --g1: #1b1d23;
@@ -2261,7 +2400,7 @@
   --tint-yellow-bg: #241f14;
   --tint-yellow-fg: #facc15;
 }
-[data-theme="light"] {
+:global([data-theme="light"]) {
   --g0: #e9ebf0;
   --g1: #f7f8fa;
   --g2: #ffffff;
@@ -3769,6 +3908,113 @@
     flex-direction: column;
     padding: 16px;
     gap: 12px;
+  }
+  /* P10.5 设置分区（左导航 + 内容区） */
+  .settings-modal {
+    width: 880px;
+    max-width: 94vw;
+  }
+  .settings-body {
+    display: flex;
+    gap: 14px;
+    flex: 1;
+    min-height: 0;
+  }
+  .settings-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 150px;
+    flex-shrink: 0;
+  }
+  .settings-nav button {
+    text-align: left;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: transparent;
+    border: none;
+    color: var(--g6);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .settings-nav button:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .settings-nav button.active {
+    background: var(--g3);
+    color: var(--g7);
+    font-weight: 600;
+  }
+  .settings-content {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 4px;
+    min-width: 0;
+  }
+  .theme-cards {
+    display: flex;
+    gap: 10px;
+  }
+  .theme-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid var(--g3);
+    background: var(--g2);
+    color: var(--g7);
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+  }
+  .theme-card.active {
+    border-color: var(--g5);
+    box-shadow: 0 0 0 1px var(--g5);
+  }
+  .theme-preview {
+    height: 46px;
+    border-radius: 6px;
+    border: 1px solid var(--g3);
+  }
+  .dark-preview {
+    background: linear-gradient(135deg, #17181c 55%, #2f323c 55%, #2f323c 78%, #9ec1ff 78%);
+  }
+  .light-preview {
+    background: linear-gradient(135deg, #f7f8fa 55%, #ffffff 55%, #ffffff 78%, #2f5fd0 78%);
+  }
+  .theme-desc {
+    font-size: 11px;
+    color: var(--g5);
+  }
+  .mem-stats {
+    font-size: 12px;
+    color: var(--g6);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .mem-stats code {
+    font-size: 11px;
+    color: var(--g5);
+  }
+  .agents-editor {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 12px;
+    background: var(--g1);
+    color: var(--g7);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    padding: 10px;
+    resize: vertical;
+  }
+  .agents-editor:focus {
+    outline: none;
+    border-color: var(--g4);
   }
   .modal-head {
     display: flex;
