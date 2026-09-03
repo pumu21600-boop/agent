@@ -284,6 +284,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
         .route("/api/trace", get(get_trace))
+        .route("/api/memory", get(get_memory).post(save_memory_agents))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
@@ -1373,6 +1374,51 @@ pub struct TraceQuery {
 }
 fn default_trace_limit() -> usize {
     5
+}
+
+// —— P10.5 设置面板「记忆」分区 ——
+
+/// GET /api/memory —— 记忆层状态 + 双层 AGENTS.md 原文（编辑器数据源）。
+async fn get_memory(State(state): State<AppState>) -> Json<Value> {
+    let mem = state.memory.read().unwrap().clone();
+    let projects_registered = mem.load_index().projects.len();
+    Json(json!({
+        "enabled": mem.enabled,
+        "global_dir": mem.global_dir().display().to_string(),
+        "project_dir": mem.project_dir().display().to_string(),
+        "events_lines": mem.events_lines(),
+        "projects_registered": projects_registered,
+        "agents_global": mem.agents_raw("global"),
+        "agents_project": mem.agents_raw("project"),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveAgentsRequest {
+    /// "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
+    pub scope: String,
+    pub content: String,
+}
+
+/// POST /api/memory/agents —— 保存用户编辑的 AGENTS.md（下次任务注入自动生效）。
+async fn save_memory_agents(
+    State(state): State<AppState>,
+    Json(req): Json<SaveAgentsRequest>,
+) -> (StatusCode, Json<Value>) {
+    if !matches!(req.scope.as_str(), "global" | "project") {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "scope 须为 global 或 project" })));
+    }
+    let mem = state.memory.read().unwrap().clone();
+    match mem.save_agents(&req.scope, &req.content) {
+        Ok(path) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "memory.agents_saved", "scope": req.scope, "path": path.display().to_string() }),
+            );
+            (StatusCode::OK, Json(json!({ "ok": true, "path": path.display().to_string() })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。

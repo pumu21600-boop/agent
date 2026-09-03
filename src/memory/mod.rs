@@ -182,6 +182,47 @@ impl Memory {
         out
     }
 
+    // —— P10.5 设置面板「记忆」分区（只读状态 + AGENTS.md 编辑）——
+    pub fn global_dir(&self) -> &Path {
+        &self.global_dir
+    }
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
+    }
+    /// 项目层 events.log 行数（无文件为 0）。
+    pub fn events_lines(&self) -> usize {
+        std::fs::read_to_string(self.project_dir.join("events.log"))
+            .map(|c| c.lines().count())
+            .unwrap_or(0)
+    }
+    /// AGENTS.md 原文（编辑器用；缺省返回模板，模板不注入只展示）。
+    /// scope: "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
+    pub fn agents_raw(&self, scope: &str) -> String {
+        let path = match scope {
+            "global" => self.global_dir.join("AGENTS.md"),
+            _ => self.ws.join("AGENTS.md"),
+        };
+        std::fs::read_to_string(path).unwrap_or_else(|_| {
+            if scope == "global" {
+                String::new()
+            } else {
+                AGENTS_TEMPLATE.to_string()
+            }
+        })
+    }
+    /// 保存用户编辑的 AGENTS.md（设置面板写入；下次任务注入自动生效）。
+    pub fn save_agents(&self, scope: &str, content: &str) -> anyhow::Result<PathBuf> {
+        let path = match scope {
+            "global" => {
+                std::fs::create_dir_all(&self.global_dir)?;
+                self.global_dir.join("AGENTS.md")
+            }
+            _ => self.ws.join("AGENTS.md"),
+        };
+        std::fs::write(&path, content)?;
+        Ok(path)
+    }
+
     /// 项目根无 AGENTS.md 时生成空白模板（开箱即用；内容由用户自填，留空=不注入）。
     pub fn ensure_agents_template(&self, ws: &Path) {
         if !self.enabled {
