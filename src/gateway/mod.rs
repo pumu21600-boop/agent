@@ -119,22 +119,40 @@ pub fn build_body_with_compat(
     // —— 思考参数：按 thinkingFormat 分支（对齐 OpenClaw buildOpenAICompletionsParams）——
     let requested = params.thinking.as_deref();
     match compat.thinking_format {
-        // zai（智谱 GLM/豆包 Seed）：{type:enabled|disabled}；档位无意义，非 off 一律 enabled
+        // zai（智谱 GLM-5/豆包 Seed）：{type:enabled|disabled}，新版支持 reasoning_effort (low/medium/high/max)
         ThinkingFormat::Zai => {
             if let Some(t) = requested {
-                body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
+                if t == "off" {
+                    body["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    body["thinking"] = json!({ "type": "enabled" });
+                    if matches!(t, "low" | "medium" | "high" | "max") {
+                        body["reasoning_effort"] = json!(t);
+                    }
+                }
             }
         }
-        // deepseek/小米：thinking 对象（官方无档位/开关参数，仅此对象形态）
+        // deepseek（V4 Pro/Flash/R1）：thinking 对象；V4 支持 reasoning_effort (low/high/max)
         ThinkingFormat::Deepseek => {
             if let Some(t) = requested {
-                body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
+                if t == "off" {
+                    body["thinking"] = json!({ "type": "disabled" });
+                } else {
+                    body["thinking"] = json!({ "type": "enabled" });
+                    if matches!(t, "low" | "high" | "max") {
+                        body["reasoning_effort"] = json!(t);
+                    }
+                }
             }
         }
-        // qwen（百炼/混元）：顶层布尔 enable_thinking
+        // qwen（百炼/混元）：顶层布尔 enable_thinking，新版支持 reasoning_effort (low/high/max)
         ThinkingFormat::Qwen => {
             if let Some(t) = requested {
-                body["enable_thinking"] = json!(t != "off");
+                let on = t != "off";
+                body["enable_thinking"] = json!(on);
+                if on && matches!(t, "low" | "high" | "max") {
+                    body["reasoning_effort"] = json!(t);
+                }
             }
         }
         // 本地推理服务聊天模板：chat_template_kwargs.enable_thinking（vLLM/llama.cpp Qwen3 系）
