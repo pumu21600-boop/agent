@@ -160,11 +160,13 @@ impl Config {
     }
 
     /// 是否已保存 key
+    #[allow(dead_code)]
     pub fn has_key(&self) -> bool {
         self.key_cipher.is_some()
     }
 
     /// key 的尾 4 位提示
+    #[allow(dead_code)]
     pub fn key_hint(&self) -> String {
         self.decrypted_key()
             .map(|k| {
@@ -197,6 +199,7 @@ impl Config {
 }
 
 /// 根据模型名称智能推荐官方对齐协议规范
+#[allow(dead_code)]
 pub fn infer_protocol_preset(model_id: &str) -> Option<&'static str> {
     let id = model_id.trim().to_lowercase();
     if id.contains("deepseek") || id.contains("r1") {
