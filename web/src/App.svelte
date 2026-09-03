@@ -932,7 +932,7 @@
             <div class="bar-menu">
               <button
                 class="pill think-pill"
-                class:active={thinking === 'on'}
+                class:active={thinking === 'on' || thinking === 'low' || thinking === 'medium' || thinking === 'high'}
                 on:click={() => (thinkMenuOpen = !thinkMenuOpen)}
                 title={thinkHint}
               >
@@ -944,28 +944,18 @@
                   <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
                     默认<span class="bar-item-hint">跟渠道自身行为走</span>
                   </button>
-                  {#if thinkingStyle === 'openai'}
-                    <!-- OpenAI 风格：思考分档（档位经网关按模型解析降级） -->
-                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                      低<span class="bar-item-hint">reasoning_effort: low</span>
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
-                      中<span class="bar-item-hint">reasoning_effort: medium</span>
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'high'} on:click={() => pickThinking('high')}>
-                      高<span class="bar-item-hint">reasoning_effort: high</span>
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭<span class="bar-item-hint">模型不支持显式关档时不发参数</span>
-                    </button>
-                  {:else}
-                    <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
-                      开启<span class="bar-item-hint">{thinkHint}</span>
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭<span class="bar-item-hint">{thinkingStyle === 'none' ? '不发参数（形态=无）' : '发关闭参数'}</span>
-                    </button>
-                  {/if}
+                  <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
+                    低<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: low' : '轻度思考 (低档)'}</span>
+                  </button>
+                  <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
+                    中<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: medium' : '标准思考 (中档)'}</span>
+                  </button>
+                  <button class="bar-item" class:active={thinking === 'high'} on:click={() => pickThinking('high')}>
+                    高<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: high' : '深度思考 (高档)'}</span>
+                  </button>
+                  <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                    关闭<span class="bar-item-hint">{thinkingStyle === 'none' ? '不发参数' : '发关闭参数'}</span>
+                  </button>
                 </div>
               {/if}
             </div>
