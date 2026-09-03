@@ -658,6 +658,7 @@
                     tool: d.approval_request.tool,
                     args: d.approval_request.args,
                     risk: d.approval_request.risk ?? 1,
+                    riskLabel: d.approval_request.risk_label || '',
                     reason: d.approval_request.reason || '',
                     decided: null,
                   },
@@ -1127,19 +1128,24 @@
     }
   }
 
-  // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）
-  async function decideApproval(id, approved) {
+  // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）。
+  // remember=true → 本会话内「同类操作」不再询问（P9 A3）；后端拒绝记忆 Dangerous 档。
+  async function decideApproval(id, approved, remember = false) {
     patchMessageApproval(id, approved);
     await fetch('/api/approvals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, approved }),
+      body: JSON.stringify({ id, approved, remember }),
     });
   }
   function patchMessageApproval(id, approved) {
     messages = messages.map((m) =>
       m.approval && m.approval.id === id ? { ...m, approval: { ...m.approval, decided: approved } } : m
     );
+  }
+  // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
+  function riskLabelFor(risk) {
+    return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
   }
 
   function nextId() {
@@ -1371,7 +1377,12 @@
               {#if m.approval}
                 <div class="approval-box" class:danger={m.approval.risk >= 2}>
                   <div class="approval-head">
-                    <span class="approval-title">⚠️ 请求执行：<b>{m.approval.tool}</b></span>
+                    <span class="approval-title"
+                      >⚠️ 请求执行：<b>{m.approval.tool}</b>
+                      <span class="approval-risk risk-{m.approval.risk}"
+                        >{m.approval.riskLabel || riskLabelFor(m.approval.risk)}</span
+                      ></span
+                    >
                     {#if m.approval.reason}
                       <span class="approval-reason" class:danger={m.approval.risk >= 2}>{m.approval.reason}</span>
                     {/if}
@@ -1380,6 +1391,11 @@
                   {#if m.approval.decided === null}
                     <div class="approval-actions">
                       <button class="btn" on:click={() => decideApproval(m.approval.id, true)}>允许</button>
+                      {#if m.approval.risk < 2}
+                        <button class="btn ghost" on:click={() => decideApproval(m.approval.id, true, true)}
+                          >允许·本会话同类不再问</button
+                        >
+                      {/if}
                       <button class="btn ghost" on:click={() => decideApproval(m.approval.id, false)}>拒绝</button>
                       <span class="approval-hint">等你的决定，120 秒不选自动拒绝</span>
                     </div>
@@ -2056,6 +2072,7 @@
   }
   .sidebar {
     width: 300px;
+    box-sizing: border-box; /* P9 修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
     flex: none;
     background: #151517;
     border-right: 1px solid #232325;
@@ -2798,6 +2815,26 @@
     font-size: 11px;
   }
   .approval-reason.danger {
+    background: #541d1d;
+    color: #ff9b9b;
+  }
+  /* P9 A4：风险档位徽章（安全/常规改动/高危操作，与 RiskLevel::label 对齐） */
+  .approval-risk {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .approval-risk.risk-0 {
+    background: #1d3a28;
+    color: #8fe3ae;
+  }
+  .approval-risk.risk-1 {
+    background: #1f2c44;
+    color: #9ec1ff;
+  }
+  .approval-risk.risk-2 {
     background: #541d1d;
     color: #ff9b9b;
   }
