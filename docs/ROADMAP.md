@@ -17,8 +17,8 @@
 | P7 记忆 v1 + AGENTS.md | events.log + 滚动摘要、双层存储（~/.agent + 项目 .agent）、index.json | ✅ 已完成（tag v0.8-p7） |
 | P8 网关补全 | 角色映射（SUMMARY/TITLE/EMBEDDING）、采样参数、限流、降级链；补齐官方网关（用户拍板：**移除第三方中转/聚合**——商汤/百炼/千帆/星火/硅基流动/Groq/OpenRouter，只留大模型厂商官方 + 本地推理；补 MiniMax/Claude/豆包/混元）；**思考参数按厂商适配**（providers.json 数据字段：reasoning_style=reasoning_content/thinking_param/effort_param/in_content（反代把 `<think>` 当正文吐，需剥离）/ thinking_budget_param / reasoning_counts_in_max_tokens——各家不同：GLM 实测思考占 max_tokens，OpenAI/DeepSeek/Claude 占；MiniMax/Claude/豆包/混元端点待真实 key 验证） | ✅ 已完成（tag v0.9-p8） |
 | P8.4 网关对齐 OpenClaw | 用户拍板：**照抄 OpenClaw v2026.8.2 网关，覆盖我们自创的实现**。机制全量移植：`thinkingFormat` 词表（openai/deepseek/zai/qwen/qwen-chat-template）+ 端点归属探测（compat.rs，官方域名/local/default 三类，custom 中转认不出时用户覆盖）；reasoning_effort 档位解析器逐行移植（effort.rs：gpt-5.x 家族 supported 列表、降级链 xhigh→high、off→none 仅在模型支持时发、gpt-5.6 拒收 temperature）；响应端四字段思考提取（reasoning_content/reasoning/reasoning_text/reasoning_details，OpenRouter details 兼容）；14 种思考标签剥离（tags.rs，对齐上游 REASONING_TAG_NAMES，孤立闭合标签丢弃）；历史回放净化（replay.rs：deepseek/zai 契约保留 reasoning_content + kimi/deepseek-v4/mimo 白名单，其余剥离；gpt-5*/o 系 system→developer；qwen 端点空消息过滤）；max_completion_tokens 按 gpt-5*/o 系切换。**删自创项**（上游没有）：thinking_model 换模型（DeepSeek 改发 thinking 对象）、thinking_budget 直发、reasoning_counts_in_max_tokens、enable_thinking/thinking_budget_param 逐字段适配。providers.json 瘦身：仅豆包(zai)/混元(qwen) 带 thinking_format 兜底，其余交给端点探测。thinking_style 覆盖改新词表 + P8.3 旧值自动映射（thinking_object→zai、reasoning_effort→openai、enable_thinking→qwen）。商汤真实冒烟：on→`thinking:{type:enabled}` 思考分片正常，off→disabled 0 分片，多轮回放渠道照收。57 测试全绿 | ✅ 已完成 |
-| P8.5 模型配置重构 | 施工单 011：三层解耦（渠道/模型/角色）+ 消除镜像冗余确立单一真理源 + 8大官方规范全覆盖 + 模型能力标记（工具/视觉/视频/音频）与角色专职分工路由 + 清除Key。67 测试全绿，前端完整构建（tag v0.9.5-p8.5，之后的思考档位系列与多模态在 tag 外） | 🔁 核心完成；2026-09-04 审计出 5 必修项 + 语义固化 + 3 归位项，见施工单 012 |
-| P9 Plan 模式 + 审批规则引擎 | 留口转正式（注：审批风险分级引擎 v0 已于 P8.5 提前落地 core/rules.rs） | ⏳ |
+| P8.5 模型配置重构 | 施工单 011：三层解耦（渠道/模型/角色）+ 消除镜像冗余确立单一真理源 + 8大官方规范全覆盖 + 模型能力标记（工具/视觉/视频/音频）与角色专职分工路由 + 清除Key。67 测试全绿，前端完整构建（tag v0.9.5-p8.5）。**计划外交付**（tag 后）：多模态媒体转接全链路（f65e08d，对齐 DSH media-understanding 规范，详见 docs/HANDOFF_MEDIA_UNDERSTANDING.md）与审批风险分级引擎 v0（core/rules.rs，P9 内容提前落地）。**施工单 012 收尾**（2026-09-04）：恢复思考参数形态 UI 覆盖、能力标记所有权（用户标记>推导+重新推导按钮）、capabilities.tools 闭环、角色语义文案区分+fallbacks 接 UI、.attachments/ 自动进 git 排除；B1–B4 语义固化（见坑 14） | ✅ 已完成（tag v0.9.6-p8.5） |
+| P9 Plan 模式 + 审批规则引擎 | 留口转正式（注：审批风险分级引擎 v0 已于 P8.5 提前落地 core/rules.rs，施工单 012 补记） | ⏳ |
 | P10（第二个月） | 多开会话 + trace 时间线视图 + eval 体系 | ⏳（多开会话 v1 已于 P6.1 提前落地；工作区切换仍在本单） |
 | P11 | MCP client + WASM 插件 + 双总线 | ⏳ |
 | P12 | AppContainer + 网络出向限制；并行工具调用 + 写冲突检测 | ⏳ |
@@ -52,3 +52,9 @@
 11. **Git Bash PATH 污染对照组**：测试进程 PATH 里的 Git usr/bin 会让 `cmd /C whoami` 解析到 GNU whoami；沙箱内没事（环境是白名单重建的），不经沙箱的对照组要写绝对路径。
 12. **影子仓库回滚绝不整树 reset**（P6.1 教训）：`reset --hard <旧基线>` 会把基线之后**用户自己**的提交/改动一并刷回旧快照（真实发生过：点旧检查点回滚把已提交的文档刷回 P5 状态）。restore 必须按 `diff --name-status 基线..HEAD` 逐文件回退 agent 实际改过的文件；改动统计条的基线也必须是**任务起点当场拍的快照**，不能拿影子 HEAD 凑数（会把历史漂移算进条里）。
 13. **提示词保持最小 + AGENTS.md 归用户**（P7.1→P7.3 用户拍板）：system prompt 只留 `prompts/system.md`（"用中文简洁回答"）+ AGENTS.md，**不注入模型名/渠道/身份设定**——模型被问是谁会自造产品名（实测自称"khy/Kai-Code"），用户明确选择不修。**AGENTS.md 是用户给每个项目自填的设定文件，模板必须近乎空白**；我们做的是 agent 产品，不是"造这个产品"项目的自用工具——本仓库的开发知识（红线/坑/规范）只进 ROADMAP，绝不写进 AGENTS.md 或任何运行时注入物。
+14. **配置语义四条定死**（施工单 012 B1–B4，前后端任何一方改动必须对照；代码锚点：settings.rs / server.rs SettingsUpdate、apply_thinking_style、find_channel）：
+    - **B1 清除语义**：`0`=清除长度类（context_length/max_output_tokens）；负数=清除采样类（temperature/top_p）；空串/auto=清除思考类（thinking/thinking_style）；`clear_key=true`=清 key。P8.3「思考档位被吞」事故即源于此约定未成文。
+    - **B2 key 回落链**：拉模型/发消息的 key 取值顺序 = 请求显式 key > 激活配置 DPAPI key > `DEEPSEEK_API_KEY` 环境变量；key 永不出日志、永不出 JSONL。
+    - **B3 角色解析顺序**：`settings.roles.<role>` > `config.toml [roles]` > 回落主渠道；角色值按「配置名或配置 id」解析，解析失败回落主渠道并 Notice。
+    - **B4 思考形态解析顺序**：`Config.thinking_style` 显式覆盖 > 端点探测（compat.rs：官方域名→native 供应商规范 / 本地→local / 其余→openai 兜底）> providers.json 预设 `thinking_format` 兜底。词表（none/openai/deepseek/zai/qwen/qwen-chat-template）**只增不改名**；新形态入词表必须附真实渠道冒烟记录。
+    - 附：**能力标记所有权**（A2）——用户显式勾选 > 按模型名推导；推导值仅在配置无用户标记历史时作初值，重置走「按模型名重新推导」按钮。
