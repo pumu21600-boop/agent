@@ -198,7 +198,13 @@ pub struct ModelsRequest {
     #[serde(default)]
     pub api_key: String,
 }
-#[derive(Debug, Deserialize)]
+/// 设置更新请求。B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
+/// - `0` = 清除长度类（context_length / max_output_tokens）
+/// - 负数 = 清除采样类（temperature / top_p）
+/// - 空串 / auto = 清除思考类（thinking / thinking_style）
+/// - clear_key=true = 清 key
+/// 其余字段：null / 缺省 = 不动。
+#[derive(Debug, Deserialize, Default)]
 pub struct SettingsUpdate {
     /// 配置名称（改当前激活配置的名）
     #[serde(default)]
@@ -234,9 +240,14 @@ pub struct SettingsUpdate {
     /// none/openai/deepseek/zai/qwen/qwen-chat-template；P8.3 旧值自动映射
     #[serde(default)]
     pub thinking_style: Option<String>,
-    /// 模型能力标记（工具调用/图片/视频/音频解析）
+    /// 模型能力标记（工具调用/图片/视频/音频解析）。Some = 用户显式标记，
+    /// 同时置位 capabilities_user_set（A2：此后模型切换不得被推导覆盖）
     #[serde(default)]
     pub capabilities: Option<crate::config::settings::ModelCapabilities>,
+    /// A2 显式重置入口（「按模型名重新推导」按钮）：按当前模型名重推能力标记，
+    /// 并复位 capabilities_user_set 回推导态
+    #[serde(default)]
+    pub recompute_capabilities: Option<bool>,
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
@@ -279,7 +290,7 @@ fn json_event(payload: Value) -> Event {
     Event::default().json_data(payload).expect("SSE 事件序列化失败")
 }
 
-/// P8/P9/P8.5：从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索）。
+/// P8/P9/P8.5：从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索/工具开关）。
 fn build_chat_params(
     c: &crate::config::settings::Config,
     preset: Option<&gateway::providers::ProviderPreset>,
@@ -293,13 +304,19 @@ fn build_chat_params(
     p.top_p = c.top_p;
     p.thinking = c.thinking.clone();
     p.base_url = Some(c.effective_base_url());
+    // A3：能力标记「工具调用」闭环（施工单 012）
+    p.tools_enabled = c.capabilities.tools;
     apply_thinking_style(&mut p, c.thinking_style.as_deref());
     p
 }
 
-/// P9：思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定。
-/// 词表与 OpenClaw thinkingFormat 对齐；P8.3 旧值做别名映射。
-/// none=不发任何思考参数。
+/// P9：思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定（设置面板控件）。
+/// B4 思考形态解析顺序（施工单 012 固化）：`Config.thinking_style` 显式覆盖 >
+/// 端点探测（compat.rs：官方域名→native 供应商规范 / 本地→local / 其余→openai 兜底）>
+/// providers.json 预设 `thinking_format` 兜底（预设值在 compat::resolve 内作为探测输入，
+/// 当前仅豆包 zai/混元 qwen 带值且与探测结果一致）。
+/// 词表（none/openai/deepseek/zai/qwen/qwen-chat-template）只增不改名；
+/// 新形态入词表必须附真实渠道冒烟记录。none=不发任何思考参数。
 fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
     use gateway::compat::ThinkingFormat as TF;
     match style {
@@ -315,6 +332,8 @@ fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
 }
 
 /// P8/P8.5：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
+/// B3 角色解析顺序（施工单 012 固化）：settings.roles.<role> > config.toml [roles] > 回落主渠道；
+/// 角色值按「配置名或配置 id」解析（本函数），解析失败回落主渠道并 Notice。
 fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
     let c = s
         .configs
@@ -339,6 +358,38 @@ fn accepts_modality(model: &str, kind: &str) -> bool {
         "video" => caps.video,
         "image" => caps.vision,
         _ => false,
+    }
+}
+
+/// A5（施工单 012）：媒体附件落在 <workspace>/.attachments/，若工作区是 git 仓库且
+/// .gitignore 未含该目录，自动追加一行 `.attachments/`（只追加，绝不重写用户文件），
+/// 防止用户 `git add .` 把二进制附件提交进历史。
+fn ensure_attachments_ignored(ws: &std::path::Path) {
+    if !ws.join(".git").exists() {
+        return;
+    }
+    let gi = ws.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ".attachments/") {
+        return;
+    }
+    let mut add = String::new();
+    // 用户文件可能不带结尾换行：直接追加会粘成一行，先补一个换行
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        add.push('\n');
+    }
+    add.push_str(".attachments/\n");
+    let ok = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&gi)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, add.as_bytes()))
+        .is_ok();
+    if ok {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "attachments.gitignored", "path": gi.display().to_string() }),
+        );
     }
 }
 
@@ -378,19 +429,17 @@ async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     Json(v)
 }
 
-/// 保存设置。api_key 非空则 DPAPI 加密持久化到当前激活配置；clear_key=true 则清除。
-async fn put_settings(
-    State(state): State<AppState>,
-    Json(req): Json<SettingsUpdate>,
-) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.write().unwrap().clone();
+/// 把 SettingsUpdate 应用到当前激活配置（put_settings 的主体逻辑，独立成纯函数便于单测）。
+/// 返回 (url_changed, provider_id, effective_model)。
+fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, String, String) {
     s.ensure_active_config();
 
     if let Some(v) = &req.name {
         s.set_active_name(v);
     }
 
-    let (url_changed, pid, eff_model) = if let Some(c) = s.active_mut() {
+    let mut result = (false, "deepseek".to_string(), "deepseek-chat".to_string());
+    if let Some(c) = s.active_mut() {
         let url_before = crate::config::settings::normalize_base(&c.effective_base_url());
         if let Some(v) = &req.provider_id {
             if !v.trim().is_empty() {
@@ -401,7 +450,16 @@ async fn put_settings(
             c.base_url = v.trim().to_string();
         }
         if let Some(v) = &req.model {
-            c.model = v.trim().to_string();
+            let v = v.trim().to_string();
+            if c.model != v {
+                c.model = v;
+                // A2 能力标记所有权（施工单 012）：用户显式标记 > 推导。仅当该配置从未被
+                // 用户标记过，模型切换才用「按模型名推导」的值作初值；标记过的不被冲掉。
+                if !c.capabilities_user_set {
+                    c.capabilities =
+                        crate::config::settings::ModelCapabilities::infer_from_model_id(&c.model);
+                }
+            }
         }
         if let Some(v) = &req.models {
             let mut list: Vec<String> =
@@ -423,19 +481,29 @@ async fn put_settings(
         if let Some(v) = req.top_p {
             c.top_p = if v < 0.0 { None } else { Some(v) };
         }
-        if let Some(v) = req.thinking {
+        if let Some(v) = req.thinking.as_deref() {
             let v = v.trim().to_lowercase();
             c.thinking = match v.as_str() {
-                "on" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(v),
+                "on" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+                    Some(v.clone())
+                }
                 _ => None,
             };
         }
-        if let Some(v) = req.thinking_style {
+        if let Some(v) = req.thinking_style.as_deref() {
             let v = v.trim().to_lowercase();
-            c.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v) };
+            c.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v.to_string()) };
         }
-        if let Some(caps) = req.capabilities {
-            c.capabilities = caps;
+        if let Some(caps) = &req.capabilities {
+            c.capabilities = caps.clone();
+            // A2：显式勾选 = 用户标记，此后任何模型切换都不得改写 capabilities
+            c.capabilities_user_set = true;
+        }
+        // A2 显式重置入口：按当前模型名重新推导，并回到推导态（此后模型切换恢复自动推导）
+        if req.recompute_capabilities == Some(true) {
+            let m = c.effective_model();
+            c.capabilities = crate::config::settings::ModelCapabilities::infer_from_model_id(&m);
+            c.capabilities_user_set = false;
         }
 
         let url_after = crate::config::settings::normalize_base(&c.effective_base_url());
@@ -444,10 +512,18 @@ async fn put_settings(
             c.models.clear();
             c.model.clear();
         }
-        (changed, c.provider_id.clone(), c.effective_model())
-    } else {
-        (false, "deepseek".to_string(), "deepseek-chat".to_string())
-    };
+        result = (changed, c.provider_id.clone(), c.effective_model());
+    }
+    result
+}
+
+/// 保存设置。api_key 非空则 DPAPI 加密持久化到当前激活配置；clear_key=true 则清除。
+async fn put_settings(
+    State(state): State<AppState>,
+    Json(req): Json<SettingsUpdate>,
+) -> (StatusCode, Json<Value>) {
+    let mut s = state.settings.write().unwrap().clone();
+    let (url_changed, pid, eff_model) = apply_settings_update(&mut s, &req);
 
     if url_changed {
         observability::event(
@@ -489,6 +565,8 @@ async fn list_models(
 ) -> (StatusCode, Json<Value>) {
     let s = state.settings.read().unwrap().clone();
     let base_url = if req.base_url.trim().is_empty() { s.effective_base_url() } else { req.base_url.trim().to_string() };
+    // B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
+    // key 永不出日志、永不出 JSONL。
     let api_key = if !req.api_key.trim().is_empty() {
         req.api_key.trim().to_string()
     } else {
@@ -644,6 +722,7 @@ fn config_state_json(s: &Settings) -> Value {
                 "thinking": c.thinking,
                 "thinking_style": c.thinking_style,
                 "capabilities": c.capabilities,
+                "capabilities_user_set": c.capabilities_user_set,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
@@ -659,6 +738,7 @@ fn config_state_json(s: &Settings) -> Value {
         "top_p": active.top_p,
         "thinking": active.thinking,
         "capabilities": active.capabilities,
+        "capabilities_user_set": active.capabilities_user_set,
         "has_key": key.is_some(),
         "key_hint": key_hint_of(key),
         // P8.2 工作区 + P9/P8.5 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
@@ -856,6 +936,8 @@ async fn chat(
                     let ws = crate::tools::workspace_root();
                     let att_dir = ws.join(".attachments");
                     let _ = std::fs::create_dir_all(&att_dir);
+                    // A5：附件目录自动进工作区 git 排除（幂等，只追加）
+                    ensure_attachments_ignored(&ws);
                     let safe_name = std::path::Path::new(&att.name)
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -1106,6 +1188,7 @@ async fn chat(
         // 请求级覆盖优先：页面当前选择即时生效，不等保存
         let base_url = if !req_base_url.is_empty() { req_base_url } else { active_cfg.effective_base_url() };
         let model = if !req_model.is_empty() { req_model } else { active_cfg.effective_model() };
+        // B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
@@ -1116,6 +1199,8 @@ async fn chat(
         params.base_url = Some(base_url.clone());
         let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
         // P8/P8.5 角色映射：优先使用 settings.roles，未设回落 config.toml [roles]
+        // （B3 角色解析顺序，施工单 012 固化：settings.roles > config.toml [roles] > 回落主渠道；
+        // 角色值按「配置名或配置 id」解析，解析失败回落主渠道并 Notice）
         let roles = s.roles.as_ref();
         let summary_name = roles.and_then(|r| r.summary.as_deref())
             .or_else(|| state.roles_cfg.summary.as_deref());
@@ -1123,6 +1208,16 @@ async fn chat(
             .or_else(|| state.roles_cfg.title.as_deref());
         let summary = summary_name.and_then(|n| find_channel(&s, n));
         let title = title_name.and_then(|n| find_channel(&s, n));
+        if let Some(n) = summary_name {
+            if summary.is_none() {
+                send(json!({ "notice": format!("角色「会话摘要」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
+            }
+        }
+        if let Some(n) = title_name {
+            if title.is_none() {
+                send(json!({ "notice": format!("角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
+            }
+        }
         // P8/P8.5 降级链：优先使用 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
         let fallback_names: Vec<String> = roles
             .map(|r| r.fallbacks.clone())
@@ -1736,6 +1831,34 @@ loadProviders().then(loadSettings);
 mod tests {
     use super::*;
 
+    /// 测试用配置（custom 中转端点：探测不出规范 → openai 兜底，适合测显式覆盖）。
+    fn test_config() -> crate::config::settings::Config {
+        crate::config::settings::Config {
+            id: "cfg-t".into(),
+            name: "test".into(),
+            provider_id: "custom".into(),
+            base_url: "https://relay.example.com/v1".into(),
+            model: "m".into(),
+            models: vec![],
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+            capabilities_user_set: false,
+        }
+    }
+
+    fn test_settings() -> Settings {
+        let mut s = Settings::default();
+        s.configs.push(test_config());
+        s.active_config_id = Some("cfg-t".into());
+        s
+    }
+
     #[test]
     fn thinking_style_override() {
         let _ = gateway::providers::init(
@@ -1758,6 +1881,7 @@ mod tests {
             thinking: Some("off".into()),
             thinking_style: Some("qwen".into()),
             capabilities: Default::default(),
+            capabilities_user_set: false,
         };
         let p = build_chat_params(&c, preset);
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Qwen));
@@ -1802,6 +1926,7 @@ mod tests {
             thinking: None,
             thinking_style: None,
             capabilities: Default::default(),
+            capabilities_user_set: false,
         };
         // 自定义中转（空地址探测不出）→ openai 形态兜底
         c.provider_id = "custom".into();
@@ -1837,6 +1962,7 @@ mod tests {
             thinking: None,
             thinking_style: None,
             capabilities: Default::default(),
+            capabilities_user_set: false,
         };
         // 输入栏 🧠 菜单发的档位要能持久化（P8.3 期间被 put_settings 吞掉的老问题）
         for lvl in ["low", "medium", "high", "on", "off"] {
@@ -1863,5 +1989,146 @@ mod tests {
             .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
             .unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn thinking_style_manual_override_end_to_end() {
+        // A1（施工单 012）验收路径：custom 中转渠道手动指定 zai 形态 → 商汤式网关 on/off 生效
+        let _ = gateway::providers::init(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
+        );
+        let mut s = test_settings();
+        let req = SettingsUpdate {
+            thinking_style: Some("zai".into()),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        assert_eq!(s.active().unwrap().thinking_style.as_deref(), Some("zai"));
+        let mut p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
+        // 端点探测对中转域名给 openai 兜底；显式覆盖必须赢
+        p.thinking = Some("on".into());
+        let body = gateway::build_body(
+            "deepseek-v4-flash",
+            &json!([{ "role": "user", "content": "hi" }]),
+            true,
+            &p,
+            None,
+        );
+        assert_eq!(body["thinking"], json!({"type":"enabled"}), "覆盖 zai 后 on 发 thinking 对象");
+        p.thinking = Some("off".into());
+        let body = gateway::build_body(
+            "deepseek-v4-flash",
+            &json!([{ "role": "user", "content": "hi" }]),
+            true,
+            &p,
+            None,
+        );
+        assert_eq!(body["thinking"], json!({"type":"disabled"}), "覆盖 zai 后 off 生效");
+        // auto/空串 = 清除显式覆盖，回到端点探测
+        let req = SettingsUpdate {
+            thinking_style: Some("auto".into()),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        assert!(s.active().unwrap().thinking_style.is_none(), "auto=清除覆盖");
+    }
+
+    #[test]
+    fn capabilities_user_mark_survives_model_switch() {
+        // A2（施工单 012）：用户显式标记 > 推导，模型切换不得覆盖
+        let mut s = test_settings();
+        // 模拟用户勾选「图片解析」→ capabilities_user_set 置位
+        let req = SettingsUpdate {
+            capabilities: Some(crate::config::settings::ModelCapabilities {
+                tools: true,
+                vision: true,
+                video: false,
+                audio: false,
+            }),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        assert!(s.active().unwrap().capabilities_user_set);
+        assert!(s.active().unwrap().capabilities.vision);
+        // 切到别的模型：标记不得被推导冲掉
+        let req = SettingsUpdate {
+            model: Some("qwen3.8-flash".into()),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        assert!(
+            s.active().unwrap().capabilities.vision,
+            "用户手动标记的 vision 不得被模型切换冲掉"
+        );
+        // 显式「按模型名重新推导」→ 回到推导态（qwen3.8-flash 无视觉关键字 → vision=false）
+        let req = SettingsUpdate {
+            recompute_capabilities: Some(true),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        assert!(!s.active().unwrap().capabilities_user_set);
+        assert!(!s.active().unwrap().capabilities.vision);
+        // 推导态下切模型 → 推导初值生效（vl 模型 → vision=true，且仍属推导态）
+        let req = SettingsUpdate {
+            model: Some("qwen-vl-max".into()),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        let c = s.active().unwrap();
+        assert!(c.capabilities.vision, "无用户标记时模型切换应按模型名推导初值");
+        assert!(!c.capabilities_user_set, "推导初值不等于用户标记");
+    }
+
+    #[test]
+    fn capabilities_tools_gate_wires_to_params() {
+        // A3（施工单 012）：勾掉「工具调用」→ ChatParams.tools_enabled=false → 请求体无 tools
+        let mut s = test_settings();
+        let req = SettingsUpdate {
+            capabilities: Some(crate::config::settings::ModelCapabilities {
+                tools: false,
+                vision: false,
+                video: false,
+                audio: false,
+            }),
+            ..Default::default()
+        };
+        apply_settings_update(&mut s, &req);
+        let p = build_chat_params(s.active().unwrap(), gateway::providers::find("custom"));
+        assert!(!p.tools_enabled);
+        let body = gateway::build_body(
+            "m",
+            &json!([{ "role": "user", "content": "hi" }]),
+            true,
+            &p,
+            None,
+        );
+        assert!(body.get("tools").is_none(), "tools=false 时请求体不得携带 tools");
+        // 对照：默认（不勾掉）→ tools_enabled=true，agent 循环携带 tools
+        let p = build_chat_params(&test_config(), gateway::providers::find("custom"));
+        assert!(p.tools_enabled);
+    }
+
+    #[test]
+    fn attachments_dir_appended_to_gitignore() {
+        // A5（施工单 012）：附件目录自动进工作区 git 排除（只追加，不重写用户文件）
+        let dir = std::env::temp_dir().join(format!("agent-a5-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let gi = dir.join(".gitignore");
+        std::fs::write(&gi, "target/\nlogs/").unwrap(); // 故意不带结尾换行
+        ensure_attachments_ignored(&dir);
+        assert_eq!(
+            std::fs::read_to_string(&gi).unwrap(),
+            "target/\nlogs/\n.attachments/\n",
+            "只追加一行并补齐换行"
+        );
+        // 幂等：再跑一次不重复追加
+        ensure_attachments_ignored(&dir);
+        let text = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(text.matches(".attachments/").count(), 1, "不得重复追加");
+        // 非 git 仓库不动
+        let dir2 = std::env::temp_dir().join(format!("agent-a5-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        ensure_attachments_ignored(&dir2);
+        assert!(!dir2.join(".gitignore").exists(), "非 git 仓库不落 .gitignore");
     }
 }
