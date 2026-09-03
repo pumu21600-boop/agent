@@ -153,18 +153,21 @@
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
   const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低', medium: '中', high: '高' };
+  // 提示按「生效形态」给（覆盖 > 预设），auto/无参数渠道给可操作指引
   $: thinkHint =
-    reasoningStyle === 'in_content'
+    thinkingStyle === 'in_content'
       ? '该渠道思考混在正文，自动剥离展示'
-      : reasoningStyle === 'effort_param'
-        ? thinking === 'off'
-          ? 'o 系无可靠关参数，off 不发'
-          : 'OpenAI 风格 reasoning_effort'
-        : reasoningStyle === 'thinking_param'
+      : thinkingStyle === 'reasoning_effort'
+        ? 'OpenAI 风格 reasoning_effort 档位'
+        : thinkingStyle === 'thinking_object'
           ? 'GLM/豆包 thinking 参数'
-          : thinkingBudgetParam
-            ? '布尔开关 + 思考预算'
-            : '思考参数按渠道自动适配';
+          : thinkingStyle === 'enable_thinking'
+            ? 'Qwen 系 enable_thinking 布尔'
+            : thinkingStyle === 'enable_thinking_budget'
+              ? 'Qwen 系布尔开关 + 思考预算'
+              : thinkingStyle === 'none'
+                ? '形态=不发参数，思考由渠道决定'
+                : '该渠道无标准开关参数——关不掉到设置改「思考参数形态」';
   function pickThinking(v) {
     thinking = v;
     thinkMenuOpen = false;
@@ -1079,45 +1082,38 @@
       </div>
 
       <div class="field">
-        <label>思考{reasoningStyle === 'in_content' ? '（该渠道思考混在正文，自动剥离）' : reasoningStyle === 'effort_param' ? '（OpenAI 风格 reasoning_effort，off 不发参数）' : ''}</label>
+        <label>思考参数形态（开关/档位在输入框 🧠 处选；这里只定参数怎么发）</label>
         <div class="sub-row">
           <select
-            bind:value={thinking}
-            on:change={() => autoSave({ thinking }, 0)}
-            disabled={reasoningStyle === 'in_content'}
+            bind:value={thinkingStyleOverride}
+            on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
           >
-            <option value="">渠道默认</option>
-            <option value="on">开启思考</option>
-            <option value="off">关闭思考</option>
+            <option value={null}>自动（按供应商预设）</option>
+            <option value="none">不发思考参数（思考关不掉/渠道不认参数）</option>
+            <option value="thinking_object">thinking 对象（GLM/豆包）</option>
+            <option value="reasoning_effort">reasoning_effort 档位（OpenAI/Claude/Gemini）</option>
+            <option value="enable_thinking">enable_thinking 布尔（Qwen 系）</option>
+            <option value="enable_thinking_budget">enable_thinking + thinking_budget（Qwen 带预算）</option>
           </select>
-          {#if thinkingBudgetParam}
+          {#if thinkingStyle === 'enable_thinking_budget' || thinkingStyle === 'enable_thinking'}
             <input
               class="num-input"
               type="number" min="0"
               placeholder="思考预算"
               bind:value={thinkingBudget}
-              title={thinkingBudgetParam + '：思考阶段 token 预算，0=不设'}
+              title="thinking_budget：思考阶段 token 预算，0=不设"
               on:change={() => autoSave({ thinking_budget: Number(thinkingBudget) || 0 }, 0)}
             />
           {/if}
         </div>
-        <div class="param-hint">{thinkingBudgetParam ? `左：思考开关　右：${thinkingBudgetParam}` : '开关是否生效取决于渠道（参数形态按供应商自动适配）'}</div>
-      </div>
-
-      <div class="field">
-        <label>思考参数形态（自定义/中转渠道拿不准时手动指定；P8.3）</label>
-        <select
-          bind:value={thinkingStyleOverride}
-          on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
-        >
-          <option value={null}>自动（按供应商预设）</option>
-          <option value="none">不发思考参数（思考关不掉/渠道不认参数）</option>
-          <option value="thinking_object">thinking 对象（GLM/豆包）</option>
-          <option value="reasoning_effort">reasoning_effort 档位（OpenAI/Claude/Gemini）</option>
-          <option value="enable_thinking">enable_thinking 布尔（Qwen 系）</option>
-          <option value="enable_thinking_budget">enable_thinking + thinking_budget（Qwen 带预算）</option>
-        </select>
-        <div class="param-hint">当前生效：{thinkingStyle}；选「enable_thinking 布尔」后，关闭思考会真的发 enable_thinking:false</div>
+        <div class="param-hint">
+          当前生效：{thinkingStyle}。
+          {#if thinkingStyle === 'auto' || thinkingStyle === 'reasoning_content'}
+            该渠道无标准思考开关参数——若「关闭」后模型仍思考，把形态改为 enable_thinking 布尔（Qwen 系中转常见）或 thinking 对象（GLM 系）
+          {:else if thinkingStyle === 'none'}
+            形态=不发参数：思考开/关都不会发，由渠道决定
+          {/if}
+        </div>
       </div>
     </div>
   </div>
@@ -1968,6 +1964,7 @@
     border-radius: 10px;
     width: 560px;
     max-height: 85vh;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
     padding: 16px;
