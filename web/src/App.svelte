@@ -31,6 +31,8 @@
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
   let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
   let thinkingStyleOverride = null; // 配置里的形态覆盖值（设置面板回显）
+  let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记
+  let roles = {}; // P8.5 角色路由映射
   // —— P8.2 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
@@ -231,6 +233,8 @@
     thinking = s.thinking || '';
     thinkingStyle = s.thinking_style || 'auto';
     thinkingStyleOverride = s.thinking_style_override || null;
+    capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
+    roles = s.roles || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
     // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
@@ -250,12 +254,12 @@
     settingsMsg = '已自动保存 ' + new Date().toTimeString().slice(0, 8);
   }
 
-  // 防抖自动保存设置字段；挂起的字段先记下来，切换配置前必须落盘到当前配置
+  // 防抖自动保存设置字段；合并挂起字段，切换配置前必须落盘到当前配置
   function autoSave(fields, delay = 500) {
     clearTimeout(autoSaveTimer);
-    pendingSave = fields;
+    pendingSave = { ...(pendingSave || {}), ...fields };
     autoSaveTimer = setTimeout(async () => {
-      const body = { ...fields };
+      const body = { ...pendingSave };
       if (apiKey.trim()) {
         body.api_key = apiKey.trim();
       }
@@ -287,11 +291,16 @@
         return;
       }
       apiKey = '';
-      await loadSettings();
+      applyState(d);
       flashSaved();
     } catch (e) {
       settingsMsg = `保存失败: ${e}`;
     }
+  }
+
+  async function clearKey() {
+    await sendSettings({ clear_key: true });
+    savedKeyUrl = '';
   }
 
   // —— 配置切换 / 新建 / 删除 ——
@@ -329,8 +338,15 @@
   }
 
   function onProviderChange() {
-    providerId = providerId; // bind 已更新
-    autoSave({ provider_id: providerId });
+    const p = providers.find((x) => x.id === providerId);
+    const newBase = p ? p.default_base_url : '';
+    const matchesPreset = providers.some((x) => x.default_base_url && x.default_base_url === baseUrl);
+    if (!baseUrl || matchesPreset) {
+      baseUrl = newBase;
+      autoSave({ provider_id: providerId, base_url: baseUrl });
+    } else {
+      autoSave({ provider_id: providerId });
+    }
   }
 
   // —— 获取模型 ——
@@ -352,6 +368,27 @@
     }
   }
 
+  function inferCapabilities(mId) {
+    const id = (mId || '').toLowerCase();
+    return {
+      tools: true,
+      vision: id.includes('vl') || id.includes('vision') || id.includes('gemini') || id.includes('gpt-4o') || id.includes('claude-3') || id.includes('omni'),
+      video: id.includes('video') || id.includes('gemini-2'),
+      audio: id.includes('audio') || id.includes('realtime') || id.includes('whisper'),
+    };
+  }
+
+  function inferProtocol(mId) {
+    const id = (mId || '').toLowerCase();
+    if (id.includes('deepseek') || id.includes('r1')) return 'deepseek';
+    if (id.includes('qwen') || id.includes('hunyuan')) return 'qwen';
+    if (id.includes('glm') || id.includes('doubao')) return 'zai';
+    if (id.includes('gpt-5') || id.includes('o1') || id.includes('o3') || id.includes('o4')) return 'openai';
+    if (id.includes('claude')) return 'claude';
+    if (id.includes('kimi') || id.includes('moonshot')) return 'moonshot';
+    return null;
+  }
+
   function isChecked(m) {
     return savedModels.includes(m);
   }
@@ -361,15 +398,29 @@
       ? savedModels.filter((x) => x !== m)
       : [...savedModels, m].sort();
     savedModels = list; // 乐观更新
-    if (list.length && !list.includes(model)) model = list[0];
-    await sendSettings({ models: list, model, api_key: apiKey.trim() || undefined });
+    let newModel = model;
+    let caps = capabilities;
+    if (list.length && !list.includes(model)) {
+      newModel = list[0];
+      model = newModel;
+      caps = inferCapabilities(newModel);
+      capabilities = caps;
+    }
+    await sendSettings({ models: list, model: newModel, capabilities: caps, api_key: apiKey.trim() || undefined });
   }
 
   async function selectAllModels() {
     const list = [...fetchedModels].sort();
     savedModels = list;
-    if (!list.includes(model) && list.length) model = list[0];
-    await sendSettings({ models: list, model });
+    let newModel = model;
+    let caps = capabilities;
+    if (!list.includes(model) && list.length) {
+      newModel = list[0];
+      model = newModel;
+      caps = inferCapabilities(newModel);
+      capabilities = caps;
+    }
+    await sendSettings({ models: list, model: newModel, capabilities: caps });
   }
 
   async function selectNoModels() {
@@ -382,7 +433,17 @@
   async function pickModel(m) {
     model = m;
     modelMenuOpen = false;
-    await sendSettings({ model: m });
+    const caps = inferCapabilities(m);
+    capabilities = caps;
+    const payload = { model: m, capabilities: caps };
+    if (!thinkingStyleOverride) {
+      const proto = inferProtocol(m);
+      if (proto) {
+        payload.thinking_style = proto;
+        thinkingStyleOverride = proto;
+      }
+    }
+    await sendSettings(payload);
   }
 
   // —— 对话 ——
@@ -997,15 +1058,21 @@
 
       <div class="field">
         <label>API Key（按配置独立保存）</label>
-        <input
-          bind:value={apiKey}
-          type="password"
-          placeholder={typingHint
-            ? `本配置已保存(…${typingHint})，重新输入即覆盖`
-            : '此配置还没有 key，填入即自动保存'}
-          on:blur={() => apiKey.trim() && autoSave({})}
-          on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
-        />
+        <div class="sub-row">
+          <input
+            bind:value={apiKey}
+            type="password"
+            style="flex: 1;"
+            placeholder={typingHint
+              ? `本配置已保存(…${typingHint})，重新输入即覆盖`
+              : '此配置还没有 key，填入即自动保存'}
+            on:blur={() => apiKey.trim() && autoSave({})}
+            on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
+          />
+          {#if typingHint}
+            <button class="btn del-key" on:click={clearKey} title="清除此配置保存的 API Key">清除 Key</button>
+          {/if}
+        </div>
       </div>
 
       <div class="field">
@@ -1076,30 +1143,145 @@
       </div>
 
       <div class="field">
-        <label>思考参数形态（开关/档位在输入框 🧠 处选；这里只定参数怎么发）</label>
+        <label>参数与思考协议规范（中转渠道可在此一键对齐官方规范）</label>
         <div class="sub-row">
           <select
             bind:value={thinkingStyleOverride}
             on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
           >
-            <option value={null}>自动（按端点探测）</option>
-            <option value="none">不发思考参数（思考关不掉/渠道不认参数）</option>
-            <option value="openai">openai：reasoning_effort 档位</option>
-            <option value="zai">zai：thinking 对象（智谱 GLM）</option>
-            <option value="deepseek">deepseek：thinking 对象（DeepSeek/小米）</option>
-            <option value="qwen">qwen：enable_thinking 布尔（百炼/混元）</option>
-            <option value="qwen-chat-template">qwen-chat-template：chat_template_kwargs（本地 vLLM/llama.cpp）</option>
+            <option value={null}>自动探测（Auto，按端点域名与模型名自动推导）</option>
+            <option value="deepseek">🐳 DeepSeek 规范：thinking 对象 + 保留 reasoning_content 回放</option>
+            <option value="qwen">🔷 通义千问 (Qwen) 规范：enable_thinking 布尔 + 过滤空消息</option>
+            <option value="zai">🟣 智谱 GLM / 豆包 规范：thinking 对象参数</option>
+            <option value="openai">🟢 OpenAI / GPT-5 规范：reasoning_effort 档位 + max_completion_tokens</option>
+            <option value="claude">🟧 Claude 兼容规范：保证 max_tokens 必填 + thinking budget</option>
+            <option value="moonshot">🌙 Moonshot (Kimi) 规范：长文本与思考回放白名单</option>
+            <option value="qwen-chat-template">💻 本地模板规范：chat_template_kwargs.enable_thinking</option>
+            <option value="none">⚪ 纯净极简规范 (None)：不发任何扩展思考参数（防止中转报错）</option>
           </select>
         </div>
         <div class="param-hint">
-          当前生效：{thinkingStyle}。
+          当前生效协议：<strong>{thinkingStyle}</strong>。
           {#if thinkingStyle === 'openai'}
-            档位经网关按模型 id 解析：gpt-5 无 "none"（关闭=不发），gpt-5.1+ 关闭发 "none"
+            OpenAI 规范：档位经网关按模型 id 解析，gpt-5 无 "none"，gpt-5.1+ 关闭发 "none"，新模型自动使用 max_completion_tokens
+          {:else if thinkingStyle === 'deepseek'}
+            DeepSeek 规范：发送 thinking: enabled/disabled 对象，历史消息自动保留带回 reasoning_content
+          {:else if thinkingStyle === 'qwen'}
+            通义千问规范：发送 enable_thinking 布尔，自动过滤空 content 消息
+          {:else if thinkingStyle === 'zai'}
+            GLM/豆包规范：发送 thinking: enabled/disabled 对象
           {:else if thinkingStyle === 'none'}
-            形态=不发参数：思考开/关都不会发，由渠道决定
+            极简模式：不发任何额外思考参数，由渠道模型自身行为决定
           {:else if thinkingStyle === 'auto'}
-            该渠道按 OpenAI 标准探测——若「关闭」后模型仍思考，改形态为 deepseek/zai（thinking 对象）或 qwen（布尔，中转常见）
+            端点自适应：官方域名自动识别；若是第三方中转，强烈建议在上面手动选择对应的官方规范
           {/if}
+        </div>
+      </div>
+
+      <div class="field">
+        <label>模型能力标记（多模态转接与工具调用依据）</label>
+        <div class="caps-row">
+          <label class="cap-check">
+            <input
+              type="checkbox"
+              bind:checked={capabilities.tools}
+              on:change={() => autoSave({ capabilities }, 0)}
+            />
+            🛠️ 工具调用
+          </label>
+          <label class="cap-check">
+            <input
+              type="checkbox"
+              bind:checked={capabilities.vision}
+              on:change={() => autoSave({ capabilities }, 0)}
+            />
+            👁️ 图片解析
+          </label>
+          <label class="cap-check">
+            <input
+              type="checkbox"
+              bind:checked={capabilities.video}
+              on:change={() => autoSave({ capabilities }, 0)}
+            />
+            🎥 视频解析
+          </label>
+          <label class="cap-check">
+            <input
+              type="checkbox"
+              bind:checked={capabilities.audio}
+              on:change={() => autoSave({ capabilities }, 0)}
+            />
+            🎙️ 音频解析
+          </label>
+        </div>
+        <div class="param-hint">
+          若主力模型未勾选对应媒体能力（如纯文本模型），遇到图片/音视频时将自动转接给下方设置的解析专家
+        </div>
+      </div>
+
+      <div class="field roles-section">
+        <label>角色分工与多模态转接（专职专家席位）</label>
+        <div class="roles-grid">
+          <div class="role-item">
+            <span class="role-name">📝 会话摘要 (Summary)</span>
+            <select
+              bind:value={roles.summary}
+              on:change={() => autoSave({ roles }, 0)}
+            >
+              <option value={null}>（默认跟随当前主力渠道）</option>
+              {#each configs as c}
+                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="role-item">
+            <span class="role-name">🏷️ 标题生成 (Title)</span>
+            <select
+              bind:value={roles.title}
+              on:change={() => autoSave({ roles }, 0)}
+            >
+              <option value={null}>（默认跟随当前主力渠道）</option>
+              {#each configs as c}
+                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="role-item">
+            <span class="role-name">👁️ 图片理解专家 (Vision)</span>
+            <select
+              bind:value={roles.vision}
+              on:change={() => autoSave({ roles }, 0)}
+            >
+              <option value={null}>（默认跟随当前主力渠道）</option>
+              {#each configs as c}
+                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="role-item">
+            <span class="role-name">🎥 视频理解专家 (Video)</span>
+            <select
+              bind:value={roles.video}
+              on:change={() => autoSave({ roles }, 0)}
+            >
+              <option value={null}>（默认跟随当前主力渠道）</option>
+              {#each configs as c}
+                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="role-item">
+            <span class="role-name">🎙️ 音频理解专家 (Audio)</span>
+            <select
+              bind:value={roles.audio}
+              on:change={() => autoSave({ roles }, 0)}
+            >
+              <option value={null}>（默认跟随当前主力渠道）</option>
+              {#each configs as c}
+                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
+              {/each}
+            </select>
+          </div>
         </div>
       </div>
     </div>
@@ -1158,9 +1340,15 @@
           <div class="empty">渠道未返回任何模型</div>
         {/if}
         {#each fetchedModels as m}
+          {@const caps = inferCapabilities(m)}
           <label class="model-item">
             <input type="checkbox" checked={isChecked(m)} on:change={() => toggleModel(m)} />
-            {m}
+            <span class="m-name">{m}</span>
+            <span class="m-caps">
+              {#if caps.vision}<span class="m-tag" title="支持图片理解">👁️图片</span>{/if}
+              {#if caps.video}<span class="m-tag" title="支持视频理解">🎥视频</span>{/if}
+              {#if caps.audio}<span class="m-tag" title="支持音频理解">🎙️音频</span>{/if}
+            </span>
           </label>
         {/each}
       </div>
@@ -2056,5 +2244,77 @@
     color: #6b707c;
     padding: 12px;
     text-align: center;
+  }
+  .del-key {
+    padding: 7px 10px;
+    font-size: 12px;
+    background: #4d2f2f;
+    border-color: #6b3f3f;
+    color: #fca5a5;
+  }
+  .del-key:hover {
+    background: #6b3535;
+  }
+  .caps-row {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    background: #1b1d23;
+    border: 1px solid #2f323c;
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+  .cap-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #cdd2dd;
+    cursor: pointer;
+  }
+  .cap-check input {
+    cursor: pointer;
+  }
+  .roles-section {
+    border-top: 1px solid #2f323c;
+    padding-top: 12px;
+    margin-top: 4px;
+  }
+  .roles-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .role-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .role-name {
+    font-size: 11px;
+    color: #9aa0ae;
+  }
+  .role-item select {
+    font-size: 12px;
+    padding: 6px 8px;
+  }
+  .m-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .m-caps {
+    display: flex;
+    gap: 4px;
+    font-size: 11px;
+  }
+  .m-tag {
+    background: #2b334a;
+    color: #a5b4fc;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: sans-serif;
   }
 </style>
