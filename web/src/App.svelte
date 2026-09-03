@@ -204,6 +204,13 @@
   let currentSessionId = null; // 当前会话（null=下次发送自动新建）
   let projectName = ''; // 工作区目录名
 
+  // P9 B1：Plan 档（随会话持久化到 localStorage.planMode_<sessionId>；请求级 plan_mode 带给后端）
+  let planMode = false;
+  function setPlanMode(v) {
+    planMode = v;
+    if (currentSessionId) localStorage.setItem(`planMode_${currentSessionId}`, v ? '1' : '0');
+  }
+
   onMount(async () => {
     await loadProviders();
     await loadSettings();
@@ -610,6 +617,7 @@
           model,
           base_url: baseUrl,
           approval_mode: approvalMode,
+          plan_mode: planMode, // P9 B1：Plan 档随请求带给后端
           session_id: currentSessionId || '',
         }),
         signal: controller.signal,
@@ -632,6 +640,8 @@
               const d = JSON.parse(line.slice(6));
               if (d.session) {
                 currentSessionId = d.session;
+                // P9 B1：新会话此刻才拿到 id，把当前 Plan 档补写进该会话的持久化
+                if (planMode) localStorage.setItem(`planMode_${d.session}`, '1');
               } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
               else if (d.tool_call)
@@ -669,6 +679,9 @@
                     ? { ...m, approval: { ...m.approval, decided: d.approval_decided.approved } }
                     : m
                 );
+              else if (d.plan_proposal)
+                // P9 B3：Plan 档结构化计划 → 挂到当前 assistant 消息渲染计划卡
+                patch((m) => ({ ...m, plan: d.plan_proposal }));
               else if (d.checkpoint)
                 messages = [
                   ...messages,
@@ -755,6 +768,7 @@
     try {
       const r = await fetch(`/api/session?id=${encodeURIComponent(id)}`).then((r) => r.json());
       currentSessionId = id;
+      planMode = localStorage.getItem(`planMode_${id}`) === '1'; // P9 B1：Plan 档随会话恢复
       messages = rebuildFromSession(r.messages || []);
       resetCtxUsage();
     } catch (e) {
@@ -765,6 +779,7 @@
   function startNewSession() {
     if (streaming) return;
     currentSessionId = null;
+    planMode = false; // 新会话默认 Act 档
     messages = [];
     resetCtxUsage();
     apiTotals = { prompt: 0, cached: 0 };
@@ -1148,6 +1163,13 @@
     return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
   }
 
+  // P9 B4：批准计划 → 切回 Act 档并自动下发执行指令（拒绝无按钮：继续对话调整即可）
+  function approvePlan() {
+    setPlanMode(false);
+    input = '计划已批准，请按计划开始执行。';
+    send();
+  }
+
   function nextId() {
     return ++seq;
   }
@@ -1404,6 +1426,29 @@
                   {/if}
                 </div>
               {/if}
+              {#if m.plan}
+                <!-- P9 B3/B4：Plan 档结构化计划卡 -->
+                <div class="plan-card">
+                  <div class="plan-head">📋 执行计划（等待批准）</div>
+                  {#if m.plan.goal}
+                    <div class="plan-goal">{m.plan.goal}</div>
+                  {/if}
+                  {#if m.plan.steps && m.plan.steps.length}
+                    <ol class="plan-steps">
+                      {#each m.plan.steps as s}
+                        <li>{s}</li>
+                      {/each}
+                    </ol>
+                  {/if}
+                  {#if m.plan.files && m.plan.files.length}
+                    <div class="plan-files">涉及文件：{m.plan.files.join('、')}</div>
+                  {/if}
+                  <div class="plan-actions">
+                    <button class="btn" on:click={approvePlan} disabled={streaming}>批准并开始执行</button>
+                    <span class="plan-hint">批准后切回 Act 档并自动下发执行指令；拒绝可直接对话继续调整</span>
+                  </div>
+                </div>
+              {/if}
               {#if m.tools && m.tools.length}
                 {#each m.tools as t}
                   <div class="tool-card">
@@ -1501,6 +1546,15 @@
               disabled={streaming}
             >
               📎
+            </button>
+            <button
+              class="pill"
+              class:plan-active={planMode}
+              on:click={() => setPlanMode(!planMode)}
+              disabled={streaming}
+              title="P9 Plan 模式：先规划后执行——Plan 档只放行只读操作，产出计划卡等你批准后转 Act 执行"
+            >
+              <span class="pill-label">模式:</span> {planMode ? 'Plan' : 'Act'}
             </button>
             <div class="bar-menu">
               <button
@@ -2837,6 +2891,53 @@
   .approval-risk.risk-2 {
     background: #541d1d;
     color: #ff9b9b;
+  }
+  /* P9 B：Plan 模式 pill 激活态 + 计划卡 */
+  .pill.plan-active {
+    background: #1f3a2c;
+    border-color: #3d7a55;
+    color: #8fe3ae;
+  }
+  .plan-card {
+    margin: 8px 0;
+    background: #16211b;
+    border: 1px solid #3d7a55;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+  .plan-head {
+    font-weight: 600;
+    color: #8fe3ae;
+    margin-bottom: 6px;
+  }
+  .plan-goal {
+    color: #d9e6df;
+    margin-bottom: 6px;
+  }
+  .plan-steps {
+    margin: 4px 0 6px;
+    padding-left: 22px;
+    color: #c4d2ca;
+  }
+  .plan-steps li {
+    margin: 2px 0;
+  }
+  .plan-files {
+    font-size: 12px;
+    color: #9ab5a6;
+    margin-bottom: 8px;
+    word-break: break-all;
+  }
+  .plan-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .plan-hint {
+    font-size: 11px;
+    color: #7c9184;
   }
   .approval-actions {
     display: flex;
