@@ -130,12 +130,14 @@ pub fn build_body_with_compat(
             if let Some(t) = requested {
                 if t == "off" {
                     body["thinking"] = json!({ "type": "disabled" });
+                    body["reasoning_effort"] = json!("none");
                 } else {
                     body["thinking"] = json!({ "type": "enabled" });
                     let eff = match t {
                         "low" => Some("low"),
-                        "medium" | "high" => Some("high"),
-                        "max" => Some("max"),
+                        "medium" => Some("medium"),
+                        "high" => Some("high"),
+                        "max" | "xhigh" => Some("xhigh"),
                         _ => None,
                     };
                     if let Some(e) = eff {
