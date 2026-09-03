@@ -195,6 +195,9 @@ pub struct ChatRequest {
     /// P6.1 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
     #[serde(default)]
     pub session_id: String,
+    /// P9 B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
+    #[serde(default)]
+    pub plan_mode: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1254,6 +1257,7 @@ async fn chat(
             &rec_cfg,
             &mem,
             prior_summary,
+            req.plan_mode,
             &ChatGate {
                 mode: state.approval_mode.clone(),
                 allow_unsandboxed,
@@ -1263,6 +1267,7 @@ async fn chat(
                 session_id: session_id.clone(),
                 meta: state.approval_meta.clone(),
                 approved: state.approved_scopes.clone(),
+                plan_mode: req.plan_mode,
                 tx: tx.clone(),
                 cancel: cancel.clone(),
             },
@@ -1324,6 +1329,10 @@ async fn chat(
                         ),
                     }
                 }
+                // P9 B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
+                AgentEvent::PlanProposal { goal, steps, files } => {
+                    send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
+                }
                 AgentEvent::Notice(n) => send(json!({ "notice": n }))
             },
         )
@@ -1367,11 +1376,29 @@ struct ChatGate {
     meta: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
     /// P9 A3：会话内已授权的审批范围（与 AppState.approved_scopes 同一份）
     approved: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
+    /// P9 B1：本次请求的 Plan 档（请求级 plan_mode 带入）
+    plan_mode: bool,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     cancel: Arc<CancelFlag>,
 }
 
 impl agent::ApprovalGate for ChatGate {
+    /// P9 B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。
+    /// 风险判定复用 rules::evaluate_risk 单点，与审批档位共用同一套语义。
+    fn plan_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {
+        if !self.plan_mode {
+            return None;
+        }
+        let ws = crate::tools::workspace_root();
+        let val: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
+        let (risk, reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
+        if risk == crate::core::rules::RiskLevel::Safe {
+            None
+        } else {
+            Some(format!("Plan 模式只放行只读操作（{}）：{}", risk.label(), reason))
+        }
+    }
+
     // 审批判定单点：只保留细粒度 needs_approval_for。
     // 旧版按工具静态 danger_level 的 needs_approval(mode, danger_level) 已随
     // 施工单 013 A2 删除——两套判定并存会造成语义分裂，禁止再加回来。

@@ -37,10 +37,35 @@ pub enum AgentEvent {
     Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
     /// P7 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
     Summary(String),
+    /// P9 B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
+    PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
+}
+
+/// P9 B3：Plan 档解析出的结构化计划。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    pub goal: String,
+    pub steps: Vec<String>,
+    pub files: Vec<String>,
 }
 
 /// P7 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
 pub const SUMMARY_PREFIX: &str = "【历史摘要】";
+
+/// P9 B3：Plan 档 system prompt 增量。
+/// 红线（坑 13/施工单 013 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
+pub const PLAN_PROMPT: &str = "\
+[Plan 模式]\n\
+当前处于 Plan（规划）档：只允许只读类操作（查看文件、搜索代码、只读命令）。写文件与改动类命令会被直接拒绝，请勿尝试。\n\
+请先用只读工具完成调研，然后在最终回答里输出一份执行计划，必须使用如下 ```plan 围栏格式：\n\
+```plan\n\
+目标: <一句话目标>\n\
+步骤:\n\
+1. <步骤一>\n\
+2. <步骤二>\n\
+文件: <涉及文件路径，逗号分隔>\n\
+```\n\
+用户批准该计划后才会开始实际执行。";
 
 fn is_summary_msg(m: &Value) -> bool {
     m.get("content").and_then(Value::as_str).map(|c| c.starts_with(SUMMARY_PREFIX)).unwrap_or(false)
@@ -183,6 +208,12 @@ async fn emit_checkpoint_bar(
 pub trait ApprovalGate: Send + Sync {
     /// P9 细粒度审批：结合工具名与具体参数进行风险研判
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool;
+    /// P9 B2（Plan 档）：返回 Some(理由) = 该工具在 Plan 档被**直接驳回**，
+    /// 不进审批弹窗流程（写/执行类操作连「问用户」都不问，直接拦下回喂模型调整计划）。
+    /// 默认不拦截（Plan 档之外恒 None）——判定单点原则与 A2 一致。
+    fn plan_block_reason(&self, _tool: &str, _args: &str) -> Option<String> {
+        None
+    }
     /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）
     fn sandbox_enabled(&self) -> bool;
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
@@ -211,6 +242,73 @@ fn tools_def_for(params: &ChatParams) -> Option<Value> {
     }
 }
 
+/// P9 B3：从模型回复解析 ```plan 围栏块（施工单 013 B3：计划产物结构化）。
+/// 行前缀容错匹配（中英文冒号、markdown 加粗/列表符都剥），小节顺序 目标→步骤→文件。
+/// 解析结果全空（无任何有效字段）返回 None。
+pub fn parse_plan(text: &str) -> Option<Plan> {
+    let fence = text.find("```plan")?;
+    let body_start = fence + text[fence..].find('\n')? + 1;
+    let body_end = text[body_start..]
+        .find("```")
+        .map(|i| body_start + i)
+        .unwrap_or(text.len());
+    let body = text[body_start..body_end].trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut goal = String::new();
+    let mut steps: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    let mut in_steps = false;
+
+    for line in body.lines() {
+        let t = line.trim().trim_start_matches(['*', '#']).trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("目标") {
+            goal = after_colon(t);
+        } else if t.starts_with("步骤") {
+            in_steps = true;
+        } else if t.starts_with("文件") {
+            in_steps = false;
+            files = after_colon(t)
+                .split([',', '，', '、', ';', '；', ' '])
+                .map(|s| s.trim().trim_matches('`').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        } else if in_steps {
+            // 步骤项：剥序号 "1. " / "1、" / "1)" / "- "
+            let core = t
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '、' || c == ')' || c == '-')
+                .trim()
+                .to_string();
+            if !core.is_empty() {
+                steps.push(core);
+            }
+        }
+        // 小节外的散行忽略
+    }
+
+    if goal.is_empty() && steps.is_empty() && files.is_empty() {
+        None
+    } else {
+        Some(Plan { goal, steps, files })
+    }
+}
+
+/// 取行内第一个中/英文冒号后的内容（剥 markdown 加粗星号）。
+/// 用 char_indices 定位，避免全角冒号（3 字节）切出非字符边界。
+fn after_colon(line: &str) -> String {
+    for (i, c) in line.char_indices() {
+        if c == ':' || c == '：' {
+            return line[i + c.len_utf8()..].trim().trim_matches('*').trim().to_string();
+        }
+    }
+    String::new()
+}
+
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task(
@@ -225,13 +323,29 @@ pub async fn run_task(
     rec_cfg: &RecoveryConfig,
     mem: &crate::memory::Memory,
     prior_summary: Option<String>,
+    // P9 B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
+    plan_mode: bool,
     gate: &dyn ApprovalGate,
     on_event: impl Fn(AgentEvent) + Send + Sync,
 ) -> anyhow::Result<LoopOutcome> {
     let primary = &channels.primary;
     let max_output_tokens = primary.params.max_tokens;
+    // P9 B1/B3：Plan 档注入行为约束与 ```plan 计划格式（增量不含身份/人设，坑 13）
+    let system_prompt_owned;
+    let system_prompt = if plan_mode {
+        system_prompt_owned = format!("{system_prompt}\n\n{PLAN_PROMPT}");
+        system_prompt_owned.as_str()
+    } else {
+        system_prompt
+    };
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
+    if plan_mode {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "plan.mode", "mode": "plan", "step": 0 }),
+        );
+    }
     msgs.extend(messages.iter().cloned());
     // P6 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
     on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
@@ -450,6 +564,28 @@ pub async fn run_task(
             } else {
                 turn.content.clone()
             };
+            // P9 B3：Plan 档最终回答解析 ```plan 结构化计划 → 前端计划卡
+            if plan_mode {
+                match parse_plan(&final_text) {
+                    Some(plan) => {
+                        observability::event(
+                            EventType::State,
+                            json!({
+                                "kind": "plan.proposed", "step": step,
+                                "steps": plan.steps.len(), "files": plan.files.len(),
+                            }),
+                        );
+                        on_event(AgentEvent::PlanProposal {
+                            goal: plan.goal,
+                            steps: plan.steps,
+                            files: plan.files,
+                        });
+                    }
+                    None => on_event(AgentEvent::Notice(
+                        "Plan 档：模型未按 ```plan 围栏格式输出计划，可直接对话要求它补一份格式化计划。".to_string(),
+                    )),
+                }
+            }
             // P6：最终回答写入会话并落盘（与前端看到的一致）
             msgs.push(json!({ "role": "assistant", "content": final_text }));
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
@@ -526,12 +662,29 @@ pub async fn run_task(
             // P9 细粒度审批规则引擎：按工具名及具体参数动态评估风险，替代“一刀切”
             // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
             let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
-            let approved = if gate.needs_approval_for(&call.name, &call.arguments) {
-                gate.ask(&call.name, &call.arguments).await
-            } else {
-                true
+            // P9 B2：Plan 档直接驳回**优先于审批流**——只读放行，写/执行类不弹审批窗、
+            // 直接拦下并把原因回喂模型（要求调整计划），与「拒绝后回喂」同一回填路径
+            let plan_reason = gate.plan_block_reason(&call.name, &call.arguments);
+            let approved = match &plan_reason {
+                Some(_) => false,
+                None if gate.needs_approval_for(&call.name, &call.arguments) => {
+                    gate.ask(&call.name, &call.arguments).await
+                }
+                None => true,
             };
-            let (content, ok) = if !approved {
+            let (content, ok) = if let Some(reason) = &plan_reason {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "plan.blocked", "step": step, "tool": call.name, "reason": reason }),
+                );
+                on_event(AgentEvent::Notice(format!("Plan 档已拦截 {}：{}", call.name, reason)));
+                (
+                    format!(
+                        "Plan 模式拦截（未执行）：{reason}。请勿执行写/改类操作——继续只读调研，并在最终回答中用 ```plan 围栏输出执行计划，等待用户批准。"
+                    ),
+                    true,
+                )
+            } else if !approved {
                 ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
             } else {
                 // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断
@@ -594,5 +747,45 @@ mod tests {
         assert!(tools_def_for(&p).is_some(), "默认（tools=true）携带 tools");
         p.tools_enabled = false;
         assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
+    }
+
+    // —— P9 B3：plan 块解析 ——
+    #[test]
+    fn parse_plan_standard_block() {
+        let text = "好的，我先调研一下。\n```plan\n目标: 重构审批模块\n步骤:\n1. 梳理 gate 调用点\n2. 抽出纯函数\n3. 补单测\n文件: src/core/agent.rs, src/server.rs\n```\n等待批准。";
+        let p = parse_plan(text).expect("标准格式应解析成功");
+        assert_eq!(p.goal, "重构审批模块");
+        assert_eq!(p.steps, vec!["梳理 gate 调用点", "抽出纯函数", "补单测"]);
+        assert_eq!(p.files, vec!["src/core/agent.rs", "src/server.rs"]);
+    }
+
+    #[test]
+    fn parse_plan_tolerant_marks() {
+        // 中文冒号 + markdown 加粗 + 「-」列表符 + 反引号包裹路径
+        let text = "```plan\n**目标**：完成 P9\n步骤:\n- 第一步\n- 第二步\n**文件**：`a.rs`、`b.rs`\n```";
+        let p = parse_plan(text).expect("容错格式应解析成功");
+        assert_eq!(p.goal, "完成 P9");
+        assert_eq!(p.steps, vec!["第一步", "第二步"]);
+        assert_eq!(p.files, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn parse_plan_rejects_missing_or_empty() {
+        assert!(parse_plan("没有围栏的普通回答").is_none(), "无 plan 围栏返回 None");
+        assert!(parse_plan("```plan\n```").is_none(), "空围栏返回 None");
+        assert!(
+            parse_plan("```plan\n随便写两句不带头部标记的话\n```").is_none(),
+            "围栏内无任何目标/步骤/文件标记返回 None"
+        );
+    }
+
+    #[test]
+    fn parse_plan_steps_only_is_ok() {
+        // 只有步骤也算有效计划（弱模型可能漏掉目标/文件行）
+        let text = "```plan\n步骤:\n1. 先做 A\n2. 再做 B\n```";
+        let p = parse_plan(text).expect("仅步骤应解析成功");
+        assert!(p.goal.is_empty());
+        assert_eq!(p.steps, vec!["先做 A", "再做 B"]);
+        assert!(p.files.is_empty());
     }
 }
