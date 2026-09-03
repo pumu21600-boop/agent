@@ -157,9 +157,9 @@ pub fn find(name: &str) -> Option<&'static ToolSpec> {
     all().iter().find(|t| t.name == name)
 }
 
-/// 发给 OpenAI 兼容请求的 tools 数组。
+/// 发给 OpenAI 兼容请求的 tools 数组（P11：含已启用+已确认的 MCP 动态工具）。
 pub fn definitions() -> Vec<Value> {
-    all()
+    let mut out: Vec<Value> = all()
         .iter()
         .map(|t| {
             json!({
@@ -171,11 +171,17 @@ pub fn definitions() -> Vec<Value> {
                 }
             })
         })
-        .collect()
+        .collect();
+    out.extend(crate::plugin::mcp::tool_definitions());
+    out
 }
 
 /// 执行工具，返回文本结果；Err 的内容会作为 tool 消息回填给模型（不中断循环）。
 pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String, String> {
+    // P11：MCP 动态工具分发（进程隔离自带边界，不走本地沙箱/工作区约束）
+    if name.starts_with(crate::plugin::mcp::PREFIX) {
+        return crate::plugin::mcp::call_tool(name, args).await;
+    }
     match name {
         "read_file" => read_file(args, cfg.max_chars),
         "read_page" => read_page(args, cfg.max_chars),

@@ -286,6 +286,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/trace", get(get_trace))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/agents", post(save_memory_agents))
+        .route("/api/mcp", get(get_mcp).post(post_mcp))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
@@ -569,6 +570,7 @@ async fn put_settings(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": pid, "model": eff_model }),
@@ -645,6 +647,7 @@ async fn manage_configs(
     let pid = s.provider_id();
     let model = s.effective_model();
     *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "config.changed", "action": req.action, "provider_id": pid, "model": model }),
@@ -708,6 +711,7 @@ async fn set_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
@@ -1422,6 +1426,154 @@ async fn save_memory_agents(
     }
 }
 
+// —— P11（施工单 016）：MCP 插件 ——
+
+/// GET /api/mcp —— server 列表（配置 + 在线状态 + 工具清单）。
+async fn get_mcp(State(state): State<AppState>) -> Json<Value> {
+    let s = state.settings.read().unwrap().clone();
+    let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
+        crate::plugin::mcp::status()
+            .into_iter()
+            .map(|(n, o, t)| (n, (o, t)))
+            .collect();
+    let servers: Vec<Value> = s
+        .mcp_servers
+        .iter()
+        .map(|c| {
+            let (online, tools) = status
+                .get(&c.name)
+                .cloned()
+                .unwrap_or((false, Vec::new()));
+            json!({
+                "name": c.name, "command": c.command, "args": c.args, "env": c.env,
+                "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
+                "online": online,
+                "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({ "servers": servers }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpActionRequest {
+    /// save（新增/更新）| remove | confirm（首装确认）| refresh（重连发现）| toggle（启停）
+    pub action: String,
+    #[serde(default)]
+    pub server: Option<Value>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub risk: Option<String>,
+}
+
+/// POST /api/mcp —— 配置管理与生命周期动作（全部落 settings.json 并同步管理器）。
+async fn post_mcp(
+    State(state): State<AppState>,
+    Json(req): Json<McpActionRequest>,
+) -> (StatusCode, Json<Value>) {
+    let mut s = state.settings.read().unwrap().clone();
+    let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
+    match req.action.as_str() {
+        "save" => {
+            let Some(srv) = req.server.clone() else {
+                return err("缺少 server 配置".into());
+            };
+            let cfg: crate::config::settings::McpServerCfg = match serde_json::from_value(srv) {
+                Ok(c) => c,
+                Err(e) => return err(format!("server 配置不合法: {e}")),
+            };
+            if !crate::plugin::mcp::valid_name(&cfg.name) {
+                return err("名称非法（非空、仅字母数字-_、禁止包含 __）".into());
+            }
+            s.mcp_servers.retain(|c| c.name != cfg.name);
+            s.mcp_servers.push(cfg);
+        }
+        "remove" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            s.mcp_servers.retain(|c| &c.name != name);
+        }
+        "confirm" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            let Some(c) = s.mcp_servers.iter_mut().find(|c| &c.name == name) else {
+                return err(format!("未知 server: {name}"));
+            };
+            c.confirmed = true;
+            if let Some(r) = &req.risk {
+                if r == "dangerous" || r == "normal" {
+                    c.risk = r.clone();
+                }
+            }
+        }
+        "toggle" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            let Some(c) = s.mcp_servers.iter_mut().find(|c| &c.name == name) else {
+                return err(format!("未知 server: {name}"));
+            };
+            c.enabled = !c.enabled;
+        }
+        "refresh" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            if !s.mcp_servers.iter().any(|c| &c.name == name) {
+                return err(format!("未知 server: {name}"));
+            }
+            // 只重连+重新发现；配置不动（ensure_online 用管理器内已同步的 cfg）
+        }
+        other => return err(format!("未知操作: {other}")),
+    }
+
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers);
+
+    // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
+    if req.action == "refresh" {
+        let name = req.name.clone().unwrap_or_default();
+        let r = tokio::task::spawn_blocking(move || crate::plugin::mcp::ensure_online_by_name(&name)).await;
+        match r {
+            Ok(Ok(n)) => {
+                return (StatusCode::OK, Json(json!({ "ok": true, "tools_found": n })));
+            }
+            Ok(Err(e)) => {
+                return (StatusCode::OK, Json(json!({ "ok": false, "error": e })));
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+            }
+        }
+    }
+
+    (StatusCode::OK, get_mcp_inner(&state))
+}
+
+fn get_mcp_inner(state: &AppState) -> Json<Value> {
+    let s = state.settings.read().unwrap().clone();
+    let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
+        crate::plugin::mcp::status()
+            .into_iter()
+            .map(|(n, o, t)| (n, (o, t)))
+            .collect();
+    let servers: Vec<Value> = s
+        .mcp_servers
+        .iter()
+        .map(|c| {
+            let (online, tools) = status
+                .get(&c.name)
+                .cloned()
+                .unwrap_or((false, Vec::new()));
+            json!({
+                "name": c.name, "command": c.command, "args": c.args, "env": c.env,
+                "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
+                "online": online,
+                "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({ "servers": servers }))
+}
+
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
 /// **只读解析** JSONL（payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；
 /// 坏行跳过；文件不存在/为空返回空 tasks 而非报错。
@@ -1767,6 +1919,7 @@ async fn remove_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
 }
@@ -1791,6 +1944,7 @@ async fn alias_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "workspace.aliased", "path": path, "name": name }),

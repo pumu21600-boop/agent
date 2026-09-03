@@ -262,6 +262,10 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_aliases: BTreeMap<String, String>,
 
+    /// P11（施工单 016）：MCP server 配置（stdio transport；工具以 mcp__<server>__<tool> 接入）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerCfg>,
+
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
     pub keys: BTreeMap<String, String>,
@@ -280,8 +284,37 @@ impl Default for Settings {
             workspace_aliases: BTreeMap::new(),
             keys: BTreeMap::new(),
             key_cipher: None,
+            mcp_servers: Vec::new(),
         }
     }
+}
+
+/// P11：单个 MCP server 的连接与策略配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerCfg {
+    /// 服务名（工具名 mcp__<name>__<tool>；禁止包含 "__"）
+    pub name: String,
+    /// 启动命令（如 npx / node / 绝对路径 exe）
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// 启停（false 时工具不下发、不可调用）
+    #[serde(default = "crate::config::settings::yes")]
+    pub enabled: bool,
+    /// 首装确认（总架构 §7：接入时向用户展示完整工具清单后确认）
+    #[serde(default)]
+    pub confirmed: bool,
+    /// 该 server 全部工具的审批档："normal"（auto 档放行）| "dangerous"（逐次弹窗）
+    #[serde(default = "default_risk")]
+    pub risk: String,
+}
+fn yes() -> bool {
+    true
+}
+fn default_risk() -> String {
+    "normal".into()
 }
 
 /// key 存储作用域归一化：小写、去首尾空白与尾部 '/'。

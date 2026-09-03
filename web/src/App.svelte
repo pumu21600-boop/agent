@@ -1177,6 +1177,7 @@
     settingsTab = t;
     localStorage.setItem('settingsTab', t);
     if (t === 'memory' && !memData) loadMemory();
+    if (t === 'plugins') loadMcp();
   }
 
   // —— P10.5 记忆分区（双层 AGENTS.md 编辑 + 状态）——
@@ -1220,6 +1221,38 @@
     } finally {
       memSaving = false;
     }
+  }
+
+  // —— P11（施工单 016）：MCP 插件分区 ——
+  let mcpServers = [];
+  let mcpForm = { name: '', command: '', args: '' };
+  let mcpRiskChoice = 'normal';
+  async function loadMcp() {
+    try {
+      const r = await fetch('/api/mcp').then((r) => r.json());
+      mcpServers = r.servers || [];
+    } catch (e) {
+      mcpServers = [];
+    }
+  }
+  async function mcpAction(action, name, risk, server) {
+    try {
+      const r = await fetch('/api/mcp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, name, risk, server }),
+      }).then((r) => r.json());
+      if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
+      if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
+    } catch (e) {
+      settingsMsg = `MCP ${action} 失败: ${e.message || e}`;
+    }
+    await loadMcp();
+  }
+  function addMcpServer() {
+    const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
+    mcpAction('save', null, null, { name: mcpForm.name.trim(), command: mcpForm.command.trim(), args });
+    mcpForm = { name: '', command: '', args: '' };
   }
   // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
   function riskLabelFor(risk) {
@@ -1870,6 +1903,7 @@
           <button class:active={settingsTab === 'params'} on:click={() => pickSettingsTab('params')}>🎛 模型参数</button>
           <button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}>👥 角色分工</button>
           <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}>🧠 记忆</button>
+          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}>🔌 插件 (MCP)</button>
           <button class:active={settingsTab === 'workspace'} on:click={() => pickSettingsTab('workspace')}>📁 工作区</button>
         </div>
         <div class="settings-content">
@@ -2198,6 +2232,63 @@
         {:else}
           <div class="trace-empty">加载中…</div>
         {/if}
+      {/if}
+      {#if settingsTab === 'plugins'}
+        <div class="param-hint">MCP（Model Context Protocol）：接入外部工具生态。工具名以 mcp__服务__工具 下发；首次接入需确认工具清单后才对 AI 可见（防工具投毒）；每服务可设审批档。</div>
+        {#each mcpServers as sv}
+          <div class="field mcp-card">
+            <div class="mcp-head">
+              <span class="dot" class:haskey={sv.online}></span>
+              <b>{sv.name}</b>
+              <span class="mcp-status">{sv.online ? '在线' : '离线'}</span>
+              <span class="mcp-risk">{sv.risk === 'dangerous' ? '高危档' : '常规档'}{sv.confirmed ? '' : ' · 待确认'}</span>
+              <span class="flex-sp"></span>
+              <button class="btn ghost" on:click={() => mcpAction('toggle', sv.name)}>{sv.enabled ? '停用' : '启用'}</button>
+              <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
+              <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
+            </div>
+            <div class="mcp-cmd">{sv.command} {sv.args.join(' ')}</div>
+            {#if !sv.confirmed}
+              <div class="mcp-confirm">
+                {#if sv.tools.length}
+                  <div class="mcp-tools-list">
+                    <b>发现 {sv.tools.length} 个工具，请确认后启用：</b>
+                    {#each sv.tools as t}
+                      <div class="mcp-tool-item"><code>{t.name}</code> {t.desc}</div>
+                    {/each}
+                  </div>
+                  <div class="sub-row">
+                    <label class="mcp-risk-label">审批档：</label>
+                    <select bind:value={mcpRiskChoice}>
+                      <option value="normal">常规（auto 档自动放行）</option>
+                      <option value="dangerous">高危（每次调用都弹窗）</option>
+                    </select>
+                    <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
+                  </div>
+                {:else}
+                  <button class="btn primary" on:click={() => mcpAction('refresh', sv.name)}>连接并获取工具清单</button>
+                {/if}
+              </div>
+            {:else}
+              <div class="mcp-tools-list">
+                {#each sv.tools as t}
+                  <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
+                {/each}
+                {#if !sv.tools.length}<span class="hint">（未发现工具——点「重连」尝试）</span>{/if}
+              </div>
+            {/if}
+          </div>
+        {/each}
+        <div class="field">
+          <label>添加 MCP server（stdio：本地命令 + 参数）</label>
+          <div class="sub-row">
+            <input placeholder="名称（字母数字-_）" bind:value={mcpForm.name} style="max-width:160px" />
+            <input placeholder="命令，如 node / npx" bind:value={mcpForm.command} />
+            <input placeholder="参数（空格分隔）" bind:value={mcpForm.args} />
+            <button class="btn primary" on:click={addMcpServer} disabled={!mcpForm.name.trim() || !mcpForm.command.trim()}>添加</button>
+          </div>
+          <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
+        </div>
       {/if}
       {#if settingsTab === 'workspace'}
       <div class="field">
@@ -4019,6 +4110,63 @@
   .agents-editor:focus {
     outline: none;
     border-color: var(--g4);
+  }
+  /* P11 MCP 插件分区 */
+  .mcp-card {
+    border: 1px solid var(--g3);
+    border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .mcp-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    color: var(--g7);
+  }
+  .mcp-status {
+    font-size: 11px;
+    color: var(--g5);
+  }
+  .mcp-risk {
+    font-size: 11px;
+    color: var(--tint-yellow-fg);
+    background: var(--tint-yellow-bg);
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .flex-sp {
+    flex: 1;
+  }
+  .mcp-cmd {
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    color: var(--g5);
+    margin: 6px 0;
+    word-break: break-all;
+  }
+  .mcp-tools-list {
+    font-size: 12px;
+    color: var(--g6);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin: 6px 0;
+  }
+  .mcp-tool-item code {
+    background: var(--g2);
+    border: 1px solid var(--g3);
+    border-radius: 4px;
+    padding: 0 4px;
+    margin-right: 6px;
+    font-size: 11px;
+  }
+  .mcp-confirm {
+    margin-top: 6px;
+  }
+  .mcp-risk-label {
+    font-size: 12px;
+    color: var(--g6);
   }
   .modal-head {
     display: flex;
