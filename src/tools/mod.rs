@@ -309,9 +309,9 @@ fn search(args: &str, max_chars: usize) -> Result<String, String> {
             .stdin(Stdio::null())
             .output()
     } else {
-        // findstr 兜底：/s 递归 /n 行号 /i 忽略大小写
+        // findstr 兜底：/s 递归 /n 行号 /i 忽略大小写；/c:<query> 必须为单参数
         Command::new("findstr")
-            .args(["/s", "/n", "/i", "/c:", query])
+            .args(["/s", "/n", "/i", &format!("/c:{query}")])
             .arg("*")
             .current_dir(&target)
             .stdin(Stdio::null())
