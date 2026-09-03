@@ -1170,6 +1170,66 @@
     send();
   }
 
+  // —— P10-A：trace 时间线（最近任务的事件流）——
+  let traceOpen = false;
+  let traceTasks = [];
+  let traceLoading = false;
+  let traceNote = '';
+  let traceExpanded = null; // 当前展开的任务索引（一次一个）
+
+  async function openTrace() {
+    traceOpen = true;
+    traceLoading = true;
+    traceNote = '';
+    traceExpanded = null;
+    try {
+      const r = await fetch('/api/trace?limit=10').then((r) => r.json());
+      traceTasks = r.tasks || [];
+      traceNote = r.note || '';
+    } catch (e) {
+      traceNote = `读取失败: ${e.message || e}`;
+      traceTasks = [];
+    } finally {
+      traceLoading = false;
+    }
+  }
+  // 事件摘要（一行）：按类型提取可读文本
+  function traceSummary(ev) {
+    const p = ev.payload || {};
+    switch (ev.etype) {
+      case 'state': return p.kind || JSON.stringify(p).slice(0, 90);
+      case 'tool_call': return `${p.name}  ${String(p.arguments || '').slice(0, 90)}`;
+      case 'tool_result': return `${p.ok ? '✓' : '✕'} ${String(p.preview || '').slice(0, 90)}`;
+      case 'model_chunk': return p.aggregated ? `${p.count} 个模型流式分片（聚合展示）` : '模型分片';
+      case 'thought': return String(p.text || '').slice(0, 90);
+      case 'error': return String(p.message || p.error || JSON.stringify(p)).slice(0, 90);
+      default: return JSON.stringify(p).slice(0, 90);
+    }
+  }
+  // tool_call → 后续同名 tool_result 配对耗时（毫秒；配不上返回 null）
+  function tracePairMs(events, i) {
+    const c = events[i];
+    if (!c || c.etype !== 'tool_call') return null;
+    for (let j = i + 1; j < events.length; j++) {
+      const r = events[j];
+      if (r.etype === 'tool_result' && r.payload?.name === c.payload?.name) {
+        return r.offset_ms - c.offset_ms;
+      }
+      if (r.etype === 'tool_call') return null;
+    }
+    return null;
+  }
+  function traceBadge(ev) {
+    return { state: 'st', tool_call: 'call', tool_result: (ev.payload?.ok === false ? 'fail' : 'res'), model_chunk: 'chunk', thought: 'th', error: 'err' }[ev.etype] || 'st';
+  }
+  function fmtClock(ts) {
+    const d = new Date(ts);
+    return isNaN(d) ? ts : d.toLocaleTimeString('zh-CN', { hour12: false });
+  }
+  function fmtDur(ms) {
+    return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+  }
+
   function nextId() {
     return ++seq;
   }
@@ -1205,6 +1265,9 @@
           </button>
           <button class="icon-btn" title="添加项目" on:click={addProject} disabled={streaming}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.2v5.8a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3.2l1.8 2H18a2 2 0 0 1 2 2v.2"/><line x1="17" y1="2.5" x2="17" y2="8"/><line x1="14.2" y1="5.2" x2="19.8" y2="5.2"/></svg>
+          </button>
+          <button class="icon-btn" title="时间线（最近任务的事件流）" on:click={openTrace}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2.2"/></svg>
           </button>
         </span>
         {#if viewMenuOpen}
@@ -2106,6 +2169,53 @@
     <div class="image-modal" on:click|stopPropagation>
       <img src={previewImageModal} alt="大图预览" />
       <button class="image-modal-close" on:click={() => (previewImageModal = null)}>✕</button>
+    </div>
+  </div>
+{/if}
+
+{#if traceOpen}
+  <!-- P10-A：trace 时间线面板（最近任务的事件流） -->
+  <div class="modal-backdrop" on:click={() => (traceOpen = false)}>
+    <div class="modal trace-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <h2>时间线 · 最近任务</h2>
+        <button class="icon-btn" title="刷新" on:click={openTrace}>⟳</button>
+        <button class="icon-btn" title="关闭" on:click={() => (traceOpen = false)}>✕</button>
+      </div>
+      {#if traceLoading}
+        <div class="trace-empty">加载中…</div>
+      {:else if traceNote && traceTasks.length === 0}
+        <div class="trace-empty">{traceNote}</div>
+      {:else if traceTasks.length === 0}
+        <div class="trace-empty">还没有任务记录（跑一次对话后这里会出现事件流）</div>
+      {:else}
+        {#if traceNote}<div class="trace-note">{traceNote}</div>{/if}
+        {#each traceTasks as task, ti}
+          <div class="trace-task">
+            <button class="trace-task-head" on:click={() => (traceExpanded = traceExpanded === ti ? null : ti)}>
+              <span class="trace-idx">#{traceTasks.length - ti}</span>
+              <span class="trace-time">{fmtClock(task.start_ts)}</span>
+              <span class="trace-meta">{fmtDur(task.duration_ms)} · {task.events.length} 事件</span>
+              <span class="caret">{traceExpanded === ti ? '▾' : '▸'}</span>
+            </button>
+            {#if traceExpanded === ti}
+              <div class="trace-events">
+                {#each task.events as ev, ei}
+                  {@const pairMs = tracePairMs(task.events, ei)}
+                  <div class="trace-ev">
+                    <span class="trace-offset">{(ev.offset_ms / 1000).toFixed(1)}s</span>
+                    <span class="trace-badge trace-badge-{traceBadge(ev)}">{ev.etype}</span>
+                    <span class="trace-sum" title={JSON.stringify(ev.payload)}>{traceSummary(ev)}</span>
+                    {#if pairMs !== null}
+                      <span class="trace-pair">{fmtDur(pairMs)}</span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/each}
+      {/if}
     </div>
   </div>
 {/if}
@@ -3460,6 +3570,124 @@
     align-items: center;
     justify-content: center;
     z-index: 20;
+  }
+  /* P10-A：trace 时间线面板 */
+  .trace-modal {
+    width: 720px;
+  }
+  .trace-empty {
+    color: #8b8f9c;
+    font-size: 13px;
+    text-align: center;
+    padding: 24px 0;
+  }
+  .trace-note {
+    font-size: 12px;
+    color: #d9a75f;
+    background: #241f14;
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+  .trace-task {
+    border: 1px solid #333742;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .trace-task-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    background: #262932;
+    border: none;
+    color: #dfe1e8;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+  }
+  .trace-task-head:hover {
+    background: #2b2f39;
+  }
+  .trace-idx {
+    color: #8fb8ff;
+    font-weight: 600;
+  }
+  .trace-time {
+    font-variant-numeric: tabular-nums;
+  }
+  .trace-meta {
+    color: #8b8f9c;
+    font-size: 12px;
+    flex: 1;
+  }
+  .trace-events {
+    display: flex;
+    flex-direction: column;
+    padding: 6px 10px 10px;
+    max-height: 46vh;
+    overflow-y: auto;
+  }
+  .trace-ev {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 3px 0;
+    border-bottom: 1px dashed #2b2e38;
+    font-size: 12px;
+    color: #c6c9d4;
+  }
+  .trace-ev:last-child {
+    border-bottom: none;
+  }
+  .trace-offset {
+    color: #6f7480;
+    font-variant-numeric: tabular-nums;
+    min-width: 52px;
+    text-align: right;
+  }
+  .trace-badge {
+    min-width: 78px;
+    text-align: center;
+    border-radius: 4px;
+    padding: 0 4px;
+    font-size: 11px;
+  }
+  .trace-badge-st {
+    background: #1f2c44;
+    color: #9ec1ff;
+  }
+  .trace-badge-call {
+    background: #1d3a28;
+    color: #8fe3ae;
+  }
+  .trace-badge-res {
+    background: #263024;
+    color: #b9e0a5;
+  }
+  .trace-badge-fail {
+    background: #541d1d;
+    color: #ff9b9b;
+  }
+  .trace-badge-chunk {
+    background: #33343a;
+    color: #a7abb8;
+  }
+  .trace-badge-th {
+    background: #2d2344;
+    color: #c3a6ff;
+  }
+  .trace-badge-err {
+    background: #541d1d;
+    color: #ff9b9b;
+  }
+  .trace-sum {
+    flex: 1;
+    word-break: break-all;
+  }
+  .trace-pair {
+    color: #d9a75f;
+    font-variant-numeric: tabular-nums;
   }
   .modal {
     background: #23252d;
