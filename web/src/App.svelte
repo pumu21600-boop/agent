@@ -151,7 +151,7 @@
   // —— ZCode 式输入框：思考模式选择器（常驻）——
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
-  const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低', medium: '中', high: '高' };
+  const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低档', medium: '中档', high: '高档', max: '最大' };
   // 提示按「生效形态」给（覆盖 > 端点探测），auto/无参数渠道给可操作指引
   $: thinkHint =
     thinkingStyle === 'zai'
@@ -944,18 +944,68 @@
                   <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
                     默认<span class="bar-item-hint">跟渠道自身行为走</span>
                   </button>
-                  <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                    低<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: low' : '轻度思考 (低档)'}</span>
-                  </button>
-                  <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
-                    中<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: medium' : '标准思考 (中档)'}</span>
-                  </button>
-                  <button class="bar-item" class:active={thinking === 'high'} on:click={() => pickThinking('high')}>
-                    高<span class="bar-item-hint">{thinkingStyle === 'openai' ? 'reasoning_effort: high' : '深度思考 (高档)'}</span>
-                  </button>
-                  <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                    关闭<span class="bar-item-hint">{thinkingStyle === 'none' ? '不发参数' : '发关闭参数'}</span>
-                  </button>
+
+                  {#if thinkingStyle === 'deepseek'}
+                    <!-- DeepSeek 官方专属思考档位：低档、高档、最大、关闭 -->
+                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
+                      低档<span class="bar-item-hint">快速推理 · low</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('high')}>
+                      高档<span class="bar-item-hint">平衡深度（推荐） · high</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
+                      最大<span class="bar-item-hint">深度推理 · max</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">发关闭参数 · disabled</span>
+                    </button>
+                  {:else if thinkingStyle === 'openai'}
+                    <!-- OpenAI 官方专属思考档位：低、中、高、关闭 -->
+                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
+                      低<span class="bar-item-hint">reasoning_effort: low</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
+                      中<span class="bar-item-hint">reasoning_effort: medium</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'max'} on:click={() => pickThinking('high')}>
+                      高<span class="bar-item-hint">reasoning_effort: high</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">发关闭参数 · off</span>
+                    </button>
+                  {:else if thinkingStyle === 'qwen'}
+                    <!-- 通义千问 / 混元 官方专属：布尔开关 -->
+                    <button class="bar-item" class:active={thinking === 'on' || thinking === 'high' || thinking === 'medium' || thinking === 'low' || thinking === 'max'} on:click={() => pickThinking('on')}>
+                      开启<span class="bar-item-hint">enable_thinking: true</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">enable_thinking: false</span>
+                    </button>
+                  {:else if thinkingStyle === 'zai'}
+                    <!-- 智谱 GLM / 字节豆包 官方专属：thinking 对象开关 -->
+                    <button class="bar-item" class:active={thinking === 'on' || thinking === 'high' || thinking === 'medium' || thinking === 'low' || thinking === 'max'} on:click={() => pickThinking('on')}>
+                      开启<span class="bar-item-hint">thinking: enabled</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">thinking: disabled</span>
+                    </button>
+                  {:else if thinkingStyle === 'qwen-chat-template'}
+                    <!-- 本地推理服务聊天模板形态 -->
+                    <button class="bar-item" class:active={thinking === 'on' || thinking === 'high' || thinking === 'medium' || thinking === 'low' || thinking === 'max'} on:click={() => pickThinking('on')}>
+                      开启<span class="bar-item-hint">chat_template_kwargs.enable_thinking</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">关闭模板思考</span>
+                    </button>
+                  {:else}
+                    <!-- 极简模式 / 未知自定义端点 -->
+                    <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on')}>
+                      开启<span class="bar-item-hint">发送开启参数</span>
+                    </button>
+                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                      关闭<span class="bar-item-hint">不发思考参数</span>
+                    </button>
+                  {/if}
                 </div>
               {/if}
             </div>
