@@ -173,6 +173,7 @@ pub fn definitions() -> Vec<Value> {
         })
         .collect();
     out.extend(crate::plugin::mcp::tool_definitions());
+    out.extend(crate::plugin::wasm::tool_definitions());
     out
 }
 
@@ -181,6 +182,10 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
     // P11：MCP 动态工具分发（进程隔离自带边界，不走本地沙箱/工作区约束）
     if name.starts_with(crate::plugin::mcp::PREFIX) {
         return crate::plugin::mcp::call_tool(name, args).await;
+    }
+    // P11 017：WASM 插件工具分发（纯计算沙箱，自带边界）
+    if name.starts_with(crate::plugin::wasm::PREFIX) {
+        return crate::plugin::wasm::call_tool(name, args).await;
     }
     match name {
         "read_file" => read_file(args, cfg.max_chars),

@@ -1428,31 +1428,9 @@ async fn save_memory_agents(
 
 // —— P11（施工单 016）：MCP 插件 ——
 
-/// GET /api/mcp —— server 列表（配置 + 在线状态 + 工具清单）。
+/// GET /api/mcp —— server 列表 + WASM 插件（配置/在线状态/工具清单）。
 async fn get_mcp(State(state): State<AppState>) -> Json<Value> {
-    let s = state.settings.read().unwrap().clone();
-    let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
-        crate::plugin::mcp::status()
-            .into_iter()
-            .map(|(n, o, t)| (n, (o, t)))
-            .collect();
-    let servers: Vec<Value> = s
-        .mcp_servers
-        .iter()
-        .map(|c| {
-            let (online, tools) = status
-                .get(&c.name)
-                .cloned()
-                .unwrap_or((false, Vec::new()));
-            json!({
-                "name": c.name, "command": c.command, "args": c.args, "env": c.env,
-                "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
-                "online": online,
-                "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
-    Json(json!({ "servers": servers }))
+    get_mcp_inner(&state)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1529,6 +1507,7 @@ async fn post_mcp(
     crate::plugin::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
+    crate::plugin::wasm::rescan(); // 017：顺带重扫 WASM 插件
     if req.action == "refresh" {
         let name = req.name.clone().unwrap_or_default();
         let r = tokio::task::spawn_blocking(move || crate::plugin::mcp::ensure_online_by_name(&name)).await;
@@ -1549,6 +1528,15 @@ async fn post_mcp(
 }
 
 fn get_mcp_inner(state: &AppState) -> Json<Value> {
+    let wasm_list: Vec<Value> = crate::plugin::wasm::status()
+        .into_iter()
+        .map(|(stem, ok, tools, err)| {
+            json!({
+                "stem": stem, "ok": ok, "load_error": err,
+                "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     let s = state.settings.read().unwrap().clone();
     let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
         crate::plugin::mcp::status()
@@ -1571,7 +1559,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "servers": servers }))
+    Json(json!({ "servers": servers, "wasm": wasm_list }))
 }
 
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。

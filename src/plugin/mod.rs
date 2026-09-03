@@ -4,3 +4,4 @@
 //! 016（P11）：MCP client stdio 最小闭环已落地（见 mcp.rs）；WASM 与组件总线留 017。
 
 pub mod mcp;
+pub mod wasm;

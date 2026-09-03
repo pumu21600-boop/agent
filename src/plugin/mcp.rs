@@ -100,6 +100,12 @@ pub fn sync_configs(cfgs: &[McpServerCfg]) {
 /// 启动子进程并握手（initialize → initialized → tools/list）。
 /// 已在线则直接返回；失败重置进程并返回 Err（离线）。
 fn ensure_online(st: &mut ServerState) -> Result<(), String> {
+    // 先收割已退出的子进程（崩溃自愈：标记离线，走下方重启路径）
+    if let Some(child) = st.child.as_mut() {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            st.reset_proc();
+        }
+    }
     if st.online && st.stdin.is_some() && st.reader.is_some() {
         return Ok(());
     }

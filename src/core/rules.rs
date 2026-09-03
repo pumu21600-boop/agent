@@ -117,6 +117,13 @@ const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".
 pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
     // P11（施工单 016）：MCP 动态工具——档位由 plugin 层按「首装确认 + server 配置」判定：
     // 未确认/禁用/未知 → Dangerous（总架构 §7 tool poisoning 防线）；确认后 Normal/Dangerous。
+    if let Some(rest) = tool_name.strip_prefix(crate::plugin::wasm::PREFIX) {
+        return match crate::plugin::wasm::risk_for(tool_name) {
+            Some(2) => (RiskLevel::Dangerous, format!("WASM 插件工具（加载失败/未知）: {rest}")),
+            Some(_) => (RiskLevel::Normal, format!("WASM 插件工具（本地可信目录）: {rest}")),
+            None => (RiskLevel::Dangerous, format!("未知 WASM 插件工具: {tool_name}")),
+        };
+    }
     if let Some(rest) = tool_name.strip_prefix(crate::plugin::mcp::PREFIX) {
         return match crate::plugin::mcp::risk_for(tool_name) {
             Some(2) => (

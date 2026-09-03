@@ -46,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
     // —— 设置：settings.json 持久化；首次用 config.toml 的 gateway 节作种子 ——
     let user_settings = config::settings::Settings::load(&config.gateway.base_url, &config.gateway.model);
     crate::plugin::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
+    crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
+    crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
     observability::event(
         observability::EventType::State,
         serde_json::json!({

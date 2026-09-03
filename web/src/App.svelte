@@ -1227,12 +1227,15 @@
   let mcpServers = [];
   let mcpForm = { name: '', command: '', args: '' };
   let mcpRiskChoice = 'normal';
+  let wasmPlugins = [];
   async function loadMcp() {
     try {
       const r = await fetch('/api/mcp').then((r) => r.json());
       mcpServers = r.servers || [];
+      wasmPlugins = r.wasm || [];
     } catch (e) {
       mcpServers = [];
+      wasmPlugins = [];
     }
   }
   async function mcpAction(action, name, risk, server) {
@@ -2289,6 +2292,28 @@
           </div>
           <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
         </div>
+        {#if wasmPlugins.length}
+          <div class="field">
+            <label>WASM 插件（plugins/ 目录，本地纯计算沙箱，trap 不连坐）</label>
+            {#each wasmPlugins as w}
+              <div class="mcp-card" style="margin-bottom:8px">
+                <div class="mcp-head">
+                  <b>{w.stem}</b>
+                  <span class="mcp-status">{w.ok ? '已加载' : '加载失败'}</span>
+                </div>
+                {#if w.load_error}
+                  <div class="mcp-cmd">{w.load_error}</div>
+                {/if}
+                <div class="mcp-tools-list">
+                  {#each w.tools as t}
+                    <div class="mcp-tool-item"><code>wasm__{w.stem}__{t.name}</code> {t.desc}</div>
+                  {/each}
+                </div>
+              </div>
+            {/each}
+            <div class="param-hint">放置 .wasm/.wat 到项目 plugins/ 目录后点任意「重连」重新扫描；WASM 是纯计算沙箱（无文件/网络），工具默认常规档</div>
+          </div>
+        {/if}
       {/if}
       {#if settingsTab === 'workspace'}
       <div class="field">

@@ -2,7 +2,7 @@
 name = "agent"
 version = "0.1.0"
 edition = "2024"
-description = "Windows 原生、类 Codex 的自主编码 Agent —— 施工单 001：日志地基 + 网关冒烟 + 取消按钮"
+description = "跑在 Windows 上的类 Codex 自主编码 Agent —— 施工单 001：日志地基 + 网关冒烟 + 取消按钮"
 
 [dependencies]
 anyhow = "1"
@@ -20,6 +20,8 @@ tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
 # DSH 式侧边栏「添加项目」：Win 原生 IFileDialog 选文件夹（server 本地进程弹原生窗口）
 rfd = "0.15"
+# P11 WASM 插件宿主（总架构 §7：自带沙箱即边界；wat feature 支持文本格式插件，零工具链依赖）
+wasmtime = "24"
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
