@@ -128,12 +128,25 @@ pub fn run_assertion(
             .unwrap_or(false),
         "no_new_files" => {
             let now = list_files(ws_dir);
-            now.iter().all(|f| files_before.contains(f))
+            now.iter().all(|f| {
+                files_before.contains(f) || is_runtime_file(f)
+            })
         }
         "sse_event" => sse_events.contains(&a.event),
         _ => false, // 未知类型一律失败（防任务集手滑静默通过）
     };
     (ok, desc)
+}
+
+/// 服务自身管理的运行时文件（eval 断言应忽略，不算「任务改动」）：
+/// .agent/ 记忆层、AGENTS.md 模板、.gitignore（服务会自动建/追加）、.git/、.attachments/。
+fn is_runtime_file(rel: &str) -> bool {
+    let lower = rel.to_lowercase();
+    lower.starts_with(".agent/")
+        || lower.starts_with(".git/")
+        || lower.starts_with(".attachments/")
+        || lower == "agents.md"
+        || lower == ".gitignore"
 }
 
 // —— SSE 驱动器 ——
@@ -296,11 +309,18 @@ mod tests {
     }
 
     #[test]
-    fn no_new_files_detects_newcomer() {
+    fn no_new_files_detects_newcomer_but_skips_runtime_files() {
         let (_g, ws) = ws_with("newcomer", &[("base.txt", "x")]);
         let before = list_files(&ws);
         std::fs::write(ws.join("new.txt"), "y").unwrap();
         assert!(!run_assertion(&a("no_new_files", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+        std::fs::remove_file(ws.join("new.txt")).unwrap(); // 移除非法新增后再验证运行时文件豁免
+        // 服务运行时文件不算「任务改动」（记忆层/AGENTS.md 模板/.gitignore 等）
+        std::fs::create_dir_all(ws.join(".agent")).unwrap();
+        std::fs::write(ws.join(".agent").join("index.json"), "{}").unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "模板").unwrap();
+        std::fs::write(ws.join(".gitignore"), ".attachments/\n").unwrap();
+        assert!(run_assertion(&a("no_new_files", "", "", ""), &ws, &before, &BTreeSet::new()).0);
     }
 
     #[test]
