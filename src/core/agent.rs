@@ -173,23 +173,14 @@ async fn emit_checkpoint_bar(
     }
 }
 
-/// 审批三档判定（Codex 式，施工单 005/006）：
-/// - read-only（只读）：查询类自动，写文件/执行命令要批
-/// - auto（自动）：沙箱内全自动（等效 Codex workspace-write）
-/// - full-access（完全访问）：脱沙箱全自动（审批策略由 gate 按 unsandboxed_approval 决定）
-/// 旧档位名 suggest/auto-edit/full-auto/local 在 server 层归一化后映射进来。
-pub fn needs_approval(mode: &str, danger_level: u8) -> bool {
-    match mode {
-        "auto" | "full-access" | "full-auto" | "local" => false,
-        "auto-edit" => danger_level >= 2,
-        _ => danger_level >= 1, // read-only / suggest（默认兜底）
-    }
-}
+/// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
+/// `core::rules::evaluate_risk` + `should_ask_approval` 的档位映射）。
+/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在 P9 施工单 013 A2 中删除——
+/// 两套判定并存会造成语义分裂，此后再无第二处审批判定入口。
+/// （工具静态 danger_level 现仅用于「是否拍影子仓库检查点」，不参与审批判定。）
 
 /// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
 pub trait ApprovalGate: Send + Sync {
-    /// 当前档位下该危险等级是否要审批（保留兼容）
-    fn needs_approval(&self, danger_level: u8) -> bool;
     /// P9 细粒度审批：结合工具名与具体参数进行风险研判
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool;
     /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）

@@ -1356,15 +1356,9 @@ struct ChatGate {
 }
 
 impl agent::ApprovalGate for ChatGate {
-    fn needs_approval(&self, danger_level: u8) -> bool {
-        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
-        // 完全访问档默认免审批；unsandboxed_approval=true 时执行类仍要批
-        if (mode == "full-access" || mode == "local") && self.unsandboxed_approval {
-            return danger_level >= 2;
-        }
-        agent::needs_approval(&mode, danger_level)
-    }
-
+    // 审批判定单点：只保留细粒度 needs_approval_for。
+    // 旧版按工具静态 danger_level 的 needs_approval(mode, danger_level) 已随
+    // 施工单 013 A2 删除——两套判定并存会造成语义分裂，禁止再加回来。
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
         let ws = crate::tools::workspace_root();
@@ -1392,8 +1386,12 @@ impl agent::ApprovalGate for ChatGate {
             EventType::State,
             json!({ "kind": "approval.requested", "id": id, "tool": tool, "risk": risk.as_u8(), "reason": reason }),
         );
+        // 注意：SSE 可增字段（前端审批卡展示用），JSONL 事件不动——6 类 schema 已定死。
         let _ = self.tx.send(Ok(json_event(json!({
-            "approval_request": { "id": id, "tool": tool, "args": args, "risk": risk.as_u8(), "reason": reason }
+            "approval_request": {
+                "id": id, "tool": tool, "args": args,
+                "risk": risk.as_u8(), "risk_label": risk.label(), "reason": reason
+            }
         }))));
         let pending = self.pending.clone();
         let tx = self.tx.clone();
