@@ -11,7 +11,7 @@ use std::{convert::Infallible, path::PathBuf, pin::Pin, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{
         Html,
@@ -283,6 +283,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
+        .route("/api/trace", get(get_trace))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
@@ -1360,6 +1361,48 @@ async fn cancel(State(state): State<AppState>) -> Json<Value> {
 /// GET /api/cancel —— 查询取消标志当前状态。
 async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "cancelled": state.cancel.is_set() }))
+}
+
+// —— P10-A（施工单 014）：trace 时间线 ——
+
+#[derive(Debug, Deserialize)]
+pub struct TraceQuery {
+    /// 最近任务数（1–50，默认 5）
+    #[serde(default = "default_trace_limit")]
+    pub limit: usize,
+}
+fn default_trace_limit() -> usize {
+    5
+}
+
+/// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
+/// **只读解析** JSONL（payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；
+/// 坏行跳过；文件不存在/为空返回空 tasks 而非报错。
+async fn get_trace(Query(q): Query<TraceQuery>) -> (StatusCode, Json<Value>) {
+    let Some(path) = observability::log_path() else {
+        return (StatusCode::OK, Json(json!({ "tasks": [], "note": "logger 未初始化" })));
+    };
+    let limit = q.limit.clamp(1, 50);
+    let path = path.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || observability::read_tasks(&path, limit)).await;
+    match res {
+        Ok(Ok(tasks)) => {
+            let list: Vec<Value> = tasks
+                .iter()
+                .map(|t| {
+                    json!({
+                        "start_ts": t.start_ts,
+                        "end_ts": t.end_ts,
+                        "duration_ms": t.duration_ms(),
+                        "events": observability::trace::render_events(t),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "tasks": list })))
+        }
+        Ok(Err(e)) => (StatusCode::OK, Json(json!({ "tasks": [], "note": format!("读取失败: {e}") }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 /// 审批门（施工单 005 + 本机直跑）：SSE 发审批请求，oneshot 等用户决定；

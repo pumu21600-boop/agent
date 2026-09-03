@@ -8,7 +8,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -48,18 +48,26 @@ impl EventType {
 pub struct Logger {
     file: Mutex<File>,
     session_id: String,
+    /// P10-A：当前日志文件完整路径（trace 查询接口用）
+    path: PathBuf,
 }
 
 impl Logger {
     /// 打开（追加）JSONL 文件，目录不存在则创建。
     pub fn open(dir: &Path, file_name: &str, session_id: String) -> anyhow::Result<Arc<Self>> {
         fs::create_dir_all(dir)?;
-        let file = OpenOptions::new().create(true).append(true).open(dir.join(file_name))?;
-        Ok(Arc::new(Self { file: Mutex::new(file), session_id }))
+        let path = dir.join(file_name);
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Arc::new(Self { file: Mutex::new(file), session_id, path }))
     }
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// P10-A：当前 JSONL 文件路径（未初始化时 None）。
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// 写一条日志：单行 JSON + 换行，写完立即 flush（落盘即完整）。
@@ -114,6 +122,14 @@ pub fn get() -> &'static Arc<Logger> {
 pub fn event(event_type: EventType, payload: Value) {
     get().log(event_type, payload);
 }
+
+/// P10-A：当前 JSONL 日志文件路径（logger 未初始化时 None）。
+pub fn log_path() -> Option<&'static Path> {
+    LOGGER.get().map(|l| l.path())
+}
+
+pub mod trace;
+pub use trace::read_tasks;
 
 /// 全局控制台调试输出。
 pub fn debug(msg: &str) {

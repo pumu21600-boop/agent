@@ -340,6 +340,8 @@ pub async fn run_task(
     };
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
+    // P10-A：任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
+    observability::event(EventType::State, json!({ "kind": "task.start" }));
     if plan_mode {
         observability::event(
             EventType::State,
