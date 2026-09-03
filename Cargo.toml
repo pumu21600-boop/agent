@@ -18,6 +18,8 @@ tokio-stream = "0.1"
 toml = "0.8"
 tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
+# DSH 式侧边栏「添加项目」：Win 原生 IFileDialog 选文件夹（server 本地进程弹原生窗口）
+rfd = "0.15"
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",

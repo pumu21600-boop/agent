@@ -23,6 +23,15 @@ pub struct SessionFile {
     /// P7 滚动摘要（跨任务延续；无摘要时缺省）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// 创建时所在的工作区（DSH 式侧边栏「按工作区」分组用；旧文件缺省=未分组）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
+    /// DSH 式侧边栏：置顶（列表内沉底排序的最前）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    /// DSH 式侧边栏：归档（默认列表隐藏，管理模式可见/可取消）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// 列表条目（不携带消息体）。
@@ -33,6 +42,9 @@ pub struct SessionMeta {
     pub created_at: String,
     pub updated_at: String,
     pub count: usize,
+    pub workspace: String,
+    pub pinned: bool,
+    pub archived: bool,
 }
 
 pub struct SessionManager {
@@ -84,17 +96,34 @@ impl SessionManager {
         uuid::Uuid::new_v4().to_string()
     }
 
-    /// 落盘（原子写）：已存在则保留 created_at 与标题，否则标题取首条用户消息。
-    /// summary 传 Some 才更新（None 保留旧值）。
+    /// 原子写（临时文件 + rename），save / rename / set_meta / fork 共用。
+    fn write(&self, f: &SessionFile) -> anyhow::Result<()> {
+        let tmp = self.path(&f.id).with_extension("json.tmp");
+        let text = serde_json::to_string(f).context("会话序列化失败")?;
+        std::fs::write(&tmp, text).with_context(|| format!("写临时文件失败: {}", tmp.display()))?;
+        std::fs::rename(&tmp, self.path(&f.id))
+            .with_context(|| format!("替换会话文件失败: {}", self.path(&f.id).display()))?;
+        Ok(())
+    }
+
+    /// 落盘（原子写）：已存在则保留 created_at/标题/置顶/归档/工作区，否则标题取首条
+    /// 用户消息、工作区记为当前工作区。summary 传 Some 才更新（None 保留旧值）。
     pub fn save(&self, id: &str, messages: &[Value], summary: Option<&str>) -> anyhow::Result<()> {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let (title, created_at, old_summary) = match self.get(id) {
-            Some(old) => (old.title, old.created_at, old.summary),
-            None => (first_user_title(messages), now.clone(), None),
+        let (title, created_at, old_summary, workspace, pinned, archived) = match self.get(id) {
+            Some(old) => (old.title, old.created_at, old.summary, old.workspace, old.pinned, old.archived),
+            None => (
+                first_user_title(messages),
+                now.clone(),
+                None,
+                crate::tools::workspace_root().display().to_string(),
+                false,
+                false,
+            ),
         };
         let file = SessionFile {
             id: id.to_string(),
@@ -103,12 +132,11 @@ impl SessionManager {
             updated_at: now,
             messages: messages.to_vec(),
             summary: summary.map(|s| s.to_string()).or(old_summary),
+            workspace,
+            pinned,
+            archived,
         };
-        let tmp = self.path(id).with_extension("json.tmp");
-        let text = serde_json::to_string(&file).context("会话序列化失败")?;
-        std::fs::write(&tmp, text).with_context(|| format!("写临时文件失败: {}", tmp.display()))?;
-        std::fs::rename(&tmp, self.path(id)).with_context(|| format!("替换会话文件失败: {}", self.path(id).display()))?;
-        Ok(())
+        self.write(&file)
     }
 
     pub fn get(&self, id: &str) -> Option<SessionFile> {
@@ -133,7 +161,7 @@ impl SessionManager {
         self.list().first().and_then(|m| self.get(&m.id))
     }
 
-    /// 全部会话元信息，按更新时间新→旧。
+    /// 全部会话元信息：置顶优先，其余按更新时间新→旧（归档项一并返回，由前端过滤）。
     pub fn list(&self) -> Vec<SessionMeta> {
         let mut metas: Vec<SessionMeta> = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -152,9 +180,12 @@ impl SessionManager {
                 created_at: f.created_at,
                 updated_at: f.updated_at,
                 count: f.messages.len(),
+                workspace: f.workspace,
+                pinned: f.pinned,
+                archived: f.archived,
             });
         }
-        metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        metas.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.updated_at.cmp(&a.updated_at)));
         metas
     }
 
@@ -170,24 +201,50 @@ impl SessionManager {
         }
     }
 
-    /// 改会话标题（P8 TITLE 角色）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
+    /// 改会话标题（P8 TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
         let Some(mut f) = self.get(id) else { return Ok(()) };
         f.title = title.chars().take(60).collect();
+        f.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        self.write(&f)
+    }
+
+    /// DSH 式侧边栏：置顶 / 归档标记（其余字段原样保留；不动 updated_at）。
+    pub fn set_flags(&self, id: &str, pinned: Option<bool>, archived: Option<bool>) -> anyhow::Result<()> {
+        let Some(mut f) = self.get(id) else {
+            anyhow::bail!("会话不存在: {id}");
+        };
+        if let Some(p) = pinned {
+            f.pinned = p;
+        }
+        if let Some(a) = archived {
+            f.archived = a;
+        }
+        self.write(&f)
+    }
+
+    /// DSH 式侧边栏「分叉会话」：复制消息/摘要/工作区为新会话，标题加「（分叉）」。
+    /// 返回新会话 id；分叉不带走置顶/归档状态。
+    pub fn fork(&self, id: &str) -> anyhow::Result<String> {
+        let Some(f) = self.get(id) else {
+            anyhow::bail!("会话不存在: {id}");
+        };
+        let new_id = self.new_id();
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let title = format!("{}（分叉）", f.title).chars().take(60).collect();
         let file = SessionFile {
-            id: f.id,
-            title: f.title,
-            created_at: f.created_at,
+            id: new_id.clone(),
+            title,
+            created_at: now.clone(),
             updated_at: now,
             messages: f.messages,
             summary: f.summary,
+            workspace: f.workspace,
+            pinned: false,
+            archived: false,
         };
-        let tmp = self.path(id).with_extension("json.tmp");
-        let text = serde_json::to_string(&file).context("会话序列化失败")?;
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, self.path(id))?;
-        Ok(())
+        self.write(&file)?;
+        Ok(new_id)
     }
 }
 
@@ -288,5 +345,51 @@ mod tests {
         assert!(m.get("../evil").is_none());
         assert!(m.delete("../evil").is_err());
         assert!(m.get("不存在的会话").is_none());
+    }
+
+    #[test]
+    fn pin_archive_fork_lifecycle() {
+        // DSH 式侧边栏三操作：置顶排序、归档标记、分叉复制
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("pinfork");
+        let a = m.new_id();
+        m.save(&a, &[json!({"role":"user","content":"原始会话"})], None).unwrap();
+        // 新会话记录当前工作区
+        assert!(!m.get(&a).unwrap().workspace.is_empty(), "新会话应记录创建时的工作区");
+
+        // 置顶 → 列表置前；save 续写后置顶保留
+        m.set_flags(&a, Some(true), None).unwrap();
+        assert!(m.list()[0].pinned);
+        m.save(&a, &[json!({"role":"user","content":"原始会话"}), json!({"role":"assistant","content":"好"})], None).unwrap();
+        assert!(m.get(&a).unwrap().pinned, "save 不得丢置顶标记");
+
+        // 归档 → 标记可见（前端负责过滤）
+        m.set_flags(&a, None, Some(true)).unwrap();
+        assert!(m.get(&a).unwrap().archived);
+        assert!(m.list()[0].archived);
+
+        // 取消置顶+取消归档
+        m.set_flags(&a, Some(false), Some(false)).unwrap();
+        let fa = m.get(&a).unwrap();
+        assert!(!fa.pinned && !fa.archived);
+
+        // 分叉：消息/摘要/工作区复制，标题加（分叉），新 id，无置顶归档
+        m.set_flags(&a, Some(true), None).unwrap();
+        m.rename(&a, "原始标题").unwrap();
+        let forked = m.fork(&a).unwrap();
+        let ff = m.get(&forked).unwrap();
+        assert_eq!(ff.title, "原始标题（分叉）");
+        assert_eq!(ff.messages.len(), m.get(&a).unwrap().messages.len());
+        assert_eq!(ff.workspace, m.get(&a).unwrap().workspace);
+        assert!(!ff.pinned && !ff.archived, "分叉不带走置顶/归档");
+        assert_ne!(forked, a);
+
+        // 不存在的会话
+        assert!(m.set_flags("ghost", Some(true), None).is_err());
+        assert!(m.fork("ghost").is_err());
     }
 }

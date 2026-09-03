@@ -265,6 +265,12 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/meta", post(session_meta))
+        .route("/api/sessions/fork", post(fork_session))
+        .route("/api/sessions/batch", post(batch_sessions))
+        .route("/api/workspace/picker", post(pick_workspace))
+        .route("/api/workspace/remove", post(remove_workspace))
+        .route("/api/workspace/alias", post(alias_workspace))
         .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
@@ -744,6 +750,7 @@ fn config_state_json(s: &Settings) -> Value {
         // P8.2 工作区 + P9/P8.5 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
         "workspace": crate::tools::workspace_root().display().to_string(),
         "recent_workspaces": s.recent_workspaces,
+        "workspace_aliases": s.workspace_aliases,
         "thinking_style_override": active.thinking_style,
         "thinking_style": effective_thinking_style(active, preset),
         "roles": s.roles,
@@ -1469,6 +1476,166 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     Json(json!({ "project": project, "sessions": state.session.list() }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionMetaUpdate {
+    pub id: String,
+    /// Some=重命名会话标题
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Some=置顶/取消置顶
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Some=归档/取消归档
+    #[serde(default)]
+    pub archived: Option<bool>,
+}
+
+/// POST /api/sessions/meta —— DSH 式侧边栏：置顶/取消置顶、归档/取消归档、重命名。
+async fn session_meta(
+    State(state): State<AppState>,
+    Json(req): Json<SessionMetaUpdate>,
+) -> (StatusCode, Json<Value>) {
+    let sess = state.session.clone();
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if let Some(t) = &req.title {
+            sess.rename(&req.id, t.trim())?;
+        }
+        if req.pinned.is_some() || req.archived.is_some() {
+            sess.set_flags(&req.id, req.pinned, req.archived)?;
+        }
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForkRequest {
+    pub id: String,
+}
+
+/// POST /api/sessions/fork —— DSH 式「分叉会话」：复制消息/摘要/工作区为新会话。
+async fn fork_session(
+    State(state): State<AppState>,
+    Json(req): Json<ForkRequest>,
+) -> (StatusCode, Json<Value>) {
+    let sess = state.session.clone();
+    let id = req.id.clone();
+    match tokio::task::spawn_blocking(move || sess.fork(&id)).await {
+        Ok(Ok(new_id)) => (StatusCode::OK, Json(json!({ "ok": true, "id": new_id }))),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionBatchRequest {
+    pub ids: Vec<String>,
+    /// Some=批量置顶/取消置顶
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Some=批量归档/取消归档（管理模式主用）
+    #[serde(default)]
+    pub archived: Option<bool>,
+}
+
+/// POST /api/sessions/batch —— 管理模式批量操作（归档/取消归档/置顶）。
+async fn batch_sessions(
+    State(state): State<AppState>,
+    Json(req): Json<SessionBatchRequest>,
+) -> (StatusCode, Json<Value>) {
+    let sess = state.session.clone();
+    let ids = req.ids.clone();
+    let (pinned, archived) = (req.pinned, req.archived);
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let mut n = 0;
+        for id in &ids {
+            if sess.set_flags(id, pinned, archived).is_ok() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    })
+    .await;
+    match res {
+        Ok(Ok(n)) => (StatusCode::OK, Json(json!({ "ok": true, "updated": n }))),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /api/workspace/picker —— 弹 Win 原生选文件夹窗口（rfd/IFileDialog），返回所选路径。
+/// 用户取消时 canceled=true。对话框由本地 server 进程弹出，即系统原生窗口。
+async fn pick_workspace() -> (StatusCode, Json<Value>) {
+    let res = tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder()).await;
+    match res {
+        Ok(Some(path)) => {
+            // Windows canonicalize 加 \\?\ 前缀难看；rfd 返回的是用户选择的原始路径，直接清洗
+            let s = path.display().to_string();
+            let s = s.strip_prefix(r"\\?\").unwrap_or(&s).to_string();
+            (StatusCode::OK, Json(json!({ "ok": true, "path": s })))
+        }
+        Ok(None) => (StatusCode::OK, Json(json!({ "ok": true, "canceled": true }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /api/workspace/remove —— 从侧边栏项目列表（recent_workspaces）移除（不删目录）。
+async fn remove_workspace(
+    State(state): State<AppState>,
+    Json(req): Json<WorkspaceRequest>,
+) -> (StatusCode, Json<Value>) {
+    let path = req.path.trim();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
+    }
+    let mut s = state.settings.write().unwrap().clone();
+    s.recent_workspaces.retain(|w| w != path);
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap() = s.clone();
+    observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
+    (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
+}
+
+/// POST /api/workspace/alias —— 侧边栏「重命名项目」：工作区显示别名；空名=清除别名。
+async fn alias_workspace(
+    State(state): State<AppState>,
+    Json(req): Json<WorkspaceAliasRequest>,
+) -> (StatusCode, Json<Value>) {
+    let path = req.path.trim();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
+    }
+    let mut s = state.settings.write().unwrap().clone();
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        s.workspace_aliases.remove(path);
+    } else {
+        s.workspace_aliases.insert(path.to_string(), name.clone());
+    }
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap() = s.clone();
+    observability::event(
+        EventType::State,
+        json!({ "kind": "workspace.aliased", "path": path, "name": name }),
+    );
+    (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceAliasRequest {
+    pub path: String,
+    pub name: String,
 }
 
 /// GET /api/session?id=xxx —— 恢复指定会话；缺省返回最近更新的一条。

@@ -213,10 +213,13 @@
   });
 
   function closeMenusOnOutside(e) {
-    if (e.target && e.target.closest && e.target.closest('.bar-menu')) return;
+    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more'))) return;
     modelMenuOpen = false;
     thinkMenuOpen = false;
     approvalMenuOpen = false;
+    viewMenuOpen = false;
+    sessMenuId = null;
+    projMenuPath = null;
   }
 
   // —— P8.2 工作区切换 ——
@@ -379,6 +382,7 @@
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
     capabilitiesUserSet = s.capabilities_user_set || false;
     roles = s.roles || {};
+    workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
     // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
@@ -772,6 +776,284 @@
     loadSessions();
   }
 
+  // —— DSH 式侧边栏（项目=工作区；置顶/归档/分叉/搜索/批量管理/视图切换）——
+  let workspaceAliases = {}; // 工作区路径 → 项目显示名（重命名项目）
+  let sidebarView = localStorage.getItem('sidebarView') === 'list' ? 'list' : 'workspace'; // 按工作区 | 单列表
+  let expandedFlags = { __ungrouped__: true, ...(JSON.parse(localStorage.getItem('projExpanded') || '{}') || {}) }; // path → 展开？
+  let showAllFlags = {}; // path → 展开全部会话（默认每项目先显 5 条）
+  let searchOpen = false;
+  let searchQuery = '';
+  let manageMode = false;
+  let checkedIds = [];
+  let sidebarCollapsed = false;
+  let sidebarW = Number(localStorage.getItem('sidebarW')) || 300; // 侧栏宽度（右缘拖拽可调，240–520）
+  let resizing = false;
+
+  // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化
+  function startResize(e) {
+    e.preventDefault();
+    resizing = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const move = (ev) => {
+      sidebarW = Math.min(520, Math.max(240, Math.round(ev.clientX)));
+    };
+    const up = () => {
+      resizing = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem('sidebarW', String(sidebarW));
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  }
+  let sessMenuId = null; // 打开了操作菜单的会话 id
+  let projMenuPath = null; // 打开了操作菜单的项目 path
+  let viewMenuOpen = false;
+  let renameModal = null; // { kind: 'session'|'project', target, value }
+  const CONV_PREVIEW = 5; // 项目收起态先显 5 条，其余走「展开其余 N 个会话」
+
+  $: if (workspace && !(workspace in expandedFlags)) {
+    expandedFlags = { ...expandedFlags, [workspace]: true };
+  }
+
+  function normPath(p) {
+    return (p || '').replace(/[\\/]+$/, '');
+  }
+
+  // 项目列表 = 当前工作区 + 最近工作区（去重，按新→旧）
+  $: projectList = (() => {
+    const list = [];
+    const seen = new Set();
+    if (workspace) {
+      list.push({ path: workspace, active: true });
+      seen.add(normPath(workspace).toLowerCase());
+    }
+    for (const w of recentWorkspaces) {
+      if (!seen.has(normPath(w).toLowerCase())) {
+        list.push({ path: w, active: false });
+        seen.add(normPath(w).toLowerCase());
+      }
+    }
+    return list.map((p) => ({
+      ...p,
+      name: workspaceAliases[p.path] || p.path.split(/[\\/]/).filter(Boolean).pop() || p.path,
+    }));
+  })();
+
+  $: searchQ = searchQuery.trim().toLowerCase();
+  $: visibleSessions = manageMode ? sessions : sessions.filter((s) => !s.archived);
+
+  // 分组：会话按创建时工作区归项目；无工作区记录的旧会话进「未分组」
+  $: sessionsByProject = (() => {
+    const map = {};
+    for (const s of visibleSessions) {
+      if (searchQ && !(s.title || '').toLowerCase().includes(searchQ)) continue;
+      const hit = projectList.find((p) => normPath(p.path).toLowerCase() === normPath(s.workspace).toLowerCase());
+      const k = hit ? hit.path : '__ungrouped__';
+      (map[k] = map[k] || []).push(s);
+    }
+    return map;
+  })();
+
+  $: ungroupedSessions = sessionsByProject['__ungrouped__'] || [];
+
+  // 单列表视图：全部会话平铺（后端已按置顶→更新时间排序）
+  $: flatSessions = visibleSessions.filter((s) => !searchQ || (s.title || '').toLowerCase().includes(searchQ));
+
+  // 渲染行序列：单列表=纯会话流；工作区视图=项目行+缩进会话行+「展开其余」行
+  $: displayRows = (() => {
+    const rows = [];
+    if (sidebarView === 'list') {
+      for (const s of flatSessions) rows.push({ type: 'conv', s });
+      if (!rows.length) rows.push({ type: 'empty' });
+      return rows;
+    }
+    const pushGroup = (path, name, active, items) => {
+      rows.push({ type: 'proj', path, name, active, count: items.length });
+      const expanded = !!searchQ || !!expandedFlags[path];
+      if (!expanded) return;
+      const capped = searchQ
+        ? items
+        : items.slice(0, showAllFlags[path] ? items.length : CONV_PREVIEW);
+      for (const s of capped) rows.push({ type: 'conv', s });
+      if (!searchQ && items.length > CONV_PREVIEW && !showAllFlags[path]) {
+        rows.push({ type: 'more', path, rest: items.length - CONV_PREVIEW });
+      }
+    };
+    for (const p of projectList) pushGroup(p.path, p.name, p.active, sessionsByProject[p.path] || []);
+    if (ungroupedSessions.length) pushGroup('__ungrouped__', '未分组', false, ungroupedSessions);
+    if (!rows.length) rows.push({ type: 'empty' });
+    return rows;
+  })();
+
+  function toggleProjectRow(path) {
+    if (searchQ) return; // 搜索态全展开
+    expandedFlags = { ...expandedFlags, [path]: !expandedFlags[path] };
+    localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
+  }
+
+  async function switchProject(path) {
+    if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) return;
+    if (streaming) {
+      settingsMsg = '正在流式输出，稍后再切换项目';
+      return;
+    }
+    await applyWorkspace(path);
+  }
+
+  function newSessionInProject(path, active) {
+    if (active) {
+      startNewSession();
+    } else {
+      switchProject(path).then(() => startNewSession());
+    }
+  }
+
+  // 时间用 DSH 短格式：4天 / 3小时 / 刚刚
+  function relShort(iso) {
+    if (!iso) return '';
+    const ms = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return '刚刚';
+    if (m < 60) return `${m}分钟`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}小时`;
+    return `${Math.floor(h / 24)}天`;
+  }
+
+  // —— 工具栏四键：搜索 / 管理 / 视图 / 添加项目 ——
+  function toggleSearch() {
+    searchOpen = !searchOpen;
+    if (!searchOpen) searchQuery = '';
+  }
+
+  function toggleManage() {
+    manageMode = !manageMode;
+    checkedIds = [];
+  }
+
+  function toggleChecked(id) {
+    checkedIds = checkedIds.includes(id) ? checkedIds.filter((x) => x !== id) : [...checkedIds, id];
+  }
+
+  function manageVisibleIds() {
+    return sidebarView === 'list' ? flatSessions.map((s) => s.id) : displayRows.filter((r) => r.type === 'conv').map((r) => r.s.id);
+  }
+
+  async function batchSet(archived) {
+    if (!checkedIds.length) return;
+    await fetch('/api/sessions/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: checkedIds, archived }),
+    });
+    checkedIds = [];
+    await loadSessions();
+  }
+
+  async function batchDelete() {
+    if (!checkedIds.length || !confirm(`删除选中的 ${checkedIds.length} 条会话？不可恢复`)) return;
+    for (const id of checkedIds) {
+      await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    }
+    if (checkedIds.includes(currentSessionId)) startNewSession();
+    checkedIds = [];
+    await loadSessions();
+  }
+
+  function pickView(v) {
+    sidebarView = v;
+    viewMenuOpen = false;
+    localStorage.setItem('sidebarView', v);
+  }
+
+  // 添加项目：server 弹 Win 原生选文件夹窗口 → 选中的目录注册为项目（=切换工作区）
+  async function addProject() {
+    try {
+      const r = await fetch('/api/workspace/picker', { method: 'POST' }).then((r) => r.json());
+      if (r.canceled || !r.path) return;
+      await applyWorkspace(r.path);
+    } catch (e) {
+      settingsMsg = `选择文件夹失败: ${e.message || e}`;
+    }
+  }
+
+  async function removeProject(path, name) {
+    if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) {
+      settingsMsg = '当前项目不能移除，先切换到其他项目';
+      return;
+    }
+    if (!confirm(`从侧边栏移除项目「${name}」？\n只移出列表，不删除磁盘上的文件夹与会话。`)) return;
+    projMenuPath = null;
+    await fetch('/api/workspace/remove', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    await loadSettings();
+  }
+
+  // —— 会话菜单四项：置顶 / 重命名 / 分叉 / 归档 ——
+  async function togglePin(s) {
+    sessMenuId = null;
+    await fetch('/api/sessions/meta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: s.id, pinned: !s.pinned }),
+    });
+    await loadSessions();
+  }
+
+  async function toggleArchive(s) {
+    sessMenuId = null;
+    await fetch('/api/sessions/meta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: s.id, archived: !s.archived }),
+    });
+    await loadSessions();
+  }
+
+  async function forkSession(id) {
+    sessMenuId = null;
+    try {
+      const r = await fetch('/api/sessions/fork', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      }).then((r) => r.json());
+      await loadSessions();
+      if (r.id) await loadSession(r.id);
+    } catch (e) {
+      settingsMsg = `分叉失败: ${e.message || e}`;
+    }
+  }
+
+  function submitRename() {
+    if (!renameModal) return;
+    const v = renameModal.value.trim();
+    const modal = renameModal;
+    renameModal = null;
+    if (modal.kind === 'session') {
+      if (v && v !== modal.value) {
+        fetch('/api/sessions/meta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: modal.target, title: v }),
+        }).then(() => loadSessions());
+      }
+    } else {
+      fetch('/api/workspace/alias', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: modal.target, name: v }),
+      }).then(() => loadSettings());
+    }
+  }
+
   // —— P6.1 改动统计条：撤销 = 工作树回滚到任务起点基线 ——
   async function undoCheckpoint(cp) {
     if (!confirm(`撤销本次任务的改动？\n${cp.files} 个文件将恢复到任务开始前（含删除本次新建的已跟踪文件）。\nshell 副作用不可回滚。`))
@@ -866,41 +1148,174 @@
 </script>
 
 <div class="app">
-  <aside class="sidebar">
-    <div class="brand">Agent</div>
-    <div class="side-project">
-      <label class="side-label">工作区</label>
-      <div class="proj-name" title={workspace}>📁 {projectName || 'agent'}</div>
-      <button class="btn ghost ws-switch" on:click={() => { wsModalOpen = true; wsPath = ''; wsMsg = ''; }} disabled={streaming}>
-        切换工作区…
+  <aside class="sidebar" class:collapsed={sidebarCollapsed} class:resizing={resizing} style="width:{sidebarW}px">
+    <div class="side-head">
+      <div class="brand-row">
+        <svg class="whale" viewBox="-0.54 -0.06 56.78 41.72" aria-hidden="true"><path fill="currentColor" d="M55.6128,3.4712c-.5953-.2917-.8517.2642-1.1998.5466-.1191.0911-.2198.2095-.3206.3188-.8701.9292-1.8867,1.5398-3.2148,1.4668-1.9417-.1094-3.5995.5012-5.065,1.9863-.3114-1.8313-1.3463-2.9248-2.9217-3.6262-.8242-.3645-1.6577-.729-2.2348-1.5217-.403-.5647-.5129-1.1934-.7144-1.813-.1283-.3735-.2565-.7563-.687-.8201-.4671-.0728-.6503.3188-.8335.647-.7327,1.3394-1.0166,2.8154-.9892,4.3096.0641,3.3621,1.4838,6.0406,4.3047,7.9449.3206.2187.403.4372.3023.7563-.1924.656-.4214,1.2937-.6228,1.9497-.1283.4192-.3207.5103-.7694.3279-1.5479-.6467-2.8852-1.6035-4.0667-2.7605-2.0058-1.9407-3.8193-4.0818-6.0815-5.7583-.5312-.3918-1.0625-.7561-1.6121-1.1025-2.3081-2.2412.3023-4.0818.9068-4.3003.6319-.2278.2198-1.0115-1.8227-1.0022-2.0425.009-3.9109.6924-6.2922,1.6035-.348.1367-.7145.2368-1.09.3188-2.1615-.4099-4.4055-.5012-6.7502-.2368-4.4147.4919-7.9408,2.5784-10.5328,6.1409C.1914,13.1289-.5413,17.9941.3563,23.0691c.9434,5.3481,3.6727,9.7761,7.8676,13.2385,4.3506,3.5896,9.3606,5.3481,15.0758,5.011,3.4713-.2004,7.5027-1.5586,10.9096-3.4904.6597-.3732,1.3061-.7636,1.9431-1.1647.0963-.0607.1892-.1283.3207-.0675.9754.4383,2.0069.6785,3.0863.6008,1.7863-.1283,3.3526-.7837,4.6372-2.0626.4152-.4122.7981-.8629,1.0271-1.4137.1737-.4155.0848-.6528-.2136-.7087-.3238-.0606-.5181.1559-.7171.3464-.4424.4257-.8792.8623-1.4054,1.1953-1.3641.8645-2.8269,1.1212-4.3692.6344.2536-.3279.6359-.3952.9702-.5365,1.9778-.8359,3.2843-2.2719,3.7624-4.3781.0413-.1826.0772-.3664.1097-.5512.1085-.6145.0798-1.2163-.1039-1.8147-.2416-.7892-.5436-1.5545-1.0509-2.2141-.7773-1.0132-1.7827-1.7146-2.9838-2.1453-.9036-.3242-1.8389-.4709-2.7974-.4189-1.0882.0589-2.1247.3549-3.0951.8451-.9579.4846-1.7778,1.1485-2.4422,1.9958-.8585,1.0932-1.3642,2.3374-1.4744,3.7265-.0861,1.0831.0563,2.1333.4752,3.1313.5739,1.3627,1.5162,2.3944,2.7931,3.1218.1209.0691.2424.1375.3678.1983.1741.084.2086.1805.1097.3582-.2705.4865-.5297.9802-.7958,1.4698-.0677.1242-.1424.2452-.2169.3656-.0592.0954-.1402.1088-.2423.0526-1.8657-1.0286-3.3232-2.4476-4.3562-4.3129-.6723-1.2134-1.0598-2.511-1.1529-3.8904-.0283-.4183-.0306-.8378-.0128-1.2565.0051-.1203-.0301-.1564-.1478-.1495-1.1135.0652-2.1912.2819-3.2096.7305-2.6173,1.1529-4.2559,3.1448-4.8387,5.9438-.1274.6097-.1745,1.2276-.1673,1.8494.0014.1196-.0364.1471-.1455.1433-.8329-.0292-1.6424-.1919-2.4255-.4637-2.5975-.9021-4.562-2.5741-5.8622-5.0172-.7471-1.4059-1.1209-2.9122-1.1355-4.5003-.0043-.4674.0214-.9332.0874-1.3958.0088-.0617-.0136-.1587.0617-.1806.0639-.0187.1187.0532.1648.0963,1.6421,1.5276,3.5543,2.6415,5.7029,3.3254.662.2114,1.3354.3726,2.0173.4882.1171.0198.1604.0601.1473.1848-.0578.5473-.0434,1.0955.0244,1.6412.0185.1485-.0164.1864-.1632.1587-1.0813-.2049-2.1094-.5612-3.0829-1.0795-2.4993-1.3291-4.2931-3.2623-5.3628-5.8955-.4405-1.0806-.6789-2.2061-.7225-3.3708-.0258-.6917.0234-1.3776.1587-2.0556.0203-.1019.053-.2012.0794-.3017.0274-.1032.0876-.1155.1663-.0487.2729.231.5589.4433.8586.6382,2.1417,1.3985,4.4712,2.4025,6.9481,3.0743.5347.145,1.0733.2707,1.6127.3947.1095.0251.2196.0469.3296.069.053.0107.0989.0034.1119-.0612.0115-.0569-.0221-.0918-.0666-.1142-.1211-.0606-.2443-.1166-.3652-.1775-1.675-.8482-3.2055-1.9111-4.5642-3.2072-1.1633-1.1104-2.1489-2.3577-2.9257-3.7649-.4816-.8734-.8476-1.7908-1.0691-2.7623-.0592-.2579-.0654-.2573.1945-.1964,1.0394.2442,2.0905.4096,3.1546.4957,1.2397.1002,2.4805.1076,3.7208.0223,2.0513-.1417,4.0542-.5761,5.9935-1.2897,1.8939-.6987,3.6617-1.6463,5.2914-2.8224.8853-.6405,1.7112-1.3523,2.4701-2.1379.0417-.0431.0801-.0902.1178-.1372.0394-.0492.0851-.0772.1446-.0374Z"/></svg>
+        <span class="brand-name">Agent Local Build</span>
+        <button class="icon-btn" title="收起侧栏" on:click={() => (sidebarCollapsed = true)}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
+        </button>
+      </div>
+
+      <button class="new-chat" on:click={startNewSession} disabled={streaming}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></svg>
+        新会话
       </button>
-      <button class="new-chat" on:click={startNewSession} disabled={streaming}>＋ 新建对话</button>
-      <div class="sess-list">
-        {#each sessions as s (s.id)}
+
+      <div class="section-row bar-menu">
+        <span class="section-label">工作区</span>
+        <span class="section-tools">
+          <button class="icon-btn" class:on={searchOpen} title="搜索会话" on:click={toggleSearch}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.3" y2="16.3"/></svg>
+          </button>
+          <button class="icon-btn" class:on={manageMode} title="管理会话（批量归档）" on:click={toggleManage}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6.5" cy="7" r="2.2"/><line x1="11" y1="7" x2="19.5" y2="7"/><circle cx="6.5" cy="17" r="2.2"/><line x1="11" y1="17" x2="19.5" y2="17"/></svg>
+          </button>
+          <button class="icon-btn" class:on={viewMenuOpen} title="切换视图" on:click={() => (viewMenuOpen = !viewMenuOpen)}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3.5" y1="6" x2="9.5" y2="6"/><line x1="14.5" y1="6" x2="20.5" y2="6"/><circle cx="12" cy="6" r="2"/><line x1="3.5" y1="12" x2="4" y2="12"/><line x1="8" y1="12" x2="20.5" y2="12"/><circle cx="6" cy="12" r="2"/><line x1="3.5" y1="18" x2="11.5" y2="18"/><line x1="16.5" y1="18" x2="20.5" y2="18"/><circle cx="14" cy="18" r="2"/></svg>
+          </button>
+          <button class="icon-btn" title="添加项目" on:click={addProject} disabled={streaming}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.2v5.8a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3.2l1.8 2H18a2 2 0 0 1 2 2v.2"/><line x1="17" y1="2.5" x2="17" y2="8"/><line x1="14.2" y1="5.2" x2="19.8" y2="5.2"/></svg>
+          </button>
+        </span>
+        {#if viewMenuOpen}
+          <div class="side-menu view-menu">
+            <button on:click={() => pickView('workspace')}>
+              <span>按工作区</span>
+              {#if sidebarView === 'workspace'}<svg class="sel-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>{/if}
+            </button>
+            <button on:click={() => pickView('list')}>
+              <span>单列表</span>
+              {#if sidebarView === 'list'}<svg class="sel-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>{/if}
+            </button>
+          </div>
+        {/if}
+      </div>
+
+      {#if searchOpen}
+        <input class="side-search" bind:value={searchQuery} placeholder="搜索会话" />
+      {/if}
+
+      {#if manageMode}
+        <div class="manage-bar">
+          <span class="m-count">已选 {checkedIds.length} / {manageVisibleIds().length}</span>
+          <button class="m-btn" on:click={() => (checkedIds = manageVisibleIds())}>全选</button>
+          <button class="m-btn" disabled={!checkedIds.length} on:click={() => batchSet(true)}>归档</button>
+          <button class="m-btn" disabled={!checkedIds.length} on:click={() => batchSet(false)}>取消归档</button>
+          <button class="m-btn" disabled={!checkedIds.length} on:click={batchDelete}>删除</button>
+          <button class="m-btn primary" on:click={toggleManage}>完成</button>
+        </div>
+      {/if}
+    </div>
+
+    <div class="side-scroll">
+      {#each displayRows as row}
+        {#if row.type === 'proj'}
           <div
-            class="sess-item"
+            class="proj"
+            class:expanded={!!searchQ || !!expandedFlags[row.path]}
+            role="button"
+            tabindex="0"
+            title={row.path === '__ungrouped__' ? '无工作区记录的历史会话' : row.path}
+            on:click={() => (row.active ? toggleProjectRow(row.path) : switchProject(row.path))}
+            on:keydown={(e) => e.key === 'Enter' && (row.active ? toggleProjectRow(row.path) : switchProject(row.path))}
+          >
+            {#if !!searchQ || !!expandedFlags[row.path]}
+              <svg viewBox="0 0 24 24"><path d="M6.5 9.2 12 14.7l5.5-5.5z" fill="currentColor"/></svg>
+            {:else}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 19.5a1.8 1.8 0 0 0 1.8-1.8V8.3a1.8 1.8 0 0 0-1.8-1.8h-7.4a1.8 1.8 0 0 1-1.5-.8l-.8-1.2a1.8 1.8 0 0 0-1.5-.8H4a1.8 1.8 0 0 0-1.8 1.8v12.2A1.8 1.8 0 0 0 4 19.5Z"/></svg>
+            {/if}
+            <span class="proj-name">{row.name}{row.count ? '' : ''}</span>
+            {#if row.path !== '__ungrouped__'}
+              <span class="proj-side">
+                <button class="row-btn boxed" class:on={projMenuPath === row.path} title="项目操作" on:click|stopPropagation={() => (projMenuPath = projMenuPath === row.path ? null : row.path)}>
+                  <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5.5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="18.5" cy="12" r="1.5"/></svg>
+                </button>
+                <button class="row-btn" title="在项目内新建会话" on:click|stopPropagation={() => newSessionInProject(row.path, row.active)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                </button>
+              </span>
+            {/if}
+            {#if projMenuPath === row.path}
+              <div class="side-menu proj-menu">
+                <button on:click|stopPropagation={() => { projMenuPath = null; renameModal = { kind: 'project', target: row.path, value: row.name }; }}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
+                  重命名项目
+                </button>
+                <button on:click|stopPropagation={() => removeProject(row.path, row.name)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5h18"/><path d="M8 6.5V4.8A1.3 1.3 0 0 1 9.3 3.5h5.4A1.3 1.3 0 0 1 16 4.8v1.7"/><path d="M5.5 6.5 6.4 19a2 2 0 0 0 2 1.9h7.2a2 2 0 0 0 2-1.9l.9-12.5"/></svg>
+                  删除项目
+                </button>
+              </div>
+            {/if}
+          </div>
+        {:else if row.type === 'conv'}
+          {@const s = row.s}
+          <div
+            class="conv"
             class:active={s.id === currentSessionId}
             role="button"
             tabindex="0"
-            on:click={() => loadSession(s.id)}
-            on:keydown={(e) => e.key === 'Enter' && loadSession(s.id)}
+            on:click={() => (manageMode ? toggleChecked(s.id) : loadSession(s.id))}
+            on:keydown={(e) => e.key === 'Enter' && (manageMode ? toggleChecked(s.id) : loadSession(s.id))}
           >
-            <span class="sess-title" title={s.title}>{s.title}</span>
-            <span class="sess-side">
-              <button class="sess-del" title="删除会话" on:click|stopPropagation={() => deleteSession(s.id)}>✕</button>
-              <span class="sess-time">{relTime(s.updated_at)}</span>
-            </span>
+            {#if manageMode}
+              <span class="conv-check" class:on={checkedIds.includes(s.id)}>{checkedIds.includes(s.id) ? '✓' : ''}</span>
+            {:else if s.pinned}
+              <svg class="conv-pin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" transform="rotate(38 12 12)"><path d="M14.5 4.2 19.8 9.5a1 1 0 0 1-.94 1.68l-2.6-.52-3.62 3.62.55 2.87a1 1 0 0 1-1.7.89L9.9 16.4l-4.6 4.6-1.3-1.3 4.6-4.6-1.64-1.64a1 1 0 0 1 .89-1.7l2.87.55 3.62-3.62-.52-2.6a1 1 0 0 1 1.68-.94Z"/></svg>
+            {/if}
+            <span class="conv-title" class:archived={s.archived} title={s.title}>{s.title}</span>
+            {#if manageMode && s.archived}<span class="arch-tag">已归档</span>{/if}
+            {#if !manageMode}
+              <button class="conv-more" title="会话操作" on:click|stopPropagation={() => (sessMenuId = sessMenuId === s.id ? null : s.id)}>
+                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5.5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18.5" cy="12" r="1.6"/></svg>
+              </button>
+            {/if}
+            <span class="conv-time">{relShort(s.updated_at)}</span>
+            {#if sessMenuId === s.id}
+              <div class="side-menu sess-menu">
+                <button on:click|stopPropagation={() => togglePin(s)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.2 19.8 9.5a1 1 0 0 1-.94 1.68l-2.6-.52-3.62 3.62.55 2.87a1 1 0 0 1-1.7.89L9.9 16.4l-4.6 4.6-1.3-1.3 4.6-4.6-1.64-1.64a1 1 0 0 1 .89-1.7l2.87.55 3.62-3.62-.52-2.6a1 1 0 0 1 1.68-.94Z"/></svg>
+                  {s.pinned ? '取消置顶' : '置顶'}
+                </button>
+                <button on:click|stopPropagation={() => { sessMenuId = null; renameModal = { kind: 'session', target: s.id, value: s.title }; }}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
+                  重命名
+                </button>
+                <button on:click|stopPropagation={() => forkSession(s.id)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6.5h11"/><circle cx="18.3" cy="6.5" r="1.7"/><path d="M5 6.5c5.5 0 3.5 11 9.5 11"/><circle cx="18.3" cy="17.5" r="1.7"/></svg>
+                  分叉会话
+                </button>
+                <button on:click|stopPropagation={() => toggleArchive(s)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="5" rx="1.2"/><path d="M4.8 8.5V19a1.8 1.8 0 0 0 1.8 1.8h10.8a1.8 1.8 0 0 0 1.8-1.8V8.5"/><path d="M9.8 12.2h4.4"/></svg>
+                  {s.archived ? '取消归档' : '归档会话'}
+                </button>
+              </div>
+            {/if}
           </div>
-        {/each}
-      </div>
-      <button class="btn ghost handoff-btn" on:click={makeHandoff}>生成 HANDOFF</button>
+        {:else if row.type === 'more'}
+          <button class="expand-more" on:click={() => (showAllFlags = { ...showAllFlags, [row.path]: true })}>
+            展开其余 {row.rest} 个会话
+          </button>
+        {:else}
+          <div class="side-empty">{searchQ ? '没有匹配的会话' : '暂无会话，点上方「新会话」开始'}</div>
+        {/if}
+      {/each}
     </div>
+
     <div class="side-foot">
-      <button class="btn ghost" on:click={() => (settingsOpen = true)}>设置</button>
+      <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
     </div>
+    <div class="resize-handle" on:mousedown={startResize}></div>
   </aside>
 
   <main class="chat">
+    {#if sidebarCollapsed}
+      <button class="sidebar-restore" title="展开侧栏" on:click={() => (sidebarCollapsed = false)}>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
+      </button>
+    {/if}
     <header class="chat-head">
       <div>
         <div class="chat-title">对话</div>
@@ -1013,6 +1428,10 @@
     {#if !chatPinned}
       <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">↓ 最新消息</button>
     {/if}
+
+    <div class="handoff-bar">
+      <button class="handoff-btn" on:click={makeHandoff} title="把当前会话压成交接文档 HANDOFF.md（写入工作区）">交接文档</button>
+    </div>
 
     <footer class="chat-input">
       <div class="composer">
@@ -1557,6 +1976,29 @@
   </div>
 {/if}
 
+{#if renameModal}
+  <div class="modal-backdrop" on:click={() => (renameModal = null)}>
+    <div class="modal rename-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>{renameModal.kind === 'session' ? '重命名会话' : '重命名项目'}</b>
+        <button class="btn ghost" on:click={() => (renameModal = null)}>关闭</button>
+      </div>
+      <div class="field">
+        <input
+          class="rename-input"
+          bind:value={renameModal.value}
+          placeholder={renameModal.kind === 'project' ? '留空恢复为文件夹名' : '会话标题'}
+          on:keydown={(e) => e.key === 'Enter' && submitRename()}
+        />
+      </div>
+      <div class="rename-actions">
+        <button class="btn" on:click={() => (renameModal = null)}>取消</button>
+        <button class="btn primary" on:click={submitRename}>确定</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if modelModalOpen}
   <div class="modal-backdrop" on:click={() => (modelModalOpen = false)}>
     <div class="modal" on:click|stopPropagation>
@@ -1613,20 +2055,499 @@
     height: 100vh;
   }
   .sidebar {
-    width: 200px;
-    background: #1d1f26;
-    border-right: 1px solid #2a2d37;
+    width: 300px;
+    flex: none;
+    background: #151517;
+    border-right: 1px solid #232325;
     display: flex;
     flex-direction: column;
-    padding: 14px 12px;
+    padding: 14px 12px 10px;
+    position: relative;
   }
-  .brand {
-    font-size: 18px;
+  .sidebar.resizing {
+    border-right-color: #3d3d41;
+  }
+  .resize-handle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -3px;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 20;
+  }
+  .resize-handle:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .sidebar.collapsed {
+    display: none;
+  }
+  .side-head {
+    flex: none;
+  }
+  .brand-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 4px 14px;
+  }
+  .whale {
+    width: 30px;
+    height: 24px;
+    color: #fff;
+    flex: none;
+  }
+  .brand-name {
+    flex: 1;
+    font-size: 20px;
+    font-weight: 700;
+    color: #f3f4f6;
+    letter-spacing: 0.2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .icon-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: #a0a3a6;
+    cursor: pointer;
+    flex: none;
+  }
+  .icon-btn:hover {
+    background: #232326;
+    color: #e8e9ea;
+  }
+  .icon-btn.on {
+    background: #272729;
+    color: #fff;
+  }
+  .icon-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .icon-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+  .new-chat {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    height: 46px;
+    border-radius: 23px;
+    border: 1px solid #2c2c2e;
+    background: transparent;
+    color: #f3f4f6;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .new-chat:hover {
+    background: #1d1d20;
+    border-color: #3a3a3d;
+  }
+  .new-chat:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .new-chat svg {
+    width: 19px;
+    height: 19px;
+  }
+  .section-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 4px 6px;
+  }
+  .section-label {
+    color: #8a8e92;
+    font-size: 14px;
+    padding-left: 4px;
+  }
+  .section-tools {
+    display: flex;
+    gap: 2px;
+  }
+  .section-tools .icon-btn {
+    width: 32px;
+    height: 32px;
+  }
+  .side-search {
+    margin: 2px 2px 8px;
+    width: calc(100% - 4px);
+    box-sizing: border-box;
+    background: #1d1d20;
+    border: 1px solid #2c2c2e;
+    border-radius: 10px;
+    color: #f3f4f6;
+    font-size: 14px;
+    padding: 9px 12px;
+    outline: none;
+  }
+  .side-search:focus {
+    border-color: #3d3d41;
+  }
+  .manage-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 2px 10px;
+    flex-wrap: wrap;
+  }
+  .m-count {
+    color: #8a8e92;
+    font-size: 13px;
+    margin-right: auto;
+    padding-left: 4px;
+  }
+  .m-btn {
+    background: #1d1d20;
+    border: 1px solid #2c2c2e;
+    color: #d6d7d9;
+    font-size: 13px;
+    border-radius: 8px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  .m-btn:hover:not(:disabled) {
+    background: #272729;
+  }
+  .m-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .m-btn.primary {
+    background: #e7e9ea;
+    color: #17181c;
+    border-color: transparent;
     font-weight: 600;
-    letter-spacing: 1px;
+  }
+  .side-scroll {
+    flex: 1;
+    overflow-y: auto;
+    margin: 0 -4px;
+    padding: 0 4px;
+  }
+  .proj {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 48px;
+    padding: 0 10px;
+    border-radius: 12px;
+    cursor: pointer;
+    color: #eceef0;
+    font-size: 15.5px;
+  }
+  .proj:hover {
+    background: #1e1e21;
+  }
+  .proj.expanded {
+    background: #272729;
+  }
+  .proj > svg {
+    width: 19px;
+    height: 19px;
+    color: #a0a3a6;
+    flex: none;
+  }
+  .proj-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .proj-side {
+    display: none;
+    align-items: center;
+    gap: 4px;
+  }
+  .proj:hover .proj-side,
+  .proj.expanded .proj-side {
+    display: flex;
+  }
+  .row-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: #b9bcc0;
+    cursor: pointer;
+    flex: none;
+  }
+  .row-btn:hover {
+    background: #333338;
+    color: #fff;
+  }
+  .row-btn.boxed {
+    border: 1.4px solid #85888c;
+  }
+  .row-btn.on {
+    border-color: #fff;
+    color: #fff;
+  }
+  .row-btn svg {
+    width: 17px;
+    height: 17px;
+  }
+  .conv {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 42px;
+    padding: 0 10px 0 38px;
+    border-radius: 10px;
+    cursor: pointer;
+    color: #bebec0;
+    font-size: 14.5px;
+  }
+  .conv:hover {
+    background: #1e1e21;
+  }
+  .conv.active {
+    background: #272729;
+    color: #f3f4f6;
+  }
+  .conv-pin {
+    width: 15px;
+    height: 15px;
+    color: #7c7f83;
+    flex: none;
+  }
+  .conv-check {
+    width: 16px;
+    height: 16px;
+    border: 1.5px solid #4a4d52;
+    border-radius: 4.5px;
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    line-height: 1;
+    color: #17181c;
+  }
+  .conv-check.on {
+    background: #e7e9ea;
+    border-color: #e7e9ea;
+  }
+  .conv-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conv-title.archived {
+    opacity: 0.55;
+  }
+  .arch-tag {
+    font-size: 11px;
+    color: #8a8e92;
+    border: 1px solid #333338;
+    border-radius: 6px;
+    padding: 1px 6px;
+    flex: none;
+  }
+  .conv-more {
+    display: none;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    color: #a0a3a6;
+    cursor: pointer;
+    flex: none;
+  }
+  .conv-more:hover {
+    background: #333338;
+    color: #fff;
+  }
+  .conv-more svg {
+    width: 16px;
+    height: 16px;
+  }
+  .conv:hover .conv-more {
+    display: flex;
+  }
+  .conv:hover .conv-time {
+    display: none;
+  }
+  .conv-time {
+    font-size: 12.5px;
+    color: #7f8388;
+    flex: none;
+  }
+  .expand-more {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: #8a8e92;
+    font-size: 14px;
+    padding: 10px 10px 10px 38px;
+    cursor: pointer;
+    border-radius: 10px;
+  }
+  .expand-more:hover {
+    color: #c9cbce;
+    background: #1e1e21;
+  }
+  .side-empty {
+    color: #6f7276;
+    font-size: 14px;
+    padding: 18px 12px;
+  }
+  .side-menu {
+    position: absolute;
+    z-index: 40;
+    min-width: 172px;
+    background: #1b1b1e;
+    border: 1px solid #2c2c2e;
+    border-radius: 14px;
+    padding: 6px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  }
+  .sess-menu,
+  .proj-menu {
+    top: calc(100% + 4px);
+    right: 6px;
+  }
+  .view-menu {
+    top: calc(100% + 2px);
+    right: 0;
+  }
+  .side-menu button {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    background: none;
+    border: none;
+    color: #f3f4f6;
+    font-size: 14px;
+    padding: 10px 12px;
+    border-radius: 9px;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .side-menu button:hover {
+    background: #272729;
+  }
+  .side-menu button svg {
+    width: 17px;
+    height: 17px;
+    color: #a0a3a6;
+    flex: none;
+  }
+  .side-menu .sel-check {
+    margin-left: auto;
+    color: #fff;
+  }
+  .rename-modal {
+    min-width: 380px;
+  }
+  .rename-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: #1d1d20;
+    border: 1px solid #2c2c2e;
+    border-radius: 10px;
+    color: #f3f4f6;
+    font-size: 14px;
+    padding: 9px 12px;
+    outline: none;
+  }
+  .rename-input:focus {
+    border-color: #3d3d41;
+  }
+  .rename-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .sidebar-restore {
+    position: absolute;
+    left: 12px;
+    top: 12px;
+    z-index: 25;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #1d1d20;
+    border: 1px solid #2c2c2e;
+    color: #a0a3a6;
+    cursor: pointer;
+  }
+  .sidebar-restore:hover {
+    color: #fff;
+    background: #272729;
+  }
+  .sidebar-restore svg {
+    width: 20px;
+    height: 20px;
   }
   .side-foot {
-    margin-top: auto;
+    flex: none;
+    display: flex;
+    gap: 8px;
+    padding-top: 8px;
+  }
+  .foot-btn {
+    flex: 1;
+    background: transparent;
+    border: 1px solid #26262a;
+    color: #8a8e92;
+    font-size: 13px;
+    border-radius: 10px;
+    padding: 8px 0;
+    cursor: pointer;
+  }
+  .foot-btn:hover {
+    color: #d6d7d9;
+    background: #1d1d20;
+  }
+  .handoff-bar {
+    flex: none;
+    display: flex;
+    justify-content: flex-end;
+    padding: 0 16px 4px;
+  }
+  .handoff-btn {
+    background: transparent;
+    border: none;
+    color: #6f7276;
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 7px;
+    cursor: pointer;
+  }
+  .handoff-btn:hover {
+    color: #c9cbce;
+    background: #1e1e21;
   }
   .chat {
     flex: 1;
@@ -2014,115 +2935,6 @@
     align-items: center;
     justify-content: center;
   }
-  .side-approval {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 0 12px;
-  }
-  .side-label {
-    font-size: 11px;
-    color: #9aa0ae;
-  }
-  .side-approval select {
-    background: #1b1d23;
-    color: #cdd2dd;
-    border: 1px solid #2f323c;
-    border-radius: 6px;
-    padding: 4px 6px;
-    font-size: 12px;
-  }
-  .side-approval select.danger {
-    border-color: #b3403a;
-    color: #ff7b72;
-  }
-  .side-project {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 14px 12px 0;
-    min-height: 0;
-  }
-  .proj-name {
-    font-size: 13px;
-    color: #e6e9f0;
-    font-weight: 600;
-  }
-  .new-chat {
-    background: #2f6feb;
-    border: none;
-    color: #fff;
-    border-radius: 6px;
-    padding: 6px;
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .new-chat:hover {
-    background: #3d7bf5;
-  }
-  .new-chat:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .sess-list {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    overflow-y: auto;
-    min-height: 0;
-  }
-  .sess-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 6px;
-    padding: 6px 8px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 12px;
-    color: #cdd2dd;
-  }
-  .sess-item:hover {
-    background: #262932;
-  }
-  .sess-item.active {
-    background: #2f323c;
-  }
-  .sess-title {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
-  }
-  .sess-side {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-  .sess-time {
-    color: #9aa0ae;
-    font-size: 11px;
-  }
-  .sess-del {
-    background: transparent;
-    border: none;
-    color: #6b7280;
-    cursor: pointer;
-    font-size: 10px;
-    padding: 0 2px;
-    display: none;
-  }
-  .sess-item:hover .sess-del {
-    display: inline;
-  }
-  .sess-del:hover {
-    color: #ff7b72;
-  }
-  .handoff-btn {
-    font-size: 12px;
-    padding: 5px 4px;
-  }
   .cp-bar {
     display: flex;
     align-items: center;
@@ -2433,12 +3245,6 @@
     background: #a83a3a;
   }
   /* —— P8.2 工作区切换 —— */
-  .ws-switch {
-    width: 100%;
-    margin: 6px 0 4px;
-    font-size: 12px;
-    padding: 5px 8px;
-  }
   .ws-current {
     font-family: Consolas, monospace;
     font-size: 12px;

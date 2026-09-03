@@ -258,6 +258,10 @@ pub struct Settings {
     #[serde(default)]
     pub recent_workspaces: Vec<String>,
 
+    /// DSH 式侧边栏「重命名项目」：工作区路径 → 显示名（DSH 项目别名；空串=未起名）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspace_aliases: BTreeMap<String, String>,
+
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
     pub keys: BTreeMap<String, String>,
@@ -273,6 +277,7 @@ impl Default for Settings {
             roles: None,
             workspace: None,
             recent_workspaces: Vec::new(),
+            workspace_aliases: BTreeMap::new(),
             keys: BTreeMap::new(),
             key_cipher: None,
         }
