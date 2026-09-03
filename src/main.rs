@@ -107,6 +107,9 @@ async fn main() -> anyhow::Result<()> {
         memory,
         mem_cfg,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        // P9 A3：挂起审批的元信息 + 会话内已授权范围——均仅内存，重启即失效
+        approval_meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        approved_scopes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
         // P8 角色映射与网关级配置（降级链/限流参数）
         roles_cfg: Arc::new(config.roles.clone()),

@@ -54,6 +54,12 @@ pub struct AppState {
     pub mem_cfg: Arc<crate::config::MemoryConfig>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    /// P9 A3：挂起审批的附加信息 —— approval id → (scope, session_id)，
+    /// 供「本会话内同类允许」在用户决定时回写记忆。
+    pub approval_meta: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
+    /// P9 A3：会话内已授权的审批范围 —— session_id → scope 集合（见 core::rules::approval_scope）。
+    /// **仅内存，不落 settings.json**；清空会话时一并清除，服务重启即失效。
+    pub approved_scopes: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
     pub approval_mode: Arc<std::sync::RwLock<String>>,
     /// P8 角色映射（config.toml [roles]：summary/title/embedding 的配置名）
@@ -1253,6 +1259,10 @@ async fn chat(
                 allow_unsandboxed,
                 unsandboxed_approval: cfg.unsandboxed_approval,
                 pending: approvals,
+                // P9 A3：会话内同类允许的作用域与记忆存储
+                session_id: session_id.clone(),
+                meta: state.approval_meta.clone(),
+                approved: state.approved_scopes.clone(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
             },
@@ -1351,6 +1361,12 @@ struct ChatGate {
     allow_unsandboxed: bool,
     unsandboxed_approval: bool,
     pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    /// P9 A3：本次请求所属会话（会话内同类允许的作用域）
+    session_id: String,
+    /// P9 A3：挂起审批的元信息（id → scope/session），ask 时写入、decide 时取用
+    meta: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
+    /// P9 A3：会话内已授权的审批范围（与 AppState.approved_scopes 同一份）
+    approved: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     cancel: Arc<CancelFlag>,
 }
@@ -1367,7 +1383,23 @@ impl agent::ApprovalGate for ChatGate {
         if (mode == "full-access" || mode == "local") && self.unsandboxed_approval {
             return risk >= crate::core::rules::RiskLevel::Dangerous;
         }
-        crate::core::rules::should_ask_approval(&mode, risk)
+        if !crate::core::rules::should_ask_approval(&mode, risk) {
+            return false;
+        }
+        // A3：本会话内「同类操作」已授权则免审。
+        // 安全默认：Dangerous 档**不参与**会话内记忆——高危操作的设计语义就是
+        // 「必须弹窗由用户确认」，逐次确认，不允许一次性放行一整类。
+        if risk == crate::core::rules::RiskLevel::Dangerous {
+            return true;
+        }
+        let scope = crate::core::rules::approval_scope(tool, &val, risk);
+        let remembered = self
+            .approved
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&self.session_id).map(|s| s.contains(&scope)))
+            .unwrap_or(false);
+        !remembered
     }
 
     fn sandbox_enabled(&self) -> bool {
@@ -1382,6 +1414,11 @@ impl agent::ApprovalGate for ChatGate {
         let ws = crate::tools::workspace_root();
         let val: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
         let (risk, reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
+        // A3：记下本次审批的「同类范围」与所属会话，供 /api/approvals 回写会话内记忆
+        let scope = crate::core::rules::approval_scope(tool, &val, risk);
+        if let Ok(mut m) = self.meta.lock() {
+            m.insert(id.clone(), (scope, self.session_id.clone()));
+        }
         observability::event(
             EventType::State,
             json!({ "kind": "approval.requested", "id": id, "tool": tool, "risk": risk.as_u8(), "reason": reason }),
@@ -1454,9 +1491,23 @@ async fn decide_approval(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
     };
     let approved = req.get("approved").and_then(Value::as_bool).unwrap_or(false);
+    // P9 A3：remember=true 表示「本会话内同类操作不再询问」
+    let remember = req.get("remember").and_then(Value::as_bool).unwrap_or(false);
+    let meta = state.approval_meta.lock().ok().and_then(|mut m| m.remove(id));
     let sender = state.approvals.lock().unwrap().remove(id);
     match sender {
         Some(tx) => {
+            // 会话内同类允许：Dangerous 档不记忆（needs_approval_for 已拒记，此处二次兜底）
+            if approved && remember {
+                if let Some((scope, session)) = meta {
+                    let dangerous = scope.contains(":2:") || scope.ends_with(":2");
+                    if !dangerous {
+                        if let Ok(mut m) = state.approved_scopes.lock() {
+                            m.entry(session).or_default().insert(scope);
+                        }
+                    }
+                }
+            }
             let _ = tx.send(approved);
             (StatusCode::OK, Json(json!({ "ok": true })))
         }
@@ -1655,6 +1706,10 @@ async fn clear_session(State(state): State<AppState>, axum::extract::Query(q): a
     };
     match state.session.delete(id) {
         Ok(()) => {
+            // P9 A3：删会话即撤销其「会话内同类允许」记忆（仅内存，从不落盘）
+            if let Ok(mut m) = state.approved_scopes.lock() {
+                m.remove(id);
+            }
             observability::event(EventType::State, json!({ "kind": "session.cleared", "session": id }));
             (StatusCode::OK, Json(json!({ "ok": true })))
         }

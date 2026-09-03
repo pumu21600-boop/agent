@@ -375,6 +375,48 @@ fn is_within_root(root: &Path, target: &Path) -> bool {
     t == r || t.starts_with(&format!("{r}/"))
 }
 
+/// 「同类操作」的范围标识（P9 A3：会话内同类允许 的记忆键）。
+///
+/// 粒度取「工具名 + 风险档 + 参数特征」，既不能粗到「放行整个 shell」，
+/// 也不细到「只放行这一条命令」：
+/// - shell → 程序名（同程序、同风险档的后续命令不再问）；
+/// - write_file → 文件所在目录（同目录下的后续写入不再问）；
+/// - git → 子命令（同子命令、同风险档不再问）；
+/// - 其他 → 仅工具名 + 风险档。
+///
+/// 风险档参与 key：同一程序在 Normal 档获批，不代表 Dangerous 档也放行。
+pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String {
+    let tag = risk.as_u8();
+    match tool_name {
+        "shell" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            format!("shell:{tag}:{}", program_name(cmd))
+        }
+        "write_file" => {
+            let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let dir = p
+                .replace('\\', "/")
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            format!("write_file:{tag}:{dir}")
+        }
+        "git" => {
+            let sub = args
+                .get("args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            format!("git:{tag}:{sub}")
+        }
+        other => format!("{other}:{tag}"),
+    }
+}
+
 /// 判定当前审批模式下该风险等级是否需要向用户请求审批。
 ///
 /// 模式映射：
@@ -550,5 +592,45 @@ mod tests {
         assert_eq!(RiskLevel::Safe.label(), "安全");
         assert_eq!(RiskLevel::Normal.label(), "常规改动");
         assert_eq!(RiskLevel::Dangerous.label(), "高危操作");
+    }
+
+    // —— A3：会话内同类允许 的范围粒度 ——
+    #[test]
+    fn test_approval_scope_granularity() {
+        let n = RiskLevel::Normal;
+        let d = RiskLevel::Dangerous;
+        // shell：按程序名归类，同程序同档 = 同类
+        assert_eq!(
+            approval_scope("shell", &json!({"command": "cargo build"}), n),
+            approval_scope("shell", &json!({"command": "cargo build --release"}), n)
+        );
+        assert_ne!(
+            approval_scope("shell", &json!({"command": "cargo build"}), n),
+            approval_scope("shell", &json!({"command": "npm run build"}), n),
+            "不同程序不得归为同类"
+        );
+        assert_ne!(
+            approval_scope("shell", &json!({"command": "cargo build"}), n),
+            approval_scope("shell", &json!({"command": "cargo build"}), d),
+            "风险档不同即不同类——Normal 获批不放行 Dangerous"
+        );
+        // write_file：按所在目录归类
+        assert_eq!(
+            approval_scope("write_file", &json!({"path": "src/a.rs"}), n),
+            approval_scope("write_file", &json!({"path": "src/b.rs"}), n)
+        );
+        assert_ne!(
+            approval_scope("write_file", &json!({"path": "src/a.rs"}), n),
+            approval_scope("write_file", &json!({"path": "docs/x.md"}), n)
+        );
+        // git：按子命令归类
+        assert_eq!(
+            approval_scope("git", &json!({"args": "commit -m a"}), n),
+            approval_scope("git", &json!({"args": "commit -m b"}), n)
+        );
+        assert_ne!(
+            approval_scope("git", &json!({"args": "commit -m a"}), n),
+            approval_scope("git", &json!({"args": "push"}), d)
+        );
     }
 }
