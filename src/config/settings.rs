@@ -98,6 +98,11 @@ pub struct RolesSettings {
 }
 
 /// 一套配置（渠道信息 + 模型 + 本配置专属 key + 协议形态与采样参数 + 能力标记）。
+///
+/// B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
+/// `0`=清除长度类（context_length/max_output_tokens）；负数=清除采样类（temperature/top_p）；
+/// 空串/auto=清除思考类（thinking/thinking_style）；clear_key=true=清 key。
+/// P8.3「思考档位被吞」事故即源于此约定未成文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub id: String,
@@ -128,13 +133,20 @@ pub struct Config {
     /// 思考开关/档位："on"/"off"/low/medium/high/xhigh/max/minimal；None=渠道默认
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
-    /// 思考/协议规范形态覆盖（8大规范全覆盖词表）：
-    /// auto/none/openai/deepseek/zai/qwen/claude/moonshot/qwen-chat-template；None=auto 端点探测
+    /// 思考/协议规范形态覆盖（思考形态词表，只增不改名——B4 固化）：
+    /// 空=auto 端点探测；none/openai/deepseek/zai/qwen/qwen-chat-template；
+    /// P8.3 旧值（thinking_object/reasoning_effort/enable_thinking*）自动映射。
+    /// 新形态入词表必须附真实渠道冒烟记录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_style: Option<String>,
     /// 模型能力标记（工具调用/图片/视频/音频解析）
     #[serde(default)]
     pub capabilities: ModelCapabilities,
+    /// A2 能力标记所有权：true=用户显式标记过（勾选框），此后任何模型切换/勾选
+    /// 不得被推导覆盖；false=推导态（模型首次成为当前模型时按模型名推导作初值）。
+    /// 「按模型名重新推导」按钮复位为 false。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capabilities_user_set: bool,
 }
 
 impl Config {
@@ -183,7 +195,9 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// DPAPI 解密本配置专属 key（仅内存，绝不序列化、绝不出日志）
+    /// DPAPI 解密本配置专属 key（仅内存，绝不序列化、绝不出日志）。
+    /// B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key >
+    /// DEEPSEEK_API_KEY 环境变量；key 永不出日志、永不出 JSONL。
     pub fn decrypted_key(&self) -> Option<String> {
         self.key_cipher.as_deref().and_then(Settings::decrypt)
     }
@@ -325,6 +339,7 @@ impl Settings {
                             thinking: legacy.thinking,
                             thinking_style: legacy.thinking_style,
                             capabilities: cap,
+                            capabilities_user_set: false,
                         });
                     }
                 }
@@ -370,6 +385,7 @@ impl Settings {
             thinking: None,
             thinking_style: None,
             capabilities: cap,
+            capabilities_user_set: false,
         });
         s.ensure_active_config();
         let _ = s.save();
@@ -457,6 +473,7 @@ impl Settings {
                 thinking: None,
                 thinking_style: None,
                 capabilities: ModelCapabilities::default(),
+                capabilities_user_set: false,
             });
         }
         self.assign_missing_names();
@@ -555,6 +572,7 @@ impl Settings {
             thinking: None,
             thinking_style: None,
             capabilities: ModelCapabilities::default(),
+            capabilities_user_set: false,
         });
         self.active_config_id = Some(id.clone());
         id
@@ -718,6 +736,7 @@ mod tests {
             thinking: Some("on".to_string()),
             thinking_style: Some("deepseek".to_string()),
             capabilities: ModelCapabilities::default(),
+            capabilities_user_set: false,
         });
         s.configs.push(Config {
             id: "cfg-2".to_string(),
@@ -734,6 +753,7 @@ mod tests {
             thinking: Some("off".to_string()),
             thinking_style: Some("qwen".to_string()),
             capabilities: ModelCapabilities::default(),
+            capabilities_user_set: false,
         });
         s.active_config_id = Some("cfg-1".to_string());
 

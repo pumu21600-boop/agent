@@ -39,7 +39,7 @@ pub struct Gateway {
 
 /// 请求参数（P9）：全部可选，None=不发字段走渠道默认。
 /// 思考接线不再自带厂商字段——由 compat 按端点探测；用户设置只有开/关 + 档位。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ChatParams {
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
@@ -52,6 +52,24 @@ pub struct ChatParams {
     /// 端点探测线索：渠道预设 id 与实际 base_url（build_body 内部探测用）。
     pub provider_id: Option<String>,
     pub base_url: Option<String>,
+    /// A3 能力标记「工具调用」闭环（施工单 012）：false 时核心循环不携带 tools 参数，
+    /// 模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响。默认 true。
+    pub tools_enabled: bool,
+}
+
+impl Default for ChatParams {
+    fn default() -> Self {
+        Self {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_format: None,
+            provider_id: None,
+            base_url: None,
+            tools_enabled: true,
+        }
+    }
 }
 
 impl ChatParams {

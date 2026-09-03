@@ -210,6 +210,16 @@ fn short_args(args: &str, max_chars: usize) -> String {
     flat.chars().take(max_chars).collect()
 }
 
+/// A3（施工单 012）：能力标记「工具调用」闭环的核心判定——tools_enabled=false 时不带
+/// tools 参数。独立成纯函数便于单测。
+fn tools_def_for(params: &ChatParams) -> Option<Value> {
+    if params.tools_enabled {
+        Some(Value::Array(tools::definitions()))
+    } else {
+        None
+    }
+}
+
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task(
@@ -258,7 +268,9 @@ pub async fn run_task(
     // P6 自动交接：本任务内只触发一次
     let mut handoff_done = false;
 
-    let tools_def = Value::Array(tools::definitions());
+    // A3 能力标记「工具调用」闭环（施工单 012）：capabilities.tools=false 时不携带 tools
+    // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
+    let tools_def = tools_def_for(&primary.params);
     let mut prev_tool_sigs: Vec<String> = Vec::new();
 
     for step in 0..cfg.max_steps {
@@ -385,7 +397,7 @@ pub async fn run_task(
                 .stream_chat(
                     ch,
                     &Value::Array(msgs.clone()),
-                    Some(&tools_def),
+                    tools_def.as_ref(),
                     cancel,
                     |chunk| {
                         let delta = extract_delta(chunk);
@@ -578,4 +590,18 @@ pub async fn run_task(
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
     on_event(AgentEvent::StepLimit(cfg.max_steps));
     Ok(LoopOutcome::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_def_follows_capability_mark() {
+        // A3（施工单 012）：capabilities.tools=false → 请求不携带 tools 参数
+        let mut p = ChatParams::default();
+        assert!(tools_def_for(&p).is_some(), "默认（tools=true）携带 tools");
+        p.tools_enabled = false;
+        assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
+    }
 }
