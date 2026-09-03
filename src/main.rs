@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         serde_json::json!({
             "kind": "startup",
             "session_id": session_id,
-            "provider_id": user_settings.provider_id,
+            "provider_id": user_settings.provider_id(),
             "base_url": user_settings.effective_base_url(),
             "model": user_settings.effective_model(),
             "host": config.server.host,

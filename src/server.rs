@@ -129,6 +129,12 @@ pub struct SettingsUpdate {
     /// none/openai/deepseek/zai/qwen/qwen-chat-template；P8.3 旧值自动映射
     #[serde(default)]
     pub thinking_style: Option<String>,
+    /// 模型能力标记（工具调用/图片/视频/音频解析）
+    #[serde(default)]
+    pub capabilities: Option<crate::config::settings::ModelCapabilities>,
+    /// 角色路由映射（摘要/标题/多模态旁路/降级链）
+    #[serde(default)]
+    pub roles: Option<crate::config::settings::RolesSettings>,
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
@@ -168,21 +174,21 @@ fn json_event(payload: Value) -> Event {
     Event::default().json_data(payload).expect("SSE 事件序列化失败")
 }
 
-/// P8/P9：从设置镜像 + 供应商预设组装请求参数（采样/思考/端点探测线索）。
+/// P8/P9/P8.5：从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索）。
 fn build_chat_params(
-    s: &Settings,
+    c: &crate::config::settings::Config,
     preset: Option<&gateway::providers::ProviderPreset>,
 ) -> gateway::ChatParams {
     let mut p = match preset {
         Some(p) => gateway::ChatParams::from_preset(p),
         None => gateway::ChatParams::default(),
     };
-    p.max_tokens = s.max_output_tokens;
-    p.temperature = s.temperature;
-    p.top_p = s.top_p;
-    p.thinking = s.thinking.clone();
-    p.base_url = Some(s.effective_base_url());
-    apply_thinking_style(&mut p, s.thinking_style.as_deref());
+    p.max_tokens = c.max_output_tokens;
+    p.temperature = c.temperature;
+    p.top_p = c.top_p;
+    p.thinking = c.thinking.clone();
+    p.base_url = Some(c.effective_base_url());
+    apply_thinking_style(&mut p, c.thinking_style.as_deref());
     p
 }
 
@@ -203,39 +209,21 @@ fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&str>) {
     }
 }
 
-/// P8：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
+/// P8/P8.5：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
 fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
     let c = s
         .configs
         .iter()
         .find(|c| c.name == name || c.id == name)?;
-    let base_url = if !c.base_url.trim().is_empty() {
-        c.base_url.trim().to_string()
-    } else {
-        gateway::providers::find(&c.provider_id)
-            .map(|p| p.default_base_url.clone())
-            .unwrap_or_default()
-    };
-    if base_url.trim().is_empty() {
+    let base_url = c.effective_base_url();
+    if base_url.is_empty() {
         return None;
     }
-    let model = if !c.model.trim().is_empty() {
-        c.model.trim().to_string()
-    } else {
-        c.models.first().cloned().unwrap_or_else(|| {
-            gateway::providers::find(&c.provider_id)
-                .map(|p| p.default_model.clone())
-                .unwrap_or_default()
-        })
-    };
+    let model = c.effective_model();
     let preset = gateway::providers::find(&c.provider_id);
-    let mut params = build_chat_params(s, preset);
-    // 角色/降级渠道用自己的 max_output_tokens（若该配置单独设置过）与思考形态覆盖
-    params.max_tokens = c.max_output_tokens;
-    apply_thinking_style(&mut params, c.thinking_style.as_deref());
-    // 端点探测以本渠道实际地址为准（角色映射可能落到不同渠道）
-    params.base_url = Some(base_url.clone());
-    Some(gateway::Channel::new(&base_url, &model, &s.config_key(c).unwrap_or_default(), params))
+    let params = build_chat_params(c, preset);
+    let key = s.config_key(c).unwrap_or_default();
+    Some(gateway::Channel::new(&base_url, &model, &key, params))
 }
 
 /// 供应商预设列表（数据驱动自 providers.json）。
@@ -280,58 +268,72 @@ async fn put_settings(
     Json(req): Json<SettingsUpdate>,
 ) -> (StatusCode, Json<Value>) {
     let mut s = state.settings.write().unwrap().clone();
-    // 渠道地址变更检测：换渠道后旧渠道的模型清单/当前模型作废（重新获取重新勾选）
-    let url_before = crate::config::settings::normalize_base(&s.effective_base_url());
+    s.ensure_active_config();
+
     if let Some(v) = &req.name {
         s.set_active_name(v);
     }
-    if let Some(v) = &req.provider_id {
-        if !v.trim().is_empty() {
-            s.provider_id = v.trim().to_string();
+
+    let (url_changed, pid, eff_model) = if let Some(c) = s.active_mut() {
+        let url_before = crate::config::settings::normalize_base(&c.effective_base_url());
+        if let Some(v) = &req.provider_id {
+            if !v.trim().is_empty() {
+                c.provider_id = v.trim().to_string();
+            }
         }
-    }
-    if let Some(v) = &req.base_url {
-        s.base_url = v.trim().to_string();
-    }
-    if let Some(v) = &req.model {
-        s.model = v.trim().to_string();
-    }
-    if let Some(v) = &req.models {
-        let mut list: Vec<String> =
-            v.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect();
-        list.sort();
-        list.dedup();
-        s.models = list;
-    }
-    if let Some(v) = req.context_length {
-        s.context_length = if v == 0 { None } else { Some(v) };
-    }
-    if let Some(v) = req.max_output_tokens {
-        s.max_output_tokens = if v == 0 { None } else { Some(v) };
-    }
-    // P8 采样参数：temperature 0.0 是合法值（确定性输出），清除用负数
-    if let Some(v) = req.temperature {
-        s.temperature = if v < 0.0 { None } else { Some(v) };
-    }
-    if let Some(v) = req.top_p {
-        s.top_p = if v < 0.0 { None } else { Some(v) };
-    }
-    if let Some(v) = req.thinking {
-        let v = v.trim().to_lowercase();
-        // P9：接受开/关 + effort 档位（输入栏 🧠 菜单按生效形态发档位）；
-        // 不认识的值一律回渠道默认（不发思考参数）
-        s.thinking = match v.as_str() {
-            "on" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(v),
-            _ => None,
-        };
-    }
-    if let Some(v) = req.thinking_style {
-        let v = v.trim().to_lowercase();
-        s.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v) };
-    }
-    if url_before != crate::config::settings::normalize_base(&s.effective_base_url()) {
-        s.models.clear();
-        s.model.clear();
+        if let Some(v) = &req.base_url {
+            c.base_url = v.trim().to_string();
+        }
+        if let Some(v) = &req.model {
+            c.model = v.trim().to_string();
+        }
+        if let Some(v) = &req.models {
+            let mut list: Vec<String> =
+                v.iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect();
+            list.sort();
+            list.dedup();
+            c.models = list;
+        }
+        if let Some(v) = req.context_length {
+            c.context_length = if v == 0 { None } else { Some(v) };
+        }
+        if let Some(v) = req.max_output_tokens {
+            c.max_output_tokens = if v == 0 { None } else { Some(v) };
+        }
+        // P8 采样参数：temperature 0.0 是合法值（确定性输出），清除用负数
+        if let Some(v) = req.temperature {
+            c.temperature = if v < 0.0 { None } else { Some(v) };
+        }
+        if let Some(v) = req.top_p {
+            c.top_p = if v < 0.0 { None } else { Some(v) };
+        }
+        if let Some(v) = req.thinking {
+            let v = v.trim().to_lowercase();
+            c.thinking = match v.as_str() {
+                "on" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Some(v),
+                _ => None,
+            };
+        }
+        if let Some(v) = req.thinking_style {
+            let v = v.trim().to_lowercase();
+            c.thinking_style = if v.is_empty() || v == "auto" { None } else { Some(v) };
+        }
+        if let Some(caps) = req.capabilities {
+            c.capabilities = caps;
+        }
+
+        let url_after = crate::config::settings::normalize_base(&c.effective_base_url());
+        let changed = url_before != url_after;
+        if changed {
+            c.models.clear();
+            c.model.clear();
+        }
+        (changed, c.provider_id.clone(), c.effective_model())
+    } else {
+        (false, "deepseek".to_string(), "deepseek-chat".to_string())
+    };
+
+    if url_changed {
         observability::event(
             EventType::State,
             json!({ "kind": "settings.channel_changed", "base_url": s.effective_base_url() }),
@@ -348,20 +350,20 @@ async fn put_settings(
             }
         }
     }
-    // 改动即时回写激活配置（配置即生效，无"保存"概念）
-    s.sync_config_from_mirror();
+
+    if let Some(roles) = req.roles {
+        s.roles = Some(roles);
+    }
+
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap() = s.clone();
     observability::event(
         EventType::State,
-        json!({ "kind": "settings.updated", "provider_id": s.provider_id, "model": s.effective_model() }),
+        json!({ "kind": "settings.updated", "provider_id": pid, "model": eff_model }),
     );
-    (
-        StatusCode::OK,
-        Json(json!({ "ok": true, "has_key": s.get_key().is_some(), "key_hint": key_hint_of(s.get_key()) })),
-    )
+    (StatusCode::OK, Json(config_state_json(&s)))
 }
 
 /// 拉取渠道模型列表。请求里没给 base_url/key 就用已保存设置。
@@ -409,7 +411,6 @@ async fn manage_configs(
         |m: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     match req.action.as_str() {
         "new" => {
-            s.sync_config_from_mirror();
             s.new_config();
         }
         "delete" => {
@@ -429,10 +430,12 @@ async fn manage_configs(
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
+    let pid = s.provider_id();
+    let model = s.effective_model();
     *state.settings.write().unwrap() = s.clone();
     observability::event(
         EventType::State,
-        json!({ "kind": "config.changed", "action": req.action, "provider_id": s.provider_id, "model": s.model }),
+        json!({ "kind": "config.changed", "action": req.action, "provider_id": pid, "model": model }),
     );
     (StatusCode::OK, Json(config_state_json(&s)))
 }
@@ -500,13 +503,15 @@ async fn set_workspace(
     (StatusCode::OK, Json(json!({ "ok": true, "current": cur, "recent": s.recent_workspaces })))
 }
 
-/// 配置快照（含各配置 key 状态），供前端全量刷新。
-fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思考适配画像（前端决定思考开关是否展示、预算参数是否有意义）
-    let preset = gateway::providers::find(&s.provider_id);
+/// 配置快照（含各配置 key 状态与角色路由），供前端全量刷新。
+fn config_state_json(s: &Settings) -> Value {
+    let active = s.active_or_default();
+    let preset = gateway::providers::find(&active.provider_id);
+    let key = s.get_key();
     json!({
         "ok": true,
         "configs": s.configs.iter().map(|c| {
-            let key = s.config_key(c);
+            let k = s.config_key(c);
             json!({
                 "id": c.id,
                 "name": c.name.clone(),
@@ -514,46 +519,49 @@ fn config_state_json(s: &Settings) -> Value {    // P8：当前供应商的思�
                 "base_url": c.base_url.clone(),
                 "model": c.model.clone(),
                 "models": c.models.clone(),
-                "has_key": key.is_some(),
-                "key_hint": key_hint_of(key),
+                "has_key": k.is_some(),
+                "key_hint": key_hint_of(k),
                 "context_length": c.context_length,
                 "max_output_tokens": c.max_output_tokens,
                 "temperature": c.temperature,
                 "top_p": c.top_p,
                 "thinking": c.thinking,
                 "thinking_style": c.thinking_style,
+                "capabilities": c.capabilities,
             })
         }).collect::<Vec<Value>>(),
         "active_config_id": s.active_config_id,
-        "name": s.active().map(|c| c.name.clone()).unwrap_or_default(),
-        "provider_id": s.provider_id,
-        "base_url": s.base_url,
-        "effective_base_url": s.effective_base_url(),
-        "model": s.model,
-        "models": s.models,
-        "context_length": s.context_length,
-        "max_output_tokens": s.max_output_tokens,
-        "temperature": s.temperature,
-        "top_p": s.top_p,
-        "thinking": s.thinking,
-        "has_key": s.get_key().is_some(),
-        "key_hint": key_hint_of(s.get_key()),
-        // P8.2 工作区 + P9 思考参数形态覆盖（前端按它渲染档位菜单）
+        "name": active.name.clone(),
+        "provider_id": active.provider_id,
+        "base_url": active.base_url,
+        "effective_base_url": active.effective_base_url(),
+        "model": active.model,
+        "models": active.models,
+        "context_length": active.context_length,
+        "max_output_tokens": active.max_output_tokens,
+        "temperature": active.temperature,
+        "top_p": active.top_p,
+        "thinking": active.thinking,
+        "capabilities": active.capabilities,
+        "has_key": key.is_some(),
+        "key_hint": key_hint_of(key),
+        // P8.2 工作区 + P9/P8.5 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
         "workspace": crate::tools::workspace_root().display().to_string(),
         "recent_workspaces": s.recent_workspaces,
-        "thinking_style_override": s.thinking_style,
-        "thinking_style": effective_thinking_style(s, preset),
+        "thinking_style_override": active.thinking_style,
+        "thinking_style": effective_thinking_style(active, preset),
+        "roles": s.roles,
     })
 }
 
-/// 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）：渠道覆盖 > 端点探测。
-/// 值：none | openai | deepseek | zai | qwen | qwen-chat-template | auto
+/// 生效的思考参数形态（P9/P8.5，8大规范词表）：渠道覆盖 > 端点探测。
+/// 值：none | openai | deepseek | zai | qwen | claude | moonshot | qwen-chat-template | auto
 fn effective_thinking_style(
-    s: &Settings,
+    c: &crate::config::settings::Config,
     preset: Option<&gateway::providers::ProviderPreset>,
 ) -> &'static str {
     use gateway::compat::ThinkingFormat as TF;
-    match s.thinking_style.as_deref() {
+    match c.thinking_style.as_deref() {
         Some("none") => "none",
         // P8.3 旧词表别名 → 新词表
         Some("thinking_object") => TF::Zai.as_str(),
@@ -562,9 +570,9 @@ fn effective_thinking_style(
         Some(v) => TF::parse(v).map(|f| f.as_str()).unwrap_or("auto"),
         // auto：端点探测（预设 thinking_format 是探测认不出时的兜底）
         _ => gateway::compat::resolve(
-            Some(s.provider_id.as_str()),
-            Some(&s.effective_base_url()),
-            &s.model,
+            Some(c.provider_id.as_str()),
+            Some(&c.effective_base_url()),
+            &c.model,
             preset.and_then(|p| p.thinking_format),
         )
         .thinking_format
@@ -595,13 +603,13 @@ async fn chat(
     let gateway = state.gateway.clone();
     let cancel = state.cancel.clone();
     let s = state.settings.read().unwrap().clone();
+    let active_cfg = s.active_or_default().clone();
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
     let ctx_cfg = {
-        // 预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）
         let mut c = (*state.context_cfg).clone();
-        if let Some(cl) = s.context_length {
+        if let Some(cl) = active_cfg.context_length {
             c.budget_tokens = cl;
         }
         c
@@ -666,24 +674,31 @@ async fn chat(
         // P6.1：先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
         // 请求级覆盖优先：页面当前选择即时生效，不等保存
-        let base_url = if !req_base_url.is_empty() { req_base_url } else { s.effective_base_url() };
-        let model = if !req_model.is_empty() { req_model } else { s.effective_model() };
+        let base_url = if !req_base_url.is_empty() { req_base_url } else { active_cfg.effective_base_url() };
+        let model = if !req_model.is_empty() { req_model } else { active_cfg.effective_model() };
         let api_key = if !req_api_key.is_empty() {
             req_api_key
         } else {
-            s.get_key().or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
+            s.config_key(&active_cfg).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
         };
-        // P8：主渠道 = 设置镜像（采样/思考）+ 供应商预设（厂商适配字段）→ ChatParams
-        let params = build_chat_params(&s, gateway::providers::find(&s.provider_id));
+        // P8/P8.5：主渠道 = 激活配置 + 供应商预设 → ChatParams
+        let mut params = build_chat_params(&active_cfg, gateway::providers::find(&active_cfg.provider_id));
+        params.base_url = Some(base_url.clone());
         let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
-        // P8 角色映射：[roles] summary/title 按配置名或 id 解析成完整渠道；解析失败回落主渠道
-        let roles = &state.roles_cfg;
-        let summary = roles.summary.as_deref().and_then(|n| find_channel(&s, n));
-        let title = roles.title.as_deref().and_then(|n| find_channel(&s, n));
-        // P8 降级链：fallback_configs 按配置名解析；解析不到的名字跳过并记日志
-        let fallbacks: Vec<gateway::Channel> = state
-            .gateway_cfg
-            .fallback_configs
+        // P8/P8.5 角色映射：优先使用 settings.roles，未设回落 config.toml [roles]
+        let roles = s.roles.as_ref();
+        let summary_name = roles.and_then(|r| r.summary.as_deref())
+            .or_else(|| state.roles_cfg.summary.as_deref());
+        let title_name = roles.and_then(|r| r.title.as_deref())
+            .or_else(|| state.roles_cfg.title.as_deref());
+        let summary = summary_name.and_then(|n| find_channel(&s, n));
+        let title = title_name.and_then(|n| find_channel(&s, n));
+        // P8/P8.5 降级链：优先使用 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
+        let fallback_names: Vec<String> = roles
+            .map(|r| r.fallbacks.clone())
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| state.gateway_cfg.fallback_configs.clone());
+        let fallbacks: Vec<gateway::Channel> = fallback_names
             .iter()
             .filter_map(|n| find_channel(&s, n))
             .collect();
@@ -1284,28 +1299,40 @@ mod tests {
         );
         // 自定义中转端点探测认不出 → 覆盖为 qwen 布尔形态
         let preset = gateway::providers::find("custom");
-        let mut s = Settings::default();
-        s.provider_id = "custom".into();
-        s.thinking = Some("off".into());
-        s.thinking_style = Some("qwen".into());
-        let p = build_chat_params(&s, preset);
+        let mut c = crate::config::settings::Config {
+            id: "cfg-t".into(),
+            name: "test".into(),
+            provider_id: "custom".into(),
+            base_url: "".into(),
+            model: "m".into(),
+            models: vec![],
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: Some("off".into()),
+            thinking_style: Some("qwen".into()),
+            capabilities: Default::default(),
+        };
+        let p = build_chat_params(&c, preset);
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Qwen));
         // 覆盖后 off 真的会发 enable_thinking:false
         let body = gateway::build_body("m", &json!([]), true, &p, None);
         assert_eq!(body["enable_thinking"], json!(false));
         // P8.3 旧设置值自动映射：thinking_object → zai
-        s.thinking_style = Some("thinking_object".into());
-        let p = build_chat_params(&s, preset);
+        c.thinking_style = Some("thinking_object".into());
+        let p = build_chat_params(&c, preset);
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Zai));
         // none：任何思考参数都不发（none 用 openai 形态但不发档位=零思考字段）
-        s.thinking_style = Some("none".into());
-        let p = build_chat_params(&s, gateway::providers::find("zhipu"));
+        c.thinking_style = Some("none".into());
+        let p = build_chat_params(&c, gateway::providers::find("zhipu"));
         let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
         assert!(body.get("thinking").is_none() && body.get("enable_thinking").is_none());
         // auto：端点探测（zhipu 官方域名 → zai 形态）
-        s.thinking_style = None;
-        s.thinking = Some("on".into());
-        let p = build_chat_params(&s, gateway::providers::find("zhipu"));
+        c.thinking_style = None;
+        c.thinking = Some("on".into());
+        let p = build_chat_params(&c, gateway::providers::find("zhipu"));
         let body = gateway::build_body("glm-4.6", &json!([]), true, &p, None);
         assert_eq!(p.thinking_format, None, "auto 不写覆盖，探测说了算");
         assert_eq!(body["thinking"], json!({"type":"enabled"}), "探测出 zai 形态后 on 生效");
@@ -1316,19 +1343,34 @@ mod tests {
         let _ = gateway::providers::init(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
         );
-        let mut s = Settings::default();
+        let mut c = crate::config::settings::Config {
+            id: "cfg-t".into(),
+            name: "test".into(),
+            provider_id: "custom".into(),
+            base_url: "".into(),
+            model: "m".into(),
+            models: vec![],
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+        };
         // 自定义中转（空地址探测不出）→ openai 形态兜底
-        s.provider_id = "custom".into();
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("custom")), "openai");
+        c.provider_id = "custom".into();
+        assert_eq!(effective_thinking_style(&c, gateway::providers::find("custom")), "openai");
         // 智谱官方域名探测 → zai
-        s.provider_id = "zhipu".into();
-        s.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "zai");
+        c.provider_id = "zhipu".into();
+        c.base_url = "https://open.bigmodel.cn/api/paas/v4".into();
+        assert_eq!(effective_thinking_style(&c, gateway::providers::find("zhipu")), "zai");
         // 覆盖优先，旧词表也映射
-        s.thinking_style = Some("enable_thinking_budget".into());
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "qwen");
-        s.thinking_style = Some("none".into());
-        assert_eq!(effective_thinking_style(&s, gateway::providers::find("zhipu")), "none");
+        c.thinking_style = Some("enable_thinking_budget".into());
+        assert_eq!(effective_thinking_style(&c, gateway::providers::find("zhipu")), "qwen");
+        c.thinking_style = Some("none".into());
+        assert_eq!(effective_thinking_style(&c, gateway::providers::find("zhipu")), "none");
     }
 
     #[test]
@@ -1336,12 +1378,26 @@ mod tests {
         let _ = gateway::providers::init(
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"),
         );
-        let mut s = Settings::default();
-        s.provider_id = "openai".into();
+        let mut c = crate::config::settings::Config {
+            id: "cfg-t".into(),
+            name: "test".into(),
+            provider_id: "openai".into(),
+            base_url: "".into(),
+            model: "m".into(),
+            models: vec![],
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+        };
         // 输入栏 🧠 菜单发的档位要能持久化（P8.3 期间被 put_settings 吞掉的老问题）
         for lvl in ["low", "medium", "high", "on", "off"] {
-            s.thinking = Some(lvl.into());
-            let p = build_chat_params(&s, gateway::providers::find("openai"));
+            c.thinking = Some(lvl.into());
+            let p = build_chat_params(&c, gateway::providers::find("openai"));
             assert_eq!(p.thinking.as_deref(), Some(lvl));
         }
     }
