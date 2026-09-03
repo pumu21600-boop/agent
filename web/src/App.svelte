@@ -32,6 +32,7 @@
   let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
   let thinkingStyleOverride = null; // 配置里的形态覆盖值（设置面板回显）
   let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记
+  let capabilitiesUserSet = false; // A2：true=用户显式标记过，模型切换不再自动改写
   let roles = {}; // P8.5 角色路由映射
   // —— P8.2 工作区 ——
   let workspace = '';
@@ -376,6 +377,7 @@
     thinkingStyle = s.thinking_style || 'auto';
     thinkingStyleOverride = s.thinking_style_override || null;
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
+    capabilitiesUserSet = s.capabilities_user_set || false;
     roles = s.roles || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
@@ -530,28 +532,25 @@
       : [...savedModels, m].sort();
     savedModels = list; // 乐观更新
     let newModel = model;
-    let caps = capabilities;
     if (list.length && !list.includes(model)) {
       newModel = list[0];
       model = newModel;
-      caps = inferCapabilities(newModel);
-      capabilities = caps;
     }
-    await sendSettings({ models: list, model: newModel, capabilities: caps, api_key: apiKey.trim() || undefined });
+    // A2（施工单 012）：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
+    // 后端仅在该配置无用户标记历史时按新模型名推导初值
+    await sendSettings({ models: list, model: newModel, api_key: apiKey.trim() || undefined });
   }
 
   async function selectAllModels() {
     const list = [...fetchedModels].sort();
     savedModels = list;
     let newModel = model;
-    let caps = capabilities;
     if (!list.includes(model) && list.length) {
       newModel = list[0];
       model = newModel;
-      caps = inferCapabilities(newModel);
-      capabilities = caps;
     }
-    await sendSettings({ models: list, model: newModel, capabilities: caps });
+    // A2：同上，不随选择改写能力标记
+    await sendSettings({ models: list, model: newModel });
   }
 
   async function selectNoModels() {
@@ -564,9 +563,13 @@
   async function pickModel(m) {
     model = m;
     modelMenuOpen = false;
-    const caps = inferCapabilities(m);
-    capabilities = caps;
-    await sendSettings({ model: m, capabilities: caps });
+    // A2：不随快选改写能力标记（后端在无用户标记时推导初值）
+    await sendSettings({ model: m });
+  }
+
+  // A2 显式重置入口：按当前模型名重新推导能力标记，回到推导态
+  function recomputeCapabilities() {
+    autoSave({ recompute_capabilities: true }, 0);
   }
 
   // —— 对话 ——
@@ -1371,6 +1374,25 @@
       </div>
 
       <div class="field">
+        <label>思考参数形态（中转渠道探测不准时用）</label>
+        <select
+          bind:value={thinkingStyleOverride}
+          on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
+        >
+          <option value={null}>自动（按端点探测）</option>
+          <option value="none">不发任何思考参数（none）</option>
+          <option value="openai">OpenAI · reasoning_effort 档位</option>
+          <option value="deepseek">DeepSeek/小米 · thinking 对象</option>
+          <option value="zai">智谱/豆包 · thinking 对象</option>
+          <option value="qwen">千问/混元 · enable_thinking 布尔</option>
+          <option value="qwen-chat-template">本地服务 · chat_template_kwargs（Qwen3 模板）</option>
+        </select>
+        <div class="param-hint">
+          默认按域名/供应商自动探测思考协议；中转/反代认不准时（如商汤式网关）在这里显式指定，on/off 立即按该形态发参
+        </div>
+      </div>
+
+      <div class="field">
         <label>模型能力标记（多模态转接与工具调用依据）</label>
         <div class="caps-row">
           <label class="cap-check">
@@ -1407,7 +1429,13 @@
           </label>
         </div>
         <div class="param-hint">
-          若主力模型未勾选对应媒体能力（如纯文本模型），遇到图片/音视频时将自动转接给下方设置的解析专家
+          {capabilitiesUserSet ? '已手动标记：切换/重选模型不再自动改写这些勾选' : '自动推导：随模型名变化（切换模型会按名字重推）'}
+          ；若主力模型未勾选对应媒体能力（如纯文本模型），遇到图片/音视频时将自动转接给下方设置的解析专家
+        </div>
+        <div class="sub-row">
+          <button class="btn" on:click={recomputeCapabilities} title="丢弃手动标记，按当前模型名重新推导能力标记">
+            按模型名重新推导
+          </button>
         </div>
       </div>
 
@@ -1420,7 +1448,7 @@
               bind:value={roles.summary}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（默认跟随当前主力渠道）</option>
+              <option value={null}>未配置：由主力渠道代跑摘要</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
@@ -1432,7 +1460,7 @@
               bind:value={roles.title}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（默认跟随当前主力渠道）</option>
+              <option value={null}>未配置：由主力渠道代跑标题</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
@@ -1444,7 +1472,7 @@
               bind:value={roles.vision}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（默认跟随当前主力渠道）</option>
+              <option value={null}>未配置：主力支持图片时直连，不支持时才需要配置专家</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
@@ -1456,7 +1484,7 @@
               bind:value={roles.video}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（默认跟随当前主力渠道）</option>
+              <option value={null}>未配置：主力支持视频时直连，不支持时才需要配置专家</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
@@ -1468,13 +1496,26 @@
               bind:value={roles.audio}
               on:change={() => autoSave({ roles }, 0)}
             >
-              <option value={null}>（未配置，跳过并提示占位）</option>
+              <option value={null}>未配置：主力支持音频时直连，不支持时跳过并注入占位提示</option>
               {#each configs as c}
                 <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
               {/each}
             </select>
           </div>
+          <div class="role-item">
+            <span class="role-name">降级备用渠道 (Fallbacks)</span>
+            <input
+              placeholder="逗号分隔配置名/id；留空用 config.toml [gateway].fallback_configs"
+              value={(roles.fallbacks || []).join(', ')}
+              title="主渠道当轮调用失败时按序切换重试；每次切换发 Notice"
+              on:change={(e) => {
+                roles.fallbacks = e.target.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+                autoSave({ roles }, 0);
+              }}
+            />
+          </div>
         </div>
+        <div class="param-hint">摘要/标题未配置=主力代跑；多模态专家仅主力不支持该媒体时启用，未配置则注入占位提示</div>
       </div>
     </div>
   </div>
