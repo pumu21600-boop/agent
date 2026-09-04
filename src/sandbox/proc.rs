@@ -21,7 +21,7 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         SystemInformation::GetSystemDirectoryW,
         Threading::{
-            CreateProcessAsUserW, GetExitCodeProcess, ResumeThread, WaitForSingleObject,
+            CreateProcessAsUserW, CreateProcessW, GetExitCodeProcess, ResumeThread, WaitForSingleObject,
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
             STARTF_USESTDHANDLES, STARTUPINFOW,
         },
@@ -61,6 +61,10 @@ pub(crate) fn system_dir() -> PathBuf {
 /// restricted=true：受限 token + 白名单环境（权限笼）；false：完整用户 token + 继承父环境（本机直跑）。
 /// 两种模式都保留 Job 生命周期保险丝（kill-on-close、超时整树击杀）。
 pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
+    // P12 019：AppContainer 模式——LowBox token 由 SECURITY_CAPABILITIES 启动属性创建
+    if spec.appcontainer {
+        return spawn_appcontainer_impl(spec);
+    }
     let token = if spec.restricted {
         token::create_restricted_token()?
     } else {
@@ -150,6 +154,150 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
                 "app": spec.application.display().to_string(),
                 "working_dir": spec.working_dir.display().to_string(),
                 "restricted": spec.restricted,
+                "timeout_ms": spec.limits.timeout_ms,
+                "memory_mb": spec.limits.memory_mb,
+                "active_processes": spec.limits.active_processes,
+            }),
+        );
+
+        Ok(SandboxChild { job, process: pi.hProcess, pid: pi.dwProcessId, readers: Some(readers), closed: false })
+    }
+}
+
+/// AppContainer 模式 spawn（P12 019）：profile/SID/ACE → STARTUPINFOEX(SECURITY_CAPABILITIES)
+/// → CreateProcessW（挂起）→ Job → Resume。管道/Job/读取线程与 restricted 模式共用。
+/// 白名单环境照用（AppContainer 不继承父环境）；默认断网（能力 SID 白名单空）。
+fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
+    use super::appcontainer;
+    use windows_sys::Win32::System::Threading::{
+        InitializeProcThreadAttributeList, UpdateProcThreadAttribute, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, STARTUPINFOEXW,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    };
+    use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
+
+    unsafe {
+        // 1) profile + 派生 SID（allow_network 决定是否带 INTERNET_CLIENT 能力）
+        let sid_guard = appcontainer::ensure_sid(spec.allow_network)
+            .map_err(|e| anyhow!("AppContainer profile 失败: {e}"))?;
+        // 2) 工作区目录 ACE（AppContainer 默认对任意目录无权限；失败仅告警不阻断）
+        if let Some(sid_str) = appcontainer::sid_to_string(sid_guard.sid) {
+            if let Err(e) = appcontainer::grant_dir_access(&spec.working_dir, &sid_str) {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "sandbox.appcontainer.warn", "message": e }),
+                );
+            }
+        }
+        // 3) 属性列表 + SECURITY_CAPABILITIES（指向 sid_guard 内的 SID，须保活到 CreateProcess 后）
+        let mut attr_size = 0usize;
+        let _ = InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size);
+        let mut attr_buf = vec![0u8; attr_size];
+        let attr_list = attr_buf.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
+            bail!("InitializeProcThreadAttributeList 失败");
+        }
+        let mut sec_caps: SECURITY_CAPABILITIES = mem::zeroed();
+        sec_caps.AppContainerSid = sid_guard.sid;
+        if UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+            &mut sec_caps as *mut SECURITY_CAPABILITIES as *mut c_void,
+            size_of::<SECURITY_CAPABILITIES>(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ) == 0
+        {
+            bail!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) 失败");
+        }
+
+        // 4) 管道骨架（与 restricted 模式一致）
+        let job = JobGuard::new(&spec.limits, true)?;
+        if !spec.working_dir.exists() {
+            bail!("工作目录不存在: {}", spec.working_dir.display());
+        }
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let (out_r, out_w) = create_pipe(&sa)?;
+        let (err_r, err_w) = create_pipe(&sa)?;
+        SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+        let nul = CreateFileW(
+            wide("NUL").as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_EXISTING,
+            0,
+            0,
+        );
+        if nul == 0 || nul == -1 {
+            return Err(anyhow!("打开 NUL 失败: {}", GetLastError()));
+        }
+
+        // 5) STARTUPINFOEXW + CreateProcessW（AppContainer 走 W 版 + 扩展属性）
+        let mut six: STARTUPINFOEXW = mem::zeroed();
+        six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdInput = nul;
+        six.StartupInfo.hStdOutput = out_w;
+        six.StartupInfo.hStdError = err_w;
+        six.lpAttributeList = attr_list;
+
+        let app = wide(spec.application.to_str().ok_or_else(|| anyhow!("application 路径非 UTF-8"))?);
+        let mut cmd_line = wide(&spec.command_line);
+        let cwd = wide(spec.working_dir.to_str().ok_or_else(|| anyhow!("working_dir 非 UTF-8"))?);
+        let env = build_env_block();
+
+        let mut pi: PROCESS_INFORMATION = mem::zeroed();
+        if CreateProcessW(
+            app.as_ptr(),
+            cmd_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            env.as_ptr() as *const c_void,
+            cwd.as_ptr(),
+            &mut six.StartupInfo,
+            &mut pi,
+        ) == 0
+        {
+            DeleteProcThreadAttributeList(attr_list);
+            CloseHandle(out_r);
+            CloseHandle(err_r);
+            CloseHandle(nul);
+            let e = GetLastError();
+            return Err(anyhow!(
+                "AppContainer CreateProcessW 失败: {e}（LowBox 下进程可能初始化失败，可切回 mode=restricted）"
+            ));
+        }
+        DeleteProcThreadAttributeList(attr_list);
+        drop(attr_buf);
+        CloseHandle(out_w);
+        CloseHandle(err_w);
+        CloseHandle(nul);
+
+        job.assign(pi.hProcess)?;
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+
+        let readers = (spawn_reader(out_r), spawn_reader(err_r));
+
+        observability::event(
+            EventType::State,
+            json!({
+                "kind": "sandbox.spawn",
+                "pid": pi.dwProcessId,
+                "app": spec.application.display().to_string(),
+                "working_dir": spec.working_dir.display().to_string(),
+                "appcontainer": true,
+                "allow_network": spec.allow_network,
+                "restricted": true,
                 "timeout_ms": spec.limits.timeout_ms,
                 "memory_mb": spec.limits.memory_mb,
                 "active_processes": spec.limits.active_processes,

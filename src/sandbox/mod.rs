@@ -6,6 +6,7 @@
 //!
 //! 留口（不实现）：AppContainer / 网络出向限制 / 完整性降级（P12）；交互式输入（P4 视需要）。
 
+mod appcontainer;
 mod job;
 mod proc;
 pub mod probes;
@@ -36,6 +37,10 @@ pub struct SandboxSpec {
     /// true=权限笼（受限 token + 白名单环境 + 资源/UI 上限）；
     /// false=本机直跑（完整用户 token + 继承父环境，仅留超时团灭保险丝）
     pub restricted: bool,
+    /// P12 019：AppContainer 模式（LowBox token + 能力 SID；restricted 被忽略）
+    pub appcontainer: bool,
+    /// P12 019：AppContainer 网络出向（false=断网；true=授予 INTERNET_CLIENT 能力）
+    pub allow_network: bool,
 }
 
 /// 一次受限运行的产出。

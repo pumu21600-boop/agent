@@ -37,6 +37,13 @@ default_approval = "auto"
 allow_unsandboxed = true
 # 完全访问档下，执行类命令是否仍要审批（false=连审批一起跳过，Codex Full Access 等价）
 unsandboxed_approval = false
+# P12 019：沙箱隔离模式与网络出向见下方 [sandbox] 节
+
+[sandbox]
+# P12 019：隔离模式（实验特性）："restricted"（默认，受限 token 权限笼）| "appcontainer"（LowBox + 能力 SID）
+# appcontainer 模式：默认断网（无 INTERNET_CLIENT 能力）；工作区目录自动授 ACE；异常时切回 restricted 即可
+# mode = "restricted"  # 切 appcontainer：mode = "appcontainer"（实验特性，真机验证 cmd/git 可用、默认断网）
+# allow_network = false
 
 [context]
 # P5 上下文预算：全 messages 超过此 token 估算值才触发裁剪

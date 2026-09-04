@@ -124,6 +124,18 @@ pub struct SandboxConfig {
     /// 进程树内活跃进程数上限
     #[serde(default = "default_sandbox_active_processes")]
     pub active_processes: u32,
+    /// P12 019：隔离模式 "restricted"（默认，受限 token）| "appcontainer"（LowBox + 能力 SID，默认断网；实验特性）
+    #[serde(default = "default_sandbox_mode")]
+    pub mode: String,
+    /// P12 019：启用 AppContainer 模式（mode=appcontainer 时有效）
+    #[serde(default)]
+    pub appcontainer: bool,
+    /// P12 019：AppContainer 网络出向（仅 appcontainer 模式生效）
+    #[serde(default)]
+    pub allow_network: bool,
+}
+fn default_sandbox_mode() -> String {
+    "restricted".into()
 }
 
 /// 上下文工程参数（施工单 006）。
@@ -250,6 +262,9 @@ impl Default for SandboxConfig {
             timeout_ms: default_sandbox_timeout_ms(),
             memory_mb: default_sandbox_memory_mb(),
             active_processes: default_sandbox_active_processes(),
+            mode: default_sandbox_mode(),
+            appcontainer: false,
+            allow_network: false,
         }
     }
 }

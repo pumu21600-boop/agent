@@ -56,6 +56,8 @@ fn cmd_spec(command: &str, working_dir: &Path, limits: SandboxLimits) -> Sandbox
         working_dir: working_dir.to_path_buf(),
         limits,
         restricted: true,
+        appcontainer: false,
+        allow_network: false,
     }
 }
 
@@ -247,6 +249,8 @@ pub fn probe_memory_cap(limits: SandboxLimits) -> ProbeResult {
             working_dir: probe_workdir(),
             limits: SandboxLimits { timeout_ms: 60_000, memory_mb, ..limits },
             restricted: true,
+        appcontainer: false,
+        allow_network: false,
         })
     };
     let control = run_hog(512, 2048);
@@ -315,8 +319,34 @@ mod tests {
     use super::*;
     use crate::config::SandboxConfig;
 
+    /// P12 019：AppContainer 真机探针（ignored，手工跑：cargo test appcontainer_smoke -- --ignored --nocapture）
+    #[test]
+    #[ignore]
+    fn appcontainer_smoke() {
+        use super::*;
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent_ac_probe_logs"),
+            "ac-probe.jsonl",
+            "ac-probe".into(),
+        );
+        let ws = crate::tools::workspace_root();
+        let spec = SandboxSpec {
+            application: crate::sandbox::system_cmd(),
+            command_line: format!(r#""{}" /c echo hi-from-appcontainer"#, crate::sandbox::system_cmd().display()),
+            working_dir: ws,
+            limits: SandboxLimits { timeout_ms: 15_000, memory_mb: 1024, active_processes: 32 },
+            restricted: true,
+            appcontainer: true,
+            allow_network: false, // 默认断网（NULL capabilities 分支）
+        };
+        let out = crate::sandbox::run(&spec).expect("AppContainer spawn 失败");
+        println!("[appcontainer] exit={:?} timed_out={} stdout={:?}", out.exit_code, out.timed_out, out.stdout.trim());
+        assert!(!out.timed_out);
+        assert!(out.stdout.contains("hi-from-appcontainer"), "输出应包含回显");
+    }
+
     fn cfg() -> SandboxConfig {
-        SandboxConfig { timeout_ms: 10_000, memory_mb: 1024, active_processes: 64 }
+        SandboxConfig { timeout_ms: 10_000, memory_mb: 1024, active_processes: 64, mode: "restricted".into(), appcontainer: false, allow_network: false }
     }
 
     fn probe(name: &str, r: ProbeResult) -> ProbeResult {
