@@ -298,6 +298,29 @@ pub fn parse_plan(text: &str) -> Option<Plan> {
     }
 }
 
+/// P12 018：同轮 write_file 同路径写冲突检测——返回应跳过的索引集合。
+/// 输入 (工具名, arguments JSON)；仅认 write_file；路径小写 + 反斜杠归一后判重。
+fn write_conflict_skips(calls: &[(String, String)]) -> std::collections::HashSet<usize> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, (name, args_json)) in calls.iter().enumerate() {
+        if name != "write_file" {
+            continue;
+        }
+        let path = serde_json::from_str::<Value>(args_json)
+            .ok()
+            .and_then(|v| v.get("path").and_then(Value::as_str).map(|p| p.to_lowercase().replace('\\', "/")))
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        if !seen.insert(path) {
+            skip.insert(i);
+        }
+    }
+    skip
+}
+
 /// 取行内第一个中/英文冒号后的内容（剥 markdown 加粗星号）。
 /// 用 char_indices 定位，避免全角冒号（3 字节）切出非字符边界。
 fn after_colon(line: &str) -> String {
@@ -641,13 +664,23 @@ pub async fn run_task(
             "tool_calls": calls_json,
         }));
 
-        // 逐个执行工具
+        // —— P12 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
         let exec_cfg = ExecConfig {
             sandbox: sandbox_cfg.clone(),
             max_chars: cfg.tool_result_max_chars,
             unsandboxed: !gate.sandbox_enabled(),
         };
-        for call in turn.tool_calls {
+        use futures_util::StreamExt;
+
+        // 阶段一「判定」（串行）：Plan 拦截 / 审批弹窗 / 取消——全部现有语义不变
+        struct Decision {
+            approved: bool,
+            plan_reason: Option<String>,
+            risk: u8,
+            skip_conflict: bool,
+        }
+        let mut decisions: Vec<Decision> = Vec::with_capacity(turn.tool_calls.len());
+        for call in &turn.tool_calls {
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
@@ -661,11 +694,7 @@ pub async fn run_task(
             on_event(AgentEvent::ToolCall { name: call.name.clone(), args: call.arguments.clone() });
             observability::debug(&format!("[loop] 工具 {} 参数 {}", call.name, call.arguments));
 
-            // P9 细粒度审批规则引擎：按工具名及具体参数动态评估风险，替代“一刀切”
-            // （审批请求的 SSE/JSONL/等待全部由 gate 单点负责，避免双事件双 id）
-            let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
-            // P9 B2：Plan 档直接驳回**优先于审批流**——只读放行，写/执行类不弹审批窗、
-            // 直接拦下并把原因回喂模型（要求调整计划），与「拒绝后回喂」同一回填路径
+            // P9 B2：Plan 档拦截优先于审批流；P9 细粒度审批单点不变
             let plan_reason = gate.plan_block_reason(&call.name, &call.arguments);
             let approved = match &plan_reason {
                 Some(_) => false,
@@ -674,7 +703,91 @@ pub async fn run_task(
                 }
                 None => true,
             };
-            let (content, ok) = if let Some(reason) = &plan_reason {
+            let (risk, _) = crate::core::rules::evaluate_risk(
+                &call.name,
+                &serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({})),
+                &tools::workspace_root(),
+            );
+            decisions.push(Decision {
+                approved,
+                plan_reason,
+                risk: risk.as_u8(),
+                skip_conflict: false,
+            });
+        }
+
+        // 写冲突检测（P12 018）：同轮 write_file 同路径 → 仅首个执行，其余跳过回喂
+        {
+            let calls: Vec<(String, String)> = turn
+                .tool_calls
+                .iter()
+                .map(|c| (c.name.clone(), c.arguments.clone()))
+                .collect();
+            for i in write_conflict_skips(&calls) {
+                let d = &mut decisions[i];
+                if d.approved && d.plan_reason.is_none() && !d.skip_conflict {
+                    d.skip_conflict = true;
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "write.conflict", "step": step, "tool": turn.tool_calls[i].name, "arguments": turn.tool_calls[i].arguments }),
+                    );
+                }
+            }
+        }
+
+        // 阶段二「执行」：Safe 只读组并行（无副作用无竞态），写/执行组串行独占
+        let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
+        let parallel: Vec<usize> = (0..turn.tool_calls.len())
+            .filter(|&i| {
+                let d = &decisions[i];
+                d.approved && d.plan_reason.is_none() && !d.skip_conflict && d.risk == 0
+            })
+            .collect();
+        if parallel.len() > 1 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "tools.parallel", "step": step, "count": parallel.len() }),
+            );
+        }
+        let mut futs = futures_util::stream::FuturesUnordered::new();
+        for &i in &parallel {
+            let call = &turn.tool_calls[i];
+            let cfg = exec_cfg.clone();
+            let name = call.name.clone();
+            let args = call.arguments.clone();
+            futs.push(Box::pin(async move { (i, tools::execute(&cfg, &name, &args).await) }));
+        }
+        // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
+        while let Some((i, r)) = futs.next().await {
+            let call = &turn.tool_calls[i];
+            let (content, ok) = match r {
+                Ok(s) => (s, true),
+                Err(e) => (format!("工具执行失败: {e}"), false),
+            };
+            let preview: String = content.chars().take(300).collect();
+            observability::event(
+                EventType::ToolResult,
+                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
+            );
+            on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            results[i] = (content, ok);
+        }
+
+        // 串行组（Plan 拦截 / 拒绝 / 写冲突 / 写类）：原逻辑逐个保持
+        for i in 0..turn.tool_calls.len() {
+            if parallel.contains(&i) {
+                continue;
+            }
+            if cancel.is_set() {
+                observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                emit_checkpoint_bar(baseline, &on_event).await;
+                return Ok(LoopOutcome::Cancelled);
+            }
+            let call = &turn.tool_calls[i];
+            let d = &decisions[i];
+            let danger = tools::find(&call.name).map(|s| s.danger_level).unwrap_or(2);
+            let (content, ok) = if let Some(reason) = &d.plan_reason {
                 observability::event(
                     EventType::State,
                     json!({ "kind": "plan.blocked", "step": step, "tool": call.name, "reason": reason }),
@@ -686,7 +799,16 @@ pub async fn run_task(
                     ),
                     true,
                 )
-            } else if !approved {
+            } else if d.skip_conflict {
+                on_event(AgentEvent::Notice(format!(
+                    "写冲突已跳过 {}：本轮已有对同一文件的写操作",
+                    call.name
+                )));
+                (
+                    "写冲突：本轮已有对同一文件的写操作，本次已跳过。请把对同一文件的多次写入拆分到不同轮次。".to_string(),
+                    true,
+                )
+            } else if !d.approved {
                 ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
             } else {
                 // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断
@@ -717,16 +839,20 @@ pub async fn run_task(
                     Err(e) => (format!("工具执行失败: {e}"), false),
                 }
             };
-
+            // 串行组 result 事件即时发（与原行为一致）
             let preview: String = content.chars().take(300).collect();
-            let truncated = content.contains(context::OMITTED_MARK);
             observability::event(
                 EventType::ToolResult,
-                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": truncated, "preview": preview }),
+                json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
             );
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
-            // P7 事件流水：工具调用结果
-            mem.record("tool.call", json!({ "name": call.name, "danger": danger, "ok": ok }));
+            results[i] = (content, ok);
+        }
+
+        // —— 统一回填（按 tool_calls 原顺序，协议友好）——
+        for (i, call) in turn.tool_calls.iter().enumerate() {
+            let (content, ok) = &results[i];
+            mem.record("tool.call", json!({ "name": call.name, "ok": ok }));
             msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));
         }
         // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
@@ -752,6 +878,25 @@ mod tests {
     }
 
     // —— P9 B3：plan 块解析 ——
+    // —— P12 018：写冲突检测 ——
+    #[test]
+    fn write_conflict_detection() {
+        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
+        let calls = vec![
+            mk("write_file", r#"{"path": "src/a.rs"}"#),
+            mk("read_file", r#"{"path": "src/a.rs"}"#),
+            mk("write_file", r#"{"path": "SRC\\a.rs"}"#), // 大小写+反斜杠归一后同路径
+            mk("write_file", r#"{"path": "src/b.rs"}"#),
+            mk("shell", r#"{"command": "del x"}"#),
+        ];
+        let skip = write_conflict_skips(&calls);
+        assert!(!skip.contains(&0), "首个写不跳过");
+        assert!(!skip.contains(&1), "read_file 不参与检测");
+        assert!(skip.contains(&2), "同路径（归一后）第二个写跳过");
+        assert!(!skip.contains(&3), "不同路径不跳过");
+        assert_eq!(skip, [2usize].into_iter().collect());
+    }
+
     #[test]
     fn parse_plan_standard_block() {
         let text = "好的，我先调研一下。\n```plan\n目标: 重构审批模块\n步骤:\n1. 梳理 gate 调用点\n2. 抽出纯函数\n3. 补单测\n文件: src/core/agent.rs, src/server.rs\n```\n等待批准。";
