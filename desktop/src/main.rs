@@ -1,8 +1,8 @@
 //! Agent 桌面壳（P13，施工单 020）—— 窗口 + 托盘 + 服务保活
 //!
 //! 设计（窄而刚 v0）：
-//! - WebView 直接加载 http://127.0.0.1:8321（前端零改动，agent.exe 是唯一真源）；
-//! - 启动时探测 8321，未起则 spawn `<repo>/target/release/agent.exe`（start.bat 内置化）；
+//! - WebView 直接加载 http://127.0.0.1:5173（前端零改动，agent.exe 是唯一真源）；
+//! - 启动时探测 5173，未起则 spawn `<repo>/target/release/agent.exe`（start.bat 内置化）；
 //! - 托盘：左键显示/聚焦窗口，右键菜单（打开主窗口 / 退出壳）；
 //! - 壳退出**不杀**服务（服务独立生命周期）；
 //! - agent.exe 路径按开发机布局解析（desktop/ 的上两级 target/release）；
@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use tauri::Manager;
 
-const SERVICE_URL: &str = "127.0.0.1:8321";
+const SERVICE_URL: &str = "127.0.0.1:5173";
 
 /// 服务 exe 路径：desktop/ 的上两级 target\release\agent.exe（开发机布局）。
 fn service_exe() -> PathBuf {
@@ -70,7 +70,7 @@ fn ensure_service() -> Option<u32> {
 use std::path::Path;
 
 fn main() {
-    // 服务保活先于窗口（窗口加载 8321，服务没起会白屏）
+    // 服务保活先于窗口（窗口加载 5173，服务没起会白屏）
     ensure_service();
 
     tauri::Builder::default()
@@ -84,7 +84,7 @@ fn main() {
 
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().expect("缺窗口图标").clone())
-                .tooltip("Agent（127.0.0.1:8321）")
+                .tooltip("Agent（127.0.0.1:5173）")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id.as_ref() {

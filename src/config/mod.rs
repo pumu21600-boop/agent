@@ -189,7 +189,7 @@ fn default_host() -> String {
     "127.0.0.1".to_string()
 }
 fn default_port() -> u16 {
-    8321
+    5173
 }
 fn default_base_url() -> String {
     "https://api.deepseek.com".to_string()

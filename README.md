@@ -55,7 +55,7 @@ agent/
 ## 快速启动
 
 **日常使用（脱离终端，推荐）**：双击 `start.bat` 后台启动（隐藏窗口），双击 `stop.bat` 停止。
-打开 http://127.0.0.1:8321 。
+打开 http://127.0.0.1:5173 。
 
 **开发模式**：
 
@@ -65,7 +65,7 @@ cd ..; cargo build --release         # 构建 release 二进制（start.bat 依�
 cargo run                            # 前台调试运行（关终端即停）
 ```
 
-**前端热更**：双击 `dev.bat`（vite 起在 5173，/api 与 /cancel 自动代理到 8321），改 `web/src` 即时生效，无需构建。
+**前端热更**：双击 `dev.bat`（vite 起在 5174，/api 与 /cancel 自动代理到 5173 主服务），改 `web/src` 即时生效，无需构建。
 
 ## 本机工具链（2026-09-14 装齐）
 
@@ -169,7 +169,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 node scripts/mock_provider.mjs          # 终端 1：127.0.0.1:9399
 $env:DEEPSEEK_BASE_URL = "http://127.0.0.1:9399"
 $env:DEEPSEEK_API_KEY = "sk-test"
-cargo run                                # 终端 2：127.0.0.1:8321
+cargo run                                # 终端 2：127.0.0.1:5173
 ```
 
 评测：`cargo run --bin eval`（临时工作区隔离 + 断言引擎 + 报告与 exit code，任务集在 `evals/tasks/`）。

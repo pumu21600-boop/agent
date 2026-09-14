@@ -1,6 +1,6 @@
 //! eval 评测 CLI —— 施工单 015（P10-B）
 //!
-//! 对运行中的服务（默认 http://127.0.0.1:8321）做 HTTP 黑盒驱动评测：
+//! 对运行中的服务（默认 http://127.0.0.1:5173）做 HTTP 黑盒驱动评测：
 //! 每个任务在独立临时工作区跑一轮真实对话，按任务定义断言文件系统与 SSE 事件。
 //!
 //! 用法（项目根目录）：
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
-    let mut base = "http://127.0.0.1:8321".to_string();
+    let mut base = "http://127.0.0.1:5173".to_string();
     let mut keep = false;
     let mut filter: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);

@@ -3,7 +3,8 @@
 
 [server]
 host = "127.0.0.1"
-port = 8321
+# 主服务端口（用户习惯地址；前端热更服务器见 dev.bat，走 5174 并反代到这里）
+port = 5173
 
 [gateway]
 # DeepSeek 官方渠道

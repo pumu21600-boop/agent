@@ -1,11 +1,11 @@
 //! 服务自管理（P13 前置）：双击即用 + 后台常驻 + 开机自启，不再依赖 start/stop.bat。
 //!
 //! 行为：
-//! - 无参数双击：8321 已在跑 → 直接打开浏览器；未跑 → 自己以后台方式再起一个（隐藏窗口，
+//! - 无参数双击：5173 已在跑 → 直接打开浏览器；未跑 → 自己以后台方式再起一个（隐藏窗口，
 //!   关终端不影响），然后打开浏览器；已是后台子进程则直接跑服务。
 //! - `agent.exe start`：后台启动服务（已跑则只开浏览器），与双击等价但不阻塞终端。
 //! - `agent.exe stop`：结束其他 agent.exe 服务进程（不杀自己）。
-//! - `agent.exe status`：打印 8321 监听状态与进程信息。
+//! - `agent.exe status`：打印 5173 监听状态与进程信息。
 //! - `agent.exe --install`：写 HKCU Run 开机自启（最小化启动）；`--uninstall` 移除。
 //! - `agent.exe --minimized`：后台子进程入口（隐藏窗口跑服务）。
 
@@ -18,7 +18,7 @@ fn exe_path() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent.exe"))
 }
 
-/// 8321 是否已有监听（TCP 连接探针，200ms 超时）。
+/// 5173 是否已有监听（TCP 连接探针，200ms 超时）。
 pub fn port_open(host: &str, port: u16) -> bool {
     let addr = format!("{host}:{port}");
     std::net::TcpStream::connect_timeout(

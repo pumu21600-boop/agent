@@ -128,7 +128,7 @@
 ## 5. 示例
 
 ```json
-{"ts":"2026-09-02T07:04:12.345Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","event_type":"state","payload":{"kind":"startup","base_url":"https://api.deepseek.com","model":"deepseek-chat","host":"127.0.0.1","port":8321}}
+{"ts":"2026-09-02T07:04:12.345Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","event_type":"state","payload":{"kind":"startup","base_url":"https://api.deepseek.com","model":"deepseek-chat","host":"127.0.0.1","port":5173}}
 {"ts":"2026-09-02T07:04:15.102Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","event_type":"state","payload":{"kind":"gateway.request","url":"https://api.deepseek.com/chat/completions","body":{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}],"stream":true}}}
 {"ts":"2026-09-02T07:04:15.402Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","event_type":"model_chunk","payload":{"raw":"{\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}","content":"你好"}}
 {"ts":"2026-09-02T07:04:16.001Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","event_type":"error","payload":{"message":"渠道返回 401 Unauthorized: ..."}}
