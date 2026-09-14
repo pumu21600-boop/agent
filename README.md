@@ -181,4 +181,4 @@ cargo run                                # 终端 2：127.0.0.1:5173
 - **MCP**：只做了 stdio transport + tools；HTTP/SSE transport、resources/prompts 未做。
 - **WASM 插件**：单函数 ABI（alloc/describe/run）、零 host function 的纯计算沙箱。
 - **eval 任务集**：首批 3 个（hello-file / fix-json / read-only-plan），后续功能未覆盖。
-- **远端备份**：仓库未配置 origin，代码只在本地。
+- **远端备份**：已推送到 GitHub 私有仓库 `https://github.com/pumu21600-boop/agent`（origin：`dev` 为主线 + 8 个历史阶段分支 + 全部标签）。
