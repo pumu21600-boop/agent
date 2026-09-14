@@ -1,9 +1,10 @@
 @echo off
-rem Stop the background Agent process.
-taskkill /F /IM agent.exe >nul 2>&1
-if %errorlevel%==0 (
-  echo [stop] Agent stopped.
-) else (
-  echo [stop] No running agent process.
+rem Legacy entry: forwards to agent.exe self-management.
+cd /d "%~dp0"
+if not exist "target\release\agent.exe" (
+  echo [stop] target\release\agent.exe not found. Nothing to stop.
+  pause
+  exit /b 1
 )
+target\release\agent.exe stop
 pause
