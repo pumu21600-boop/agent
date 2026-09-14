@@ -26,6 +26,8 @@ max_rpm = 0
 [logging]
 dir = "logs"
 file = "agent.jsonl"
+# 单文件轮转上限（MB）：超过就归档成 agent.jsonl.1（只留一份）再开新文件；0=不轮转
+max_mb = 20
 
 [agent]
 # 核心循环（施工单 003）

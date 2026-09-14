@@ -46,7 +46,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         manifest.join(&config.logging.dir)
     };
-    observability::init(&log_dir, &config.logging.file, session_id.clone())?;
+    observability::init_with_max(
+        &log_dir,
+        &config.logging.file,
+        session_id.clone(),
+        config.logging.max_mb.saturating_mul(1024 * 1024),
+    )?;
     observability::debug(&format!(
         "logger ready: {}",
         log_dir.join(&config.logging.file).display()

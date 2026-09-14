@@ -180,6 +180,9 @@ pub struct LoggingConfig {
     pub dir: String,
     #[serde(default = "default_log_file")]
     pub file: String,
+    /// 单文件轮转上限（MB）：超过就归档成 `<file>.1`（只留一份），0 = 不轮转
+    #[serde(default = "default_log_max_mb")]
+    pub max_mb: u64,
 }
 
 fn default_host() -> String {
@@ -199,6 +202,9 @@ fn default_log_dir() -> String {
 }
 fn default_log_file() -> String {
     "agent.jsonl".to_string()
+}
+fn default_log_max_mb() -> u64 {
+    20
 }
 fn default_max_steps() -> u32 {
     8
@@ -242,7 +248,11 @@ impl Default for GatewayConfig {
 }
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { dir: default_log_dir(), file: default_log_file() }
+        Self {
+            dir: default_log_dir(),
+            file: default_log_file(),
+            max_mb: default_log_max_mb(),
+        }
     }
 }
 impl Default for AgentConfig {

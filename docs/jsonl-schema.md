@@ -3,8 +3,11 @@
 ## 1. 文件位置
 
 - 默认：`logs/agent.jsonl`（相对工程根目录）
-- 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file`
-- 追加写（append-only），进程每次启动生成新的 `session_id`，旧内容不清理
+- 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file` / `max_mb`
+- 追加写（append-only），进程每次启动生成新的 `session_id`
+- **轮转**（2026-09-14 补）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成 `agent.jsonl.1`
+  （覆盖上一份归档、只留一份）再开新文件；启动时检查一次，运行中每 500 条复查一次，
+  轮转本身记一条 `state / log.rotated`；`max_mb = 0` 关闭轮转
 
 ## 2. 记录格式（每条一行）
 
@@ -21,7 +24,7 @@
 
 - 单行一条：序列化为一行 JSON + `\n`，**一次 write_all 写完**，立即 `flush()`
 - 不允许多线程交错写入（内部 Mutex），不产生半行
-- 新增事件一律通过 `src/logging.rs` 的 `logging::event()` 写入
+- 新增事件一律通过 `src/observability/mod.rs` 的 `observability::event()` 写入
 
 ## 3. event_type 枚举（定死 6 类）
 
@@ -90,6 +93,31 @@
 | `memory.summary_skipped` | 摘要调用失败，降级保留占位符（P7） | `step`、`note` |
 | `model.truncated` | 模型输出被 max_tokens 截断（P7.6），SSE 已提示用户 | `step`、`max_output_tokens` |
 | `gateway.retry_429` | 渠道 429 退避重试中（P7.5） | `attempt`、`wait_ms` |
+| `task.start` | 任务开始（P10 trace 的任务切分锚点） | — |
+| `gateway.error` | 渠道返回非 2xx | `status`、`body` |
+| `gateway.throttle` | 本地限流排队（P8 `max_rpm`） | `wait_ms` |
+| `gateway.fallback` | 降级链切换渠道（P8） | `step`、`from`、`to`、`base_url` |
+| `config.changed` | 配置新建/删除/切换（P8.5） | `action`（new/delete/apply）、`provider_id`、`model` |
+| `approval.mode` | 审批档位切换（P9，进行中请求即时生效） | `mode` |
+| `plan.mode` | 本轮任务处于 Plan 档（P9） | `mode`（plan）、`step` |
+| `plan.blocked` | Plan 档拦截非只读工具并回喂模型（P9） | `step`、`tool`、`reason` |
+| `plan.proposed` | 最终回答解析出结构化计划（P9） | `step`、`steps`、`files` |
+| `tools.parallel` | 同轮多个只读工具并行执行（P12） | `step`、`count` |
+| `write.conflict` | 同轮写同一路径，后者跳过并回喂（P12） | `step`、`tool`、`arguments` |
+| `sandbox.appcontainer.warn` | AppContainer 属性装配失败退化的提示（P12） | `message` |
+| `memory.agents_saved` | 约定文件保存（P10.5；scope=system/global/project） | `scope`、`path` |
+| `memory.reindex` | 记忆库强制重建向量（P14） | — |
+| `memory.search` | 记忆库检索（P14） | `query`、`hits`、`mode` |
+| `memory.similar` | 「相似会话」检索（P14） | `id`、`hits` |
+| `session.created` | 新建空会话立即落盘（09-14 补） | `session`、`workspace` |
+| `session.titled` | 会话标题自动生成 | `title` |
+| `workspace.switched` | 切换工作区 | `from`、`to` |
+| `workspace.removed` | 从项目列表移除工作区（不删目录） | `path` |
+| `workspace.aliased` | 项目重命名（空名=清除别名） | `path`、`name` |
+| `git.committed` | 界面手动提交（P10.5） | `id`、`files`、`manual` |
+| `attachments.gitignored` | 附件目录自动写入工作区 .gitignore | `path` |
+| `media.error` | 多模态理解调用失败（DSH 转接规范） | `modality`、`model`、`url`、`error` |
+| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补） | `bytes`、`limit_bytes` |
 
 ### 4.5 error —— 错误
 
@@ -110,6 +138,7 @@
 
 - **API key 永不写入 JSONL / 任何文件 / 控制台**（只存在于环境变量与内存中的 Authorization 头）
 - 事件类型只允许上述 6 类，不新增
+- `state` 的 `kind` 只增不改名；新增 kind 必须同步更新本文件
 - 每行必须完整，验收可用 `tail -1` / 逐行 JSON 解析校验
 
 ## 7. 项目记忆 events.log（P7，区别于本文件）
