@@ -42,7 +42,7 @@ pub struct RolesConfig {
     /// 会话标题生成（TITLE_GENERATION）
     #[serde(default)]
     pub title: Option<String>,
-    /// 向量嵌入（EMBEDDING，接口已预留 gateway.embed，暂无消费方）
+    /// 向量嵌入（EMBEDDING，记忆库语义检索消费；未配置时用本地哈希向量）
     #[serde(default)]
     pub embedding: Option<String>,
 }

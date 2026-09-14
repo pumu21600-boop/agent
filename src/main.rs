@@ -9,11 +9,13 @@ mod gateway;
 mod memory;
 mod observability;
 mod plugin;
-mod recovery;
-mod sandbox;
-mod server;
-mod session;
-mod tools;
+ mod recovery;
+ mod sandbox;
+ mod server;
+ mod service;
+ mod session;
+ mod skills;
+ mod tools;
 
 use std::{
     path::{Path, PathBuf},
@@ -26,6 +28,13 @@ async fn main() -> anyhow::Result<()> {
 
     // —— 配置：config.toml（server/logging/gateway 种子）——
     let config = config::load(&manifest.join("config.toml"))?;
+
+    // —— 服务自管理（P13 前置）：start/stop/status/--install/双击智能启动——
+    // 接管后直接返回，不跑服务；--minimized 后台子进程与无参服务进程继续往下走。
+    let argv: Vec<String> = std::env::args().collect();
+    if service::handle(&argv, &config.server.host, config.server.port) {
+        return Ok(());
+    }
 
     // —— 供应商预设：providers.json 数据驱动 ——
     gateway::providers::init(&manifest.join("providers.json"))?;
@@ -78,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
         "用中文简洁回答。".to_string()
     });
     let approval_default = config.agent.default_approval.clone();
+    // 开箱即用：启动时预定位 git.exe（发现链含 PATH/注册表/标准位置/捆绑目录），
+    // 并把 git 相关目录登记进沙箱 PATH——shell 工具里按名调 git 也即刻可用
+    if let Err(e) = tools::git_exe() {
+        observability::debug(&format!("[git] {e}（git 工具将不可用，其余功能不受影响）"));
+    }
     // P8.2 工作区：settings 里记了就用它（存在才生效），否则工程根
     let ws = match user_settings.workspace.as_deref() {
         Some(p) => {
@@ -106,7 +120,10 @@ async fn main() -> anyhow::Result<()> {
         context_cfg: Arc::new(config.context),
         recovery_cfg: Arc::new(config.recovery),
         system_prompt: Arc::new(system_prompt),
+        prompt_path: Arc::new(prompt_path),
         session: Arc::new(session::SessionManager::new(&log_dir)),
+        // 记忆库索引落在 <log_dir>/memory/library.json（派生缓存）
+        log_dir: Arc::new(log_dir.clone()),
         memory,
         mem_cfg,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

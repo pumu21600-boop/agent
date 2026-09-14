@@ -166,14 +166,16 @@ pub struct LoopChannels {
 /// 再算相对基线的 numstat；无改动不发。撤销 = 影子仓库 reset --hard 回基线。
 async fn emit_checkpoint_bar(
     baseline: Option<String>,
+    session_id: &str,
     on_event: &(dyn Fn(AgentEvent) + Send + Sync),
 ) {
     let Some(base) = baseline else { return };
     let ws = tools::workspace_root().to_path_buf();
+    let sid = session_id.to_string();
     let res = tokio::task::spawn_blocking({
         let base = base.clone();
         move || -> anyhow::Result<(usize, u64, u64)> {
-            recovery::checkpoint(&ws, "任务结束快照")?;
+            recovery::checkpoint(&ws, "任务结束快照", &sid)?;
             recovery::diff_stat(&ws, &base)
         }
     })
@@ -216,6 +218,11 @@ pub trait ApprovalGate: Send + Sync {
     }
     /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）
     fn sandbox_enabled(&self) -> bool;
+    /// 当前对话会话 id：检查点归属用（切回该会话时改动条/撤销只认自己的基线）。
+    /// 默认空串 = 不归属，行为与旧版一致。
+    fn session_id(&self) -> &str {
+        ""
+    }
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 }
@@ -385,8 +392,9 @@ pub async fn run_task(
     // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
     let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
         let ws = tools::workspace_root().to_path_buf();
+        let sid = gate.session_id().to_string();
         tokio::task::spawn_blocking(move || -> Option<String> {
-            let _ = recovery::checkpoint(&ws, "任务起点");
+            let _ = recovery::checkpoint(&ws, "任务起点", &sid);
             recovery::head_id(&ws).ok().flatten()
         })
         .await
@@ -408,7 +416,7 @@ pub async fn run_task(
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-            emit_checkpoint_bar(baseline, &on_event).await;
+            emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             return Ok(LoopOutcome::Cancelled);
         }
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
@@ -614,7 +622,7 @@ pub async fn run_task(
             // P6：最终回答写入会话并落盘（与前端看到的一致）
             msgs.push(json!({ "role": "assistant", "content": final_text }));
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-            emit_checkpoint_bar(baseline, &on_event).await;
+            emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             observability::event(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
@@ -686,7 +694,7 @@ pub async fn run_task(
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-                emit_checkpoint_bar(baseline, &on_event).await;
+                emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
                 return Ok(LoopOutcome::Cancelled);
             }
             observability::event(
@@ -783,7 +791,7 @@ pub async fn run_task(
             if cancel.is_set() {
                 observability::event(EventType::State, json!({ "kind": "cancel", "phase": "tool", "step": step }));
                 on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-                emit_checkpoint_bar(baseline, &on_event).await;
+                emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
                 return Ok(LoopOutcome::Cancelled);
             }
             let call = &turn.tool_calls[i];
@@ -817,11 +825,12 @@ pub async fn run_task(
                 if rec_cfg.checkpoint_enabled && danger >= 1 {
                     let reason = format!("{} {}", call.name, short_args(&call.arguments, 100));
                     let ws = tools::workspace_root().to_path_buf();
-                    match tokio::task::spawn_blocking(move || recovery::checkpoint(&ws, &reason)).await {
+                    let sid = gate.session_id().to_string(); // 归属会话（改动条/撤销按会话对齐）
+                    match tokio::task::spawn_blocking(move || recovery::checkpoint(&ws, &reason, &sid)).await {
                         Ok(Ok(Some(cp))) => {
                             observability::event(
                                 EventType::State,
-                                json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason }),
+                                json!({ "kind": "checkpoint.created", "id": cp.id, "ts": cp.ts, "reason": cp.reason, "session": cp.session }),
                             );
                             mem.record("checkpoint.created", json!({ "reason": cp.reason }));
                         }

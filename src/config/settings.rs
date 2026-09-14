@@ -92,6 +92,9 @@ pub struct RolesSettings {
     /// 音频理解专用配置名或 id（多模态旁路代理）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
+    /// 向量嵌入专用配置名或 id（记忆库语义检索；未设时用本地哈希向量，不用主渠道兜底）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<String>,
     /// 降级备用配置名列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,

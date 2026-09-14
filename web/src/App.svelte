@@ -1,5 +1,7 @@
 <script>
-  import { onMount, afterUpdate } from 'svelte';
+  import { onMount, afterUpdate, tick } from 'svelte';
+  import Select from './Select.svelte';
+  import Galaxy from './Galaxy.svelte';
 
   // —— 配置（改动即自动保存即时生效）——
   let providers = [];
@@ -30,9 +32,7 @@
   let topP = null; // 核采样（null=渠道默认）
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
   let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
-  let thinkingStyleOverride = null; // 配置里的形态覆盖值（设置面板回显）
-  let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记
-  let capabilitiesUserSet = false; // A2：true=用户显式标记过，模型切换不再自动改写
+  let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记（纯手动勾选）
   let roles = {}; // P8.5 角色路由映射
   // —— P8.2 工作区 ——
   let workspace = '';
@@ -48,6 +48,23 @@
 
   // —— 模型快选（输入栏）——
   let modelMenuOpen = false;
+  let menuExpandedCfg = ''; // 模型快选菜单里展开的配置组（默认展开当前配置）
+  // —— ZCode 式加号菜单：@ 上下文 / 能力 / 技能 ——
+  let plusMenuOpen = false;
+  let abilityMenuOpen = false;
+  let skillMenuOpen = false;
+  let ctxPickerOpen = false;
+  let ctxFiles = [];
+  let ctxLoading = false;
+  let ctxQuery = '';
+  let composerInputEl;
+  const ABILITY_TEMPLATES = [
+    { cmd: '解释', text: '请解释这段代码的作用与关键逻辑：\n' },
+    { cmd: '审查', text: '请审查以下改动，指出 bug、风险与改进建议：\n' },
+    { cmd: '测试', text: '请为下面的功能设计测试用例并写出代码：\n' },
+    { cmd: '优化', text: '请优化以下代码的性能与可读性，给出改写版本：\n' },
+    { cmd: '总结', text: '请总结以下内容的要点：\n' },
+  ];
 
   // —— 对话 ——
   let messages = [];
@@ -204,29 +221,28 @@
   let currentSessionId = null; // 当前会话（null=下次发送自动新建）
   let projectName = ''; // 工作区目录名
 
-  // P9 B1：Plan 档（随会话持久化到 localStorage.planMode_<sessionId>；请求级 plan_mode 带给后端）
-  let planMode = false;
-  function setPlanMode(v) {
-    planMode = v;
-    if (currentSessionId) localStorage.setItem(`planMode_${currentSessionId}`, v ? '1' : '0');
-  }
+  // P9 B1 Plan/Act 手动档已移除：项目类任务由模型按系统提示自动规划步骤清单（todo list），普通聊天不规划
 
   onMount(async () => {
     await loadProviders();
     await loadSettings();
     await loadSessions(true);
+    refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
     // 点工具栏菜单外部 → 全部收起（问题1）
     document.addEventListener('click', closeMenusOnOutside);
+    // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
+    stampMicroUids();
   });
 
   function closeMenusOnOutside(e) {
-    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more'))) return;
+    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more') || e.target.closest('.git-dirty') || e.target.closest('.git-pop'))) return;
     modelMenuOpen = false;
     thinkMenuOpen = false;
     approvalMenuOpen = false;
     viewMenuOpen = false;
     sessMenuId = null;
     projMenuPath = null;
+    gitPopOpen = false;
   }
 
   // —— P8.2 工作区切换 ——
@@ -270,6 +286,8 @@
   afterUpdate(() => {
     // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断
     if (chatPinned && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
+    // 单元素微调标记：Svelte 重渲染会重建节点，这里按存下的路径补盖 data-mt
+    stampMicroUids();
   });
 
   function onChatScroll() {
@@ -342,6 +360,8 @@
   }
 
   function handleKey(e) {
+    // 中文输入法组词中的 Enter（isComposing/229）只负责确认候选词，不触发发送
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -385,9 +405,7 @@
     topP = s.top_p ?? null;
     thinking = s.thinking || '';
     thinkingStyle = s.thinking_style || 'auto';
-    thinkingStyleOverride = s.thinking_style_override || null;
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
-    capabilitiesUserSet = s.capabilities_user_set || false;
     roles = s.roles || {};
     workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
@@ -574,22 +592,1006 @@
   async function pickModel(m) {
     model = m;
     modelMenuOpen = false;
-    // A2：不随快选改写能力标记（后端在无用户标记时推导初值）
+    // 能力标记完全由用户手动勾选，切换模型不改写
     await sendSettings({ model: m });
   }
 
-  // A2 显式重置入口：按当前模型名重新推导能力标记，回到推导态
-  function recomputeCapabilities() {
-    autoSave({ recompute_capabilities: true }, 0);
+  // 快选菜单里跨配置选模型：先切激活配置，再把该配置的模型设为目标
+  async function pickCrossModel(cfg, m) {
+    modelMenuOpen = false;
+    if (cfg.id === activeConfigId) {
+      await pickModel(m);
+      return;
+    }
+    await manageConfig('apply', cfg.id);
+    if (model !== m) await sendSettings({ model: m });
   }
+
+  // —— 加号菜单：光标处插入文本（@ 引用 / 能力模板 / $ 技能）——
+  async function insertAtCursor(text) {
+    const el = composerInputEl;
+    if (!el) {
+      input += text;
+      return;
+    }
+    const s = el.selectionStart ?? input.length;
+    const epos = el.selectionEnd ?? input.length;
+    input = input.slice(0, s) + text + input.slice(epos);
+    await tick(); // 等 Svelte 把新 value 刷进 DOM 后再恢复光标
+    el.focus();
+    const caret = s + text.length;
+    el.setSelectionRange(caret, caret);
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  }
+
+  async function openCtxPicker() {
+    plusMenuOpen = false;
+    ctxPickerOpen = true;
+    ctxQuery = '';
+    ctxLoading = true;
+    try {
+      const r = await fetch('/api/workspace/files').then((r) => r.json());
+      ctxFiles = r.files || [];
+    } catch (e) {
+      ctxFiles = [];
+    }
+    ctxLoading = false;
+  }
+
+  function pickCtxFile(rel) {
+    ctxPickerOpen = false;
+    insertAtCursor(`@${rel} `);
+  }
+
+  function openAbilityMenu() {
+    plusMenuOpen = false;
+    abilityMenuOpen = true;
+  }
+
+  async function openSkillMenu() {
+    plusMenuOpen = false;
+    if (!skillsData.length) loadSkills();
+    if (!mcpServers.length && !wasmPlugins.length) await loadMcp();
+    skillMenuOpen = true;
+  }
+
+  // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
+  let terminalOpen = false;
+  let termLines = []; // { cmd, out, ok }
+  let termInput = '';
+  let termRunning = false;
+  let termOutEl;
+  let rightPanelOpen = false;
+  let rpTab = 'artifacts';
+  let rpFiles = [];
+  let rpLoading = false;
+  let rpPreviewPath = '';
+  let rpPreviewContent = '';
+
+  async function runTerm(cmd) {
+    termRunning = true;
+    termLines = [...termLines, { cmd, out: '', ok: true }];
+    termInput = '';
+    await tick();
+    if (termOutEl) termOutEl.scrollTop = termOutEl.scrollHeight;
+    try {
+      const r = await fetch('/api/shell', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: cmd }),
+      }).then((r) => r.json());
+      termLines = termLines.map((l, i) =>
+        i === termLines.length - 1 ? { ...l, out: (r.output || '').trim(), ok: r.ok !== false } : l
+      );
+    } catch (e) {
+      termLines = termLines.map((l, i) => (i === termLines.length - 1 ? { ...l, out: `请求失败: ${e.message || e}`, ok: false } : l));
+    }
+    termRunning = false;
+    await tick();
+    if (termOutEl) termOutEl.scrollTop = termOutEl.scrollHeight;
+  }
+
+  // 当前任务基线 = 消息流里最近一次 checkpoint
+  function currentBaseline() {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].cp && messages[i].cp.id) return messages[i].cp.id;
+    }
+    return '';
+  }
+
+  async function loadArtifacts() {
+    const baseline = currentBaseline();
+    if (!baseline) {
+      rpFiles = [];
+      rpLoading = false;
+      return;
+    }
+    rpLoading = true;
+    try {
+      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((r) => r.json());
+      rpFiles = r.files || [];
+    } catch (e) {
+      rpFiles = [];
+    }
+    rpLoading = false;
+  }
+
+  async function previewFile(f) {
+    rpPreviewPath = f;
+    rpTab = 'preview';
+    rpPreviewContent = '';
+    try {
+      const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(f)}`).then((r) => r.json());
+      rpPreviewContent = r.ok ? r.content : `读取失败: ${r.error}`;
+    } catch (e) {
+      rpPreviewContent = `读取失败: ${e.message || e}`;
+    }
+  }
+
+  function openRightPanel() {
+    rpTab = 'artifacts';
+    loadArtifacts();
+  }
+
+  // —— 改动条：钉在输入框上方。实时会话用消息流里的检查点；
+  // 旧会话（消息流无检查点）回退到影子仓库基线 + diff 文件数。
+  // 基线优先取**本会话自己的**检查点（检查点带 Agent-Session 归属），没有才用全局最新一个
+  // —— 同一项目里多条会话来回切时，各自的改动条不会互相串。
+  let dockCp = null; // { id, files, additions, deletions } additions/deletions 可为 null（旧会话未知）
+  let gitInfo = null; // { is_repo, branch, head, dirty, upstream, ahead, behind, files: [{status, path}] }
+  let gitPopOpen = false; // 「N 处未提交」点开后的待提交明细
+  async function refreshGit() {
+    try {
+      gitInfo = await fetch('/api/git/status').then((r) => r.json());
+    } catch (e) {
+      gitInfo = null;
+    }
+  }
+  // porcelain 状态码 → 人看的短标签
+  function gitStatusLabel(s) {
+    const c = String(s || '');
+    if (c.includes('?')) return '未跟踪';
+    if (c.includes('U')) return '冲突';
+    if (c.includes('R')) return '重命名';
+    if (c.includes('A')) return '新增';
+    if (c.includes('D')) return '删除';
+    if (c.includes('M')) return '修改';
+    return c || '改动';
+  }
+  // 点文件 → 右侧面板直接预览内容（改动条里的路径同样可读）
+  function openGitFile(path) {
+    gitPopOpen = false;
+    rightPanelOpen = true;
+    terminalOpen = false;
+    previewFile(path);
+  }
+
+  // —— 手动提交（界面上直接 commit，不必让 AI 代劳）——
+  // 默认勾选已跟踪的改动；未跟踪文件（日志、构建产物等）默认不勾，由用户自己决定
+  let commitModal = null; // { msg, files: [{ path, status, sel }], busy, err }
+  function openCommit() {
+    if (!gitInfo || !gitInfo.is_repo) return;
+    commitModal = {
+      msg: '',
+      files: (gitInfo.files || []).map((f) => ({ path: f.path, status: f.status, sel: !f.status.includes('?') })),
+      busy: false,
+      err: '',
+    };
+  }
+  function toggleCommitFile(path) {
+    if (!commitModal) return;
+    commitModal = {
+      ...commitModal,
+      files: commitModal.files.map((f) => (f.path === path ? { ...f, sel: !f.sel } : f)),
+    };
+  }
+  function commitSelCount() {
+    return (commitModal?.files || []).filter((f) => f.sel).length;
+  }
+  async function doCommit() {
+    const m = commitModal;
+    if (!m || m.busy) return;
+    const msg = m.msg.trim();
+    if (!msg) {
+      commitModal = { ...m, err: '写一句提交信息' };
+      return;
+    }
+    const files = m.files.filter((f) => f.sel).map((f) => f.path);
+    if (!files.length) {
+      commitModal = { ...m, err: '至少勾一个文件' };
+      return;
+    }
+    commitModal = { ...m, busy: true, err: '' };
+    try {
+      const r = await fetch('/api/git/commit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: msg, files }),
+      }).then((x) => x.json());
+      if (!r.ok) {
+        commitModal = { ...commitModal, busy: false, err: r.error || '提交失败' };
+        return;
+      }
+      commitModal = null;
+      messages = [
+        ...messages,
+        { id: nextId(), role: 'system', content: `已提交 ${r.id}（${files.length} 个文件）: ${msg}` },
+      ];
+      await refreshGit();
+      refreshDock();
+    } catch (e) {
+      commitModal = { ...commitModal, busy: false, err: `提交失败: ${e.message || e}` };
+    }
+  }
+  async function refreshDock() {
+    refreshGit(); // 分支/脏文件数一并刷新（不阻塞改动条）
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].cp && messages[i].cp.id) {
+        dockCp = messages[i].cp;
+        return;
+      }
+    }
+    try {
+      const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
+      const r = await fetch(`/api/checkpoints${q}`).then((r) => r.json());
+      const latest = (r.mine || [])[0] || (r.checkpoints || [])[0];
+      if (!latest) {
+        dockCp = null;
+        return;
+      }
+      const c = await fetch(`/api/changes?baseline=${encodeURIComponent(latest.id)}`).then((x) => x.json());
+      dockCp = { id: latest.id, files: (c.files || []).length, additions: null, deletions: null };
+    } catch (e) {
+      dockCp = null;
+    }
+  }
+
+  // —— CSS 注入器：用户自定义 CSS，实时生效并记住 ——
+  let customCss = localStorage.getItem('customCss') || '';
+  // 给每条顶层规则的选择器加 #app 前缀：压过 Svelte scoped 样式（.composer.s-xxx 两级类名）；
+  // @media/@keyframes 等整块原样保留
+  function escalateCss(css) {
+    let out = '';
+    let i = 0;
+    const n = css.length;
+    while (i < n) {
+      const brace = css.indexOf('{', i);
+      if (brace === -1) {
+        out += css.slice(i);
+        break;
+      }
+      const selector = css.slice(i, brace);
+      if (selector.trim().startsWith('@')) {
+        let depth = 1;
+        let j = brace + 1;
+        while (j < n && depth > 0) {
+          if (css[j] === '{') depth++;
+          else if (css[j] === '}') depth--;
+          j++;
+        }
+        out += css.slice(i, j);
+        i = j;
+      } else {
+        const prefixed = selector
+          .split(',')
+          .map((s) => {
+            const t = s.trim();
+            return t ? `#app ${t}` : t;
+          })
+          .join(', ');
+        out += `${prefixed}{`;
+        // 跳过这条规则的声明块，直到它的关闭 '}'（声明不嵌套）
+        const close = css.indexOf('}', brace + 1);
+        const end = close === -1 ? n : close + 1;
+        out += css.slice(brace + 1, end);
+        i = end;
+      }
+    }
+    return out;
+  }
+  function applyCustomCss() {
+    let el = document.getElementById('user-custom-css');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'user-custom-css';
+      document.head.appendChild(el);
+    }
+    // 微调规则在前，手动 CSS 在后——注入框永远有最终话语权，手写 background: transparent 能盖掉微调
+    const micro = microCss(microTweaks);
+    el.textContent = (micro ? `${micro}\n` : '') + escalateCss(customCss);
+    localStorage.setItem('customCss', customCss);
+  }
+
+  // —— 界面微调模式：右击元素弹出属性面板，实时预览，生成微调规则 ——
+  // 元素别名表：语义名 → 稳定选择器（Svelte scoped 类名跨构建不稳定，禁止用原始类名当选择器）。
+  // 每个别名可带 pick：命中大容器时进一步收敛到具体控件，避免"一点按钮选中整条底板"。
+  //  - 'self'：只在点中容器自身（padding/空隙）时才算容器，点中子元素时继续往下落
+  //  - 选择器：命中容器后，在容器内按该选择器找离点击最近的祖先，找到就用它
+  const ELEMENT_ALIASES = [
+    { sel: '.composer', name: '输入框', pick: 'self' },
+    { sel: '.composer-input', name: '输入文本区' },
+    { sel: '.composer-bar', name: '输入框工具栏', pick: 'self' },
+    { sel: '.icon-btn', name: '图标按钮' },
+    { sel: '.pill', name: '工具栏胶囊按钮' },
+    { sel: '.send-btn', name: '发送按钮' },
+    { sel: '.ctx-ring', name: '上下文圆环' },
+    { sel: '.user-bubble', name: '用户消息气泡' },
+    { sel: '.asst-bubble', name: 'AI 消息气泡', pick: 'self' },
+    { sel: '.bubble', name: '消息气泡', pick: 'self' },
+    { sel: '.error-bubble', name: '错误消息气泡' },
+    { sel: '.tool-card', name: '工具卡' },
+    { sel: '.tool-preview', name: '工具输出（代码块）' },
+    { sel: '.tool-head', name: '工具卡头部' },
+    { sel: '.tool-badge', name: '工具状态徽章' },
+    { sel: '.tool-name', name: '工具名' },
+    { sel: '.tool-args', name: '工具参数' },
+    { sel: '.thinking', name: '思考折叠块', pick: 'self' },
+    { sel: '.thinking-body', name: '思考内容' },
+    { sel: '.approval-box', name: '审批框' },
+    { sel: '.term-panel', name: '终端面板', pick: 'self' },
+    { sel: '.term-head', name: '终端标题栏' },
+    { sel: '.term-title', name: '终端标题' },
+    { sel: '.term-hint', name: '终端提示文字' },
+    { sel: '.term-clear', name: '终端清空按钮' },
+    { sel: '.term-close', name: '终端关闭按钮' },
+    { sel: '.term-in', name: '终端输入栏' },
+    { sel: '.term-out', name: '终端输出区' },
+    { sel: '.term-line', name: '终端输出行' },
+    { sel: '.term-prompt', name: '终端命令提示符' },
+    { sel: '.term-text', name: '终端输出文本' },
+    { sel: '.cp-bar', name: '改动条', pick: 'self' },
+    { sel: '.cp-btn', name: '改动条按钮' },
+    { sel: '.new-chat', name: '新会话按钮' },
+    { sel: '.chat-head', name: '顶栏', pick: 'self' },
+    { sel: '.right-panel', name: '产物面板', pick: 'self' },
+    { sel: '.rp-tabs', name: '产物面板标签栏', pick: 'self' },
+    { sel: '.rp-tabs button', name: '产物面板标签' },
+    { sel: '.rp-body', name: '产物面板内容区' },
+    { sel: '.rp-empty', name: '产物面板空提示' },
+    { sel: '.rp-refresh', name: '产物刷新按钮' },
+    { sel: '.rp-file', name: '产物文件条目' },
+    { sel: '.rp-preview', name: '预览代码块' },
+    { sel: '.rp-preview-path', name: '预览文件路径' },
+    { sel: '.modal.settings-modal', name: '设置弹窗', pick: 'self' },
+    { sel: '.settings-nav button', name: '设置导航按钮' },
+    { sel: '.theme-opt', name: '主题选项按钮' },
+    { sel: '.agents-editor', name: 'CSS 注入框' },
+    { sel: '.field input', name: '设置输入框' },
+    { sel: '.field select', name: '设置下拉框' },
+    { sel: '.btn', name: '按钮' },
+    { sel: '.csel', name: '下拉框' },
+    { sel: '.csel-caret', name: '下拉箭头' },
+    { sel: '.csel-menu', name: '下拉菜单', pick: 'self' },
+    { sel: '.csel-item', name: '下拉选项' },
+    { sel: '.chip', name: '配置标签' },
+    { sel: '.sidebar', name: '侧栏', pick: 'self' },
+    { sel: '.side-head', name: '侧栏头部', pick: 'self' },
+    { sel: '.row-btn', name: '侧栏工具按钮' },
+    { sel: '.conv', name: '会话条目' },
+    { sel: '.conv-title', name: '会话标题' },
+    { sel: '.conv-time', name: '会话时间' },
+    { sel: '.conv-more', name: '会话更多按钮' },
+    { sel: '.proj', name: '项目行' },
+    { sel: '.proj-name', name: '项目名' },
+    { sel: '.foot-btn', name: '侧栏底部按钮' },
+    { sel: '.handoff-btn', name: '交接文档按钮' },
+    { sel: '.cp-dock', name: '改动条容器', pick: 'self' },
+    { sel: '.cp-undo', name: '撤销按钮' },
+    { sel: '.ctx-wrap', name: '上下文圆环容器', pick: 'self' },
+    { sel: '.ctx-card', name: '上下文明细卡' },
+    { sel: '.head-btn', name: '顶栏按钮' },
+    { sel: '.user-text', name: '用户消息文字' },
+    { sel: '.bar-dropdown', name: '下拉菜单', pick: 'self' },
+    { sel: '.bar-item', name: '下拉菜单项' },
+  ];
+  let editMode = false;
+  let microPanel = null; // { x, y, key, name, sel, el, color, bg, bgOpacity, radius, blur, fontSize, bgTransparent, *Dirty }
+  let microTweaks = (() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('microTweaks') || '{}');
+      // 一次性迁移（老代码残留）：旧版"应用"会把当时算出的背景色一并落盘，
+      // 深色主题下就是 #17171a 这类近黑实色，带 #app 前缀后压过壁纸半透明规则，
+      // 表现为"消息里几块死黑、写 CSS 也去不掉"。清掉全部存量背景键（只清一次，
+      // 迁移后用户手动改的背景会正常保留），其他属性（圆角/字号/文字色）保留。
+      if (localStorage.getItem('microTweaksBgMigrated') !== '2') {
+        for (const k of Object.keys(raw || {})) {
+          const t = raw[k];
+          if (t && typeof t === 'object') {
+            delete t.bg;
+            delete t.bgOpacity;
+          }
+        }
+        try { localStorage.setItem('microTweaks', JSON.stringify(raw)); } catch (e) {}
+        try { localStorage.setItem('microTweaksBgMigrated', '2'); } catch (e) {}
+      }
+      return raw;
+    } catch (e) {
+      return {};
+    }
+  })();
+
+  // 取色/透明度解析：同时支持 rgb()/rgba() 与 Chromium 解析 color-mix 后给出的
+  // color(srgb r g b / a)（分量是 0-1 小数）。取不出返回 null，由调用方决定不存该属性，
+  // 禁止再兜底成 #000000（那是黑底叠层的直接来源）
+  function parseCssColor(c) {
+    const s = String(c || '').trim();
+    let m = s.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/);
+    if (m) {
+      const a = m[4] == null ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4]);
+      return { r: +m[1], g: +m[2], b: +m[3], a };
+    }
+    m = s.match(/^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)$/);
+    if (m) {
+      return { r: Math.round(+m[1] * 255), g: Math.round(+m[2] * 255), b: Math.round(+m[3] * 255), a: m[4] == null ? 1 : +m[4] };
+    }
+    return null;
+  }
+  function rgbToHex(rgb) {
+    const c = parseCssColor(rgb);
+    if (!c) return null;
+    return '#' + [c.r, c.g, c.b].map((x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, '0')).join('');
+  }
+  // 解析不出的按不透明处理
+  function rgbAlpha(rgb) {
+    const c = parseCssColor(rgb);
+    return c ? Math.round(c.a * 100) : 100;
+  }
+
+  // 未登记元素：生成结构选择器。优先用稳定类名锚点（.icon-btn/.pill/.btn 等），
+  // 比纯 tag:nth-of-type 链更抗排序变化；实在没有类名才回落序号链（止于 #app）
+  function structuralSelector(el) {
+    const clsOf = (node) => {
+      const cls = typeof node.className === 'string' ? node.className : (node.getAttribute && node.getAttribute('class')) || '';
+      return cls.split(/\s+/).filter((c) => c && !/^s-[A-Za-z0-9_-]+$/.test(c));
+    };
+    // 自身或近祖先有稳定类名：直接用 ".类名" 锚定（多类取首个非 svelte 作用域类）
+    let cur = el;
+    for (let up = 0; up < 3 && cur && cur.id !== 'app'; up++) {
+      const stable = clsOf(cur).find((c) => /^(icon-btn|pill|btn|chip|bar-item|conv|proj|row-btn|foot-btn|theme-opt|agents-editor|ctx-ring|ctx-card|send-btn|new-chat|composer-input|tool-card|tool-preview|tool-head|thinking-body|approval-box|cp-bar|cp-undo|head-btn|user-text|proj-name|conv-title)$/.test(c));
+      if (stable) return `.${stable}`;
+      cur = cur.parentElement;
+    }
+    const parts = [];
+    cur = el;
+    while (cur && cur.id !== 'app') {
+      if (cur.id && cur !== el) {
+        parts.unshift(`#${CSS.escape(cur.id)}`);
+        return parts.join(' > ');
+      }
+      const parent = cur.parentElement;
+      if (!parent) break;
+      const sibs = [...parent.children].filter((c) => c.tagName === cur.tagName);
+      let seg = cur.tagName.toLowerCase();
+      if (sibs.length > 1) seg += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
+      parts.unshift(seg);
+      cur = parent;
+    }
+    return parts.join(' > ');
+  }
+
+  // —— 单元素定位（修"改一处、同类全改"）：给具体元素盖一个 data-mt 唯一标记，
+  // 规则写成 #app [data-mt="mtXXXX"]，只作用这一个元素；Svelte 重渲染会重建节点丢标记，
+  // 所以存下"从 #app 起的孩子序号路径"，每次更新后按路径找回并补盖 ——
+  function pathOf(el) {
+    const parts = [];
+    let cur = el;
+    while (cur && cur.id !== 'app') {
+      const parent = cur.parentElement;
+      if (!parent) break;
+      parts.unshift(`${cur.tagName.toLowerCase()}:${[...parent.children].indexOf(cur)}`);
+      cur = parent;
+    }
+    return parts.join('/');
+  }
+  function findByPath(path) {
+    let cur = document.getElementById('app');
+    for (const seg of String(path || '').split('/').filter(Boolean)) {
+      const i = seg.lastIndexOf(':');
+      const tag = seg.slice(0, i);
+      const idx = Number(seg.slice(i + 1));
+      if (!cur || !cur.children[idx]) return null;
+      cur = cur.children[idx];
+      if (tag && cur.tagName.toLowerCase() !== tag) return null;
+    }
+    return cur;
+  }
+  function makeUid() {
+    return 'mt' + Math.random().toString(36).slice(2, 8);
+  }
+  // 补盖标记：只在元素还匹配原选择器时才盖，避免路径漂移后错标到别的元素
+  function stampMicroUids() {
+    for (const t of Object.values(microTweaks || {})) {
+      if (!t || !t.uid || !t.path) continue;
+      if (document.querySelector(`[data-mt="${t.uid}"]`)) continue;
+      const el = findByPath(t.path);
+      if (!el) continue;
+      try {
+        if (!t.sel || el.matches(t.sel)) el.setAttribute('data-mt', t.uid);
+      } catch (e) {}
+    }
+  }
+  function unstampAll() {
+    for (const el of document.querySelectorAll('#app [data-mt]')) el.removeAttribute('data-mt');
+  }
+
+  function onMicroContext(e) {
+    if (!editMode) return;
+    if (e.target.closest && e.target.closest('.micro-panel')) return;
+    // 目标归一化：SVG/文本节点先收敛到可调元素——点中图标里的 path 先升到 button，
+    // 点中按钮里的文字/图标先升到该按钮，避免结构选择器落到 svg/path/span 碎片上
+    let target = e.target;
+    if (target && target.nodeType !== 1) target = target.parentElement;
+    if (target && target.closest) {
+      const svgHit = target.closest('svg');
+      if (svgHit && svgHit.closest('button')) target = svgHit.closest('button');
+      else if (target instanceof SVGElement) target = target.closest('button') || target.parentElement || target;
+    }
+    if (!target || !target.closest) return;
+    // 候选收集：所有命中的别名都算上，按"离点击最近"排序；
+    // pick:'self' 的大容器只有点中自身（空隙/padding）时才参选，点中子元素时让位给具体控件；
+    // pick:选择器的容器先收敛到内部最近控件，找不到才回落容器自身
+    const cands = [];
+    for (const a of ELEMENT_ALIASES) {
+      const el = target.closest(a.sel);
+      if (!el) continue;
+      let depth = 0;
+      let cur = target;
+      while (cur && cur !== el) {
+        cur = cur.parentElement;
+        depth++;
+      }
+      if (a.pick === 'self' && depth > 0) continue;
+      if (typeof a.pick === 'string' && a.pick !== 'self') {
+        const inner = target.closest(a.pick);
+        if (inner && el.contains(inner)) {
+          let d2 = 0;
+          let c2 = target;
+          while (c2 && c2 !== inner) {
+            c2 = c2.parentElement;
+            d2++;
+          }
+          cands.push({ alias: { sel: a.pick, name: `${a.name} · 子项` }, el: inner, depth: d2 });
+          continue;
+        }
+      }
+      cands.push({ alias: a, el, depth });
+    }
+    cands.sort((x, y) => x.depth - y.depth);
+    e.preventDefault();
+    if (cands.length && cands[0].depth <= 3) {
+      const win = cands[0];
+      openMicroPanel(e.clientX, e.clientY, win.alias.name, win.alias.sel, win.el);
+      return;
+    }
+    // 兜底一：按元素自身语义类名精确命中（终端标题栏、清空按钮这类没登记的小条）
+    const auto = autoClassTarget(target);
+    if (auto) {
+      openMicroPanel(e.clientX, e.clientY, auto.name, auto.sel, auto.el);
+      return;
+    }
+    // 兜底二：附近没有别名 → 放宽 pick:'self'，回退到最近的"容器别名"（任意深度）。
+    // 比结构选择器更稳：点右侧面板内部就选中「产物面板」，不会再出"未登记元素"的
+    // div:nth-of-type 长链（那种选择器一改布局就失效）
+    const relaxed = [];
+    for (const a of ELEMENT_ALIASES) {
+      const el = target.closest(a.sel);
+      if (!el) continue;
+      let depth = 0;
+      let cur = target;
+      while (cur && cur !== el) {
+        cur = cur.parentElement;
+        depth++;
+      }
+      relaxed.push({ alias: a, el, depth });
+    }
+    relaxed.sort((x, y) => x.depth - y.depth);
+    if (relaxed.length) {
+      const win = relaxed[0];
+      openMicroPanel(e.clientX, e.clientY, win.alias.name, win.alias.sel, win.el);
+      return;
+    }
+    // 兜底三：整条链都没有登记过 → 结构选择器（止于 #app 的序号链）
+    openMicroPanel(e.clientX, e.clientY, '', structuralSelector(target), target);
+  }
+
+  // 元素自身是否画了背景（透明度 >5% 才算；transparent/全透明都不算）
+  function paintsBg(el) {
+    const c = parseCssColor(getComputedStyle(el).backgroundColor);
+    return !!c && c.a > 0.05;
+  }
+  // 往上层找第一个真正画背景的祖先：用户常右键在透明的内容层上（如 .rp-body），
+  // 改它当然没反应——真正那块"黑"是父层画的，这里把父层找出来供一键跳转
+  function findBgHost(el) {
+    let cur = el.parentElement;
+    while (cur && cur.id !== 'app') {
+      if (paintsBg(cur)) {
+        for (const a of ELEMENT_ALIASES) {
+          try {
+            if (cur.matches(a.sel)) return { name: a.name, sel: a.sel, el: cur };
+          } catch (e) {}
+        }
+        return { name: '', sel: structuralSelector(cur), el: cur };
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  // 通用兜底：按元素自身的语义类名自动生成选择器。跳过 svelte 作用域类与状态/通用类，
+  // 优先带连字符的语义类（term-head、rp-body 这类），这样任何"小条/小按钮"不用逐个登记
+  // 也能精确命中，而不是一路回退到整个大面板
+  const GENERIC_CLASSES = new Set([
+    'active', 'on', 'sel', 'expanded', 'open', 'haskey', 'danger', 'primary', 'ghost', 'stop',
+    'running', 'fail', 'ok', 'dim', 'err', 'warn', 'crit', 'archived', 'pinned', 'empty', 'more',
+    'group-head', 'wp-pick', 'css-injector', 'micro-readonly', 'content', 'user', 'assistant',
+    'boxed', 'left', 'right', 'center', 'small', 'large', 'selected', 'checked', 'risk-0', 'risk-1', 'risk-2',
+  ]);
+  function autoClassTarget(el) {
+    let cur = el;
+    for (let up = 0; up < 3 && cur && cur.id !== 'app'; up++) {
+      const raw = typeof cur.className === 'string' ? cur.className : '';
+      const cls = raw
+        .split(/\s+/)
+        .filter((c) => c && !/^s-[A-Za-z0-9_-]+$/.test(c) && !GENERIC_CLASSES.has(c));
+      if (cls.length) {
+        const semantic = cls.find((c) => c.includes('-')) || cls[0];
+        return { name: semantic, sel: `.${CSS.escape(semantic)}`, el: cur };
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  function openMicroPanel(x, y, name, sel, el) {
+    const cs = getComputedStyle(el);
+    const key = name || sel;
+    // 优先用该元素已存的微调值（面板显示与实际生效一致）；没有才读 computed
+    const saved = microTweaks[key] || Object.values(microTweaks).find((t) => t && t.sel === sel) || null;
+    const numOf = (v, fallback) => {
+      const n = parseFloat(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    // computed backdrop-filter: 'none' 或 'blur(Npx)'，提取 N
+    const blurNow = (() => {
+      const m = String(cs.backdropFilter || '').match(/blur\(([\d.]+)px\)/);
+      return m ? parseFloat(m[1]) : 0;
+    })();
+    // 背景解析：color(srgb ...) 这类计算值也认；解析不出或全透明都算"透明（不动）"，
+    // 面板照实显示色值+透明度，不再出现"背景色 #000000、透明 0%"这种吓人的假象
+    const bgParsed = parseCssColor(cs.backgroundColor);
+    const bgNow = rgbToHex(cs.backgroundColor);
+    microPanel = {
+      // 位置：右侧留出面板宽度，下方至少留 340px 可用高度（面板自身 max-height 按 y 计算，
+      // 配合内部滚动，保证底部「应用/重置/取消」始终可见可点）
+      x: Math.max(8, Math.min(x, window.innerWidth - 300)),
+      y: Math.max(8, Math.min(y, window.innerHeight - 340)),
+      key,
+      name: name || '未登记元素',
+      sel,
+      el,
+      color: saved?.color || rgbToHex(cs.color) || '#000000',
+      bg: saved?.bg || bgNow || '#000000',
+      // 背景取不出（渐变/color-mix 未解析）或全透明时不填黑：bgTransparent=true，
+      // 预览与保存都跳过背景；只有用户真的点了颜色框（dirty）才落盘
+      bgTransparent: !saved?.bg && (!bgParsed || bgParsed.a === 0),
+      bgDirty: false,
+      colorDirty: false,
+      radiusDirty: false,
+      blurDirty: false,
+      fontSizeDirty: false,
+      bgOpacity: saved != null && saved.bgOpacity != null ? saved.bgOpacity : bgParsed ? Math.round(bgParsed.a * 100) : 0,
+      radius: numOf(saved?.radius, Math.round(parseFloat(cs.borderTopLeftRadius) || 0)),
+      // 描边：宽度 + 颜色（用户显式改过才落盘；只改颜色时尊重元素原有边框样式）
+      border: numOf(saved?.border, Math.round(parseFloat(cs.borderTopWidth) || 0)),
+      borderColor: saved?.borderColor || rgbToHex(cs.borderTopColor) || '#000000',
+      borderDirty: false,
+      borderColorDirty: false,
+      blur: numOf(saved?.blur, blurNow),
+      fontSize: numOf(saved?.fontSize, Math.round(parseFloat(cs.fontSize) || 14)),
+      // 自身透明但上层有实底时，面板给出"背景其实由上级绘制"的跳转入口
+      bgHost: !paintsBg(el) ? findBgHost(el) : null,
+      // 作用范围：默认只改这一个元素（修"改一处、同类全改"）；
+      // 该元素已存的是"同类全部"规则（无 uid）时，切到"同类"以保持一致
+      scope: saved && !saved.uid ? 'all' : 'only',
+    };
+  }
+
+  // 跳到真正绘制背景的上级（用户右键在透明内容层时的救急入口）
+  function useBgHost() {
+    const p = microPanel;
+    if (!p || !p.bgHost) return;
+    const h = p.bgHost;
+    clearMicroInline(p.el);
+    openMicroPanel(p.x, p.y, h.name || '上级元素', h.sel, h.el);
+  }
+
+  function microPreview(prop, value) {
+    if (!microPanel) return;
+    // 脏标记：只记录用户亲手改过的属性，"应用"时只存这些
+    const dirtyKey = { bg: 'bgDirty', bgOpacity: 'bgDirty', color: 'colorDirty', radius: 'radiusDirty', blur: 'blurDirty', fontSize: 'fontSizeDirty', border: 'borderDirty', borderColor: 'borderColorDirty' }[prop];
+    microPanel = { ...microPanel, [prop]: value, ...(dirtyKey ? { [dirtyKey]: true, ...(prop === 'bg' || prop === 'bgOpacity' ? { bgTransparent: false } : {}) } : {}) };
+    // 广播：自绘下拉等浮层收到后重新贴合定位（预览会改动样式/布局，菜单要跟着挪）
+    try {
+      window.dispatchEvent(new CustomEvent('micro-preview', { detail: { sel: microPanel.sel } }));
+    } catch (e) {}
+    const el = microPanel.el;
+    if (!el || !el.isConnected) return;
+    if (prop === 'border') {
+      // 拖宽度必须同时给 border-style，否则 border:none 的元素看不出变化
+      el.style.borderStyle = 'solid';
+      el.style.borderWidth = `${value}px`;
+      return;
+    }
+    if (prop === 'borderColor') {
+      el.style.borderStyle = 'solid';
+      el.style.borderColor = value;
+      return;
+    }
+    if (prop === 'bg' || prop === 'bgOpacity') {
+      // 透明底元素：预览也不烤实色，避免"还没点应用就先黑一块"吓到人
+      if (microPanel.bgTransparent) return;
+      el.style.backgroundColor = hexWithAlpha(microPanel.bg, microPanel.bgOpacity);
+      return;
+    }
+    if (prop === 'blur') {
+      el.style.backdropFilter = value > 0 ? `blur(${value}px)` : 'none';
+      return;
+    }
+    if (prop === 'color') {
+      el.style.color = value;
+      return;
+    }
+    el.style[prop === 'radius' ? 'borderRadius' : 'fontSize'] = `${value}px`;
+  }
+
+  function hexWithAlpha(hex, opacityPct) {
+    const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
+    if (!m) return hex;
+    const a = Math.min(1, Math.max(0, (opacityPct ?? 100) / 100));
+    const r = parseInt(m[1].slice(0, 2), 16);
+    const g = parseInt(m[1].slice(2, 4), 16);
+    const b = parseInt(m[1].slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
+
+  function clearMicroInline(el) {
+    for (const k of ['color', 'backgroundColor', 'borderRadius', 'backdropFilter', 'fontSize', 'borderWidth', 'borderColor', 'borderStyle']) el.style[k] = '';
+  }
+
+  function applyMicro() {
+    const p = microPanel;
+    if (!p) return;
+    // 从面板控件读当前值（按 data-m 属性显式取值，不依赖顺序；不依赖组件状态的事件同步）
+    const panelEl = document.querySelector('.micro-panel');
+    const val = (name) => (panelEl ? panelEl.querySelector(`[data-m="${name}"]`)?.value : undefined);
+    const num = (name) => {
+      const v = val(name);
+      return v == null || v === '' ? undefined : +v;
+    };
+    const color = val('color') ?? p.color;
+    const bg = val('bg') ?? p.bg;
+    const bgOpacity = num('bgOpacity') ?? p.bgOpacity;
+    const blurN = num('blur') ?? p.blur;
+    const radiusN = num('radius') ?? p.radius;
+    const fontSizeN = num('fontSize') ?? p.fontSize;
+    // 只落盘用户亲手改过的属性（dirty 标记），但保留该元素上一次已存的其他属性——
+    // 老存量/别次改的背景不会因为"这次只改圆角"就被弄丢；没动背景就不碰 bg，透明底元素不会再被误写黑底
+    const prev = microTweaks[p.key] && typeof microTweaks[p.key] === 'object' ? microTweaks[p.key] : {};
+    const entry = { sel: p.sel, name: p.name };
+    if (p.colorDirty) entry.color = color;
+    else if (prev.color) entry.color = prev.color;
+    if (p.bgTransparent) {
+      if (prev.bg) {
+        entry.bg = prev.bg;
+        if (prev.bgOpacity != null) entry.bgOpacity = prev.bgOpacity;
+      }
+    } else if (p.bgDirty) {
+      entry.bg = bg;
+      entry.bgOpacity = bgOpacity;
+    } else if (prev.bg) {
+      entry.bg = prev.bg;
+      if (prev.bgOpacity != null) entry.bgOpacity = prev.bgOpacity;
+    }
+    if (p.radiusDirty) entry.radius = `${radiusN}px`;
+    else if (prev.radius) entry.radius = prev.radius;
+    // 描边：宽度/颜色各自独立落盘；只改颜色时尊重原有边框样式
+    const borderN = num('border') ?? p.border;
+    const borderColorV = val('borderColor') ?? p.borderColor;
+    if (p.borderDirty) entry.border = `${borderN}px`;
+    else if (prev.border) entry.border = prev.border;
+    if (p.borderColorDirty) entry.borderColor = borderColorV;
+    else if (prev.borderColor) entry.borderColor = prev.borderColor;
+    // 毛玻璃护栏：背景不透明（opacity>=85%）时存 blur 没有视觉意义，反而会在弹窗/遮罩下发灰叠影；
+    // 这种组合直接丢弃 blur，只保留其他属性。想要毛玻璃先把背景透明度降下来。
+    const bgEffOpaque = p.bgTransparent
+      ? false
+      : p.bgDirty
+        ? (bgOpacity ?? 100) >= 85
+        : prev.bg
+          ? (prev.bgOpacity ?? 100) >= 85
+          : (p.bgOpacity ?? 100) >= 85;
+    if (p.blurDirty && !((parseInt(blurN, 10) || 0) > 0 && bgEffOpaque)) entry.blur = blurN;
+    else if (prev.blur != null && !(bgEffOpaque && (parseInt(prev.blur, 10) || 0) > 0)) entry.blur = prev.blur;
+    if (p.fontSizeDirty) entry.fontSize = `${fontSizeN}px`;
+    else if (prev.fontSize) entry.fontSize = prev.fontSize;
+    // 作用范围：仅此元素 → 盖唯一标记并记结构路径（重渲染后按路径补盖）；
+    // 同类全部 → 清掉标记字段，规则改回元素选择器
+    if (p.scope === 'all') {
+      if (prev.uid) {
+        const old = document.querySelector(`[data-mt="${prev.uid}"]`);
+        if (old) old.removeAttribute('data-mt');
+      }
+    } else {
+      entry.uid = prev.uid || makeUid();
+      entry.path = pathOf(p.el);
+      try {
+        p.el.setAttribute('data-mt', entry.uid);
+      } catch (e) {}
+    }
+    clearMicroInline(p.el);
+    const cur = { ...microTweaks };
+    cur[p.key] = entry;
+    microTweaks = cur;
+    localStorage.setItem('microTweaks', JSON.stringify(cur));
+    applyCustomCss();
+    microPanel = null;
+  }
+
+  function resetMicro() {
+    const p = microPanel;
+    if (!p) return;
+    clearMicroInline(p.el);
+    const prevUid = microTweaks[p.key] && microTweaks[p.key].uid;
+    if (prevUid) {
+      const stamped = document.querySelector(`[data-mt="${prevUid}"]`);
+      if (stamped) stamped.removeAttribute('data-mt');
+    }
+    const cur = { ...microTweaks };
+    delete cur[p.key];
+    microTweaks = cur;
+    localStorage.setItem('microTweaks', JSON.stringify(cur));
+    applyCustomCss();
+    microPanel = null;
+  }
+
+  // 一键清空所有微调规则（手写 CSS 不动）；用于清掉历史遗留的实色深底等顽固样式
+  function clearAllMicro() {
+    microTweaks = {};
+    localStorage.setItem('microTweaks', '{}');
+    unstampAll();
+    applyCustomCss();
+    settingsMsg = '已清空全部微调规则';
+  }
+
+  function cancelMicro() {
+    if (!microPanel) return;
+    clearMicroInline(microPanel.el);
+    microPanel = null;
+  }
+
+  // —— CSS 规则导出 / 导入：把「微调规则」与「手写 CSS」打包成一个 JSON 文件，可备份、换机迁移 ——
+  let cssImportInput;
+  const CSS_RULES_KIND = 'zcode-ui-css-rules';
+
+  function exportCssRules() {
+    const payload = {
+      type: CSS_RULES_KIND,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      customCss,
+      microTweaks,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ui-css-rules.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const n = Object.keys(microTweaks || {}).length;
+    settingsMsg = `已导出 CSS 规则（微调 ${n} 条${customCss.trim() ? ' + 手写 CSS' : ''}）`;
+  }
+
+  function onImportCssRules(e) {
+    const file = e.target.files && e.target.files[0];
+    if (e.target) e.target.value = ''; // 复位，允许再次选择同一个文件
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => (settingsMsg = '导入失败：文件读取错误');
+    reader.onload = (ev) => {
+      const text = String(ev.target.result || '');
+      let css = '';
+      let tweaks = null; // null 表示"这次不动微调规则"（导入纯 CSS 文本时）
+      try {
+        const data = JSON.parse(text);
+        if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('不是有效的规则文件');
+        if ('customCss' in data || 'microTweaks' in data || data.type === CSS_RULES_KIND) {
+          css = typeof data.customCss === 'string' ? data.customCss : '';
+          tweaks = data.microTweaks && typeof data.microTweaks === 'object' && !Array.isArray(data.microTweaks) ? data.microTweaks : {};
+        } else {
+          tweaks = data; // 兼容只含微调规则对象的旧文件
+        }
+      } catch (err) {
+        // 看起来想写 JSON 却解析失败 → 报错；否则当作纯手写 CSS 文本导入
+        if (/^[{[]/.test(text.trim())) {
+          settingsMsg = `导入失败：${err.message || err}`;
+          return;
+        }
+        css = text;
+      }
+      let n = 0;
+      if (tweaks != null) {
+        // 只收下结构合法的微调条目，避免脏数据让微调模式崩溃
+        const clean = {};
+        for (const [k, v] of Object.entries(tweaks)) {
+          if (v && typeof v === 'object' && typeof v.sel === 'string' && v.sel) clean[k] = v;
+        }
+        tweaks = clean;
+        n = Object.keys(tweaks).length;
+      }
+      const existing = Object.keys(microTweaks || {}).length;
+      const overwriteMicro = tweaks != null;
+      const scope = overwriteMicro ? `当前的 ${existing} 条微调规则和手写 CSS` : '当前的手写 CSS';
+      if ((existing || customCss.trim()) && !confirm(`导入将覆盖${scope}，继续？`)) return;
+      customCss = css;
+      if (overwriteMicro) {
+        microTweaks = tweaks;
+        try { localStorage.setItem('microTweaks', JSON.stringify(tweaks)); } catch (err) {}
+        unstampAll();
+      }
+      applyCustomCss();
+      settingsMsg = overwriteMicro
+        ? `已导入 CSS 规则（微调 ${n} 条${css.trim() ? ' + 手写 CSS' : ''}）`
+        : '已导入手写 CSS';
+    };
+    reader.readAsText(file);
+  }
+
+  // 微调规则 → CSS（拼在手动 CSS 之前，手写 CSS 永远有最终话语权）；
+  // 只输出当初亲手改过的属性（有键才输出），没动过的背景/颜色不会凭空出现。
+  // background 用 background-color 而非简写，避免盖掉原有的渐变/图片/transparent 语义
+  function microCss(tweaks) {
+    let out = '';
+    for (const t of Object.values(tweaks || {})) {
+      if (!t || !t.sel) continue;
+      const decls = [];
+      if (t.color) decls.push(`color: ${t.color}`);
+      if (t.bg) decls.push(`background-color: ${hexWithAlpha(t.bg, t.bgOpacity ?? 100)}`);
+      if (t.border) decls.push(`border-style: solid`, `border-width: ${t.border}`);
+      if (t.borderColor) decls.push(`border-color: ${t.borderColor}`);
+      if (t.blur != null && String(t.blur) !== '' && (parseInt(t.blur, 10) || 0) !== 0) decls.push(`backdrop-filter: blur(${parseInt(t.blur, 10) || 0}px)`);
+      if (t.radius) decls.push(`border-radius: ${t.radius}`);
+      if (t.fontSize) decls.push(`font-size: ${t.fontSize}`);
+      if (!decls.length) continue;
+      // 单个元素：用 data-mt 唯一标记；同类全部：用元素选择器
+      if (t.uid) out += `/* 微调:${t.name || t.sel} · 仅此元素 */\n#app [data-mt="${t.uid}"] { ${decls.join('; ')} }\n`;
+      else out += `/* 微调:${t.name || t.sel} · 同类全部 */\n#app ${t.sel} { ${decls.join('; ')} }\n`;
+    }
+    return out;
+  }
+  // 启动时应用：微调规则 + 手动 CSS
+  applyCustomCss();
+  // (hmr-probe)
 
   // —— 对话 ——
   async function send() {
     const msg = input.trim();
     if ((!msg && pendingAttachments.length === 0) || streaming) return;
     streaming = true;
+    // 发送时收起所有输入区菜单
+    plusMenuOpen = false;
+    abilityMenuOpen = false;
+    skillMenuOpen = false;
+    modelMenuOpen = false;
     controller = new AbortController();
     const effectiveMsg = msg || (pendingAttachments.length > 0 ? '请查看分析附带的媒体文件' : '');
+    // 新会话：顶栏标题即时取首条消息（与后端初始标题一致），不等标题生成
+    if (!currentSessionId && effectiveMsg) {
+      currentTitle = effectiveMsg.slice(0, 50);
+    }
     const sendingAttachments = [...pendingAttachments];
     pendingAttachments = [];
     const history = messages
@@ -617,7 +1619,6 @@
           model,
           base_url: baseUrl,
           approval_mode: approvalMode,
-          plan_mode: planMode, // P9 B1：Plan 档随请求带给后端
           session_id: currentSessionId || '',
         }),
         signal: controller.signal,
@@ -640,8 +1641,6 @@
               const d = JSON.parse(line.slice(6));
               if (d.session) {
                 currentSessionId = d.session;
-                // P9 B1：新会话此刻才拿到 id，把当前 Plan 档补写进该会话的持久化
-                if (planMode) localStorage.setItem(`planMode_${d.session}`, '1');
               } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
               else if (d.tool_call)
@@ -679,17 +1678,19 @@
                     ? { ...m, approval: { ...m.approval, decided: d.approval_decided.approved } }
                     : m
                 );
-              else if (d.plan_proposal)
-                // P9 B3：Plan 档结构化计划 → 挂到当前 assistant 消息渲染计划卡
-                patch((m) => ({ ...m, plan: d.plan_proposal }));
-              else if (d.checkpoint)
+              else if (d.checkpoint) {
                 messages = [
                   ...messages,
                   { id: nextId(), role: 'cp', cp: d.checkpoint },
                 ];
+                refreshDock(); // 改动条数据更新
+              }
               else if (d.notice)
-                messages = [...messages, { id: nextId(), role: 'system', content: '⚠️ ' + d.notice }];
-              else if (d.title) loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
+                messages = [...messages, { id: nextId(), role: 'system', content: '[通知] ' + d.notice }];
+              else if (d.title) {
+                loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
+                if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
+              }
               else if (d.context_usage)
                 ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
               else if (d.api_usage) {
@@ -743,15 +1744,28 @@
     return '';
   }
 
+  // —— 顶栏标题（仅对话标题；审批/备份状态在输入区与改动条上，不再重复展示）——
+  // currentTitle：直接跟随当前会话（新会话首条消息即时上屏，不等标题生成）
+  let currentTitle = '';
+  // 注意：必须用 $: 响应式声明——模板里直接调 currentSessionTitle() 不会因 currentTitle 变化而重渲染（Svelte 4 不跨函数追踪依赖）
+  $: displayTitle =
+    currentTitle ||
+    (sessions.find((x) => x.id === currentSessionId)?.title ?? '') ||
+    '新的对话';
+
   // —— P6.1 多会话：列表 / 切换 / 新建（新建不清空历史）——
   async function loadSessions(autoPick = false) {
     try {
       const r = await fetch('/api/sessions').then((r) => r.json());
       projectName = r.project || '';
       sessions = r.sessions || [];
-      // 启动时默认恢复最近一条会话
-      if (autoPick && currentSessionId === null && sessions.length) {
-        await loadSession(sessions[0].id);
+      // 启动/切项目时恢复最近一条会话：只认当前工作区里的会话。
+      // 不筛会打开别的项目的会话，而 /api/sessions/open 会把工作区切回那个项目（侧栏项目来回弹）
+      if (autoPick && currentSessionId === null) {
+        const mine = sessions.filter(
+          (s) => !s.workspace || normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase(),
+        );
+        if (mine.length) await loadSession(mine[0].id);
       }
     } catch (e) {
       sessions = [];
@@ -763,32 +1777,73 @@
     ctxUsage = { tokens: 0, budget: ctxUsage.budget, breakdown: null };
   }
 
+  // 打开会话：后端会在其所属项目与当前项目不同时先切过去（切会话 = 回到那个项目），
+  // 所以走 /api/sessions/open 而不是只读的 /api/session。
   async function loadSession(id) {
     if (streaming) return;
     try {
-      const r = await fetch(`/api/session?id=${encodeURIComponent(id)}`).then((r) => r.json());
+      const r = await fetch('/api/sessions/open', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      }).then((r) => r.json());
+      if (r.error) {
+        settingsMsg = r.error;
+        return;
+      }
       currentSessionId = id;
-      planMode = localStorage.getItem(`planMode_${id}`) === '1'; // P9 B1：Plan 档随会话恢复
+      currentTitle = r.title || (sessions.find((x) => x.id === id)?.title ?? '');
       messages = rebuildFromSession(r.messages || []);
       resetCtxUsage();
+      dockCp = null;
+      if (r.warning) settingsMsg = r.warning;
+      if (r.switched) {
+        // 项目换了：配置（工作区路径/AGENTS.md）与会话分组都要跟着刷新
+        await loadSettings();
+        await loadSessions();
+      }
+      refreshDock();
     } catch (e) {
       // 加载失败不阻塞
     }
   }
 
-  function startNewSession() {
+  // 新建会话：立即在后端落一条空会话（侧栏当前项目下马上可见），首条消息写进同一条。
+  // 同一项目已有一条空会话时后端会复用，连点不会堆出一排。
+  async function startNewSession() {
     if (streaming) return;
     currentSessionId = null;
-    planMode = false; // 新会话默认 Act 档
+    currentTitle = '';
+    dockCp = null;
     messages = [];
     resetCtxUsage();
     apiTotals = { prompt: 0, cached: 0 };
+    try {
+      const r = await fetch('/api/sessions/new', { method: 'POST' }).then((r) => r.json());
+      if (r.ok && r.id) {
+        currentSessionId = r.id;
+        currentTitle = r.title || '';
+        if (workspace) {
+          // 新会话就在当前项目下：展开该项目，马上能看到这条空会话
+          expandedFlags = { ...expandedFlags, [workspace]: true };
+          localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
+        }
+        await loadSessions();
+      } else if (r.error) {
+        settingsMsg = `新建会话失败: ${r.error}`;
+      }
+    } catch (e) {
+      settingsMsg = `新建会话失败: ${e.message || e}`;
+    }
   }
 
   async function deleteSession(id) {
     if (!confirm('删除这条会话？其余会话不受影响')) return;
     await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (id === currentSessionId) startNewSession();
+    if (id === currentSessionId) {
+      await startNewSession();
+      return; // startNewSession 里已刷新列表
+    }
     loadSessions();
   }
 
@@ -920,12 +1975,13 @@
     await applyWorkspace(path);
   }
 
-  function newSessionInProject(path, active) {
-    if (active) {
-      startNewSession();
-    } else {
-      switchProject(path).then(() => startNewSession());
+  async function newSessionInProject(path, active) {
+    if (!active) {
+      await switchProject(path);
+      // 没真正切过去（流式输出中/目录不存在）就别新建，否则会话会落到别的项目里
+      if (normPath(workspace).toLowerCase() !== normPath(path).toLowerCase()) return;
     }
+    await startNewSession();
   }
 
   // 时间用 DSH 短格式：4天 / 3小时 / 刚刚
@@ -975,7 +2031,7 @@
     for (const id of checkedIds) {
       await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
     }
-    if (checkedIds.includes(currentSessionId)) startNewSession();
+    if (checkedIds.includes(currentSessionId)) await startNewSession();
     checkedIds = [];
     await loadSessions();
   }
@@ -1086,9 +2142,10 @@
         {
           id: nextId(),
           role: 'system',
-          content: d.ok ? `↩ 已撤销：${cp.files} 个文件恢复到任务开始前` : `⚠️ 撤销失败：${d.error}`,
+          content: d.ok ? `已撤销：${cp.files} 个文件恢复到任务开始前` : `撤销失败：${d.error}`,
         },
       ];
+      refreshDock(); // 撤销后改动数变化，刷新钉条
     } catch (e) {
       messages = [...messages, { id: nextId(), role: 'error', content: `[撤销请求失败] ${e}` }];
     }
@@ -1135,7 +2192,7 @@
         {
           id: nextId(),
           role: 'system',
-          content: d.ok ? `📄 交接文档已生成：${d.path}` : `⚠️ HANDOFF 生成失败：${d.error}`,
+          content: d.ok ? `交接文档已生成：${d.path}` : `HANDOFF 生成失败：${d.error}`,
         },
       ];
     } catch (e) {
@@ -1159,48 +2216,130 @@
     );
   }
 
-  // —— P10.5 主题系统（深/浅）——
-  let theme = localStorage.getItem('theme') === 'light' ? 'light' : 'dark';
-  function applyTheme(t) {
-    theme = t;
-    localStorage.setItem('theme', t);
-    document.documentElement.dataset.theme = t;
+  // —— 主题系统（深/浅/跟随系统）——
+  const sysDark = window.matchMedia('(prefers-color-scheme: dark)');
+  let themeMode = ['dark', 'light', 'system'].includes(localStorage.getItem('theme'))
+    ? localStorage.getItem('theme')
+    : 'dark';
+  let theme = resolveTheme(themeMode);
+  function resolveTheme(mode) {
+    return mode === 'system' ? (sysDark.matches ? 'dark' : 'light') : mode;
+  }
+  function applyThemeMode(m) {
+    themeMode = m;
+    localStorage.setItem('theme', m);
+    theme = resolveTheme(m);
+    document.documentElement.dataset.theme = theme;
   }
   function toggleTheme() {
-    applyTheme(theme === 'dark' ? 'light' : 'dark');
+    applyThemeMode(theme === 'dark' ? 'light' : 'dark');
   }
-  applyTheme(theme); // 首屏即应用（组件初始化阶段，早于首帧渲染）
+  sysDark.addEventListener('change', () => {
+    if (themeMode === 'system') {
+      theme = resolveTheme('system');
+      document.documentElement.dataset.theme = theme;
+    }
+  });
+  applyThemeMode(themeMode); // 首屏即应用（组件初始化阶段，早于首帧渲染）
+
+  // —— 自定义背景壁纸（dataURL 存 localStorage；选图时降采样防超配额）——
+  let wallpaper = localStorage.getItem('wallpaper') || '';
+  let wallpaperOpacity = Number(localStorage.getItem('wallpaperOpacity') ?? 30);
+  let wallpaperMsg = '';
+  $: document.body.classList.toggle('has-wallpaper', !!wallpaper);
+  // 微调模式：body 标记（hover 虚线高亮由 CSS 接管）；关闭时收起面板
+  $: {
+    document.body.classList.toggle('micro-edit-mode', editMode);
+    if (!editMode) microPanel = null;
+  }
+  $: localStorage.setItem('wallpaperOpacity', String(wallpaperOpacity));
+  function onWallpaperPick(e) {
+    const file = e.currentTarget.files && e.currentTarget.files[0];
+    e.currentTarget.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const max = 1920;
+        const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const h = Math.max(1, Math.round(img.naturalHeight * scale));
+        const cv = document.createElement('canvas');
+        cv.width = w;
+        cv.height = h;
+        const ctx = cv.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        try {
+          wallpaper = cv.toDataURL('image/jpeg', 0.85);
+          localStorage.setItem('wallpaper', wallpaper);
+          wallpaperMsg = '';
+        } catch (err) {
+          wallpaperMsg = '壁纸保存失败（图片过大），换张小图试试';
+        }
+      };
+      img.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  }
+  function clearWallpaper() {
+    wallpaper = '';
+    localStorage.removeItem('wallpaper');
+    wallpaperMsg = '';
+  }
 
   // —— P10.5 设置分区（左侧导航）——
-  let settingsTab = localStorage.getItem('settingsTab') || 'model';
+  // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'plugins'].includes(localStorage.getItem('settingsTab'))
+    ? localStorage.getItem('settingsTab')
+    : 'model';
   function pickSettingsTab(t) {
     settingsTab = t;
     localStorage.setItem('settingsTab', t);
-    if (t === 'memory' && !memData) loadMemory();
-    if (t === 'plugins') loadMcp();
+    if (t === 'mcp' || t === 'plugins') loadMcp();
+    if (t === 'skills') loadSkills();
   }
 
-  // —— P10.5 记忆分区（双层 AGENTS.md 编辑 + 状态）——
+  // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
+  // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md。
+  // 文本框始终显示文件当前内容：进入分区/切 chips/保存后都回读一次盘。
   let memData = null;
-  let memTab = 'project';
+  let memTab = 'system';
   let memText = '';
   let memSaving = false;
   let memMsg = '';
+  // 有未保存的编辑：后台回读不得覆盖输入框（否则刚写的约定会被静默清空/回退成旧内容）
+  let memDirty = false;
+  const MEM_SCOPES = {
+    system: { text: 'system_prompt', path: 'system_path', label: '系统约定' },
+    global: { text: 'agents_global', path: 'global_agents_path', label: '全局约定' },
+    project: { text: 'agents_project', path: 'project_agents_path', label: '项目约定' },
+  };
+  function memTextOf(r, tab) {
+    const k = (MEM_SCOPES[tab] || MEM_SCOPES.project).text;
+    return (r && r[k]) || '';
+  }
+  // 当前约定文件路径。必须是响应式变量：模板里直接调用函数不会随 memTab 重算（Svelte 看不到函数体依赖）
+  $: memPath = (memData && MEM_SCOPES[memTab] ? memData[MEM_SCOPES[memTab].path] : '') || '';
   async function loadMemory() {
-    memData = null;
     try {
-      const r = await fetch('/api/memory').then((r) => r.json());
+      // 带时间戳绕开浏览器缓存：显示的一定是盘上当下的内容
+      const r = await fetch(`/api/memory?t=${Date.now()}`).then((r) => r.json());
       memData = r;
-      memText = memTab === 'global' ? r.agents_global || '' : r.agents_project || '';
+      if (!memDirty) memText = memTextOf(r, memTab);
     } catch (e) {
-      memMsg = `读取失败: ${e.message || e}`;
+      if (!memData) memMsg = `读取失败: ${e.message || e}`;
     }
   }
   function pickMemTab(t) {
     if (!memData || memTab === t) return;
     memTab = t;
-    memText = t === 'global' ? memData.agents_global || '' : memData.agents_project || '';
+    memText = memTextOf(memData, t); // 先用上一份快照，随即回读盘上真容
+    memDirty = false; // 换 tab = 看那个文件的内容，放弃当前未保存编辑
     memMsg = '';
+    loadMemory();
   }
   async function saveAgents() {
     memSaving = true;
@@ -1211,15 +2350,95 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope: memTab, content: memText }),
       }).then((r) => r.json());
-      memMsg = r.ok ? `已保存到 ${r.path}` : `保存失败: ${r.error}`;
-      if (r.ok && memData) {
-        if (memTab === 'global') memData.agents_global = memText;
-        else memData.agents_project = memText;
+      if (r.ok) {
+        memDirty = false; // 先清脏标记再回读，框里保留的就是文件真实内容
+        await loadMemory();
+        memMsg = `已保存到 ${r.path}`;
+      } else {
+        memMsg = `保存失败: ${r.error}`;
       }
     } catch (e) {
       memMsg = `保存失败: ${e.message || e}`;
     } finally {
       memSaving = false;
+    }
+  }
+  // 打开设置面板 / 切到记忆分区时都回读文件（含直接打开面板、持久化分区的情形）
+  $: if (settingsOpen && settingsTab === 'memory') loadMemory();
+
+  // —— 技能（Skill / SKILL.md）分区 ——
+  let skillsData = [];
+  let skillsLoading = false;
+  let skillMsg = '';
+  let skillEditor = null; // { isNew, name, description, content, source }
+  async function loadSkills() {
+    skillsLoading = true;
+    try {
+      const r = await fetch('/api/skills').then((r) => r.json());
+      skillsData = r.skills || [];
+    } catch (e) {
+      skillsData = [];
+    }
+    skillsLoading = false;
+  }
+  function newSkill() {
+    skillEditor = {
+      isNew: true,
+      name: '',
+      description: '',
+      content: '---\nname: \ndescription: \n---\n\n1. 步骤一\n2. 步骤二\n',
+      source: 'project',
+    };
+  }
+  function editSkill(s) {
+    skillEditor = {
+      isNew: false,
+      name: s.name,
+      description: s.description || '',
+      content: s.content || '',
+      source: s.source || 'project',
+    };
+  }
+  async function saveSkill() {
+    if (!skillEditor) return;
+    const name = skillEditor.name.trim();
+    if (!name) {
+      skillMsg = '技能名不能为空';
+      return;
+    }
+    try {
+      const r = await fetch('/api/skills', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'save',
+          name,
+          description: skillEditor.description,
+          content: skillEditor.content,
+        }),
+      }).then((r) => r.json());
+      if (r.error) {
+        skillMsg = `保存失败: ${r.error}`;
+        return;
+      }
+      skillMsg = `已保存到 ${r.dir}`;
+      skillEditor = null;
+      await loadSkills();
+    } catch (e) {
+      skillMsg = `保存失败: ${e.message || e}`;
+    }
+  }
+  async function deleteSkill(name) {
+    try {
+      const r = await fetch('/api/skills', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', name }),
+      }).then((r) => r.json());
+      skillMsg = r.error ? `删除失败: ${r.error}` : `已删除 ${name}`;
+      await loadSkills();
+    } catch (e) {
+      skillMsg = `删除失败: ${e.message || e}`;
     }
   }
 
@@ -1262,11 +2481,11 @@
     return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
   }
 
-  // P9 B4：批准计划 → 切回 Act 档并自动下发执行指令（拒绝无按钮：继续对话调整即可）
-  function approvePlan() {
-    setPlanMode(false);
-    input = '计划已批准，请按计划开始执行。';
-    send();
+  // —— 记忆库星云：每个光点 = 一次会话；搜索走向量检索 ——
+  let galaxyOpen = false;
+  function openSessionFromGalaxy(e) {
+    galaxyOpen = false;
+    loadSession(e.detail);
   }
 
   // —— P10-A：trace 时间线（最近任务的事件流）——
@@ -1298,7 +2517,7 @@
     switch (ev.etype) {
       case 'state': return p.kind || JSON.stringify(p).slice(0, 90);
       case 'tool_call': return `${p.name}  ${String(p.arguments || '').slice(0, 90)}`;
-      case 'tool_result': return `${p.ok ? '✓' : '✕'} ${String(p.preview || '').slice(0, 90)}`;
+      case 'tool_result': return `${p.ok ? '[成功] ' : '[失败] '}${String(p.preview || '').slice(0, 90)}`;
       case 'model_chunk': return p.aggregated ? `${p.count} 个模型流式分片（聚合展示）` : '模型分片';
       case 'thought': return String(p.text || '').slice(0, 90);
       case 'error': return String(p.message || p.error || JSON.stringify(p)).slice(0, 90);
@@ -1334,12 +2553,18 @@
   }
 </script>
 
+<svelte:window on:contextmenu={onMicroContext} />
+
+{#if wallpaper}
+  <div class="wallpaper" style="background-image:url('{wallpaper}'); opacity:{wallpaperOpacity / 100}"></div>
+{/if}
+
 <div class="app">
   <aside class="sidebar" class:collapsed={sidebarCollapsed} class:resizing={resizing} style="width:{sidebarW}px">
     <div class="side-head">
       <div class="brand-row">
-        <svg class="whale" viewBox="-0.54 -0.06 56.78 41.72" aria-hidden="true"><path fill="currentColor" d="M55.6128,3.4712c-.5953-.2917-.8517.2642-1.1998.5466-.1191.0911-.2198.2095-.3206.3188-.8701.9292-1.8867,1.5398-3.2148,1.4668-1.9417-.1094-3.5995.5012-5.065,1.9863-.3114-1.8313-1.3463-2.9248-2.9217-3.6262-.8242-.3645-1.6577-.729-2.2348-1.5217-.403-.5647-.5129-1.1934-.7144-1.813-.1283-.3735-.2565-.7563-.687-.8201-.4671-.0728-.6503.3188-.8335.647-.7327,1.3394-1.0166,2.8154-.9892,4.3096.0641,3.3621,1.4838,6.0406,4.3047,7.9449.3206.2187.403.4372.3023.7563-.1924.656-.4214,1.2937-.6228,1.9497-.1283.4192-.3207.5103-.7694.3279-1.5479-.6467-2.8852-1.6035-4.0667-2.7605-2.0058-1.9407-3.8193-4.0818-6.0815-5.7583-.5312-.3918-1.0625-.7561-1.6121-1.1025-2.3081-2.2412.3023-4.0818.9068-4.3003.6319-.2278.2198-1.0115-1.8227-1.0022-2.0425.009-3.9109.6924-6.2922,1.6035-.348.1367-.7145.2368-1.09.3188-2.1615-.4099-4.4055-.5012-6.7502-.2368-4.4147.4919-7.9408,2.5784-10.5328,6.1409C.1914,13.1289-.5413,17.9941.3563,23.0691c.9434,5.3481,3.6727,9.7761,7.8676,13.2385,4.3506,3.5896,9.3606,5.3481,15.0758,5.011,3.4713-.2004,7.5027-1.5586,10.9096-3.4904.6597-.3732,1.3061-.7636,1.9431-1.1647.0963-.0607.1892-.1283.3207-.0675.9754.4383,2.0069.6785,3.0863.6008,1.7863-.1283,3.3526-.7837,4.6372-2.0626.4152-.4122.7981-.8629,1.0271-1.4137.1737-.4155.0848-.6528-.2136-.7087-.3238-.0606-.5181.1559-.7171.3464-.4424.4257-.8792.8623-1.4054,1.1953-1.3641.8645-2.8269,1.1212-4.3692.6344.2536-.3279.6359-.3952.9702-.5365,1.9778-.8359,3.2843-2.2719,3.7624-4.3781.0413-.1826.0772-.3664.1097-.5512.1085-.6145.0798-1.2163-.1039-1.8147-.2416-.7892-.5436-1.5545-1.0509-2.2141-.7773-1.0132-1.7827-1.7146-2.9838-2.1453-.9036-.3242-1.8389-.4709-2.7974-.4189-1.0882.0589-2.1247.3549-3.0951.8451-.9579.4846-1.7778,1.1485-2.4422,1.9958-.8585,1.0932-1.3642,2.3374-1.4744,3.7265-.0861,1.0831.0563,2.1333.4752,3.1313.5739,1.3627,1.5162,2.3944,2.7931,3.1218.1209.0691.2424.1375.3678.1983.1741.084.2086.1805.1097.3582-.2705.4865-.5297.9802-.7958,1.4698-.0677.1242-.1424.2452-.2169.3656-.0592.0954-.1402.1088-.2423.0526-1.8657-1.0286-3.3232-2.4476-4.3562-4.3129-.6723-1.2134-1.0598-2.511-1.1529-3.8904-.0283-.4183-.0306-.8378-.0128-1.2565.0051-.1203-.0301-.1564-.1478-.1495-1.1135.0652-2.1912.2819-3.2096.7305-2.6173,1.1529-4.2559,3.1448-4.8387,5.9438-.1274.6097-.1745,1.2276-.1673,1.8494.0014.1196-.0364.1471-.1455.1433-.8329-.0292-1.6424-.1919-2.4255-.4637-2.5975-.9021-4.562-2.5741-5.8622-5.0172-.7471-1.4059-1.1209-2.9122-1.1355-4.5003-.0043-.4674.0214-.9332.0874-1.3958.0088-.0617-.0136-.1587.0617-.1806.0639-.0187.1187.0532.1648.0963,1.6421,1.5276,3.5543,2.6415,5.7029,3.3254.662.2114,1.3354.3726,2.0173.4882.1171.0198.1604.0601.1473.1848-.0578.5473-.0434,1.0955.0244,1.6412.0185.1485-.0164.1864-.1632.1587-1.0813-.2049-2.1094-.5612-3.0829-1.0795-2.4993-1.3291-4.2931-3.2623-5.3628-5.8955-.4405-1.0806-.6789-2.2061-.7225-3.3708-.0258-.6917.0234-1.3776.1587-2.0556.0203-.1019.053-.2012.0794-.3017.0274-.1032.0876-.1155.1663-.0487.2729.231.5589.4433.8586.6382,2.1417,1.3985,4.4712,2.4025,6.9481,3.0743.5347.145,1.0733.2707,1.6127.3947.1095.0251.2196.0469.3296.069.053.0107.0989.0034.1119-.0612.0115-.0569-.0221-.0918-.0666-.1142-.1211-.0606-.2443-.1166-.3652-.1775-1.675-.8482-3.2055-1.9111-4.5642-3.2072-1.1633-1.1104-2.1489-2.3577-2.9257-3.7649-.4816-.8734-.8476-1.7908-1.0691-2.7623-.0592-.2579-.0654-.2573.1945-.1964,1.0394.2442,2.0905.4096,3.1546.4957,1.2397.1002,2.4805.1076,3.7208.0223,2.0513-.1417,4.0542-.5761,5.9935-1.2897,1.8939-.6987,3.6617-1.6463,5.2914-2.8224.8853-.6405,1.7112-1.3523,2.4701-2.1379.0417-.0431.0801-.0902.1178-.1372.0394-.0492.0851-.0772.1446-.0374Z"/></svg>
-        <span class="brand-name">Agent Local Build</span>
+        <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 20 7.5v5c0 4.5-3.2 7.6-8 9-4.8-1.4-8-4.5-8-9v-5Z"/><path d="m9 11.5 2.2 2.2L15.5 9.5"/></svg></span>
+        <span class="brand-name">Agent</span>
         <button class="icon-btn" title={theme === 'dark' ? '切到浅色主题' : '切到深色主题'} on:click={toggleTheme}>
           {#if theme === 'dark'}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6"/></svg>
@@ -1412,21 +2637,30 @@
           <div
             class="proj"
             class:expanded={!!searchQ || !!expandedFlags[row.path]}
+            class:active={row.active}
             role="button"
             tabindex="0"
-            title={row.path === '__ungrouped__' ? '无工作区记录的历史会话' : row.path}
-            on:click={() => (row.active ? toggleProjectRow(row.path) : switchProject(row.path))}
-            on:keydown={(e) => e.key === 'Enter' && (row.active ? toggleProjectRow(row.path) : switchProject(row.path))}
+            title={row.path === '__ungrouped__' ? '无工作区记录的历史会话' : `${row.path}（点行切换项目，点左侧图标展开/收起列表）`}
+            on:click={() => ((row.path === '__ungrouped__' || row.active) ? toggleProjectRow(row.path) : switchProject(row.path))}
+            on:keydown={(e) => e.key === 'Enter' && ((row.path === '__ungrouped__' || row.active) ? toggleProjectRow(row.path) : switchProject(row.path))}
           >
-            {#if !!searchQ || !!expandedFlags[row.path]}
-              <svg viewBox="0 0 24 24"><path d="M6.5 9.2 12 14.7l5.5-5.5z" fill="currentColor"/></svg>
-            {:else}
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 19.5a1.8 1.8 0 0 0 1.8-1.8V8.3a1.8 1.8 0 0 0-1.8-1.8h-7.4a1.8 1.8 0 0 1-1.5-.8l-.8-1.2a1.8 1.8 0 0 0-1.5-.8H4a1.8 1.8 0 0 0-1.8 1.8v12.2A1.8 1.8 0 0 0 4 19.5Z"/></svg>
-            {/if}
+            <!-- 展开/收起：独立按钮，任何项目都能点开看会话（点行本身仍是切换项目） -->
+            <button
+              class="proj-toggle"
+              title={!!searchQ || !!expandedFlags[row.path] ? '收起会话列表' : '展开会话列表'}
+              on:click|stopPropagation={() => toggleProjectRow(row.path)}
+            >
+              {#if !!searchQ || !!expandedFlags[row.path]}
+                <svg viewBox="0 0 24 24"><path d="M6.5 9.2 12 14.7l5.5-5.5z" fill="currentColor"/></svg>
+              {:else}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M20 19.5a1.8 1.8 0 0 0 1.8-1.8V8.3a1.8 1.8 0 0 0-1.8-1.8h-7.4a1.8 1.8 0 0 1-1.5-.8l-.8-1.2a1.8 1.8 0 0 0-1.5-.8H4a1.8 1.8 0 0 0-1.8 1.8v12.2A1.8 1.8 0 0 0 4 19.5Z"/></svg>
+              {/if}
+            </button>
             <span class="proj-name">{row.name}{row.count ? '' : ''}</span>
+            {#if row.active}<span class="proj-cur" title="当前项目"></span>{/if}
             {#if row.path !== '__ungrouped__'}
               <span class="proj-side">
-                <button class="row-btn boxed" class:on={projMenuPath === row.path} title="项目操作" on:click|stopPropagation={() => (projMenuPath = projMenuPath === row.path ? null : row.path)}>
+                <button class="row-btn" class:on={projMenuPath === row.path} title="项目操作" on:click|stopPropagation={() => (projMenuPath = projMenuPath === row.path ? null : row.path)}>
                   <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5.5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="18.5" cy="12" r="1.5"/></svg>
                 </button>
                 <button class="row-btn" title="在项目内新建会话" on:click|stopPropagation={() => newSessionInProject(row.path, row.active)}>
@@ -1458,7 +2692,7 @@
             on:keydown={(e) => e.key === 'Enter' && (manageMode ? toggleChecked(s.id) : loadSession(s.id))}
           >
             {#if manageMode}
-              <span class="conv-check" class:on={checkedIds.includes(s.id)}>{checkedIds.includes(s.id) ? '✓' : ''}</span>
+              <span class="conv-check" class:on={checkedIds.includes(s.id)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span>
             {:else if s.pinned}
               <svg class="conv-pin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" transform="rotate(38 12 12)"><path d="M14.5 4.2 19.8 9.5a1 1 0 0 1-.94 1.68l-2.6-.52-3.62 3.62.55 2.87a1 1 0 0 1-1.7.89L9.9 16.4l-4.6 4.6-1.3-1.3 4.6-4.6-1.64-1.64a1 1 0 0 1 .89-1.7l2.87.55 3.62-3.62-.52-2.6a1 1 0 0 1 1.68-.94Z"/></svg>
             {/if}
@@ -1502,27 +2736,58 @@
     </div>
 
     <div class="side-foot">
+      <button class="foot-btn galaxy-btn" on:click={() => (galaxyOpen = true)} title="记忆库：以星云看每一次会话，支持语义搜索">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="9.2" ry="3.6" transform="rotate(-24 12 12)"/><circle cx="19.4" cy="8.6" r="1.1" fill="currentColor" stroke="none"/><circle cx="5.2" cy="15.2" r="0.9" fill="currentColor" stroke="none"/></svg>
+        记忆库
+      </button>
       <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
     </div>
     <div class="resize-handle" on:mousedown={startResize}></div>
   </aside>
 
-  <main class="chat">
+  <main class="chat" class:side-collapsed={sidebarCollapsed}>
     {#if sidebarCollapsed}
       <button class="sidebar-restore" title="展开侧栏" on:click={() => (sidebarCollapsed = false)}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
       </button>
     {/if}
     <header class="chat-head">
-      <div>
-        <div class="chat-title">对话</div>
-        <div class="chat-sub">P6 恢复与续命 · 会话落盘可恢复 · 改动前自动检查点</div>
+      <div class="head-main">
+        <div class="chat-title">{displayTitle}</div>
+      </div>
+      <div class="head-side">
+        <button
+          class="head-btn"
+          class:active={terminalOpen}
+          title="终端（沙箱内执行命令）"
+          on:click={() => {
+            terminalOpen = !terminalOpen;
+            if (terminalOpen) rightPanelOpen = false;
+          }}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="m7.5 9.5 3.2 2.8-3.2 2.8"/><path d="M12.8 15.4h4"/></svg>
+        </button>
+        <button
+          class="head-btn"
+          class:active={rightPanelOpen}
+          title="产物与预览"
+          on:click={() => {
+            rightPanelOpen = !rightPanelOpen;
+            if (rightPanelOpen) {
+              terminalOpen = false;
+              openRightPanel();
+            }
+          }}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="M14.5 4.5v15"/><path d="M17.5 9.5h1M17.5 12.5h1" stroke-linecap="round"/></svg>
+        </button>
       </div>
     </header>
 
-    <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
+    <div class="chat-main">
+      <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
       {#if messages.length === 0}
-        <div class="empty-hint">输入消息开始对话（Enter 发送）</div>
+        <div class="empty-hint"><div class="empty-title">开始新的对话</div><div class="empty-sub">输入消息后按 Enter 发送，支持粘贴截图与拖拽文件</div></div>
       {/if}
       {#each messages as m (m.id)}
         {#if m.role === 'user'}
@@ -1546,7 +2811,7 @@
                     {:else if a.mime && a.mime.startsWith('audio/')}
                       <audio class="msg-att-audio" controls src={a.data}></audio>
                     {:else}
-                      <div class="msg-att-file">📎 {a.name}</div>
+                      <div class="msg-att-file"><svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg> {a.name}</div>
                     {/if}
                   {/each}
                 </div>
@@ -1569,7 +2834,7 @@
                 <div class="approval-box" class:danger={m.approval.risk >= 2}>
                   <div class="approval-head">
                     <span class="approval-title"
-                      >⚠️ 请求执行：<b>{m.approval.tool}</b>
+                      ><span class="approval-kicker">审批请求</span><b>{m.approval.tool}</b>
                       <span class="approval-risk risk-{m.approval.risk}"
                         >{m.approval.riskLabel || riskLabelFor(m.approval.risk)}</span
                       ></span
@@ -1591,31 +2856,8 @@
                       <span class="approval-hint">等你的决定，120 秒不选自动拒绝</span>
                     </div>
                   {:else}
-                    <div class="approval-state">{m.approval.decided ? '✓ 已允许' : '✕ 已拒绝'}</div>
+                    <div class="approval-state">{m.approval.decided ? '已允许' : '已拒绝'}</div>
                   {/if}
-                </div>
-              {/if}
-              {#if m.plan}
-                <!-- P9 B3/B4：Plan 档结构化计划卡 -->
-                <div class="plan-card">
-                  <div class="plan-head">📋 执行计划（等待批准）</div>
-                  {#if m.plan.goal}
-                    <div class="plan-goal">{m.plan.goal}</div>
-                  {/if}
-                  {#if m.plan.steps && m.plan.steps.length}
-                    <ol class="plan-steps">
-                      {#each m.plan.steps as s}
-                        <li>{s}</li>
-                      {/each}
-                    </ol>
-                  {/if}
-                  {#if m.plan.files && m.plan.files.length}
-                    <div class="plan-files">涉及文件：{m.plan.files.join('、')}</div>
-                  {/if}
-                  <div class="plan-actions">
-                    <button class="btn" on:click={approvePlan} disabled={streaming}>批准并开始执行</button>
-                    <span class="plan-hint">批准后切回 Act 档并自动下发执行指令；拒绝可直接对话继续调整</span>
-                  </div>
                 </div>
               {/if}
               {#if m.tools && m.tools.length}
@@ -1635,28 +2877,23 @@
               {#if m.content}
                 <div class="content">{m.content}</div>
               {:else if m.streaming}
-                <div class="typing">▍</div>
+                <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
               {/if}
-              {#if m.streaming && m.content}<span class="cursor">▍</span>{/if}
+              {#if m.streaming && m.content}<span class="cursor"></span>{/if}
             </div>
-          </div>
-        {:else if m.role === 'cp'}
-          <div class="cp-bar">
-            <span class="cp-sum">› <b>{m.cp.files}</b> 个文件已更改</span>
-            <span class="cp-add">+{m.cp.additions}</span>
-            <span class="cp-del">−{m.cp.deletions}</span>
-            <button class="cp-undo" on:click={() => undoCheckpoint(m.cp)}>↩ 撤销</button>
           </div>
         {:else if m.role === 'error'}
           <div class="msg system"><div class="bubble error-bubble">{m.content}</div></div>
+        {:else if m.role === 'cp'}
+          <!-- 检查点消息只给改动条提供基线（dockCp），不渲染 -->
         {:else}
-          <div class="msg system"><div class="sys-text">{m.content}</div></div>
+          <div class="msg system"><div class="sys-text">{m.content ?? ''}</div></div>
         {/if}
       {/each}
     </div>
 
     {#if !chatPinned}
-      <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">↓ 最新消息</button>
+      <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">回到底部</button>
     {/if}
 
     <div class="handoff-bar">
@@ -1664,6 +2901,63 @@
     </div>
 
     <footer class="chat-input">
+      {#if dockCp || (gitInfo && gitInfo.is_repo)}
+        <div class="cp-dock">
+          <div class="cp-bar">
+            {#if gitInfo && gitInfo.is_repo}
+              <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
+                <svg class="git-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
+                <b>{gitInfo.branch}</b>{#if gitInfo.head}<span class="git-head">@{gitInfo.head}</span>{/if}
+              </span>
+              {#if gitInfo.ahead || gitInfo.behind}
+                <span class="git-ab" title="相对上游的领先/落后提交数">{#if gitInfo.ahead}↑{gitInfo.ahead}{/if}{#if gitInfo.behind}↓{gitInfo.behind}{/if}</span>
+              {/if}
+              {#if gitInfo.dirty}
+                <button
+                  class="git-dirty"
+                  class:on={gitPopOpen}
+                  title="点开看待提交文件清单（{gitInfo.dirty} 处）"
+                  on:click={() => (gitPopOpen = !gitPopOpen)}
+                >{gitInfo.dirty} 处未提交</button>
+              {/if}
+            {/if}
+            {#if dockCp && dockCp.files > 0}
+              <span class="cp-sum">› <b>{dockCp.files}</b> 个文件已更改</span>
+              {#if dockCp.additions != null}
+                <span class="cp-add">+{dockCp.additions}</span>
+                <span class="cp-del">-{dockCp.deletions}</span>
+              {/if}
+            {/if}
+            <span class="cp-actions">
+              {#if dockCp && dockCp.files > 0}
+                <button class="cp-undo" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
+              {/if}
+              {#if gitInfo && gitInfo.is_repo && gitInfo.dirty > 0}
+                <button class="cp-commit" on:click={openCommit}>提交</button>
+              {/if}
+            </span>
+          </div>
+          {#if gitPopOpen && gitInfo && gitInfo.is_repo}
+            <div class="git-pop">
+              <div class="git-pop-head">
+                <b>{gitInfo.dirty}</b> 处未提交改动
+                <span class="git-pop-hint">点文件名看内容</span>
+              </div>
+              <div class="git-pop-list">
+                {#each gitInfo.files as f (f.path + f.status)}
+                  <button class="git-pop-row" title={f.path} on:click={() => openGitFile(f.path)}>
+                    <span class="git-st">{gitStatusLabel(f.status)}</span>
+                    <span class="git-path">{f.path}</span>
+                  </button>
+                {/each}
+                {#if gitInfo.dirty > gitInfo.files.length}
+                  <div class="git-pop-more">还有 {gitInfo.dirty - gitInfo.files.length} 处未列出</div>
+                {/if}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
       <div class="composer">
         {#if pendingAttachments.length > 0}
           <div class="composer-attachments">
@@ -1672,15 +2966,15 @@
                 {#if att.mime.startsWith('image/')}
                   <img class="att-thumb" src={att.data} alt={att.name} />
                 {:else if att.mime.startsWith('video/')}
-                  <span class="att-badge">🎬</span>
+                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5.5" width="18" height="13" rx="2.5"/><path d="M3 9.5h18M7.5 5.5v4M16.5 5.5v4"/></svg>
                 {:else if att.mime.startsWith('audio/')}
-                  <span class="att-badge">🎵</span>
+                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="7.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M10 17.5V6l10-2.5V15.5"/></svg>
                 {:else}
-                  <span class="att-badge">📎</span>
+                  <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>
                 {/if}
                 <span class="att-name">{att.name}</span>
                 <span class="att-size">{fmtBytes(att.size)}</span>
-                <button class="att-del" on:click={() => removeAttachment(idx)} title="移除">✕</button>
+                <button class="att-del" on:click={() => removeAttachment(idx)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
               </div>
             {/each}
           </div>
@@ -1688,8 +2982,9 @@
         <textarea
           class="composer-input"
           rows="1"
+          bind:this={composerInputEl}
           bind:value={input}
-          placeholder="提出后续修改要求（支持粘贴图片截图、拖拽文件或点 📎 附件）"
+          placeholder="输入消息，Enter 发送，Shift+Enter 换行（支持粘贴截图、拖拽文件）"
           on:keydown={handleKey}
           on:input={autoRows}
           on:paste={handlePaste}
@@ -1699,7 +2994,68 @@
         ></textarea>
         <div class="composer-bar">
           <div class="composer-left">
-            <button class="icon-btn" title="新建对话" on:click={startNewSession} disabled={streaming}>＋</button>
+            <div class="bar-menu">
+              <button
+                class="icon-btn"
+                title="添加上下文 / 能力 / 技能"
+                on:click={() => {
+                  plusMenuOpen = !plusMenuOpen;
+                  abilityMenuOpen = false;
+                  skillMenuOpen = false;
+                }}
+                disabled={streaming}
+              ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+              {#if plusMenuOpen}
+                <div class="bar-dropdown">
+                  <button class="bar-item" on:click={openCtxPicker}>
+                    <span class="menu-sym">@</span> 使用 @ 添加上下文
+                  </button>
+                  <button class="bar-item" on:click={openAbilityMenu}>
+                    <span class="menu-sym">/</span> 使用 / 选择能力
+                  </button>
+                  <button class="bar-item" on:click={openSkillMenu}>
+                    <span class="menu-sym">$</span> 使用 $ 选择技能
+                  </button>
+                </div>
+              {/if}
+              {#if abilityMenuOpen}
+                <div class="bar-dropdown">
+                  {#each ABILITY_TEMPLATES as t}
+                    <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(t.text); }}>
+                      <span class="menu-sym">/</span> {t.cmd}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+              {#if skillMenuOpen}
+                <div class="bar-dropdown">
+                  {#if !skillsData.length && !mcpServers.length && !wasmPlugins.length}
+                    <div class="menu-empty">暂无技能：可在「设置 → 技能」创建，或添加 MCP/WASM 插件</div>
+                  {/if}
+                  {#each skillsData as sk (sk.name)}
+                    <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
+                      <span class="menu-sym">$</span> {sk.name}
+                    </button>
+                  {/each}
+                  {#each mcpServers as srv}
+                    {#if srv.online !== false && srv.tools && srv.tools.length}
+                      {#each srv.tools as t}
+                        <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$mcp__${srv.name}__${t.name} `); }}>
+                          <span class="menu-sym">$</span> {t.name}
+                        </button>
+                      {/each}
+                    {/if}
+                  {/each}
+                  {#each wasmPlugins as w}
+                    {#each w.tools || [] as t}
+                      <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$wasm__${w.stem}__${t.name} `); }}>
+                        <span class="menu-sym">$</span> wasm__{w.stem}__{t.name}
+                      </button>
+                    {/each}
+                  {/each}
+                </div>
+              {/if}
+            </div>
             <input
               type="file"
               bind:this={fileInput}
@@ -1714,16 +3070,7 @@
               on:click={() => fileInput && fileInput.click()}
               disabled={streaming}
             >
-              📎
-            </button>
-            <button
-              class="pill"
-              class:plan-active={planMode}
-              on:click={() => setPlanMode(!planMode)}
-              disabled={streaming}
-              title="P9 Plan 模式：先规划后执行——Plan 档只放行只读操作，产出计划卡等你批准后转 Act 执行"
-            >
-              <span class="pill-label">模式:</span> {planMode ? 'Plan' : 'Act'}
+              <svg class="att-ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>
             </button>
             <div class="bar-menu">
               <button
@@ -1733,16 +3080,13 @@
                 title="审批档位：控制工具执行要不要先问你"
               >
                 <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalMode] || approvalMode}
-                <span class="caret">▾</span>
+                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
               {#if approvalMenuOpen}
                 <div class="bar-dropdown">
                   {#each Object.entries(APPROVAL_LABELS) as [val, label]}
                     <button class="bar-item" class:active={val === approvalMode} on:click={() => pickApproval(val)}>
                       {label}
-                      <span class="bar-item-hint">
-                        {val === 'read-only' ? '改动要批' : val === 'auto' ? '沙箱内全自动' : '脱沙箱！'}
-                      </span>
                     </button>
                   {/each}
                 </div>
@@ -1794,19 +3138,42 @@
               </div>
             {/if}
             <div class="bar-menu">
-              <button class="pill model-pill" on:click={() => (modelMenuOpen = !modelMenuOpen)} title="切换模型">
+              <button
+                class="pill model-pill"
+                on:click={() => {
+                  modelMenuOpen = !modelMenuOpen;
+                  if (modelMenuOpen) menuExpandedCfg = activeConfigId;
+                }}
+                title="切换模型（按配置分组）"
+              >
                 {model || '未选模型'}
-                <span class="caret">▾</span>
+                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
               {#if modelMenuOpen}
                 <div class="bar-dropdown right">
-                  {#if savedModels.length === 0}
-                    <div class="menu-empty">暂无模型，先到设置里获取</div>
-                  {/if}
-                  {#each savedModels as m}
-                    <button class="bar-item" class:active={m === model} on:click={() => { pickModel(m); modelMenuOpen = false; }}>
-                      {m}
+                  {#each configs as cfg}
+                    <button
+                      class="bar-item group-head"
+                      class:active={cfg.id === activeConfigId}
+                      on:click={() => (menuExpandedCfg = menuExpandedCfg === cfg.id ? '' : cfg.id)}
+                    >
+                      <span>{configLabel(cfg)}{cfg.id === activeConfigId ? ' · 当前' : ''}</span>
+                      <svg class="caret-ico" class:open={menuExpandedCfg === cfg.id} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
                     </button>
+                    {#if menuExpandedCfg === cfg.id}
+                      {#if !(cfg.models || []).length}
+                        <div class="menu-empty">（该配置还没有模型，去设置里获取）</div>
+                      {/if}
+                      {#each cfg.models || [] as m}
+                        <button
+                          class="bar-item sub"
+                          class:active={cfg.id === activeConfigId && m === model}
+                          on:click={() => pickCrossModel(cfg, m)}
+                        >
+                          {m}
+                        </button>
+                      {/each}
+                    {/if}
                   {/each}
                   <div class="menu-sep"></div>
                   <button class="bar-item" on:click={() => { modelMenuOpen = false; settingsOpen = true; }}>
@@ -1823,7 +3190,7 @@
                 title={thinkHint}
               >
                 <span class="pill-label">思考:</span> {THINK_LABELS[thinking] || '默认'}
-                <span class="caret">▾</span>
+                <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
               {#if thinkMenuOpen}
                 <div class="bar-dropdown right compact">
@@ -1880,16 +3247,171 @@
               {/if}
             </div>
             {#if streaming}
-              <button class="send-btn stop" on:click={stop} title="停止">■</button>
+              <button class="send-btn stop" on:click={stop} title="停止" aria-label="停止"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
             {:else}
-              <button class="send-btn" on:click={send} disabled={!input.trim()} title="发送（Enter）">↑</button>
+              <button class="send-btn" on:click={send} disabled={!input.trim()} title="发送（Enter）" aria-label="发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
             {/if}
           </div>
         </div>
       </div>
     </footer>
+    </div>
+    {#if terminalOpen}
+      <div class="term-panel">
+        <div class="term-head">
+          <span class="term-title">终端</span>
+          <span class="term-hint">工作区内 · 沙箱执行</span>
+          <span class="flex-sp"></span>
+          <button class="term-clear" on:click={() => (termLines = [])}>清空</button>
+          <button class="term-close" title="关闭终端" on:click={() => (terminalOpen = false)}>×</button>
+        </div>
+        <div class="term-out" bind:this={termOutEl}>
+          {#if !termLines.length}
+            <div class="term-line dim">输入命令回车执行（如 dir、git status）。命令在你的工作区内、受限沙箱中运行。</div>
+          {/if}
+          {#each termLines as l}
+            <div class="term-block" class:err={!l.ok}>
+              <div class="term-line"><span class="term-prompt">❯</span>{l.cmd}</div>
+              {#if l.out}<pre class="term-text">{l.out}</pre>{/if}
+            </div>
+          {/each}
+          {#if termRunning}
+            <div class="term-line dim">执行中…</div>
+          {/if}
+        </div>
+        <div class="term-in">
+          <span class="term-prompt">❯</span>
+          <input
+            bind:value={termInput}
+            placeholder="输入命令，Enter 运行"
+            disabled={termRunning}
+            spellcheck="false"
+            on:keydown={(e) => {
+              if (e.isComposing || e.keyCode === 229) return;
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const cmd = termInput.trim();
+                if (cmd && !termRunning) runTerm(cmd);
+              }
+            }}
+          />
+        </div>
+      </div>
+    {/if}
   </main>
+
+  {#if rightPanelOpen}
+    <aside class="right-panel">
+      <div class="rp-tabs">
+        <button class:active={rpTab === 'artifacts'} on:click={() => { rpTab = 'artifacts'; loadArtifacts(); }}>产物</button>
+        <button class:active={rpTab === 'preview'} on:click={() => { rpTab = 'preview'; if (!rpPreviewContent && rpFiles.length) previewFile(rpFiles[0]); }}>预览</button>
+        <span class="flex-sp"></span>
+        <button class="rp-refresh" title="刷新产物清单" on:click={loadArtifacts}>↻</button>
+      </div>
+      <div class="rp-body">
+        {#if rpTab === 'artifacts'}
+          {#if rpLoading}
+            <div class="trace-empty">加载中…</div>
+          {:else if !rpFiles.length}
+            <div class="rp-empty">本任务还没有产物。<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
+          {:else}
+            {#each rpFiles as f (f)}
+              <button class="rp-file" class:sel={f === rpPreviewPath} title={f} on:click={() => previewFile(f)}>
+                {f}
+              </button>
+            {/each}
+          {/if}
+        {:else}
+          {#if rpPreviewPath}
+            <div class="rp-preview-path">{rpPreviewPath}</div>
+            <pre class="rp-preview">{rpPreviewContent || '（空文件）'}</pre>
+          {:else}
+            <div class="rp-empty">从「产物」里点一个文件查看内容</div>
+          {/if}
+        {/if}
+      </div>
+    </aside>
+  {/if}
+
 </div>
+
+{#if microPanel}
+  <div
+    class="micro-panel"
+    style="left:{microPanel.x}px; top:{microPanel.y}px; max-height: calc(100vh - {microPanel.y}px - 10px);"
+  >
+    <div class="micro-head">
+      <div class="micro-name">{microPanel.name}</div>
+      <div class="micro-sel">{microPanel.sel}</div>
+    </div>
+    <div class="micro-body">
+      <div class="micro-row">
+        <label>文字色</label>
+        <input type="color" data-m="color" value={microPanel.color} on:input={(e) => microPreview('color', e.target.value)} />
+        <span class="micro-val">{microPanel.color}</span>
+      </div>
+      <div class="micro-row">
+        <label>背景色</label>
+        <input type="color" data-m="bg" value={microPanel.bg} on:input={(e) => microPreview('bg', e.target.value)} />
+        <span class="micro-val">{microPanel.bgTransparent && !microPanel.bgDirty ? '透明（不动）' : microPanel.bg}</span>
+      </div>
+      <div class="micro-row">
+        <label>背景透明</label>
+        <input type="range" min="0" max="100" data-m="bgOpacity" value={microPanel.bgOpacity} on:input={(e) => microPreview('bgOpacity', +e.target.value)} />
+        <span class="micro-val">{microPanel.bgOpacity}%</span>
+      </div>
+      {#if microPanel.bgHost}
+        <div class="micro-warn">这个元素本身是透明的，你看到的底色其实由上级「{microPanel.bgHost.name || microPanel.bgHost.sel}」绘制。改本层背景不会有变化。</div>
+        <div class="micro-actions" style="margin-top:0">
+          <button class="btn primary" on:click={useBgHost}>改上级「{microPanel.bgHost.name || microPanel.bgHost.sel}」</button>
+        </div>
+      {/if}
+      <div class="micro-row">
+        <label>模糊</label>
+        <input type="range" min="0" max="30" data-m="blur" value={microPanel.blur} on:input={(e) => microPreview('blur', +e.target.value)} />
+        <span class="micro-val">{microPanel.blur}px</span>
+      </div>
+      {#if microPanel.blur > 0 && microPanel.bgOpacity >= 85 && !microPanel.bgTransparent}
+        <div class="micro-warn">毛玻璃需要半透明底：模糊要透出下层，背景不透明度建议先降到 85% 以下，否则模糊不可见还会在弹窗下发灰。现在这条模糊不会被保存（半透明后可再加）。</div>
+      {/if}
+      <div class="micro-row">
+        <label>圆角</label>
+        <input type="range" min="0" max="40" data-m="radius" value={microPanel.radius} on:input={(e) => microPreview('radius', +e.target.value)} />
+        <span class="micro-val">{microPanel.radius}px</span>
+      </div>
+      <div class="micro-row">
+        <label>描边</label>
+        <input type="range" min="0" max="8" data-m="border" value={microPanel.border} on:input={(e) => microPreview('border', +e.target.value)} />
+        <span class="micro-val">{microPanel.border}px</span>
+      </div>
+      <div class="micro-row">
+        <label>描边色</label>
+        <input type="color" data-m="borderColor" value={microPanel.borderColor} on:input={(e) => microPreview('borderColor', e.target.value)} />
+        <span class="micro-val">{microPanel.borderColor}</span>
+      </div>
+      <div class="micro-row">
+        <label>字号</label>
+        <input type="number" min="9" max="24" data-m="fontSize" value={microPanel.fontSize} on:input={(e) => microPreview('fontSize', +e.target.value)} />
+        <span class="micro-val">{microPanel.fontSize}px</span>
+      </div>
+      <div class="micro-row">
+        <label>作用范围</label>
+        <div class="scope-opts">
+          <button class="scope-opt" class:active={microPanel.scope !== 'all'} on:click={() => (microPanel = { ...microPanel, scope: 'only' })}>仅此元素</button>
+          <button class="scope-opt" class:active={microPanel.scope === 'all'} on:click={() => (microPanel = { ...microPanel, scope: 'all' })}>同类全部</button>
+        </div>
+      </div>
+      <div class="micro-hint">改动实时预览；「应用」只保存你动过的属性。作用范围默认「仅此元素」，要统一改一类元素就切「同类全部」。生成的规则见下方 CSS 注入器里的只读预览，手写 CSS 永远优先。</div>
+    </div>
+    <div class="micro-foot">
+      <div class="micro-actions">
+        <button class="btn primary" on:click={applyMicro}>应用</button>
+        <button class="btn" on:click={resetMicro}>重置此元素</button>
+        <button class="btn ghost" on:click={cancelMicro}>取消</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if settingsOpen}
   <div class="modal-backdrop" on:click={() => (settingsOpen = false)}>
@@ -1901,31 +3423,88 @@
       </div>
       <div class="settings-body">
         <div class="settings-nav">
-          <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}>🎨 外观</button>
-          <button class:active={settingsTab === 'model'} on:click={() => pickSettingsTab('model')}>🔌 模型配置</button>
-          <button class:active={settingsTab === 'params'} on:click={() => pickSettingsTab('params')}>🎛 模型参数</button>
-          <button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}>👥 角色分工</button>
-          <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}>🧠 记忆</button>
-          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}>🔌 插件 (MCP)</button>
-          <button class:active={settingsTab === 'workspace'} on:click={() => pickSettingsTab('workspace')}>📁 工作区</button>
+          <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="9" cy="10" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8.5" r="1.2" fill="currentColor"/><circle cx="15.5" cy="11" r="1.2" fill="currentColor"/></svg> 外观</button>
+          <button class:active={settingsTab === 'model'} on:click={() => pickSettingsTab('model')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> 模型配置</button>
+          <button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5"/><circle cx="17" cy="9.5" r="2.4"/><path d="M16 15.2c2.4.2 3.9 1.6 4.4 4"/></svg> 角色分工</button>
+          <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆</button>
+          <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
+          <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
+          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="8" height="8" rx="1.5"/><path d="M10 8V4.5M14 8V4.5M10 19.5V16M14 19.5V16M4.5 10H8M4.5 14H8M16 10h3.5M16 14h3.5"/></svg> 插件</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
           <div class="field">
             <label>主题</label>
-            <div class="theme-cards">
-              <button class="theme-card" class:active={theme === 'dark'} on:click={() => applyTheme('dark')}>
-                <span class="theme-preview dark-preview"></span>
-                <span>深色</span>
-                <span class="theme-desc">暗夜工作模式（默认）</span>
-              </button>
-              <button class="theme-card" class:active={theme === 'light'} on:click={() => applyTheme('light')}>
-                <span class="theme-preview light-preview"></span>
-                <span>浅色</span>
-                <span class="theme-desc">日间高对比</span>
+            <div class="theme-opts">
+              <button class="theme-opt" class:active={themeMode === 'dark'} on:click={() => applyThemeMode('dark')}>深色</button>
+              <button class="theme-opt" class:active={themeMode === 'light'} on:click={() => applyThemeMode('light')}>浅色</button>
+              <button class="theme-opt" class:active={themeMode === 'system'} on:click={() => applyThemeMode('system')}>跟随系统</button>
+            </div>
+            <div class="param-hint">即时生效并记住；侧栏顶部可快速切换</div>
+          </div>
+          <div class="field">
+            <label>背景壁纸</label>
+            <div class="wp-row">
+              <label class="theme-opt wp-pick">选择图片
+                <input type="file" accept="image/*" on:change={onWallpaperPick} />
+              </label>
+              {#if wallpaper}
+                <button class="theme-opt" on:click={clearWallpaper}>清除壁纸</button>
+                <span class="wp-opacity">不透明度 <b>{wallpaperOpacity}</b>
+                  <input type="range" min="0" max="100" bind:value={wallpaperOpacity} />
+                </span>
+              {:else}
+                <span class="param-hint">聊天区背景图（0=隐藏，100=不透明）</span>
+              {/if}
+            </div>
+            {#if wallpaperMsg}<div class="param-hint">{wallpaperMsg}</div>{/if}
+          </div>
+          <div class="field">
+            <label>CSS 注入器</label>
+            <textarea
+              class="agents-editor css-injector"
+              rows="8"
+              spellcheck="false"
+              bind:value={customCss}
+              on:input={() => applyCustomCss()}
+              placeholder={'直接写 CSS 规则，实时生效并记住。例如：\n.composer { border-radius: 24px; }\n.chat-head { display: none; }'}
+            ></textarea>
+            <div class="param-hint">手写 CSS 优先级最高；改崩了就清空重来</div>
+            {#if microCss(microTweaks)}
+              <label>微调生成的规则（只读预览，实际已生效）</label>
+              <textarea
+                class="agents-editor css-injector micro-readonly"
+                rows="6"
+                spellcheck="false"
+                readonly
+                value={microCss(microTweaks)}
+              ></textarea>
+              <div class="sub-row">
+                <button class="btn" on:click={clearAllMicro}>清空全部微调规则</button>
+                <span class="param-hint" style="align-self:center">一键清空微调规则（不影响手写 CSS）</span>
+              </div>
+            {/if}
+            <div class="sub-row">
+              <button class="btn" on:click={exportCssRules}>导出规则</button>
+              <button class="btn" on:click={() => cssImportInput && cssImportInput.click()}>导入规则</button>
+              <input
+                class="css-rules-file"
+                type="file"
+                accept=".json,.css,.txt,application/json,text/css,text/plain"
+                bind:this={cssImportInput}
+                on:change={onImportCssRules}
+              />
+              <span class="param-hint" style="align-self:center">导出 JSON 含微调+手写；导入 JSON 覆盖两者，.css 只覆盖手写</span>
+            </div>
+          </div>
+          <div class="field">
+            <label>界面微调模式</label>
+            <div class="sub-row">
+              <button class="btn" class:primary={editMode} on:click={() => (editMode = !editMode)}>
+                {editMode ? '● 微调中：右击界面元素即可修改（再点关闭）' : '开启微调：右击界面元素修改样式'}
               </button>
             </div>
-            <div class="param-hint">主题即时生效并记住选择；侧栏顶部 ☀/🌙 按钮可随时切换</div>
+            <div class="param-hint">开启后右击元素弹出属性面板，改动实时预览并保存；刷新后需重新开启</div>
           </div>
         {/if}
         {#if settingsTab === 'model'}
@@ -1943,8 +3522,8 @@
               <span class="dot" class:haskey={c.has_key}></span>{configLabel(c)}
             </button>
           {/each}
-          <button class="chip add" on:click={newConfig}>＋ 新建配置</button>
-          <button class="chip del" on:click={deleteConfig}>✕ 删除当前</button>
+          <button class="chip add" on:click={newConfig}>新建配置</button>
+          <button class="chip del" on:click={deleteConfig}>删除当前</button>
         </div>
       </div>
 
@@ -1959,11 +3538,15 @@
 
       <div class="field">
         <label>供应商</label>
-        <select bind:value={providerId} on:change={onProviderChange}>
-          {#each providers as p}
-            <option value={p.id}>{p.name}</option>
-          {/each}
-        </select>
+        <Select
+          value={providerId}
+          title="供应商预设"
+          options={providers.map((p) => ({ value: p.id, label: p.name }))}
+          on:change={(e) => {
+            providerId = e.detail;
+            onProviderChange();
+          }}
+        />
       </div>
 
       <div class="field">
@@ -1997,26 +3580,23 @@
       <div class="field">
         <label>模型</label>
         <div class="sub-row">
-          <select
-            bind:value={model}
-            on:change={() => autoSave({ model }, 0)}
-          >
-            {#if !savedModels.includes(model) && model}
-              <option value={model}>{model}</option>
-            {/if}
-            {#each savedModels as m}
-              <option value={m}>{m}</option>
-            {/each}
-            {#if !model && !savedModels.length}
-              <option value="">（点右侧获取模型）</option>
-            {/if}
-          </select>
+          <Select
+            value={model}
+            placeholder="（点右侧获取模型）"
+            title="当前模型"
+            options={[
+              ...(model && !savedModels.includes(model) ? [{ value: model, label: model }] : []),
+              ...savedModels.map((m) => ({ value: m, label: m })),
+            ]}
+            on:change={(e) => {
+              model = e.detail;
+              autoSave({ model }, 0);
+            }}
+          />
           <button class="btn primary" on:click={fetchModels}>获取模型</button>
         </div>
       </div>
 
-      {/if}
-      {#if settingsTab === 'params'}
       <div class="field">
         <label>模型参数（tokens，0=恢复默认）</label>
         <div class="sub-row">
@@ -2037,7 +3617,7 @@
             on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
           />
         </div>
-        <div class="param-hint">左：上下文长度　右：最大输出长度</div>
+        <div class="param-hint">左：上下文长度　右：最大输出长度；以下参数均随当前配置独立保存，切换配置即切换参数</div>
       </div>
 
       <div class="field">
@@ -2061,25 +3641,6 @@
           />
         </div>
         <div class="param-hint">左：temperature（-1 清除）　右：top_p（-1 清除）</div>
-      </div>
-
-      <div class="field">
-        <label>思考参数形态（中转渠道探测不准时用）</label>
-        <select
-          bind:value={thinkingStyleOverride}
-          on:change={() => autoSave({ thinking_style: thinkingStyleOverride || 'auto' }, 0)}
-        >
-          <option value={null}>自动（按端点探测）</option>
-          <option value="none">不发任何思考参数（none）</option>
-          <option value="openai">OpenAI · reasoning_effort 档位</option>
-          <option value="deepseek">DeepSeek/小米 · thinking 对象</option>
-          <option value="zai">智谱/豆包 · thinking 对象</option>
-          <option value="qwen">千问/混元 · enable_thinking 布尔</option>
-          <option value="qwen-chat-template">本地服务 · chat_template_kwargs（Qwen3 模板）</option>
-        </select>
-        <div class="param-hint">
-          默认按域名/供应商自动探测思考协议；中转/反代认不准时（如商汤式网关）在这里显式指定，on/off 立即按该形态发参
-        </div>
       </div>
 
       <div class="field">
@@ -2118,15 +3679,7 @@
             音频解析
           </label>
         </div>
-        <div class="param-hint">
-          {capabilitiesUserSet ? '已手动标记：切换/重选模型不再自动改写这些勾选' : '自动推导：随模型名变化（切换模型会按名字重推）'}
-          ；若主力模型未勾选对应媒体能力（如纯文本模型），遇到图片/音视频时将自动转接给下方设置的解析专家
-        </div>
-        <div class="sub-row">
-          <button class="btn" on:click={recomputeCapabilities} title="丢弃手动标记，按当前模型名重新推导能力标记">
-            按模型名重新推导
-          </button>
-        </div>
+        <div class="param-hint">勾选即时保存；未勾的模态自动转给「角色分工」的解析专家</div>
       </div>
 
       {/if}
@@ -2136,63 +3689,99 @@
         <div class="roles-grid">
           <div class="role-item">
             <span class="role-name">会话摘要 (Summary)</span>
-            <select
-              bind:value={roles.summary}
-              on:change={() => autoSave({ roles }, 0)}
-            >
-              <option value={null}>未配置：由主力渠道代跑摘要</option>
-              {#each configs as c}
-                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
-              {/each}
-            </select>
+            <Select
+              value={roles.summary ?? null}
+              title="会话摘要角色"
+              options={[
+                { value: null, label: '未配置：由主力渠道代跑摘要' },
+                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, summary: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
           </div>
           <div class="role-item">
             <span class="role-name">标题生成 (Title)</span>
-            <select
-              bind:value={roles.title}
-              on:change={() => autoSave({ roles }, 0)}
-            >
-              <option value={null}>未配置：由主力渠道代跑标题</option>
-              {#each configs as c}
-                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
-              {/each}
-            </select>
+            <Select
+              value={roles.title ?? null}
+              title="标题生成角色"
+              options={[
+                { value: null, label: '未配置：由主力渠道代跑标题' },
+                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, title: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
+          </div>
+          <div class="role-item">
+            <span class="role-name">向量嵌入 (Embedding)</span>
+            <Select
+              value={roles.embedding ?? null}
+              title="向量嵌入角色（记忆库语义检索用）"
+              options={[
+                { value: null, label: '未配置：记忆库用本地哈希向量（离线可用）' },
+                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, embedding: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
           </div>
           <div class="role-item">
             <span class="role-name">图片理解专家 (Vision)</span>
-            <select
-              bind:value={roles.vision}
-              on:change={() => autoSave({ roles }, 0)}
-            >
-              <option value={null}>未配置：主力支持图片时直连，不支持时才需要配置专家</option>
-              {#each configs as c}
-                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
-              {/each}
-            </select>
+            <Select
+              value={roles.vision ?? null}
+              title="图片理解专家"
+              options={[
+                { value: null, label: '未配置' },
+                ...configs
+                  .filter((c) => c.id === roles.vision || c.capabilities?.vision)
+                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.vision ? '' : '（未勾「图片解析」）'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, vision: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
           </div>
           <div class="role-item">
             <span class="role-name">视频理解专家 (Video)</span>
-            <select
-              bind:value={roles.video}
-              on:change={() => autoSave({ roles }, 0)}
-            >
-              <option value={null}>未配置：主力支持视频时直连，不支持时才需要配置专家</option>
-              {#each configs as c}
-                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
-              {/each}
-            </select>
+            <Select
+              value={roles.video ?? null}
+              title="视频理解专家"
+              options={[
+                { value: null, label: '未配置' },
+                ...configs
+                  .filter((c) => c.id === roles.video || c.capabilities?.video)
+                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.video ? '' : '（未勾「视频解析」）'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, video: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
           </div>
           <div class="role-item">
             <span class="role-name">音频理解专家 (Audio)</span>
-            <select
-              bind:value={roles.audio}
-              on:change={() => autoSave({ roles }, 0)}
-            >
-              <option value={null}>未配置：主力支持音频时直连，不支持时跳过并注入占位提示</option>
-              {#each configs as c}
-                <option value={c.id}>{configLabel(c)} · {c.model || '未选模型'}</option>
-              {/each}
-            </select>
+            <Select
+              value={roles.audio ?? null}
+              title="音频理解专家"
+              options={[
+                { value: null, label: '未配置' },
+                ...configs
+                  .filter((c) => c.id === roles.audio || c.capabilities?.audio)
+                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.audio ? '' : '（未勾「音频解析」）'}` })),
+              ]}
+              on:change={(e) => {
+                roles = { ...roles, audio: e.detail };
+                autoSave({ roles }, 0);
+              }}
+            />
           </div>
           <div class="role-item">
             <span class="role-name">降级备用渠道 (Fallbacks)</span>
@@ -2207,37 +3796,91 @@
             />
           </div>
         </div>
-        <div class="param-hint">摘要/标题未配置=主力代跑；多模态专家仅主力不支持该媒体时启用，未配置则注入占位提示</div>
+        <div class="param-hint">留空 = 自动兜底（摘要/标题用主力，嵌入用本地向量）；专家下拉只列勾了对应解析能力的配置</div>
       </div>
       {/if}
       {#if settingsTab === 'memory'}
         {#if memData}
           <div class="field">
-            <label>记忆层状态（{memData.enabled ? '已启用' : '未启用'}）</label>
+            <label>记忆存储（自动记录，非约定）</label>
             <div class="mem-stats">
-              <div>· 全局层 <code>{memData.global_dir}</code> · 已登记 {memData.projects_registered} 个项目</div>
-              <div>· 项目层 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
+              <div>· 全局目录 <code>{memData.global_dir}</code> · {memData.projects_registered} 个项目</div>
+              <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
             </div>
-            <div class="param-hint">记忆随工作区切换而重开：events.log 沉淀任务/工具/交接流水，滚动摘要注入上下文，index.json 登记项目身份防串</div>
+            <div class="param-hint">events.log 是自动流水，不是约定。</div>
           </div>
           <div class="field">
-            <label>AGENTS.md（每次任务注入 system 的设定文件；留空白模板 = 不注入）</label>
-            <div class="chips">
-              <button class="chip" class:active={memTab === 'project'} on:click={() => pickMemTab('project')}>项目约定（当前工作区根）</button>
-              <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定（所有项目共用）</button>
-            </div>
-            <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText}></textarea>
+            <label>记忆库</label>
             <div class="sub-row">
-              <button class="btn primary" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
+              <button class="btn" on:click={() => { settingsOpen = false; galaxyOpen = true; }}>打开记忆库</button>
+              <span class="hint">一次会话 = 一个光点，可搜索</span>
+            </div>
+          </div>
+          <div class="field">
+            <label>约定文件（注入 system，留空 = 不注入）</label>
+            <div class="chips">
+              <button class="chip" class:active={memTab === 'system'} on:click={() => pickMemTab('system')}>系统约定</button>
+              <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定</button>
+              <button class="chip" class:active={memTab === 'project'} on:click={() => pickMemTab('project')}>项目约定</button>
+            </div>
+            <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText} on:input={() => (memDirty = true)}></textarea>
+            <div class="sub-row">
+              <button class="btn" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
               <span class="hint">{memMsg}</span>
+            </div>
+            <div class="param-hint">
+              {#if memTab === 'system'}基础提示词。{/if}
+              {#if memTab === 'global'}所有项目共用。{/if}
+              {#if memTab === 'project'}仅当前工作区。{/if}
+              文件：<code>{memPath}</code>
             </div>
           </div>
         {:else}
-          <div class="trace-empty">加载中…</div>
+          <div class="trace-empty">{memMsg || '加载中…'}</div>
         {/if}
       {/if}
-      {#if settingsTab === 'plugins'}
-        <div class="param-hint">MCP（Model Context Protocol）：接入外部工具生态。工具名以 mcp__服务__工具 下发；首次接入需确认工具清单后才对 AI 可见（防工具投毒）；每服务可设审批档。</div>
+      {#if settingsTab === 'skills'}
+        <div class="param-hint">一个技能 = 一个文件夹 + SKILL.md；目录：工作区 skills/ 与 ~/.agent/skills/（同名项目优先）。system 只注入名字+描述，消息写 $技能名 指定</div>
+        <div class="sub-row">
+          <button class="btn primary" on:click={newSkill}>新建技能</button>
+          <button class="btn" on:click={loadSkills}>刷新</button>
+          <span class="hint">{skillMsg}</span>
+        </div>
+        {#if skillEditor}
+          <div class="field">
+            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}{skillEditor.source === 'global' ? '（全局技能 · 保存将在工作区生成同名项目级覆盖）' : ''}</label>
+            <div class="sub-row">
+              <input placeholder="技能名（可中文，禁 / \ ..）" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
+              <input placeholder="一句话描述（注入索引给模型看）" bind:value={skillEditor.description} />
+            </div>
+            <textarea class="agents-editor" rows="14" spellcheck="false" bind:value={skillEditor.content}></textarea>
+            <div class="sub-row">
+              <button class="btn primary" on:click={saveSkill}>保存</button>
+              <button class="btn" on:click={() => (skillEditor = null)}>取消</button>
+            </div>
+          </div>
+        {/if}
+        {#if skillsLoading}
+          <div class="trace-empty">加载中…</div>
+        {:else}
+          {#each skillsData as s (s.name)}
+            <div class="mcp-card">
+              <div class="mcp-head">
+                <b>${s.name}</b>
+                <span class="mcp-status">{s.source === 'project' ? '项目级' : '全局'}</span>
+                <span class="flex-sp"></span>
+                <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
+                <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
+              </div>
+              <div class="mcp-cmd">{s.description || '（无描述）'}</div>
+            </div>
+          {:else}
+            <div class="menu-empty">还没有技能：点「新建技能」，或在 skills/ 目录放 &lt;名字&gt;/SKILL.md</div>
+          {/each}
+        {/if}
+      {/if}
+      {#if settingsTab === 'mcp'}
+        <div class="param-hint">接入外部工具（mcp__服务__工具）。首次接入要先确认工具清单；每服务可设审批档</div>
         {#each mcpServers as sv}
           <div class="field mcp-card">
             <div class="mcp-head">
@@ -2262,10 +3905,15 @@
                   </div>
                   <div class="sub-row">
                     <label class="mcp-risk-label">审批档：</label>
-                    <select bind:value={mcpRiskChoice}>
-                      <option value="normal">常规（auto 档自动放行）</option>
-                      <option value="dangerous">高危（每次调用都弹窗）</option>
-                    </select>
+                    <Select
+                      value={mcpRiskChoice}
+                      title="MCP 调用审批档"
+                      options={[
+                        { value: 'normal', label: '常规（auto 档自动放行）' },
+                        { value: 'dangerous', label: '高危（每次调用都弹窗）' },
+                      ]}
+                      on:change={(e) => (mcpRiskChoice = e.detail)}
+                    />
                     <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
                   </div>
                 {:else}
@@ -2292,9 +3940,12 @@
           </div>
           <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
         </div>
+      {/if}
+      {#if settingsTab === 'plugins'}
+        <div class="param-hint">WASM 插件：本地纯计算沙箱（无文件/网络），trap 不连坐；工具名以 wasm__插件__函数 下发，默认常规审批档。</div>
         {#if wasmPlugins.length}
           <div class="field">
-            <label>WASM 插件（plugins/ 目录，本地纯计算沙箱，trap 不连坐）</label>
+            <label>已加载插件（plugins/ 目录）</label>
             {#each wasmPlugins as w}
               <div class="mcp-card" style="margin-bottom:8px">
                 <div class="mcp-head">
@@ -2311,37 +3962,37 @@
                 </div>
               </div>
             {/each}
-            <div class="param-hint">放置 .wasm/.wat 到项目 plugins/ 目录后点任意「重连」重新扫描；WASM 是纯计算沙箱（无文件/网络），工具默认常规档</div>
+            <div class="param-hint">放置 .wasm/.wat 到项目 plugins/ 目录后点任意「重连」重新扫描</div>
           </div>
+        {:else}
+          <div class="menu-empty">plugins/ 目录下还没有 .wasm/.wat 插件。放入后刷新本页即可扫描加载。</div>
         {/if}
       {/if}
-      {#if settingsTab === 'workspace'}
-      <div class="field">
-        <label>当前工作区</label>
-        <div class="ws-current" title={workspace}>{workspace || '（工程根）'}</div>
-      </div>
-      <div class="field">
-        <label>本地文件夹路径（agent 的文件读写/命令执行/影子仓库都在这里，与 agent 自身目录隔离）</label>
-        <div class="sub-row">
-          <input bind:value={wsPath} placeholder="如 D://projects//demo 或 C://Users//你//test" />
-          <button class="btn primary" on:click={() => applyWorkspace(wsPath)} disabled={!wsPath.trim()}>应用</button>
         </div>
       </div>
-      {#if recentWorkspaces.length}
-        <div class="field">
-          <label>最近使用</label>
-          <div class="ws-recent">
-            {#each recentWorkspaces as w}
-              <button class="ws-chip" class:active={w === workspace} title={w} on:click={() => applyWorkspace(w)}>
-                {w.split(/[\\/]/).filter(Boolean).pop()}
-              </button>
-            {/each}
-          </div>
-        </div>
-      {/if}
-      <div class="param-hint">切换后：会话列表/记忆层（.agent、AGENTS.md）按新工作区重开；进行中的任务不受影响</div>
-      {/if}
-        </div>
+    </div>
+  </div>
+{/if}
+
+{#if ctxPickerOpen}
+  <div class="modal-backdrop" on:click={() => (ctxPickerOpen = false)}>
+    <div class="modal ctx-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>使用 @ 添加上下文</b>
+        <span class="hint">选择工作区文件，以 @相对路径 插入消息，模型会自行读取</span>
+        <button class="btn ghost" on:click={() => (ctxPickerOpen = false)}>关闭</button>
+      </div>
+      <input class="ctx-search" placeholder="搜索文件…" bind:value={ctxQuery} />
+      <div class="ctx-file-list">
+        {#if ctxLoading}
+          <div class="trace-empty">加载中…</div>
+        {:else}
+          {#each ctxFiles.filter((f) => !ctxQuery || f.toLowerCase().includes(ctxQuery.toLowerCase())) as f (f)}
+            <button class="ctx-file" on:click={() => pickCtxFile(f)}>{f}</button>
+          {:else}
+            <div class="menu-empty">没有匹配的文件</div>
+          {/each}
+        {/if}
       </div>
     </div>
   </div>
@@ -2378,7 +4029,7 @@
           </div>
         </div>
       {/if}
-      <div class="param-hint">切换后：会话列表/记忆层（.agent、AGENTS.md）按新工作区重开；进行中的任务不受影响</div>
+        <div class="param-hint">切换后会话列表与约定按新工作区重开；进行中的任务不受影响</div>
     </div>
   </div>
 {/if}
@@ -2442,9 +4093,14 @@
   <div class="modal-backdrop" on:click={() => (previewImageModal = null)}>
     <div class="image-modal" on:click|stopPropagation>
       <img src={previewImageModal} alt="大图预览" />
-      <button class="image-modal-close" on:click={() => (previewImageModal = null)}>✕</button>
+      <button class="image-modal-close" on:click={() => (previewImageModal = null)} aria-label="关闭"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     </div>
   </div>
+{/if}
+
+{#if galaxyOpen}
+  <!-- 记忆库星云：光点 = 会话；搜索 = 向量检索过滤 -->
+  <Galaxy currentSessionId={currentSessionId || ''} on:close={() => (galaxyOpen = false)} on:open={openSessionFromGalaxy} />
 {/if}
 
 {#if traceOpen}
@@ -2452,9 +4108,11 @@
   <div class="modal-backdrop" on:click={() => (traceOpen = false)}>
     <div class="modal trace-modal" on:click|stopPropagation>
       <div class="modal-head">
-        <h2>时间线 · 最近任务</h2>
-        <button class="icon-btn" title="刷新" on:click={openTrace}>⟳</button>
-        <button class="icon-btn" title="关闭" on:click={() => (traceOpen = false)}>✕</button>
+        <div class="mh-left">
+          <h2>时间线 · 最近任务</h2>
+          <button class="icon-btn" title="刷新" on:click={openTrace}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 3.5V8h-4.5"/></svg></button>
+        </div>
+        <button class="icon-btn" title="关闭" on:click={() => (traceOpen = false)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </div>
       {#if traceLoading}
         <div class="trace-empty">加载中…</div>
@@ -2470,7 +4128,7 @@
               <span class="trace-idx">#{traceTasks.length - ti}</span>
               <span class="trace-time">{fmtClock(task.start_ts)}</span>
               <span class="trace-meta">{fmtDur(task.duration_ms)} · {task.events.length} 事件</span>
-              <span class="caret">{traceExpanded === ti ? '▾' : '▸'}</span>
+              <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
             </button>
             {#if traceExpanded === ti}
               <div class="trace-events">
@@ -2494,18 +4152,64 @@
   </div>
 {/if}
 
+{#if commitModal}
+  <div class="modal-backdrop" on:click={() => (commitModal = null)}>
+    <div class="modal commit-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>提交改动</b>
+        <span class="hint">{gitInfo?.branch || ''}{gitInfo?.head ? '@' + gitInfo.head : ''}</span>
+        <button class="btn ghost" on:click={() => (commitModal = null)}>关闭</button>
+      </div>
+      <div class="commit-body">
+        <div class="commit-files">
+          <div class="commit-files-head">
+            已选 {commitSelCount()} / {commitModal.files.length} 个文件
+            <span class="param-hint">未跟踪文件默认不勾（日志/构建产物等），需要就自己勾上</span>
+          </div>
+          <div class="commit-files-list">
+            {#each commitModal.files as f (f.path)}
+              <label class="commit-file" title={f.path}>
+                <input type="checkbox" checked={f.sel} on:change={() => toggleCommitFile(f.path)} />
+                <span class="git-st">{gitStatusLabel(f.status)}</span>
+                <span class="git-path">{f.path}</span>
+              </label>
+            {/each}
+          </div>
+        </div>
+        <textarea
+          class="agents-editor commit-msg"
+          rows="3"
+          spellcheck="false"
+          placeholder="提交信息（一句话说清这次改了什么）"
+          bind:value={commitModal.msg}
+        ></textarea>
+        {#if commitModal.err}<div class="commit-err">{commitModal.err}</div>{/if}
+        <div class="sub-row">
+          <button class="btn primary" disabled={commitModal.busy} on:click={doCommit}>
+            {commitModal.busy ? '提交中…' : `提交 ${commitSelCount()} 个文件`}
+          </button>
+          <span class="param-hint" style="align-self:center">只做本地 commit，不推送。</span>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
 :global(:root),
   :global([data-theme="dark"]) {
+  color-scheme: dark;
+  scrollbar-color: var(--g4) transparent;
 /* P10.5 主题系统：变量由聚类脚本生成；dark=原视觉，light=翻转 */
-  --g0: #151517;
-  --g1: #1b1d23;
-  --g2: #2f323c;
-  --g3: #333742;
-  --g4: #5c606b;
-  --g5: #6f7686;
-  --g6: #9aa0ae;
-  --g7: #fff;
+/* P13 主题系统：中性色阶（无彩色倾向），侧栏/对话区/设置面板层级靠明度微差区分 */
+  --g0: #0e0e10;
+  --g1: #17171a;
+  --g2: #202024;
+  --g3: #2c2c31;
+  --g4: #3d3d44;
+  --g5: #777b85;
+  --g6: #a7abb5;
+  --g7: #f4f5f7;
   --overlay: rgba(0, 0, 0, 0.55);
   --veil: rgba(255, 255, 255, 0.07);
   --tint-blue-bg: #1f2c44;
@@ -2517,16 +4221,24 @@
   --tint-red-fg: #ff9b9b;
   --tint-yellow-bg: #241f14;
   --tint-yellow-fg: #facc15;
+  /* 成熟化品牌强调色：单色系唯一行动色（发送/主按钮/用户气泡/激活态） */
+  --brand: #4f7cff;
+  --brand-hover: #3d6bf5;
+  --brand-ink: #ffffff;
 }
 :global([data-theme="light"]) {
-  --g0: #f5f6f8;
+  color-scheme: light;
+  scrollbar-color: var(--g4) transparent;
+  --g0: #f6f6f7;
   --g1: #ffffff;
-  --g2: #ffffff;
-  --g3: #e6e9ef;
-  --g4: #d3d8e2;
-  --g5: #8a90a0;
-  --g6: #43485a;
-  --g7: #171921;
+  /* g2 在深色里是「凸起面/次级描边」，浅色必须给淡灰而不是纯白，否则气泡描边、
+     header 底边、模型 chip、按钮底色会全部隐形 */
+  --g2: #f0f0f2;
+  --g3: #e4e4e7;
+  --g4: #d4d4d8;
+  --g5: #7d7f88;
+  --g6: #4b4d55;
+  --g7: #17171a;
   --overlay: rgba(15, 23, 42, 0.32);
   --veil: rgba(13, 18, 28, 0.05);
   --tint-red-bg: #fdeaea;
@@ -2547,13 +4259,19 @@
   --tint-pink-fg: #b0326c;
   --tint-gray-bg: #eceef2;
   --tint-gray-fg: #4a4f5e;
+  /* 成熟化品牌强调色：与深色主题同值，保证双主题行动色一致 */
+  --brand: #4f7cff;
+  --brand-hover: #3d6bf5;
+  --brand-ink: #ffffff;
 }
 
   :global(body) {
     margin: 0;
     background: var(--g1);
     color: var(--g7);
-    font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
   }
   :global(#app) {
     height: 100vh;
@@ -2561,6 +4279,77 @@
   .app {
     display: flex;
     height: 100vh;
+    position: relative;
+    z-index: 1;
+  }
+  /* —— 背景壁纸层：fixed 铺满，压在内容之下；开启后主要表面改半透明透出壁纸 —— */
+  .wallpaper {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    pointer-events: none;
+  }
+  :global(body.has-wallpaper) {
+    background: transparent;
+  }
+  :global(body.has-wallpaper) .sidebar {
+    background: color-mix(in srgb, var(--g0) 60%, transparent);
+    border-right-color: color-mix(in srgb, var(--g4) 30%, transparent);
+  }
+  :global(body.has-wallpaper) .chat-head {
+    background: color-mix(in srgb, var(--g1) 62%, transparent);
+    border-bottom-color: color-mix(in srgb, var(--g4) 30%, transparent);
+  }
+  /* 消息流内的深色面全部转半透明：88% 实色在壁纸上就是一块黑，用户 CSS 想盖也因为
+     规则分散（.tool-card/.cp-bar/...）而显得"去不掉"，这里统一收口 */
+  :global(body.has-wallpaper) .asst-bubble {
+    background: color-mix(in srgb, var(--g1) 72%, transparent);
+    border-color: color-mix(in srgb, var(--g2) 50%, transparent);
+  }
+  :global(body.has-wallpaper) .composer {
+    background: color-mix(in srgb, var(--g2) 72%, transparent);
+  }
+  :global(body.has-wallpaper) .tool-card,
+  :global(body.has-wallpaper) .tool-preview,
+  :global(body.has-wallpaper) .thinking-body,
+  :global(body.has-wallpaper) .cp-bar,
+  :global(body.has-wallpaper) .approval-box,
+  :global(body.has-wallpaper) .ctx-card {
+    background: color-mix(in srgb, var(--g1) 66%, transparent);
+    border-color: color-mix(in srgb, var(--g3) 50%, transparent);
+  }
+  :global(body.has-wallpaper) .term-panel {
+    background: color-mix(in srgb, #101216 82%, transparent);
+  }
+  :global(body.has-wallpaper) .new-chat {
+    background: color-mix(in srgb, var(--g1) 66%, transparent);
+  }
+  :global(body.has-wallpaper) .conv.active {
+    background: color-mix(in srgb, var(--g2) 66%, transparent);
+  }
+  :global(body.has-wallpaper) .conv:hover {
+    background: color-mix(in srgb, var(--g1) 55%, transparent);
+  }
+  :global(body.has-wallpaper) .proj,
+  :global(body.has-wallpaper) .side-search {
+    background: color-mix(in srgb, var(--g2) 60%, transparent);
+  }
+  /* 自绘下拉的弹出菜单：壁纸模式下同样半透明，保持与其他浮层一致 */
+  :global(body.has-wallpaper) .csel-menu {
+    background: color-mix(in srgb, var(--g1) 80%, transparent);
+    border-color: color-mix(in srgb, var(--g3) 60%, transparent);
+  }
+  /* 右侧产物/预览面板：整块 g0 实色，之前漏了壁纸半透明，表现为"改了内部元素透明度还是黑" */
+  :global(body.has-wallpaper) .right-panel {
+    background: color-mix(in srgb, var(--g0) 60%, transparent);
+    border-left-color: color-mix(in srgb, var(--g4) 30%, transparent);
+  }
+  :global(body.has-wallpaper) .rp-preview {
+    background: color-mix(in srgb, var(--g1) 66%, transparent);
+    border-color: color-mix(in srgb, var(--g3) 50%, transparent);
   }
   .sidebar {
     width: 300px;
@@ -2591,6 +4380,10 @@
   .sidebar.collapsed {
     display: none;
   }
+  /* 侧栏收起时展开按钮浮在左上角，标题要让位，否则两者叠在一起 */
+  .chat.side-collapsed .chat-head {
+    padding-left: 60px;
+  }
   .side-head {
     flex: none;
   }
@@ -2600,16 +4393,25 @@
     gap: 10px;
     padding: 2px 4px 14px;
   }
-  .whale {
+  .brand-mark {
     width: 30px;
-    height: 24px;
-    color: var(--g7);
+    height: 30px;
+    border-radius: 8px;
+    background: var(--g7);
+    color: var(--g0);
+    display: flex;
+    align-items: center;
+    justify-content: center;
     flex: none;
+  }
+  .brand-mark svg {
+    width: 18px;
+    height: 18px;
   }
   .brand-name {
     flex: 1;
-    font-size: 20px;
-    font-weight: 700;
+    font-size: 16px;
+    font-weight: 650;
     color: var(--g7);
     letter-spacing: 0.2px;
     overflow: hidden;
@@ -2651,17 +4453,18 @@
     justify-content: center;
     gap: 8px;
     width: 100%;
-    height: 46px;
-    border-radius: 23px;
-    border: 1px solid var(--g2);
-    background: transparent;
+    height: 40px;
+    border-radius: 10px;
+    border: 1px solid var(--g3);
+    background: var(--g1);
     color: var(--g7);
-    font-size: 15px;
+    font-size: 13.5px;
+    font-weight: 600;
     cursor: pointer;
   }
   .new-chat:hover {
-    background: var(--g1);
-    border-color: var(--g3);
+    background: var(--g2);
+    border-color: var(--g4);
   }
   .new-chat:disabled {
     opacity: 0.5;
@@ -2736,10 +4539,10 @@
     cursor: default;
   }
   .m-btn.primary {
-    background: var(--g7);
-    color: var(--g1);
-    border-color: transparent;
-    font-weight: 600;
+    background: var(--g3);
+    color: var(--g7);
+    border-color: var(--g5);
+    font-weight: 650;
   }
   .side-scroll {
     flex: 1;
@@ -2771,11 +4574,47 @@
     color: var(--g6);
     flex: none;
   }
+  /* 展开/收起的独立热区（在项目行内部，点它不切项目） */
+  .proj-toggle {
+    width: 22px;
+    height: 22px;
+    margin: 0 -3px 0 -2px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--g6);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex: none;
+    border-radius: 6px;
+  }
+  .proj-toggle:hover {
+    color: var(--g7);
+    background: var(--g3);
+  }
+  .proj-toggle svg {
+    width: 19px;
+    height: 19px;
+  }
   .proj-name {
     flex: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .proj.active .proj-name {
+    font-weight: 600;
+  }
+  /* 当前项目的小圆点标记 */
+  .proj-cur {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--g5);
+    flex: none;
+    margin-left: 2px;
   }
   .proj-side {
     display: none;
@@ -2802,9 +4641,6 @@
   .row-btn:hover {
     background: var(--g2);
     color: var(--g7);
-  }
-  .row-btn.boxed {
-    border: 1.4px solid var(--g5);
   }
   .row-btn.on {
     border-color: var(--g7);
@@ -2840,21 +4676,27 @@
     flex: none;
   }
   .conv-check {
+    position: relative;
     width: 16px;
     height: 16px;
     border: 1.5px solid var(--g4);
     border-radius: 4.5px;
     flex: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 12px;
-    line-height: 1;
+  }
+  .conv-check svg {
+    position: absolute;
+    inset: 1px;
+    width: calc(100% - 2px);
+    height: calc(100% - 2px);
     color: var(--g1);
+    opacity: 0;
   }
   .conv-check.on {
     background: var(--g7);
     border-color: var(--g7);
+  }
+  .conv-check.on svg {
+    opacity: 1;
   }
   .conv-title {
     flex: 1;
@@ -3039,6 +4881,16 @@
     color: var(--g6);
     background: var(--g1);
   }
+  .galaxy-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .galaxy-btn svg {
+    width: 15px;
+    height: 15px;
+  }
   .handoff-bar {
     flex: none;
     display: flex;
@@ -3067,7 +4919,7 @@
   }
   .jump-bottom {
     position: absolute;
-    bottom: 78px;
+    bottom: 130px; /* 悬浮输入框上方 */
     left: 50%;
     transform: translateX(-50%);
     z-index: 6;
@@ -3178,77 +5030,593 @@
   .num-input {
     width: 100%;
     background: var(--g1);
-    color: var(--tint-blue-fg);
+    color: var(--g7);
     border: 1px solid var(--g2);
     border-radius: 6px;
     padding: 6px 8px;
     font-size: 12px;
   }
   .param-hint {
-    margin-top: 4px;
+    margin-top: 2px;
     color: var(--g5);
-    font-size: 11px;
+    font-size: 11.5px;
+    line-height: 1.65;
   }
   .chat-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 10px 16px;
+    gap: 12px;
+    padding: 12px 20px;
     border-bottom: 1px solid var(--g2);
+    background: var(--g1);
+  }
+  .head-main {
+    min-width: 0;
   }
   .chat-title {
-    font-size: 14px;
+    font-size: 15px;
+    font-weight: 650;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .head-side {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+  .chat-main {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+  .head-btn {
+    width: 32px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--g5);
+    cursor: pointer;
+    flex: none;
+  }
+  .head-btn svg {
+    width: 19px;
+    height: 19px;
+  }
+  .head-btn:hover {
+    color: var(--g7);
+    background: var(--g2);
+  }
+  .head-btn.active {
+    color: var(--brand);
+    border-color: var(--g3);
+    background: var(--g2);
+  }
+  /* —— 终端面板：占据对话区底部，把聊天内容顶起 —— */
+  .term-panel {
+    flex: none;
+    height: 38vh;
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+    background: #101216;
+    color: #d4d4d4;
+    border-top: 1px solid var(--g3);
+    font-family: Consolas, 'Cascadia Mono', monospace;
+    font-size: 12.5px;
+  }
+  .term-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    color: #9aa0ae;
+  }
+  .term-title {
+    font-weight: 650;
+    color: #d4d4d4;
+  }
+  .term-hint {
+    font-size: 11px;
+    color: #6f7686;
+  }
+  .term-clear,
+  .term-close {
+    background: transparent;
+    border: none;
+    color: #9aa0ae;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 5px;
+  }
+  .term-clear:hover,
+  .term-close:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+  }
+  .term-close {
+    font-size: 16px;
+    line-height: 1;
+  }
+  .term-out {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 12px;
+  }
+  .term-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #d4d4d4;
+  }
+  .term-line.dim {
+    color: #6f7686;
+  }
+  .term-block.err .term-text {
+    color: #ff9b9b;
+  }
+  .term-prompt {
+    color: #8fe3ae;
+    margin-right: 8px;
+  }
+  .term-text {
+    margin: 2px 0 6px;
+    padding-left: 18px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #c9cdd6;
+    font-family: inherit;
+  }
+  .term-in {
+    display: flex;
+    align-items: center;
+    padding: 6px 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .term-in input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #d4d4d4;
+    font-family: inherit;
+    font-size: 12.5px;
+  }
+  /* —— 右侧栏：产物 / 预览 —— */
+  .right-panel {
+    width: 360px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--g0);
+    border-left: 1px solid var(--g3);
+    min-height: 0;
+  }
+  .rp-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--g3);
+  }
+  .rp-tabs button {
+    padding: 5px 14px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: var(--g5);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .rp-tabs button:hover {
+    color: var(--g7);
+  }
+  .rp-tabs button.active {
+    background: var(--g2);
+    color: var(--g7);
     font-weight: 600;
   }
-  .chat-sub {
-    font-size: 11px;
+  .rp-refresh {
+    background: transparent;
+    border: none;
     color: var(--g5);
+    font-size: 15px;
+    cursor: pointer;
+    padding: 2px 8px;
+    border-radius: 5px;
+  }
+  .rp-refresh:hover {
+    color: var(--g7);
+    background: var(--g2);
+  }
+  .rp-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+  }
+  .rp-empty {
+    margin: auto;
+    text-align: center;
+    color: var(--g5);
+    font-size: 12.5px;
+    line-height: 1.7;
+    padding: 0 16px;
+  }
+  .rp-file {
+    text-align: left;
+    padding: 7px 10px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    font-size: 12.5px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rp-file:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .rp-file.sel {
+    background: var(--g2);
+    color: var(--brand);
+  }
+  /* 路径标签吸顶：代码滚动时它不跟着滚，也不会被裁掉半个字 */
+  .rp-preview-path {
+    position: sticky;
+    top: -8px; /* 抵消 .rp-body 的 8px padding，贴住面板上沿 */
+    z-index: 2;
+    flex: none;
+    margin: -8px -8px 6px;
+    padding: 8px 10px;
+    background: var(--g1);
+    border-bottom: 1px solid var(--g2);
+    color: var(--g5);
+    font-family: Consolas, monospace;
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rp-preview {
+    margin: 0;
+    padding: 8px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    /* 代码按词换行，不从单词中间劈开（原来 break-all 会把 SECURITY 拆成两行） */
+    white-space: pre-wrap;
+    word-break: normal;
+    overflow-wrap: break-word;
+    tab-size: 4;
+  }
+  /* —— 界面微调模式 —— */
+  :global(body.micro-edit-mode *:hover) {
+    outline: 1px dashed color-mix(in srgb, var(--brand) 55%, transparent);
+    outline-offset: -1px;
+  }
+  .micro-panel {
+    position: fixed;
+    z-index: 200; /* 盖过设置弹窗（z-20）等一切浮层 */
+    width: 270px;
+    box-sizing: border-box; /* max-height 必须把 padding/border 一起算进去，否则底部会溢出视口 */
+    background: var(--g2);
+    border: 1px solid var(--brand);
+    border-radius: 10px;
+    padding: 10px;
+    box-shadow: 0 8px 24px var(--overlay);
+    font-size: 12px;
+    /* 纵向弹性布局：头部与底部按钮固定，中间属性区滚动——
+       面板比视口高时下面的「应用/重置/取消」也始终可见可点 */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .micro-head {
+    flex: none;
+  }
+  .micro-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--g4) transparent;
+    padding-right: 2px;
+  }
+  .micro-foot {
+    flex: none;
+    padding-top: 8px;
+    margin-top: 4px;
+    border-top: 1px solid var(--g3);
+  }
+  .micro-foot .micro-actions {
+    margin-top: 0;
+  }
+  .micro-name {
+    font-weight: 650;
+    color: var(--g7);
+    margin-bottom: 4px;
+  }
+  .micro-sel {
+    font-family: Consolas, monospace;
+    font-size: 10.5px;
+    color: var(--g5);
+    margin-bottom: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .micro-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .micro-row label {
+    width: 52px;
+    flex: none;
+    color: var(--g5);
+  }
+  .micro-row input[type='color'] {
+    width: 34px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--g3);
+    border-radius: 5px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .micro-row input[type='range'] {
+    flex: 1;
+    accent-color: var(--brand);
+  }
+  .micro-row input[type='number'] {
+    width: 64px;
+    background: var(--g1);
+    color: var(--g7);
+    border: 1px solid var(--g3);
+    border-radius: 5px;
+    padding: 3px 6px;
+  }
+  .micro-val {
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    min-width: 52px;
+  }
+  .micro-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .micro-hint {
+    margin-top: 6px;
+    color: var(--g5);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .micro-warn {
+    margin: 6px 0;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: var(--tint-yellow-bg);
+    color: var(--tint-yellow-fg);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .scope-opts {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+  }
+  .scope-opt {
+    flex: 1;
+    padding: 4px 6px;
+    border-radius: 7px;
+    border: 1px solid var(--g3);
+    background: var(--g1);
+    color: var(--g6);
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .scope-opt:hover {
+    border-color: var(--g4);
+    color: var(--g7);
+  }
+  .scope-opt.active {
+    background: var(--brand);
+    border-color: var(--brand);
+    color: var(--brand-ink);
   }
   .chat-body {
     flex: 1;
     overflow-y: auto;
-    padding: 16px;
+    padding: 20px 0 170px; /* 底部留出悬浮输入框 + 改动条的高度，最后一条消息不被遮挡 */
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
   }
   .empty-hint {
     margin: auto;
     color: var(--g4);
     font-size: 13px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .empty-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--g6);
+  }
+  .empty-sub {
+    font-size: 12.5px;
+    color: var(--g5);
+  }
+  /* —— 成熟化图标体系：单色线性，尺寸统一 —— */
+  .nav-ico {
+    width: 16px;
+    height: 16px;
+    flex: none;
+  }
+  .settings-nav button {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .att-ico {
+    width: 15px;
+    height: 15px;
+    flex: none;
+    color: var(--g6);
+  }
+  .msg-att-file .att-ico {
+    vertical-align: -2px;
+    margin-right: 2px;
+  }
+  .att-ico-lg {
+    width: 17px;
+    height: 17px;
+    display: block;
+  }
+  .att-del svg,
+  .image-modal-close svg {
+    width: 13px;
+    height: 13px;
+    display: block;
+  }
+  .caret-ico {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    color: var(--g5);
+  }
+  .send-btn svg {
+    width: 16px;
+    height: 16px;
+    display: block;
+    margin: auto;
+  }
+  .approval-kicker {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--g6);
+    border: 1px solid var(--g3);
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin-right: 6px;
+    vertical-align: 1px;
+  }
+  .typing-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--g5);
+    margin-right: 4px;
+    animation: typing-bounce 1.2s ease-in-out infinite;
+  }
+  .typing-dot:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .typing-dot:nth-child(3) {
+    animation-delay: 0.3s;
+    margin-right: 0;
+  }
+  @keyframes typing-bounce {
+    0%,
+    60%,
+    100% {
+      transform: translateY(0);
+      opacity: 0.5;
+    }
+    30% {
+      transform: translateY(-4px);
+      opacity: 1;
+    }
+  }
+  .cursor {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    background: var(--g6);
+    vertical-align: -2px;
+    animation: blink 1s step-start infinite;
   }
   .msg {
     display: flex;
+    width: 100%;
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 0 24px;
+    box-sizing: border-box;
   }
   .msg.user {
     justify-content: flex-end;
   }
+  .msg.assistant {
+    justify-content: flex-start;
+  }
   .msg.system {
     justify-content: center;
   }
+  /* pre-wrap 只放在真正承载文本的叶子节点上；放 .bubble 上会把模板标签间的
+     换行缩进也渲染成一个空行（用户气泡开头凭空多一行） */
   .bubble {
-    max-width: 72%;
-    padding: 8px 12px;
-    border-radius: 10px;
+    max-width: 78%;
+    padding: 10px 14px;
+    border-radius: 12px;
     font-size: 14px;
-    line-height: 1.55;
-    white-space: pre-wrap;
+    line-height: 1.65;
     word-break: break-word;
   }
+  .user-text,
+  .content {
+    white-space: pre-wrap;
+  }
   .user-bubble {
-    background: var(--tint-blue-fg);
-    color: var(--g7);
-    border-bottom-right-radius: 3px;
+    background: var(--brand);
+    color: var(--brand-ink);
+    border-bottom-right-radius: 4px;
   }
   .asst-bubble {
-    background: var(--g2);
+    background: var(--g1);
     border: 1px solid var(--g2);
-    border-bottom-left-radius: 3px;
+    border-bottom-left-radius: 4px;
+    max-width: 100%;
+    width: 100%;
+  }
+  .msg.assistant .bubble {
+    max-width: 100%;
   }
   .error-bubble {
     background: var(--tint-red-bg);
     border: 1px solid var(--tint-red-bg);
     color: var(--tint-red-fg);
+    white-space: pre-wrap;
   }
   .sys-text {
     font-size: 12px;
@@ -3276,34 +5644,35 @@
     margin-bottom: 8px;
     background: var(--g1);
     border: 1px solid var(--g2);
-    border-radius: 8px;
-    padding: 6px 8px;
+    border-left: 2px solid var(--g4);
+    border-radius: 10px;
+    padding: 8px 10px;
   }
   .approval-box {
     margin-bottom: 8px;
-    background: var(--tint-yellow-bg);
-    border: 1px solid var(--tint-yellow-bg);
-    border-radius: 8px;
-    padding: 8px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-left: 2px solid var(--tint-yellow-fg);
+    border-radius: 10px;
+    padding: 10px 12px;
     font-size: 13px;
   }
   .approval-box.danger {
-    background: var(--tint-red-bg);
-    border-color: var(--tint-red-bg);
+    border-left-color: var(--tint-red-fg);
   }
   .approval-head {
     display: flex;
     gap: 8px;
     align-items: center;
     flex-wrap: wrap;
-    color: var(--tint-yellow-fg);
+    color: var(--g7);
   }
   .approval-reason {
     display: inline-block;
     padding: 1px 6px;
     border-radius: 4px;
-    background: var(--tint-yellow-bg);
-    color: var(--tint-yellow-fg);
+    background: var(--g2);
+    color: var(--g6);
     font-size: 11px;
   }
   .approval-reason.danger {
@@ -3329,53 +5698,6 @@
   .approval-risk.risk-2 {
     background: var(--tint-red-bg);
     color: var(--tint-red-fg);
-  }
-  /* P9 B：Plan 模式 pill 激活态 + 计划卡 */
-  .pill.plan-active {
-    background: var(--tint-green-bg);
-    border-color: var(--tint-green-bg);
-    color: var(--tint-green-fg);
-  }
-  .plan-card {
-    margin: 8px 0;
-    background: var(--tint-green-bg);
-    border: 1px solid var(--tint-green-bg);
-    border-radius: 8px;
-    padding: 10px 12px;
-    font-size: 13px;
-  }
-  .plan-head {
-    font-weight: 600;
-    color: var(--tint-green-fg);
-    margin-bottom: 6px;
-  }
-  .plan-goal {
-    color: var(--tint-green-fg);
-    margin-bottom: 6px;
-  }
-  .plan-steps {
-    margin: 4px 0 6px;
-    padding-left: 22px;
-    color: var(--g6);
-  }
-  .plan-steps li {
-    margin: 2px 0;
-  }
-  .plan-files {
-    font-size: 12px;
-    color: var(--g6);
-    margin-bottom: 8px;
-    word-break: break-all;
-  }
-  .plan-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .plan-hint {
-    font-size: 11px;
-    color: var(--g5);
   }
   .approval-actions {
     display: flex;
@@ -3511,6 +5833,16 @@
     align-items: center;
     justify-content: center;
   }
+  .cp-dock {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 8px;
+    position: relative; /* 「待提交」明细气泡的定位基准 */
+  }
+  .cp-dock .cp-bar {
+    width: 100%;
+    max-width: 880px;
+  }
   .cp-bar {
     display: flex;
     align-items: center;
@@ -3536,17 +5868,225 @@
     font-family: monospace;
     font-size: 12px;
   }
-  .cp-undo {
+  /* 右侧动作组：撤销 / 提交（margin-left:auto 只加在容器上，两个按钮才不会各分一半空白） */
+  .cp-actions {
     margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .cp-undo {
     background: transparent;
     border: none;
-    color: var(--tint-blue-fg);
+    color: var(--g6);
     font-size: 12px;
     cursor: pointer;
     padding: 2px 4px;
+    font-family: inherit;
   }
   .cp-undo:hover {
+    color: var(--g7);
+  }
+  .cp-commit {
+    background: var(--g3);
+    border: 1px solid var(--g5);
+    color: var(--g7);
+    font-size: 12px;
+    font-weight: 650;
+    cursor: pointer;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-family: inherit;
+  }
+  .cp-commit:hover {
+    background: var(--g4);
+    border-color: var(--g6);
+  }
+  /* 提交弹窗 */
+  .commit-modal {
+    width: 560px;
+  }
+  .commit-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .commit-files {
+    border: 1px solid var(--g2);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .commit-files-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--g6);
+    border-bottom: 1px solid var(--g2);
+  }
+  .commit-files-list {
+    max-height: 240px;
+    overflow-y: auto;
+    padding: 4px;
+  }
+  .commit-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    cursor: pointer;
+  }
+  .commit-file:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .commit-file input {
+    flex: none;
+    cursor: pointer;
+    accent-color: var(--g5);
+  }
+  .commit-msg {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+  }
+  .commit-err {
+    font-size: 12px;
     color: var(--tint-red-fg);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  /* —— git 概览（分支 / 领先落后 / 未提交数），钉在改动条左侧 —— */
+  .git-ref {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--g7);
+    font-size: 12px;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-ref b {
+    font-weight: 600;
+  }
+  .git-ico {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    color: var(--g5);
+  }
+  .git-head {
+    color: var(--g5);
+    font-family: monospace;
+    font-size: 11px;
+  }
+  .git-ab {
+    color: var(--g6);
+    font-family: monospace;
+    font-size: 11px;
+  }
+  /* 「N 处未提交」可点开：待提交文件明细 */  .git-dirty {
+    color: var(--tint-yellow-fg);
+    font-size: 11.5px;
+    background: transparent;
+    border: none;
+    padding: 2px 4px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .git-dirty:hover,
+  .git-dirty.on {
+    background: var(--g2);
+  }
+  .git-pop {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 6px);
+    margin: 0 auto;
+    max-width: 880px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px var(--overlay);
+    z-index: 30;
+    overflow: hidden;
+  }
+  .git-pop-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--g6);
+    border-bottom: 1px solid var(--g2);
+  }
+  .git-pop-head b {
+    color: var(--g7);
+  }
+  .git-pop-hint {
+    margin-left: auto;
+    color: var(--g5);
+    font-size: 11px;
+  }
+  .git-pop-list {
+    max-height: 240px;
+    overflow-y: auto;
+    padding: 4px;
+  }
+  .git-pop-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: var(--g6);
+    font-size: 12px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: Consolas, monospace;
+  }
+  .git-pop-row:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .git-st {
+    flex: 0 0 auto;
+    min-width: 42px;
+    text-align: center;
+    font-size: 10.5px;
+    font-family: sans-serif;
+    color: var(--g5);
+    border: 1px solid var(--g3);
+    border-radius: 4px;
+    padding: 0 4px;
+    line-height: 16px;
+  }
+  .git-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-pop-more {
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--g5);
+  }
+  .cp-bar .cp-sum {
+    margin-left: 4px;
   }
   .tool-head {
     display: flex;
@@ -3604,21 +6144,38 @@
   .typing {
     color: var(--g6);
   }
-  /* —— ZCode 式输入框：圆角容器 = 输入区 + 底部工具栏 —— */
+  /* —— 输入区：悬浮在对话区底部（无分隔线，消息从其下方穿过）—— */
   .chat-input {
-    padding: 10px 16px 14px;
-    border-top: 1px solid var(--g2);
-    background: var(--g1);
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 5;
+    padding: 12px 0 16px;
+    background: transparent;
+    pointer-events: none; /* 空白区域点击穿透到底下的消息 */
+  }
+  .chat-input > * {
+    pointer-events: auto;
+    width: 100%;
+    max-width: 880px;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: 24px;
+    padding-right: 24px;
+    box-sizing: border-box;
   }
   .composer {
     background: var(--g2);
     border: 1px solid var(--g3);
-    border-radius: 14px;
-    padding: 4px 10px 8px;
-    transition: border-color 0.15s;
+    border-radius: 16px;
+    padding: 6px 12px 10px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    box-shadow: 0 4px 16px var(--overlay);
   }
   .composer:focus-within {
     border-color: var(--g4);
+    box-shadow: 0 6px 20px var(--overlay);
   }
   .composer-input {
     display: block;
@@ -3699,17 +6256,11 @@
     color: var(--g7);
   }
   .pill.danger {
-    color: var(--tint-yellow-fg);
+    color: var(--tint-red-fg);
+    border: 1px solid var(--tint-red-bg);
   }
   .pill.danger:hover {
-    background: var(--tint-yellow-bg);
-  }
-  .pill .pill-icon {
-    font-size: 12px;
-  }
-  .pill .caret {
-    font-size: 9px;
-    color: var(--g5);
+    background: var(--tint-red-bg);
   }
   .model-pill {
     font-family: Consolas, monospace;
@@ -3758,18 +6309,88 @@
   .bar-item:hover {
     background: var(--g2);
   }
-  .bar-item.active {
-    background: var(--tint-blue-fg);
+  /* 模型快选：配置分组头 + 子项 */
+  .bar-item.group-head {
+    font-weight: 650;
+    color: var(--g6);
+    align-items: center;
+  }
+  .bar-item.group-head.active {
     color: var(--g7);
   }
-  .bar-item.active .bar-item-hint {
-    color: var(--tint-blue-fg);
+  .bar-item.group-head .caret-ico {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    transition: transform 0.15s;
   }
-  .bar-item-hint {
-    color: var(--g5);
-    font-size: 11px;
+  .bar-item.group-head .caret-ico.open {
+    transform: rotate(90deg);
+  }
+  .bar-item.sub {
+    padding-left: 24px;
+  }
+  .menu-sym {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    flex: none;
+    border-radius: 5px;
+    background: var(--g3);
+    font-size: 12px;
+    font-weight: 650;
+    margin-right: 8px;
+  }
+  .ctx-modal {
+    width: 620px;
+    height: 70vh;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .ctx-search {
+    background: var(--g1);
+    color: var(--g7);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    outline: none;
+  }
+  .ctx-search:focus {
+    border-color: var(--brand);
+  }
+  .ctx-file-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ctx-file {
+    text-align: left;
+    padding: 6px 10px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    font-size: 12.5px;
+    cursor: pointer;
     overflow: hidden;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ctx-file:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .bar-item.active {
+    background: var(--g3);
+    color: var(--g7);
   }
   /* 上下文圆环：空色轨道 + 实色占用弧 */
   .ctx-ring .ctx-track {
@@ -3795,30 +6416,35 @@
     color: var(--tint-red-fg);
   }
   .send-btn {
-    width: 32px;
-    height: 32px;
-    border-radius: 9px;
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
     border: none;
-    background: var(--tint-blue-fg);
-    color: var(--g7);
+    background: var(--brand);
+    color: var(--brand-ink);
     font-size: 16px;
     line-height: 1;
     cursor: pointer;
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .send-btn:hover:not(:disabled) {
-    background: var(--tint-blue-fg);
+    background: var(--brand-hover);
   }
   .send-btn:disabled {
-    background: var(--g2);
+    background: var(--g3);
     color: var(--g5);
     cursor: default;
   }
   .send-btn.stop {
     background: var(--tint-red-bg);
+    color: var(--tint-red-fg);
   }
   .send-btn.stop:hover {
     background: var(--tint-red-bg);
+    filter: brightness(1.12);
   }
   /* —— P8.2 工作区切换 —— */
   .ws-current {
@@ -3854,8 +6480,8 @@
     color: var(--g7);
   }
   .ws-chip.active {
-    border-color: var(--tint-blue-fg);
-    color: var(--tint-blue-fg);
+    border-color: var(--g5);
+    color: var(--g7);
   }
   .menu-sep {
     height: 1px;
@@ -3868,24 +6494,41 @@
     padding: 8px 10px;
   }
   .btn {
-    padding: 7px 14px;
+    padding: 9px 17px;
     border-radius: 8px;
     border: 1px solid var(--g3);
     background: var(--g2);
     color: var(--g7);
     font-size: 13px;
+    font-weight: 550;
     cursor: pointer;
   }
   .btn:hover {
     background: var(--g3);
   }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  /* 主按钮不搞亮底高亮：用略强的底色+描边+字重表达「主要动作」，两个主题下都不刺眼 */
   .btn.primary {
-    background: var(--tint-blue-fg);
-    border-color: var(--tint-blue-fg);
+    background: var(--g3);
+    border-color: var(--g5);
+    color: var(--g7);
+    font-weight: 650;
+  }
+  .btn.primary:hover {
+    background: var(--g4);
+    border-color: var(--g6);
   }
   .btn.danger {
-    background: var(--tint-red-bg);
-    border-color: var(--tint-red-bg);
+    background: var(--g2);
+    border-color: var(--g4);
+    color: var(--g7);
+  }
+  .btn.danger:hover {
+    background: var(--g3);
+    border-color: var(--g5);
   }
   .btn.ghost {
     background: transparent;
@@ -4033,6 +6676,8 @@
   .settings-modal {
     width: 880px;
     max-width: 94vw;
+    /* 固定高度：所有设置页统一窗口大小（以最高的「模型配置」页为准），短页留白，内容区自行滚动 */
+    height: 85vh;
   }
   .settings-body {
     display: flex;
@@ -4043,13 +6688,13 @@
   .settings-nav {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 6px;
     width: 150px;
     flex-shrink: 0;
   }
   .settings-nav button {
     text-align: left;
-    padding: 8px 12px;
+    padding: 9px 12px;
     border-radius: 8px;
     background: transparent;
     border: none;
@@ -4071,50 +6716,70 @@
     overflow-y: auto;
     padding-right: 4px;
     min-width: 0;
-  }
-  .theme-cards {
-    display: flex;
-    gap: 10px;
-  }
-  .theme-card {
-    flex: 1;
+    /* 各分区之间留白，避免标题/说明/控件挤成一团 */
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 12px;
-    border-radius: 10px;
+    gap: 20px;
+  }
+  .theme-opts {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .theme-opt {
+    padding: 7px 16px;
+    border-radius: 8px;
     border: 1px solid var(--g3);
     background: var(--g2);
     color: var(--g7);
-    cursor: pointer;
-    text-align: left;
     font-size: 13px;
+    cursor: pointer;
   }
-  .theme-card.active {
+  .theme-opt:hover {
+    border-color: var(--g4);
+  }
+  .theme-opt.active {
+    background: var(--g3);
     border-color: var(--g5);
-    box-shadow: 0 0 0 1px var(--g5);
+    color: var(--g7);
+    font-weight: 650;
   }
-  .theme-preview {
-    height: 46px;
-    border-radius: 6px;
-    border: 1px solid var(--g3);
+  .wp-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
   }
-  .dark-preview {
-    background: linear-gradient(135deg, #17181c 55%, #2f323c 55%, #2f323c 78%, #9ec1ff 78%);
+  .wp-pick input[type='file'] {
+    display: none;
   }
-  .light-preview {
-    background: linear-gradient(135deg, #f7f8fa 55%, #ffffff 55%, #ffffff 78%, #2f5fd0 78%);
+  .css-rules-file {
+    display: none;
   }
-  .theme-desc {
-    font-size: 11px;
-    color: var(--g5);
+  .wp-opacity {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--g6);
+  }
+  .wp-opacity b {
+    color: var(--g7);
+    font-variant-numeric: tabular-nums;
+    min-width: 26px;
+    text-align: right;
+  }
+  .wp-opacity input[type='range'] {
+    width: 180px;
+    accent-color: var(--g5);
   }
   .mem-stats {
     font-size: 12px;
     color: var(--g6);
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 7px;
   }
   .mem-stats code {
     font-size: 11px;
@@ -4124,17 +6789,23 @@
     width: 100%;
     box-sizing: border-box;
     font-family: Consolas, 'Courier New', monospace;
-    font-size: 12px;
+    font-size: 12.5px;
+    line-height: 1.7;
     background: var(--g1);
     color: var(--g7);
     border: 1px solid var(--g3);
     border-radius: 8px;
-    padding: 10px;
+    padding: 12px 14px;
     resize: vertical;
   }
   .agents-editor:focus {
     outline: none;
     border-color: var(--g4);
+  }
+  .agents-editor.micro-readonly {
+    background: var(--g0);
+    color: var(--g5);
+    resize: vertical;
   }
   /* P11 MCP 插件分区 */
   .mcp-card {
@@ -4199,6 +6870,13 @@
     align-items: center;
     gap: 10px;
   }
+  /* 标题 + 刷新等操作靠左成组（刷新按钮原来被 space-between 挤到中间） */
+  .mh-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
   .modal-head .hint {
     flex: 1;
     text-align: right;
@@ -4212,7 +6890,7 @@
   .field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 9px;
   }
   .field label {
     font-size: 12px;
@@ -4227,19 +6905,38 @@
     color: var(--g7);
     font-size: 13px;
   }
+  /* 原生下拉的弹出层由浏览器绘制：根元素的 color-scheme 不一定传导到弹出层，
+     必须在 select 元素自身声明，并给 option 显式配色，否则深色主题下是白底浅字 */
+  :global([data-theme="dark"]) select {
+    color-scheme: dark;
+  }
+  :global([data-theme="light"]) select {
+    color-scheme: light;
+  }
+  select {
+    accent-color: var(--g5);
+  }
+  select option {
+    background: var(--g1);
+    color: var(--g7);
+  }
+  select option:checked {
+    background: var(--g2);
+    color: var(--g7);
+  }
   .sub-row {
     display: flex;
-    gap: 6px;
+    gap: 10px;
     align-items: center;
     flex-wrap: wrap;
   }
   .chips {
     display: flex;
-    gap: 6px;
+    gap: 9px;
     flex-wrap: wrap;
   }
   .chip {
-    padding: 5px 10px;
+    padding: 7px 13px;
     border-radius: 14px;
     border: 1px solid var(--g3);
     background: var(--g1);
@@ -4248,8 +6945,8 @@
     cursor: pointer;
   }
   .chip.active {
-    background: var(--tint-blue-fg);
-    border-color: var(--tint-blue-fg);
+    background: var(--g3);
+    border-color: var(--g5);
     color: var(--g7);
   }
   .dot {
@@ -4264,13 +6961,22 @@
   .dot.haskey {
     background: var(--tint-green-fg);
   }
+  /* 设置面板统一黑白：彩色只留给「已存 Key」的绿点（.dot.haskey） */
   .chip.add {
-    color: var(--tint-green-fg);
-    border-color: var(--tint-green-bg);
+    color: var(--g6);
+    border-color: var(--g3);
+  }
+  .chip.add:hover {
+    color: var(--g7);
+    border-color: var(--g5);
   }
   .chip.del {
-    color: var(--tint-red-fg);
-    border-color: var(--tint-red-bg);
+    color: var(--g6);
+    border-color: var(--g3);
+  }
+  .chip.del:hover {
+    color: var(--g7);
+    border-color: var(--g5);
   }
   .model-list {
     overflow-y: auto;
@@ -4296,12 +7002,13 @@
   .del-key {
     padding: 7px 10px;
     font-size: 12px;
-    background: var(--tint-red-bg);
-    border-color: var(--tint-red-bg);
-    color: var(--tint-red-fg);
+    background: var(--g2);
+    border-color: var(--g4);
+    color: var(--g7);
   }
   .del-key:hover {
-    background: var(--tint-red-bg);
+    background: var(--g3);
+    border-color: var(--g5);
   }
   .caps-row {
     display: flex;
@@ -4317,7 +7024,7 @@
     align-items: center;
     gap: 6px;
     font-size: 13px;
-    color: var(--tint-blue-fg);
+    color: var(--g6);
     cursor: pointer;
   }
   .cap-check input {
@@ -4331,19 +7038,27 @@
   .roles-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 4px;
+    gap: 16px 18px;
+    margin-top: 8px;
   }
   .role-item {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 8px;
   }
   .role-name {
     font-size: 11px;
     color: var(--g6);
   }
-  .role-item select {
+  /* 自绘下拉（Select 组件）在各容器里的尺寸：组件内部样式管外观，这里只调整体布局 */
+  .field > :global(.csel-wrap) {
+    width: 100%;
+  }
+  .sub-row > :global(.csel-wrap) {
+    flex: 1 1 auto;
+    width: auto;
+  }
+  .role-item :global(.csel) {
     font-size: 12px;
     padding: 6px 8px;
   }
@@ -4359,8 +7074,8 @@
     font-size: 11px;
   }
   .m-tag {
-    background: var(--tint-blue-bg);
-    color: var(--tint-blue-fg);
+    background: var(--g2);
+    color: var(--g6);
     padding: 1px 6px;
     border-radius: 4px;
     font-family: sans-serif;

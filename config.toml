@@ -17,11 +17,11 @@ max_rpm = 0
 # fallback_configs = ["配置 2", "商汤主力"]
 
 # P8 角色映射：辅助功能用专用渠道（写 settings 里的配置名或配置 id）；
-# 未配置的角色回落主渠道。EMBEDDING 为接口预留（暂无消费方）。
+# 未配置的角色回落主渠道。EMBEDDING 不走主渠道兜底——未配置时记忆库用本地哈希向量。
 [roles]
 # summary = "配置 2"   # 滚动摘要专用渠道
 # title = "配置 2"     # 会话标题生成专用渠道
-# embedding = ""       # 向量嵌入（预留）
+# embedding = "配置 2" # 向量嵌入专用渠道（须支持 OpenAI 兼容 /embeddings）
 
 [logging]
 dir = "logs"

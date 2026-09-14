@@ -12,7 +12,7 @@ mod proc;
 pub mod probes;
 mod token;
 
-pub use proc::SandboxChild;
+pub use proc::{register_path_dir, SandboxChild};
 
 /// 沙箱资源上限（config.toml [sandbox]）。
 #[derive(Debug, Clone, Copy)]

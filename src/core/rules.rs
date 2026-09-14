@@ -50,7 +50,7 @@ impl RiskLevel {
 /// 否则未登记工具会走 Dangerous 默认策略（见 `evaluate_risk` 末尾分支）。
 /// P11 的 MCP 工具接入时同样在此登记。
 const KNOWN_TOOLS: &[&str] = &[
-    "read_file", "read_page", "search", "web_fetch", "write_file", "shell", "git",
+    "read_file", "read_page", "read_skill", "search", "web_fetch", "write_file", "shell", "git",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -143,19 +143,22 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             (RiskLevel::Safe, "只读安全查询操作".into())
         }
 
+        // 读技能：只读 SKILL.md，恒定 Safe
+        "read_skill" => (RiskLevel::Safe, "读取技能文件（只读）".into()),
+
         // 写文件：区分工作区内/越界/敏感文件
         "write_file" => risk_write_file(args, workspace_root),
 
         // Git 操作：区分只读、常规提交与破坏性命令
         "git" => {
             let cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("").trim();
-            risk_git(cmd_args)
+            risk_git(cmd_args, workspace_root)
         }
 
         // Shell 命令行：拆分后逐条判定，取最高风险
         "shell" => {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-            risk_shell(command)
+            risk_shell(command, workspace_root)
         }
 
         // 已登记但暂无专门规则的工具：按常规改动保守处理
@@ -202,47 +205,210 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
     (RiskLevel::Normal, format!("项目工作区文件改写: {path_str}"))
 }
 
+/// 剥掉 git 全局参数，取出真正的子命令与其后的参数。
+/// `git -C repo push` / `git -c core.pager=cat log` 不能被误判成子命令 `-C` / `-c`。
+fn git_subcommand(cmd_args: &str) -> (String, Vec<String>) {
+    let toks: Vec<&str> = cmd_args.split_whitespace().collect();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let t = toks[i];
+        if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+            i += 2; // 选项 + 值
+            continue;
+        }
+        let inline = t.starts_with("--git-dir=")
+            || t.starts_with("--work-tree=")
+            || t.starts_with("--namespace=")
+            || t.starts_with("--exec-path=")
+            || (t.starts_with("-C") && t.len() > 2)
+            || (t.starts_with("-c") && t.len() > 2);
+        if inline
+            || matches!(
+                t,
+                "--no-pager" | "-p" | "--paginate" | "--bare" | "--literal-pathspecs"
+                    | "--no-optional-locks" | "--no-replace-objects" | "--version" | "--help"
+            )
+        {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let sub = toks.get(i).map(|s| s.to_lowercase()).unwrap_or_default();
+    let rest = toks.iter().skip(i + 1).map(|s| s.to_string()).collect();
+    (sub, rest)
+}
+
+/// 参数里是否出现某个精确 token（`--force` 不会命中 `--force-with-lease` 这类前缀）。
+fn git_flag(rest: &[String], names: &[&str]) -> bool {
+    rest.iter().any(|t| names.contains(&t.as_str()))
+}
+
+/// 不带 `-` 的参数（子命令的第二级动作、参数值）。
+fn git_words(rest: &[String]) -> Vec<String> {
+    rest.iter().filter(|t| !t.starts_with('-')).map(|t| t.to_lowercase()).collect()
+}
+
+/// 任何位置出现这些 token 都按高危处理：强制/丢弃/删除语义明确。
+const GIT_FORCE_TOKENS: &[&str] = &[
+    "-f", "--force", "--hard", "-D", "--delete", "--discard-changes", "-B",
+    "--prune=now", "--expire=now",
+];
+
 /// git 子命令风险判定（工具参数与 shell 里的 git 命令共用同一套语义）。
-fn risk_git(cmd_args: &str) -> (RiskLevel, String) {
-    let cmd_args = cmd_args.trim();
-    let mut it = cmd_args.split_whitespace();
-    let subcmd = it.next().unwrap_or("").to_lowercase();
-    let second = it.next().unwrap_or("").to_lowercase();
-    let lower = cmd_args.to_lowercase();
-
-    // 1) 破坏性 / 强推 / 硬重置 / 丢弃改动
-    if lower.contains("--hard")
-        || lower.contains(" -f ")
-        || lower.contains("--force")
-        || subcmd == "push"
-        || subcmd == "clean"
-        || (subcmd == "reset" && lower.contains("hard"))
-        || (subcmd == "branch" && (lower.contains("-d") || lower.contains("--delete")))
-        || subcmd == "rebase"
-        || (subcmd == "stash" && (second == "drop" || second == "clear"))
-        || (subcmd == "checkout" && (second == "." || second == "--" || second == "-f"))
-        || (subcmd == "remote" && second == "remove")
-    {
-        return (RiskLevel::Dangerous, format!("Git 破坏性/强推操作: git {cmd_args}"));
+///
+/// v2 修 v1 的「只读白名单过宽」：白名单只认**不带写参数**的形式
+/// （`git tag -d` 不再因为子命令是 tag 就放行），未知子命令一律常规档，不静默放行。
+fn risk_git(cmd_args: &str, ws: &Path) -> (RiskLevel, String) {
+    let (sub, rest) = git_subcommand(cmd_args.trim());
+    let say = |r: RiskLevel, why: &str| (r, format!("{why}: git {}", cmd_args.trim()));
+    if sub.is_empty() {
+        return say(RiskLevel::Safe, "Git 只读查询"); // 裸 git 打印帮助
     }
-
-    // 2) 只读子命令
-    if matches!(
-        subcmd.as_str(),
-        "status" | "diff" | "log" | "show" | "branch" | "describe" | "rev-parse" | "tag" | "remote"
-    ) && second != "-v"
-        || (subcmd == "branch" && second.is_empty())
-        || (subcmd == "remote" && second == "-v")
-    {
-        return (RiskLevel::Safe, format!("Git 只读状态查询: git {subcmd}"));
+    if git_flag(&rest, GIT_FORCE_TOKENS) {
+        return say(RiskLevel::Dangerous, "Git 破坏性/强推操作");
     }
+    let words = git_words(&rest);
+    let sub2 = words.first().map(String::as_str).unwrap_or("");
+    let read = |why: &str| say(RiskLevel::Safe, why);
+    let norm = || say(RiskLevel::Normal, "Git 常规本地操作");
 
-    // 3) 其他常规 Git 命令（add / commit / stash / checkout 分支等）
-    (RiskLevel::Normal, format!("Git 常规本地操作: git {subcmd}"))
+    match sub.as_str() {
+        // —— 纯只读 ——
+        "status" | "diff" | "log" | "show" | "describe" | "rev-parse" | "ls-files" | "ls-tree"
+        | "cat-file" | "blame" | "shortlog" | "grep" | "whatchanged" | "merge-base" | "name-rev"
+        | "count-objects" | "verify-pack" | "var" | "help" | "version" | "archive" | "bisect" => {
+            read("Git 只读状态查询")
+        }
+
+        "reflog" => match sub2 {
+            "delete" | "expire" => say(RiskLevel::Dangerous, "Git 破坏性/删除 reflog"),
+            _ => read("Git 只读状态查询"),
+        },
+
+        // 丢弃 stash / 删工作树 / 移除子模块都不可逆
+        "stash" => match sub2 {
+            "" | "list" | "show" => read("Git 只读状态查询"),
+            "drop" | "clear" => say(RiskLevel::Dangerous, "Git 破坏性/丢弃 stash"),
+            _ => norm(),
+        },
+        "worktree" => match sub2 {
+            "" | "list" => read("Git 只读状态查询"),
+            "remove" => say(RiskLevel::Dangerous, "Git 破坏性/删除工作树"),
+            _ => norm(),
+        },
+        "submodule" => match sub2 {
+            "" | "status" | "summary" => read("Git 只读状态查询"),
+            "deinit" => say(RiskLevel::Dangerous, "Git 破坏性/移除子模块"),
+            _ => norm(),
+        },
+
+        // 远端配置能悄悄改写后续 push/fetch 的去向，按高危处理
+        "remote" => match sub2 {
+            "" | "show" | "get-url" => read("Git 只读状态查询"),
+            "add" | "set-url" | "rename" | "rm" | "remove" | "set-head" => {
+                say(RiskLevel::Dangerous, "Git 远端配置变更")
+            }
+            _ => norm(),
+        },
+
+        // 建/删标签：只有「列表查询」形式算只读
+        "tag" => {
+            if rest.is_empty() || git_flag(&rest, &["-l", "--list", "-n", "-v", "--verify", "--contains", "--points-at"]) {
+                read("Git 只读状态查询")
+            } else if git_flag(&rest, &["-d", "--delete"]) {
+                say(RiskLevel::Dangerous, "Git 破坏性/删除标签")
+            } else {
+                norm()
+            }
+        }
+
+        "branch" => {
+            if git_flag(&rest, &["-d", "--delete"]) {
+                say(RiskLevel::Dangerous, "Git 破坏性/删除分支")
+            } else if rest.is_empty()
+                || git_flag(&rest, &["-l", "--list", "-a", "-r", "-v", "-vv", "--show-current", "--contains", "--merged", "--no-merged", "--points-at", "--format"])
+            {
+                read("Git 只读状态查询")
+            } else {
+                norm() // 新建 / 改名 / 设置上游
+            }
+        }
+
+        "config" => {
+            let only_read = rest.is_empty()
+                || git_flag(&rest, &["--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin"]);
+            if only_read {
+                read("Git 只读状态查询")
+            } else if git_flag(&rest, &["--global", "--system"]) {
+                say(RiskLevel::Dangerous, "Git 全局配置变更（工作区之外）")
+            } else {
+                norm()
+            }
+        }
+
+        "checkout" => {
+            // 还原路径 = 丢弃工作区改动；切分支 = 常规。路径判定结合工作区实际存在与否，
+            // 避免把 feature/x 这类带斜杠的分支名误判成路径。
+            let paths = rest.iter().position(|t| t == "--").map(|i| rest[i + 1..].to_vec());
+            let discard = match paths {
+                Some(p) => !p.is_empty(),
+                None => words.iter().any(|w| w == "." || ws.join(w).exists()),
+            };
+            if discard {
+                say(RiskLevel::Dangerous, "Git 丢弃工作区改动")
+            } else {
+                norm()
+            }
+        }
+
+        "restore" => {
+            let staged_only = git_flag(&rest, &["--staged", "-S", "--cached"])
+                && !git_flag(&rest, &["--worktree", "-W"]);
+            if staged_only {
+                norm() // 只动索引，不碰工作区文件
+            } else {
+                say(RiskLevel::Dangerous, "Git 丢弃工作区改动")
+            }
+        }
+
+        "reset" => {
+            if git_flag(&rest, &["--merge"]) {
+                say(RiskLevel::Dangerous, "Git 重置并丢弃本地改动")
+            } else {
+                norm() // --soft / --mixed / 默认 只动 HEAD 与索引
+            }
+        }
+
+        "rm" => {
+            if git_flag(&rest, &["--cached"]) && !git_flag(&rest, &["-f", "--force"]) {
+                norm() // 只从索引移除，文件保留
+            } else {
+                say(RiskLevel::Dangerous, "Git 删除工作区文件")
+            }
+        }
+
+        "update-ref" => {
+            if git_flag(&rest, &["-d", "--delete"]) {
+                say(RiskLevel::Dangerous, "Git 删除引用")
+            } else {
+                norm()
+            }
+        }
+
+        // 历史改写 / 强推 / 清理：不可逆
+        "push" => say(RiskLevel::Dangerous, "Git 推送远端（需你逐次确认）"),
+        "clean" => say(RiskLevel::Dangerous, "Git 清理未跟踪文件"),
+        "rebase" | "filter-branch" | "filter-repo" => say(RiskLevel::Dangerous, "Git 改写历史"),
+
+        // 其余本地操作（add / commit / merge / cherry-pick / fetch / pull / init / clone 等）
+        _ => norm(),
+    }
 }
 
 /// shell 命令风险判定：按分隔符拆成子命令，逐条判定取最高风险。
-fn risk_shell(command: &str) -> (RiskLevel, String) {
+/// `ws` 供路径存在性判定（`git checkout <path>` 这类）使用。
+fn risk_shell(command: &str, ws: &Path) -> (RiskLevel, String) {
     if command.trim().is_empty() {
         return (RiskLevel::Safe, "空命令".into());
     }
@@ -252,7 +418,7 @@ fn risk_shell(command: &str) -> (RiskLevel, String) {
     let mut worst_reason = String::from("沙箱命令执行");
 
     for p in parts {
-        let (risk, reason) = risk_simple_command(&p);
+        let (risk, reason) = risk_simple_command(&p, ws);
         if risk > worst {
             worst = risk;
             worst_reason = reason;
@@ -266,7 +432,7 @@ fn risk_shell(command: &str) -> (RiskLevel, String) {
 }
 
 /// 单条子命令的风险判定（不含串联分隔符）。
-fn risk_simple_command(cmd: &str) -> (RiskLevel, String) {
+fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return (RiskLevel::Safe, "空子命令".into());
@@ -280,7 +446,7 @@ fn risk_simple_command(cmd: &str) -> (RiskLevel, String) {
     // 1) shell 里跑 git：复用 git 子命令语义（git push 不能算常规）
     if prog == "git" {
         let git_args: String = rest.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
-        return risk_git(&git_args);
+        return risk_git(&git_args, ws);
     }
 
     // 2) 高危程序（精确 token 匹配，避免正文/参数里的同名子串误伤）
@@ -493,7 +659,53 @@ mod tests {
         assert_eq!(evaluate_risk("git", &json!({"args": "branch -d old"}), &ws()).0, RiskLevel::Dangerous);
         // 常规操作不受影响
         assert_eq!(evaluate_risk("git", &json!({"args": "checkout feature/x"}), &ws()).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("git", &json!({"args": "stash list"}), &ws()).0, RiskLevel::Normal);
+        // 列表查询是只读，不该要审批
+        assert_eq!(evaluate_risk("git", &json!({"args": "stash list"}), &ws()).0, RiskLevel::Safe);
+    }
+
+    // —— v2：只读白名单收窄，堵住「子命令名对就放行」的漏洞 ——
+    #[test]
+    fn test_git_v2_closes_readonly_loopholes() {
+        // v1 会把这四个判成 Safe（子命令在只读表里）或漏判，全是写/删操作
+        assert_eq!(evaluate_risk("git", &json!({"args": "tag -d v1.0"}), &ws()).0, RiskLevel::Dangerous, "删标签");
+        assert_eq!(evaluate_risk("git", &json!({"args": "tag v1.0"}), &ws()).0, RiskLevel::Normal, "建标签");
+        assert_eq!(evaluate_risk("git", &json!({"args": "remote add origin https://x/y.git"}), &ws()).0, RiskLevel::Dangerous, "加远端");
+        assert_eq!(evaluate_risk("git", &json!({"args": "remote set-url origin https://evil/x.git"}), &ws()).0, RiskLevel::Dangerous, "改远端");
+        assert_eq!(evaluate_risk("git", &json!({"args": "restore ."}), &ws()).0, RiskLevel::Dangerous, "丢弃工作区改动");
+        assert_eq!(evaluate_risk("git", &json!({"args": "restore --staged ."}), &ws()).0, RiskLevel::Normal, "只动索引");
+        assert_eq!(evaluate_risk("git", &json!({"args": "rm src/main.rs"}), &ws()).0, RiskLevel::Dangerous, "删文件");
+        assert_eq!(evaluate_risk("git", &json!({"args": "rm --cached x.txt"}), &ws()).0, RiskLevel::Normal, "只出索引");
+        assert_eq!(evaluate_risk("git", &json!({"args": "config --global user.email a@b.c"}), &ws()).0, RiskLevel::Dangerous, "改全局配置");
+        assert_eq!(evaluate_risk("git", &json!({"args": "config --get user.email"}), &ws()).0, RiskLevel::Safe, "读配置");
+        assert_eq!(evaluate_risk("git", &json!({"args": "reflog expire --all"}), &ws()).0, RiskLevel::Dangerous, "清 reflog");
+        // 只读的仍要放行，别把白名单收得误伤
+        assert_eq!(evaluate_risk("git", &json!({"args": "status"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "log --oneline -5"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "tag"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "tag -l"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "branch --show-current"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "reflog"}), &ws()).0, RiskLevel::Safe);
+    }
+
+    // —— v2：全局参数不能被当成子命令（`git -C repo push` 必须仍是高危）——
+    #[test]
+    fn test_git_global_flags_do_not_mask_subcommand() {
+        assert_eq!(evaluate_risk("git", &json!({"args": "-C . push origin main"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "-c core.pager=cat log --oneline"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "--no-pager status"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": "--git-dir=.git push"}), &ws()).0, RiskLevel::Dangerous);
+        // shell 里跑的同样要剥
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git -C . push"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git -C . status"}), &ws()).0, RiskLevel::Safe);
+    }
+
+    // —— v2：push 从 shell 与 git 工具走，语义必须一致（都需审批，不能一边硬禁一边放行）——
+    #[test]
+    fn test_git_push_uniform_risk() {
+        assert_eq!(evaluate_risk("git", &json!({"args": "push origin main"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "push --force-with-lease"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git push"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "git.exe push"}), &ws()).0, RiskLevel::Dangerous);
     }
 
     #[test]
@@ -588,7 +800,7 @@ mod tests {
         assert_eq!(evaluate_risk("mystery_tool", &json!({}), &ws()).0, RiskLevel::Dangerous);
         // 已登记但无专门规则的工具（登记表里存在）按常规处理，不再一律高危
         assert!(KNOWN_TOOLS.contains(&"write_file"));
-        assert_eq!(KNOWN_TOOLS.len(), 7, "新增内置工具须同步登记到 KNOWN_TOOLS");
+        assert_eq!(KNOWN_TOOLS.len(), 8, "新增内置工具须同步登记到 KNOWN_TOOLS");
     }
 
     #[test]

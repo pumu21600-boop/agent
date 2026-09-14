@@ -11,10 +11,14 @@ use std::{convert::Infallible, path::PathBuf, pin::Pin, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, Request, State},
+    http::{
+        HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE},
+    },
+    middleware::{self, Next},
     response::{
-        Html,
+        Html, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
@@ -45,8 +49,12 @@ pub struct AppState {
     pub context_cfg: Arc<crate::config::ContextConfig>,
     pub recovery_cfg: Arc<crate::config::RecoveryConfig>,
     pub system_prompt: Arc<String>,
+    /// 系统约定文件 prompts/system.md：记忆面板可编辑，每轮任务实时读盘（保存即生效）
+    pub prompt_path: Arc<PathBuf>,
     /// 会话落盘（P6.1 多会话）：Snapshot 事件按 session_id 写入
     pub session: Arc<crate::session::SessionManager>,
+    /// 日志目录（记忆库索引 <log_dir>/memory/library.json 的落点）
+    pub log_dir: Arc<PathBuf>,
     /// P7 记忆层（events.log / AGENTS.md / index；开关在 [memory]）
     /// P8.2：工作区可切换 → 记忆层跟着重开，用 RwLock 换引用
     pub memory: Arc<std::sync::RwLock<Arc<crate::memory::Memory>>>,
@@ -249,14 +257,9 @@ pub struct SettingsUpdate {
     /// none/openai/deepseek/zai/qwen/qwen-chat-template；P8.3 旧值自动映射
     #[serde(default)]
     pub thinking_style: Option<String>,
-    /// 模型能力标记（工具调用/图片/视频/音频解析）。Some = 用户显式标记，
-    /// 同时置位 capabilities_user_set（A2：此后模型切换不得被推导覆盖）
+    /// 模型能力标记（工具调用/图片/视频/音频解析）。Some = 用户手动勾选并保存
     #[serde(default)]
     pub capabilities: Option<crate::config::settings::ModelCapabilities>,
-    /// A2 显式重置入口（「按模型名重新推导」按钮）：按当前模型名重推能力标记，
-    /// 并复位 capabilities_user_set 回推导态
-    #[serde(default)]
-    pub recompute_capabilities: Option<bool>,
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
@@ -274,6 +277,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/chat", post(chat))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/new", post(new_session))
+        .route("/api/sessions/open", post(open_session))
         .route("/api/sessions/meta", post(session_meta))
         .route("/api/sessions/fork", post(fork_session))
         .route("/api/sessions/batch", post(batch_sessions))
@@ -282,14 +287,24 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/alias", post(alias_workspace))
         .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
+        .route("/api/git/status", get(git_status))
+        .route("/api/git/commit", post(git_commit))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
         .route("/api/trace", get(get_trace))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/agents", post(save_memory_agents))
+        .route("/api/memory/library", get(get_memory_library))
+        .route("/api/memory/library/reindex", post(reindex_memory_library))
+        .route("/api/memory/search", post(search_memory))
         .route("/api/mcp", get(get_mcp).post(post_mcp))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
+        .route("/api/workspace/files", get(list_workspace_files))
+        .route("/api/workspace/file", get(read_workspace_file))
+        .route("/api/changes", get(list_changes))
+        .route("/api/shell", post(run_shell))
+        .route("/api/skills", get(list_skills).post(post_skills))
         .route("/api/health", get(|| async { "ok" }))
         .with_state(state);
 
@@ -302,7 +317,203 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         );
         app = app.route("/", get(embedded_index));
     }
+    // index.html 不缓存：前端重建后普通刷新即可拿到新入口（带 hash 的 assets 不受影响）
+    app = app.layer(middleware::from_fn(no_cache_html));
     app
+}
+
+/// 给 text/html 响应加 Cache-Control: no-cache，防止 index.html 缓存旧入口引用旧资源
+async fn no_cache_html(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    let is_html = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"));
+    if !is_html {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts
+        .headers
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Response::from_parts(parts, body)
+}
+
+/// GET /api/workspace/files —— 工作区文件相对路径列表（「@ 添加上下文」选择器数据源；有界遍历）
+async fn list_workspace_files() -> Json<Value> {
+    const MAX_FILES: usize = 500;
+    const SKIP_DIRS: [&str; 9] = [
+        ".git",
+        ".agent",
+        ".attachments",
+        ".workbuddy",
+        "node_modules",
+        "target",
+        "dist",
+        "logs",
+        "__pycache__",
+    ];
+    let ws = crate::tools::workspace_root();
+    let mut files: Vec<String> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(ws.clone(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        if files.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if files.len() >= MAX_FILES {
+                break;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let p = e.path();
+            if p.is_dir() {
+                // 深度上限：防目录联接（junction）成环导致死循环
+                if SKIP_DIRS.contains(&name.as_str()) || rel.matches('/').count() >= 12 {
+                    continue;
+                }
+                stack.push((p, child_rel));
+            } else {
+                files.push(child_rel);
+            }
+        }
+    }
+    files.sort();
+    let truncated = files.len() >= MAX_FILES;
+    Json(json!({ "files": files, "truncated": truncated }))
+}
+
+/// GET /api/skills —— 技能列表（项目级 + 全局，含全文供编辑器回显）
+async fn list_skills() -> Json<Value> {
+    Json(json!({ "skills": crate::skills::list() }))
+}
+
+#[derive(Deserialize)]
+pub struct SkillReq {
+    /// "save" | "delete" | "read"
+    pub action: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub content: Option<String>,
+}
+
+/// POST /api/skills —— 技能保存 / 删除 / 读取
+async fn post_skills(Json(req): Json<SkillReq>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    match req.action.as_str() {
+        "save" => {
+            let name = req.name.clone().unwrap_or_default();
+            match crate::skills::save(&name, req.description.as_deref().unwrap_or(""), req.content.as_deref().unwrap_or(""))
+            {
+                Ok(dir) => Ok(Json(json!({ "ok": true, "dir": dir }))),
+                Err(e) => Err(err(e)),
+            }
+        }
+        "delete" => {
+            let name = req.name.clone().unwrap_or_default();
+            match crate::skills::delete(&name) {
+                Ok(()) => Ok(Json(json!({ "ok": true }))),
+                Err(e) => Err(err(e)),
+            }
+        }
+        "read" => {
+            let name = req.name.clone().unwrap_or_default();
+            match crate::skills::read(&name) {
+                Ok(content) => Ok(Json(json!({ "ok": true, "content": content }))),
+                Err(e) => Err(err(e)),
+            }
+        }
+        other => Err(err(format!("未知 action: {other}"))),
+    }
+}
+
+/// GET /api/workspace/file?path=xx —— 读工作区文本文件内容（「预览」标签数据源；沿用 read_file 的越界防护与截断）
+async fn read_workspace_file(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    let path = params.get("path").map(|s| s.trim()).unwrap_or("");
+    if path.is_empty() {
+        return Err(err("缺少 path".into()));
+    }
+    let sandbox_cfg = (*state.sandbox_cfg).clone();
+    let exec = crate::tools::ExecConfig {
+        max_chars: 200_000,
+        sandbox: sandbox_cfg,
+        unsandboxed: false,
+        appcontainer: false,
+        allow_network: false,
+    };
+    match crate::tools::execute(
+        &exec,
+        "read_file",
+        &json!({ "path": path }).to_string(),
+    )
+    .await
+    {
+        Ok(content) => Ok(Json(json!({ "ok": true, "content": content }))),
+        Err(e) => Err(err(e)),
+    }
+}
+
+/// GET /api/changes?baseline=xx —— 本任务相对基线的改动文件清单（「产物」标签数据源）
+async fn list_changes(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    let baseline = params.get("baseline").map(|s| s.trim()).unwrap_or("");
+    if baseline.is_empty() {
+        return Err(err("缺少 baseline".into()));
+    }
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let baseline = baseline.to_string();
+    match tokio::task::spawn_blocking(move || crate::recovery::changed_files(&ws, &baseline)).await {
+        Ok(Ok(files)) => Ok(Json(json!({ "ok": true, "files": files }))),
+        Ok(Err(e)) => Err(err(e.to_string())),
+        Err(e) => Err(err(e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ShellReq {
+    pub command: String,
+}
+
+/// POST /api/shell —— 终端面板：在沙箱内执行一条用户输入的命令（复用 shell 工具的沙箱与超时）
+async fn run_shell(
+    State(state): State<AppState>,
+    Json(req): Json<ShellReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let command = req.command.trim().to_string();
+    if command.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "命令为空" })),
+        ));
+    }
+    let sandbox_cfg = (*state.sandbox_cfg).clone();
+    let exec = crate::tools::ExecConfig {
+        max_chars: 100_000,
+        sandbox: sandbox_cfg.clone(),
+        unsandboxed: false,
+        appcontainer: sandbox_cfg.mode == "appcontainer",
+        allow_network: sandbox_cfg.allow_network,
+    };
+    match crate::tools::execute(&exec, "shell", &json!({ "command": command }).to_string()).await {
+        Ok(output) => Ok(Json(json!({ "ok": true, "output": output }))),
+        Err(e) => Ok(Json(json!({ "ok": false, "output": e }))),
+    }
 }
 
 fn json_event(payload: Value) -> Event {
@@ -471,13 +682,8 @@ fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, Strin
         if let Some(v) = &req.model {
             let v = v.trim().to_string();
             if c.model != v {
+                // 能力标记归用户手动勾选，切换模型不改写（原「按模型名推导初值」已移除）
                 c.model = v;
-                // A2 能力标记所有权（施工单 012）：用户显式标记 > 推导。仅当该配置从未被
-                // 用户标记过，模型切换才用「按模型名推导」的值作初值；标记过的不被冲掉。
-                if !c.capabilities_user_set {
-                    c.capabilities =
-                        crate::config::settings::ModelCapabilities::infer_from_model_id(&c.model);
-                }
             }
         }
         if let Some(v) = &req.models {
@@ -515,14 +721,8 @@ fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, Strin
         }
         if let Some(caps) = &req.capabilities {
             c.capabilities = caps.clone();
-            // A2：显式勾选 = 用户标记，此后任何模型切换都不得改写 capabilities
+            // 能力标记归用户所有：手动勾选即时保存
             c.capabilities_user_set = true;
-        }
-        // A2 显式重置入口：按当前模型名重新推导，并回到推导态（此后模型切换恢复自动推导）
-        if req.recompute_capabilities == Some(true) {
-            let m = c.effective_model();
-            c.capabilities = crate::config::settings::ModelCapabilities::infer_from_model_id(&m);
-            c.capabilities_user_set = false;
         }
 
         let url_after = crate::config::settings::normalize_base(&c.effective_base_url());
@@ -669,6 +869,55 @@ async fn get_workspace(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// 规范化工作区路径：Windows canonicalize 会加 `\\?\` 扩展前缀，显示与持久化都难看，剥掉。
+fn canon_workspace(p: std::path::PathBuf) -> std::path::PathBuf {
+    match p.canonicalize() {
+        Ok(c) => {
+            let s = c.display().to_string();
+            match s.strip_prefix(r"\\?\") {
+                Some(stripped) => std::path::PathBuf::from(stripped),
+                None => c,
+            }
+        }
+        Err(_) => p,
+    }
+}
+
+/// 路径等价比较（Windows 大小写不敏感、斜杠方向与结尾分隔符归一）。
+fn same_workspace(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+/// 切换工作区（/api/workspace 与「打开会话」共用）：改全局根 → 记忆层热重开
+/// → settings 持久化 + 最近列表 → MCP 同步 → 事件。调用方负责校验目录存在。
+fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Result<(), String> {
+    let old = crate::tools::set_workspace_root(&canon.to_path_buf());
+    // 记忆层重开：新项目的双层存储/index 登记/AGENTS.md 模板
+    let new_mem = Arc::new(crate::memory::Memory::open(canon, &state.mem_cfg));
+    new_mem.ensure_agents_template(canon);
+    *state.memory.write().unwrap() = new_mem;
+    // 持久化 + 最近列表（去重、新→旧、最多 8）
+    let cur = canon.display().to_string();
+    let mut s = state.settings.write().unwrap().clone();
+    s.workspace = Some(cur.clone());
+    s.recent_workspaces.retain(|w| *w != cur);
+    s.recent_workspaces.insert(0, cur.clone());
+    s.recent_workspaces.truncate(8);
+    s.save().map_err(|e| e.to_string())?;
+    *state.settings.write().unwrap() = s.clone();
+    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    observability::event(
+        EventType::State,
+        json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
+    );
+    Ok(())
+}
+
 /// POST /api/workspace —— 切换工作区：校验目录存在 → 改全局根 → 记忆层热重开
 /// （新项目 .agent/index/AGENTS.md 模板）→ settings 持久化 + 最近列表。
 /// 进行中的任务不拦（前端流式期间禁用按钮）；切换只影响之后的工具调用。
@@ -684,39 +933,12 @@ async fn set_workspace(
     if !p.is_dir() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("目录不存在: {path}") })));
     }
-    // Windows canonicalize 会加 \\?\ 扩展前缀：显示与持久化都难看，剥掉
-    let canon = match p.canonicalize() {
-        Ok(c) => {
-            let s = c.display().to_string();
-            match s.strip_prefix(r"\\?\") {
-                Some(stripped) => std::path::PathBuf::from(stripped),
-                None => c,
-            }
-        }
-        Err(_) => p,
-    };
-    let old = crate::tools::set_workspace_root(&canon);
-    // 记忆层重开：新项目的双层存储/index 登记/AGENTS.md 模板
-    let new_mem = Arc::new(crate::memory::Memory::open(&canon, &state.mem_cfg));
-    new_mem.ensure_agents_template(&canon);
-    *state.memory.write().unwrap() = new_mem;
-    // 持久化 + 最近列表（去重、新→旧、最多 8）
-    let cur = canon.display().to_string();
-    let mut s = state.settings.write().unwrap().clone();
-    s.workspace = Some(cur.clone());
-    s.recent_workspaces.retain(|w| *w != cur);
-    s.recent_workspaces.insert(0, cur.clone());
-    s.recent_workspaces.truncate(8);
-    if let Err(e) = s.save() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    let canon = canon_workspace(p);
+    if let Err(e) = apply_workspace(&state, &canon) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })));
     }
-    *state.settings.write().unwrap() = s.clone();
-    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
-    observability::event(
-        EventType::State,
-        json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
-    );
-    (StatusCode::OK, Json(json!({ "ok": true, "current": cur, "recent": s.recent_workspaces })))
+    let recent = state.settings.read().unwrap().recent_workspaces.clone();
+    (StatusCode::OK, Json(json!({ "ok": true, "current": canon.display().to_string(), "recent": recent })))
 }
 
 /// 配置快照（含各配置 key 状态与角色路由），供前端全量刷新。
@@ -834,7 +1056,8 @@ async fn chat(
         }
         c
     };
-    let prompt = state.system_prompt.clone();
+    // 系统约定每轮实时读盘（面板保存 prompts/system.md 后无需重启即生效）
+    let prompt = read_system_prompt(&state);
     // P7 AGENTS.md 双层注入（全局在前、项目在后）；P8.2 记忆层随工作区热重开
     let agents_md = state.memory.read().unwrap().agents_md();
     let approvals = state.approvals.clone();
@@ -893,6 +1116,25 @@ async fn chat(
         }
         // P6.1：先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
+
+        // 新会话开场：注入「项目现状」摘要（上一条同项目会话 + 工作区未提交改动），
+        // 让同一工作区里新开的对话直接接手项目，而不是从零问起。
+        let project_brief = {
+            let is_new = session.get(&session_id).map(|f| f.messages.is_empty()).unwrap_or(true);
+            if is_new {
+                let ws = crate::tools::workspace_root().to_path_buf();
+                let stats = tokio::task::spawn_blocking(move || {
+                    let head = crate::recovery::head_id(&ws).ok().flatten()?;
+                    crate::recovery::diff_stat(&ws, &head).ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                session.project_brief(&session_id, stats).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
 
         // P8.5 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
@@ -1007,26 +1249,31 @@ async fn chat(
                         continue;
                     }
 
-                    // 3) 能力预检（对齐 DSH acceptsMedia 门禁规范）：
-                    // 如果用户配置的渠道模型明确不具备该模态能力（如把 mimo-v2.5 错配给音频），拦截并替换为指导提示，绝对不发起注定失败的调用
+                    // 3) 能力预检：以专家配置里用户勾选的能力标记为准（勾了「图片解析」就放行，
+                    //    不再看模型名里有没有 vision 等关键字）；找不到对应配置时才退回按名推导
                     let first_ch = &candidates[0];
                     let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("custom");
                     let first_model = &first_ch.model;
 
-                    if !accepts_modality(first_model, kind) {
+                    let gate_ok = match role_target
+                        .and_then(|id| s.configs.iter().find(|c| c.id == id || c.name == id))
+                    {
+                        Some(expert) => match kind {
+                            "audio" => expert.capabilities.audio,
+                            "video" => expert.capabilities.video,
+                            "image" => expert.capabilities.vision,
+                            _ => false,
+                        },
+                        None => accepts_modality(first_model, kind),
+                    };
+                    if !gate_ok {
                         let text = format!(
-                            "[{} not run: model {}/{} does not accept {} input. The {} was NOT shown to you. 当前配置的{}模型「{}/{}」不支持{}输入，该{}未展示给主模型。请在“设置 → 角色分工”中为“{}理解专家”指定支持{}的模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
-                            success_label, first_provider, first_model, kind, kind,
-                            kind_cn, first_provider, first_model, kind_cn, kind_cn,
-                            kind_cn, kind_cn
+                            "[{} not run: 专家配置「{}/{}」未勾选{}解析能力。该{}未展示给主模型。请在「设置 → 模型配置」选中该专家配置并勾选「{}解析」（或在「角色分工」把{}理解专家换成具备该能力的模型）]",
+                            success_label, first_provider, first_model, kind_cn, kind_cn, kind_cn, kind_cn
                         );
                         projections.push(text);
                         continue;
                     }
-
-                    send(json!({
-                        "content": format!("*（📸 后台正在通过{}理解模型「{}/{}」解析「{}」，随后交由「{}」深度回答...）*\n\n", kind_cn, first_provider, first_model, att.name, active_cfg.model)
-                    }));
 
                     let candidate_prompts: Vec<Value> = if is_aud {
                         vec![
@@ -1253,9 +1500,9 @@ async fn chat(
         let outcome = agent::run_task(
             &gateway,
             &agent::LoopChannels { primary, summary, title, fallbacks },
-            // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实。
+            // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
             // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
-            &format!("{prompt}{agents_md}"),
+            &format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt()),
             &history,
             &cancel,
             &cfg,
@@ -1383,7 +1630,23 @@ fn default_trace_limit() -> usize {
 
 // —— P10.5 设置面板「记忆」分区 ——
 
-/// GET /api/memory —— 记忆层状态 + 双层 AGENTS.md 原文（编辑器数据源）。
+/// 系统约定（prompts/system.md）当前内容：每轮任务实时读盘，保存即生效；
+/// 文件缺失/读不到时回落到启动时载入的提示词。
+fn read_system_prompt(state: &AppState) -> String {
+    std::fs::read_to_string(&*state.prompt_path).unwrap_or_else(|_| (*state.system_prompt).clone())
+}
+
+/// 保存系统约定：写 prompts/system.md（目录不存在则建）。
+fn save_system_prompt(state: &AppState, content: &str) -> anyhow::Result<PathBuf> {
+    let path = (*state.prompt_path).clone();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, content)?;
+    Ok(path)
+}
+
+/// GET /api/memory —— 记忆层状态 + 三类约定文件原文（编辑器数据源，每次调用读盘 = 显示文件实时内容）。
 async fn get_memory(State(state): State<AppState>) -> Json<Value> {
     let mem = state.memory.read().unwrap().clone();
     let projects_registered = mem.load_index().projects.len();
@@ -1393,6 +1656,10 @@ async fn get_memory(State(state): State<AppState>) -> Json<Value> {
         "project_dir": mem.project_dir().display().to_string(),
         "events_lines": mem.events_lines(),
         "projects_registered": projects_registered,
+        "system_path": state.prompt_path.display().to_string(),
+        "global_agents_path": mem.global_agents_path().display().to_string(),
+        "project_agents_path": mem.project_agents_path().display().to_string(),
+        "system_prompt": read_system_prompt(&state),
         "agents_global": mem.agents_raw("global"),
         "agents_project": mem.agents_raw("project"),
     }))
@@ -1400,21 +1667,27 @@ async fn get_memory(State(state): State<AppState>) -> Json<Value> {
 
 #[derive(Debug, Deserialize)]
 pub struct SaveAgentsRequest {
-    /// "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
+    /// "system"（prompts/system.md）| "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
     pub scope: String,
     pub content: String,
 }
 
-/// POST /api/memory/agents —— 保存用户编辑的 AGENTS.md（下次任务注入自动生效）。
+/// POST /api/memory/agents —— 保存用户编辑的约定文件（system 走实时读盘，保存即生效；
+/// 两层 AGENTS.md 下次任务注入自动生效）。
 async fn save_memory_agents(
     State(state): State<AppState>,
     Json(req): Json<SaveAgentsRequest>,
 ) -> (StatusCode, Json<Value>) {
-    if !matches!(req.scope.as_str(), "global" | "project") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "scope 须为 global 或 project" })));
+    if !matches!(req.scope.as_str(), "system" | "global" | "project") {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "scope 须为 system / global / project" })));
     }
     let mem = state.memory.read().unwrap().clone();
-    match mem.save_agents(&req.scope, &req.content) {
+    let saved = if req.scope == "system" {
+        save_system_prompt(&state, &req.content)
+    } else {
+        mem.save_agents(&req.scope, &req.content)
+    };
+    match saved {
         Ok(path) => {
             observability::event(
                 EventType::State,
@@ -1424,6 +1697,177 @@ async fn save_memory_agents(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
+}
+
+// —— 记忆库（星云视图）：会话级记忆索引 + 向量检索 ——
+
+/// 解析 EMBEDDING 角色渠道（B3 顺序：settings.roles.embedding > config.toml [roles].embedding）。
+/// 嵌入**不走主渠道兜底**：主模型多半没有 /embeddings 端点，未配置时用本地哈希向量更可靠。
+fn resolve_embedder<'a>(state: &'a AppState, s: &Settings) -> Option<crate::memory::library::Embedder<'a>> {
+    let name = s
+        .roles
+        .as_ref()
+        .and_then(|r| r.embedding.as_deref())
+        .or_else(|| state.roles_cfg.embedding.as_deref())?;
+    let ch = find_channel(s, name)?;
+    if ch.api_key.trim().is_empty() {
+        return None;
+    }
+    Some(crate::memory::library::Embedder {
+        gw: &state.gateway,
+        base_url: ch.base_url,
+        model: ch.model,
+        api_key: ch.api_key,
+    })
+}
+
+/// 增量同步索引 → 记忆库 JSON（光点列表 + 项目聚合 + 索引状态）。
+async fn build_library(state: &AppState, force: bool) -> Value {
+    use crate::memory::library as lb;
+    let settings = state.settings.read().unwrap().clone();
+    let embedder = resolve_embedder(state, &settings);
+    let report = lb::sync(&state.session, &state.log_dir, embedder, force).await;
+    let lib = lb::load(&state.log_dir);
+    let items: Vec<Value> = lib
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "title": e.title,
+                "project": e.project,
+                "workspace": e.workspace,
+                "created_at": e.created_at,
+                "updated_at": e.updated_at,
+                "count": e.count,
+                "chars": e.chars,
+                "pinned": e.pinned,
+                "archived": e.archived,
+                "snippet": e.snippet,
+                "indexed": !e.vec.is_empty(),
+            })
+        })
+        .collect();
+    let mut proj: std::collections::BTreeMap<String, (String, usize)> = std::collections::BTreeMap::new();
+    for e in &lib.entries {
+        let slot = proj.entry(e.project.clone()).or_insert_with(|| (e.workspace.clone(), 0));
+        slot.1 += 1;
+    }
+    let projects: Vec<Value> = proj
+        .iter()
+        .map(|(name, (ws, n))| json!({ "name": name, "workspace": ws, "count": n }))
+        .collect();
+    let indexed = lib.entries.iter().filter(|e| !e.vec.is_empty()).count();
+    let mem = state.memory.read().unwrap().clone();
+    json!({
+        "items": items,
+        "projects": projects,
+        "stats": {
+            "sessions": lib.entries.len(),
+            "projects": projects.len(),
+            "indexed": indexed,
+            "pending": lib.entries.len() - indexed,
+            "model": lib.model,
+            "mode": report.mode,
+        },
+        "sync": report,
+        "events_lines": mem.events_lines(),
+        "notice": report.error,
+    })
+}
+
+/// GET /api/memory/library —— 记忆库光点数据（每次调用做一次有界增量同步）。
+async fn get_memory_library(State(state): State<AppState>) -> Json<Value> {
+    Json(build_library(&state, false).await)
+}
+
+/// POST /api/memory/library/reindex —— 强制重建向量（忽略指纹），返回同款光点数据。
+async fn reindex_memory_library(State(state): State<AppState>) -> Json<Value> {
+    observability::event(EventType::State, json!({ "kind": "memory.reindex" }));
+    Json(build_library(&state, true).await)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemorySearchRequest {
+    #[serde(default)]
+    pub query: String,
+    /// 「相似会话」：以该会话为源找相近的其它会话（用索引里已存的向量，不调外部渠道）
+    #[serde(default)]
+    pub like: Option<String>,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    /// 匹配下限（0..1，越小越宽）；搜索缺省 0.18、相似缺省 0.3
+    #[serde(default)]
+    pub min_score: Option<f32>,
+}
+
+/// POST /api/memory/search —— 向量检索（混合排序），返回命中的会话 id 供光点过滤。
+async fn search_memory(State(state): State<AppState>, Json(req): Json<MemorySearchRequest>) -> Json<Value> {
+    use crate::memory::library as lb;
+    let lib = lb::load(&state.log_dir);
+    let top_k = req.top_k.unwrap_or(40).clamp(1, 200);
+    if let Some(id) = req.like.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let results = lb::similar(&lib, id, top_k, req.min_score.unwrap_or(0.3).clamp(0.0, 1.0));
+        observability::event(EventType::State, json!({ "kind": "memory.similar", "id": id, "hits": results.len() }));
+        return Json(json!({
+            "results": results,
+            "total": lib.entries.len(),
+            "mode": "similar",
+            "model": lib.model,
+            "notice": Value::Null,
+        }));
+    }
+    let query = req.query.trim().to_string();
+    if query.is_empty() {
+        return Json(json!({ "results": [], "total": 0, "mode": "none", "notice": "查询为空" }));
+    }
+    let min_score = req.min_score.unwrap_or(0.18).clamp(0.0, 1.0);
+    // 查询向量必须与索引同口径：本地索引直接本地算；外部索引调嵌入席位，
+    // 失败/未配置则退化为纯词法（qvec 为空，search 内部自动降级）。
+    let mut notice: Option<String> = None;
+    let qvec = if lib.model.is_empty() || lib.model == lb::LOCAL_MODEL {
+        lb::local_vec(&query)
+    } else {
+        let settings = state.settings.read().unwrap().clone();
+        match resolve_embedder(&state, &settings) {
+            Some(emb) => {
+                match emb.gw.embed(&emb.base_url, &emb.model, &emb.api_key, std::slice::from_ref(&query)).await {
+                    Ok(vs) if !vs.is_empty() => lb::norm_vec(&vs[0]),
+                    Ok(_) => {
+                        notice = Some("嵌入渠道未返回向量，本次只用关键词匹配".into());
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        notice = Some(format!("嵌入渠道不可用（{e}），本次只用关键词匹配"));
+                        Vec::new()
+                    }
+                }
+            }
+            None => {
+                notice = Some("嵌入席位未配置或 key 缺失，本次只用关键词匹配".into());
+                Vec::new()
+            }
+        }
+    };
+    let results = lb::search(&lib, &qvec, &query, top_k, min_score);
+    let mode = if qvec.is_empty() {
+        "lexical"
+    } else if lib.model == lb::LOCAL_MODEL {
+        "local"
+    } else {
+        "external"
+    };
+    observability::event(
+        EventType::State,
+        json!({ "kind": "memory.search", "query": query, "hits": results.len(), "mode": mode }),
+    );
+    Json(json!({
+        "results": results,
+        "total": lib.entries.len(),
+        "mode": mode,
+        "model": lib.model,
+        "notice": notice,
+    }))
 }
 
 // —— P11（施工单 016）：MCP 插件 ——
@@ -1662,6 +2106,10 @@ impl agent::ApprovalGate for ChatGate {
     fn sandbox_enabled(&self) -> bool {
         let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
         !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
@@ -1953,9 +2401,74 @@ async fn get_session(State(state): State<AppState>, axum::extract::Query(q): axu
         None => state.session.latest(),
     };
     match f {
-        Some(f) => (StatusCode::OK, Json(json!({ "id": f.id, "title": f.title, "updated_at": f.updated_at, "summary": f.summary, "messages": f.messages }))),
+        Some(f) => (StatusCode::OK, Json(json!({ "id": f.id, "title": f.title, "updated_at": f.updated_at, "summary": f.summary, "workspace": f.workspace, "messages": f.messages }))),
         None => (StatusCode::OK, Json(json!({ "messages": [] }))),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionOpenRequest {
+    pub id: String,
+}
+
+/// POST /api/sessions/new —— 新建一条空会话并立即落盘（当前项目下），
+/// 侧栏马上能见到该会话；首条消息随后写入同一条。同工作区已有空会话则复用。
+async fn new_session(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    let ws = crate::tools::workspace_root().display().to_string();
+    match state.session.create_empty(&ws, "新会话") {
+        Ok(f) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "session.created", "session": f.id, "workspace": ws }),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "id": f.id, "title": f.title, "workspace": ws, "created_at": f.created_at })),
+            )
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /api/sessions/open —— 打开会话：其所属工作区与当前不同时先切过去，再返回消息。
+/// 「切会话 = 回到那个项目」的闭环入口；目录已不存在时不硬失败，降级只读打开并回 warning。
+async fn open_session(
+    State(state): State<AppState>,
+    Json(req): Json<SessionOpenRequest>,
+) -> (StatusCode, Json<Value>) {
+    let Some(f) = state.session.get(&req.id) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "会话不存在" })));
+    };
+    let current = crate::tools::workspace_root().display().to_string();
+    let mut switched = false;
+    let mut warning: Option<String> = None;
+    let target = f.workspace.trim();
+    if !target.is_empty() && !same_workspace(&current, target) {
+        let p = std::path::PathBuf::from(target);
+        if p.is_dir() {
+            let canon = canon_workspace(p);
+            match apply_workspace(&state, &canon) {
+                Ok(()) => switched = true,
+                Err(e) => warning = Some(format!("切换项目失败：{e}")),
+            }
+        } else {
+            warning = Some(format!("原项目目录已不存在，仍在当前项目里打开该会话：{target}"));
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": f.id,
+            "title": f.title,
+            "updated_at": f.updated_at,
+            "summary": f.summary,
+            "messages": f.messages,
+            "workspace": f.workspace,
+            "current_workspace": crate::tools::workspace_root().display().to_string(),
+            "switched": switched,
+            "warning": warning,
+        })),
+    )
 }
 
 /// DELETE /api/session?id=xxx —— 删除一条会话（其余不受影响）。
@@ -2000,12 +2513,63 @@ async fn make_handoff(State(state): State<AppState>) -> (StatusCode, Json<Value>
     }
 }
 
-/// GET /api/checkpoints —— 影子仓库检查点列表（新→旧，最多 20 个）。
-async fn list_checkpoints(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+/// GET /api/git/status —— 工作区 git 概览（分支/HEAD/脏文件数/上游领先落后/未提交明细）。
+/// 非 git 仓库返回 is_repo=false，前端隐藏该信息。
+async fn git_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let _ = &state;
     let ws = crate::tools::workspace_root().to_path_buf();
+    match tokio::task::spawn_blocking(move || crate::recovery::status(&ws)).await {
+        Ok(s) => (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_else(|_| json!({ "is_repo": false })))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitCommitRequest {
+    pub message: String,
+    /// 要提交的路径；缺省/空数组 = 全部改动（add -A）
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// POST /api/git/commit —— 用户手动提交：按选中路径 stage 后 commit，返回短哈希。
+async fn git_commit(
+    State(state): State<AppState>,
+    Json(req): Json<GitCommitRequest>,
+) -> (StatusCode, Json<Value>) {
+    let _ = &state;
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let msg = req.message.clone();
+    let files = req.files.clone();
+    let res = tokio::task::spawn_blocking(move || crate::recovery::commit(&ws, &msg, &files)).await;
+    match res {
+        Ok(Ok(id)) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "git.committed", "id": id, "files": req.files.len(), "manual": true }),
+            );
+            (StatusCode::OK, Json(json!({ "ok": true, "id": id })))
+        }
+        // git 自己的报错（如「没有可提交的改动」）直接给用户看，比翻译成中文更有用
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// GET /api/checkpoints[?session=<id>] —— 影子仓库检查点列表（新→旧，最多 20 个）。
+/// 带 session 时额外返回 `mine`：该会话自己的检查点（改动条基线优先取它）。
+async fn list_checkpoints(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    let _ = &state;
+    let want = q.get("session").map(|s| s.trim().to_string()).unwrap_or_default();
+    let ws = crate::tools::workspace_root().to_path_buf();
     match tokio::task::spawn_blocking(move || crate::recovery::list(&ws, 20)).await {
-        Ok(Ok(list)) => (StatusCode::OK, Json(json!({ "checkpoints": list }))),
+        Ok(Ok(list)) => {
+            let mine: Vec<_> = list.iter().filter(|c| !want.is_empty() && c.session == want).cloned().collect();
+            (StatusCode::OK, Json(json!({ "checkpoints": list, "mine": mine })))
+        }
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
@@ -2514,7 +3078,7 @@ mod tests {
 
     #[test]
     fn capabilities_user_mark_survives_model_switch() {
-        // A2（施工单 012）：用户显式标记 > 推导，模型切换不得覆盖
+        // 能力标记归用户所有：手动勾选后，任何模型切换都不得改写（推导机制已移除）
         let mut s = test_settings();
         // 模拟用户勾选「图片解析」→ capabilities_user_set 置位
         let req = SettingsUpdate {
@@ -2529,7 +3093,7 @@ mod tests {
         apply_settings_update(&mut s, &req);
         assert!(s.active().unwrap().capabilities_user_set);
         assert!(s.active().unwrap().capabilities.vision);
-        // 切到别的模型：标记不得被推导冲掉
+        // 切到别的模型：手动标记原样保留
         let req = SettingsUpdate {
             model: Some("qwen3.8-flash".into()),
             ..Default::default()
@@ -2539,23 +3103,20 @@ mod tests {
             s.active().unwrap().capabilities.vision,
             "用户手动标记的 vision 不得被模型切换冲掉"
         );
-        // 显式「按模型名重新推导」→ 回到推导态（qwen3.8-flash 无视觉关键字 → vision=false）
-        let req = SettingsUpdate {
-            recompute_capabilities: Some(true),
-            ..Default::default()
-        };
-        apply_settings_update(&mut s, &req);
-        assert!(!s.active().unwrap().capabilities_user_set);
-        assert!(!s.active().unwrap().capabilities.vision);
-        // 推导态下切模型 → 推导初值生效（vl 模型 → vision=true，且仍属推导态）
+        assert!(s.active().unwrap().capabilities_user_set);
+        // 从未被标记过的配置切模型：能力标记同样保持不变（不再按模型名推导）
+        let mut s2 = test_settings();
         let req = SettingsUpdate {
             model: Some("qwen-vl-max".into()),
             ..Default::default()
         };
-        apply_settings_update(&mut s, &req);
-        let c = s.active().unwrap();
-        assert!(c.capabilities.vision, "无用户标记时模型切换应按模型名推导初值");
-        assert!(!c.capabilities_user_set, "推导初值不等于用户标记");
+        apply_settings_update(&mut s2, &req);
+        let c = s2.active().unwrap();
+        assert!(
+            !c.capabilities.vision,
+            "无用户标记时切模型也不再推导，保持默认（仅工具调用）"
+        );
+        assert!(c.capabilities.tools, "默认工具调用能力不受影响");
     }
 
     #[test]

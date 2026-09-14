@@ -142,9 +142,11 @@ pub unsafe fn sid_to_string(sid: PSID) -> Option<String> {
 /// 给目录授 AppContainer SID 的完全控制 ACE（icacls，幂等；递归继承 OI+CI）。
 /// 失败仅返回 Err（调用方记日志，不阻断——探针会暴露权限问题）。
 pub fn grant_dir_access(dir: &Path, sid_str: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("icacls")
         .arg(dir)
         .args(["/grant", &format!("*{sid_str}:(OI)(CI)F")])
+        .creation_flags(0x0800_0000) // 不闪控制台窗口
         .output()
         .map_err(|e| format!("icacls 执行失败: {e}"))?;
     if !out.status.success() {

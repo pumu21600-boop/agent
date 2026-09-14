@@ -23,6 +23,10 @@ pub struct Checkpoint {
     pub id: String,
     pub ts: String,
     pub reason: String,
+    /// 拍点时所属会话 id（旧检查点无此信息，缺省空串）。
+    /// 有了归属，切回某条会话时才能只显示它自己的改动、只回滚它自己的基线。
+    #[serde(default)]
+    pub session: String,
 }
 
 /// 真仓库 origin remote url（无 remote/非仓库返回 None）。记忆系统项目身份用。
@@ -53,7 +57,10 @@ fn git_bin() -> anyhow::Result<PathBuf> {
 }
 
 fn git(bin: &Path, gitdir: Option<&Path>, ws: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
     let mut cmd = Command::new(bin);
+    // 后台无窗口运行时，控制台子进程会闪黑框：一律不创建新控制台窗口
+    cmd.creation_flags(0x0800_0000);
     match gitdir {
         Some(g) => {
             cmd.arg("--git-dir").arg(g);
@@ -133,7 +140,8 @@ fn tracked_files(bin: &Path, ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 /// 拍检查点：add + 有变更才 commit。返回 None 表示没有需要落的变化。
 /// 任何失败都由调用方决定降级（核心循环只记日志不阻断）。
-pub fn checkpoint(ws: &Path, reason: &str) -> anyhow::Result<Option<Checkpoint>> {
+/// `session_id` 写进提交正文的 trailer，供改动条/撤销按会话对齐。
+pub fn checkpoint(ws: &Path, reason: &str, session_id: &str) -> anyhow::Result<Option<Checkpoint>> {
     let bin = git_bin()?;
     let gitdir = ensure_shadow(&bin, ws)?;
 
@@ -169,17 +177,26 @@ pub fn checkpoint(ws: &Path, reason: &str) -> anyhow::Result<Option<Checkpoint>>
         return Ok(None);
     }
 
-    let msg = format!("checkpoint: {}", one_line(reason, 120));
+    let sid = session_id.trim();
+    let msg = if sid.is_empty() {
+        format!("checkpoint: {}", one_line(reason, 120))
+    } else {
+        // trailer 单独成段：git log %b 可解析，人看也清楚
+        format!("checkpoint: {}\n\nAgent-Session: {}", one_line(reason, 120), sid)
+    };
     git_ok(&bin, Some(&gitdir), ws, &["commit", "--quiet", "-m", &msg])?;
     let id = git_ok(&bin, Some(&gitdir), ws, &["rev-parse", "HEAD"])?;
     Ok(Some(Checkpoint {
         id,
         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         reason: one_line(reason, 200),
+        session: sid.to_string(),
     }))
 }
 
 /// 最近 limit 个检查点（新→旧）。
+/// 正文带 `Agent-Session:` trailer 的解析出归属会话；`-z` 让记录以 NUL 分隔，
+/// 这样多行正文不会破坏按行切分。
 pub fn list(ws: &Path, limit: usize) -> anyhow::Result<Vec<Checkpoint>> {
     let bin = git_bin()?;
     let gitdir = shadow_gitdir(ws);
@@ -190,18 +207,143 @@ pub fn list(ws: &Path, limit: usize) -> anyhow::Result<Vec<Checkpoint>> {
         &bin,
         Some(&gitdir),
         ws,
-        &["log", "-n", &limit.to_string(), "--pretty=%H%x1f%aI%x1f%s"],
+        &["log", "-n", &limit.to_string(), "-z", "--pretty=%H%x1f%aI%x1f%s%x1f%b"],
     )?;
     Ok(out
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.splitn(3, '\x1f');
-            let id = it.next()?.to_string();
-            let ts = it.next()?.to_string();
+        .split('\0')
+        .filter_map(|rec| {
+            let mut it = rec.splitn(4, '\x1f');
+            let id = it.next()?.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let ts = it.next().unwrap_or("").to_string();
             let reason = it.next().unwrap_or("").strip_prefix("checkpoint: ").unwrap_or("").to_string();
-            Some(Checkpoint { id, ts, reason })
+            let session = it
+                .next()
+                .unwrap_or("")
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("Agent-Session:"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            Some(Checkpoint { id, ts, reason, session })
         })
         .collect())
+}
+
+/// 工作区 git 概览：是否仓库、当前分支、HEAD、脏文件数、上游领先/落后、未提交文件清单。
+/// 非仓库（或 git 不可用）返回 is_repo=false，不报错——前端据此隐藏 git 信息。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GitStatus {
+    pub is_repo: bool,
+    pub branch: String,
+    pub head: String,
+    pub dirty: usize,
+    pub upstream: String,
+    pub ahead: u64,
+    pub behind: u64,
+    /// 未提交文件明细（前端「待提交」列表用），最多 `GIT_FILES_CAP` 条
+    pub files: Vec<GitFile>,
+}
+
+/// 一个未提交文件：`status` 是 git porcelain 的两字符状态码（`M` / `??` / `A` / `D` / `R` …）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GitFile {
+    pub status: String,
+    pub path: String,
+}
+
+/// 明细列表上限：够用又不至于把 SSE/HTTP 响应撑爆。
+const GIT_FILES_CAP: usize = 500;
+
+pub fn status(ws: &Path) -> GitStatus {
+    let blank = GitStatus {
+        is_repo: false,
+        branch: String::new(),
+        head: String::new(),
+        dirty: 0,
+        upstream: String::new(),
+        ahead: 0,
+        behind: 0,
+        files: Vec::new(),
+    };
+    let Ok(bin) = git_bin() else { return blank };
+    match git_ok(&bin, None, ws, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(t) if t.trim() == "true" => {}
+        _ => return blank,
+    }
+    let mut st = GitStatus { is_repo: true, ..blank };
+    st.branch = git_ok(&bin, None, ws, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    if st.branch == "HEAD" {
+        st.branch = "（分离头指针）".to_string();
+    }
+    st.head = git_ok(&bin, None, ws, &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
+    // core.quotepath=false：中文/特殊字符路径按原样输出，不转义成 \xxx 八进制
+    if let Ok(out) = git_ok(&bin, None, ws, &["-c", "core.quotepath=false", "status", "--porcelain=v1", "-b"]) {
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix("## ") {
+                // `## main...origin/main [ahead 1, behind 2]`
+                if let Some((_, tail)) = rest.split_once("...") {
+                    st.upstream = tail.split_whitespace().next().unwrap_or("").to_string();
+                }
+                if let Some(idx) = rest.find('[') {
+                    let inner = rest[idx + 1..].trim_end_matches(']');
+                    for part in inner.split(',') {
+                        let p = part.trim();
+                        if let Some(v) = p.strip_prefix("ahead ") {
+                            st.ahead = v.trim().parse().unwrap_or(0);
+                        } else if let Some(v) = p.strip_prefix("behind ") {
+                            st.behind = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            st.dirty += 1;
+            if st.files.len() >= GIT_FILES_CAP {
+                continue;
+            }
+            let status: String = line.chars().take(2).collect::<String>().trim().to_string();
+            let rest: String = line.chars().skip(2).collect();
+            // 重命名形如 `old -> new`，取新名字；路径两侧可能带引号（含特殊字符时）
+            let path = rest
+                .trim()
+                .rsplit(" -> ")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            st.files.push(GitFile { status, path });
+        }
+    }
+    st
+}
+
+/// 提交工作区改动（用户在界面上手动提交）。`files` 为空 = `add -A` 全部，
+/// 否则只 stage 指定路径。返回短哈希；失败（含「没有可提交的改动」）原样上抛 git 的报错。
+pub fn commit(ws: &Path, message: &str, files: &[String]) -> anyhow::Result<String> {
+    let msg = message.trim();
+    if msg.is_empty() {
+        bail!("提交信息不能为空");
+    }
+    let bin = git_bin()?;
+    match git_ok(&bin, None, ws, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok(t) if t.trim() == "true" => {}
+        _ => bail!("当前工作区不是 git 仓库"),
+    }
+    if files.is_empty() {
+        git_ok(&bin, None, ws, &["add", "-A"])?;
+    } else {
+        let mut args: Vec<&str> = vec!["add", "--"];
+        args.extend(files.iter().map(String::as_str));
+        git_ok(&bin, None, ws, &args)?;
+    }
+    git_ok(&bin, None, ws, &["commit", "-m", msg])?;
+    git_ok(&bin, None, ws, &["rev-parse", "--short", "HEAD"])
 }
 
 /// 工作树恢复到指定检查点。只回退**该检查点之后被影子仓库跟踪且发生变化的文件**
@@ -284,6 +426,28 @@ pub fn diff_stat(ws: &Path, baseline: &str) -> anyhow::Result<(usize, u64, u64)>
         dels += d.parse::<u64>().unwrap_or(0);
     }
     Ok((files, adds, dels))
+}
+
+/// 工作树相对基线 commit 的改动文件清单（`diff --numstat` 第三列）。
+pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
+    if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
+        bail!("非法基线 id: {baseline}");
+    }
+    let bin = git_bin()?;
+    let gitdir = shadow_gitdir(ws);
+    if !gitdir.exists() {
+        bail!("影子仓库不存在");
+    }
+    let out = git_ok(&bin, Some(&gitdir), ws, &["diff", "--numstat", baseline])?;
+    let mut files = Vec::new();
+    for line in out.lines() {
+        let mut it = line.splitn(3, '\t');
+        let (_a, _d) = (it.next(), it.next());
+        if let Some(p) = it.next() {
+            files.push(p.to_string());
+        }
+    }
+    Ok(files)
 }
 
 /// 测试与排障用：影子仓库当前跟踪的文件清单。
@@ -477,17 +641,17 @@ mod tests {
         std::fs::write(w.join("new.txt"), "agent-made\n").unwrap();
 
         // 第一次检查点：a.txt=v1
-        let cp1 = checkpoint(w, "任务 A 开始改 a.txt").unwrap().expect("有 tracked 文件应有检查点");
+        let cp1 = checkpoint(w, "任务 A 开始改 a.txt", "sess-test").unwrap().expect("有 tracked 文件应有检查点");
 
         // 改 a.txt + 新建 tracked 文件 b.txt
         std::fs::write(w.join("a.txt"), "v2\n").unwrap();
         std::fs::write(w.join("b.txt"), "b\n").unwrap();
         ws.git(&["add", "b.txt"]);
-        let cp2 = checkpoint(w, "任务 A 第二步").unwrap().expect("有变更应有检查点");
+        let cp2 = checkpoint(w, "任务 A 第二步", "sess-test").unwrap().expect("有变更应有检查点");
         assert_ne!(cp1.id, cp2.id);
 
         // 无变更再拍 → None
-        assert!(checkpoint(w, "重复拍").unwrap().is_none(), "无变更不应产出检查点");
+        assert!(checkpoint(w, "重复拍", "sess-test").unwrap().is_none(), "无变更不应产出检查点");
 
         let list = list(w, 10).unwrap();
         assert_eq!(list.len(), 2, "两个检查点: {list:?}");
@@ -506,6 +670,35 @@ mod tests {
         assert!(!files.iter().any(|f| f == "new.txt"), "untracked 不进影子仓库: {files:?}");
     }
 
+    /// 检查点归属：会话 id 写进提交正文，list() 能解析回来；旧检查点（无 trailer）为空串。
+    #[test]
+    fn checkpoint_records_session_owner() {
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("owner");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::write(w.join("a.txt"), "v1\n").unwrap();
+        ws.git(&["add", "a.txt"]);
+
+        checkpoint(w, "会话甲的第一步", "sess-aaa").unwrap().expect("应有检查点");
+        std::fs::write(w.join("a.txt"), "v2\n").unwrap();
+        // 空 session（旧行为/无会话上下文）不应写出 trailer
+        checkpoint(w, "无归属", "").unwrap().expect("应有检查点");
+
+        let list = list(w, 10).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].session, "", "空 session 不写 trailer");
+        assert_eq!(list[1].session, "sess-aaa", "会话 id 应能从 %b 解析回来");
+        assert!(list[1].reason.contains("会话甲"), "reason 不受 trailer 影响: {:?}", list[1].reason);
+
+        // 按会话过滤（server 层 /api/checkpoints?session= 用的就是这条判定）
+        let mine: Vec<_> = list.iter().filter(|c| c.session == "sess-aaa").collect();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].reason, "会话甲的第一步");
+    }
+
     #[test]
     fn checkpoint_excludes_and_size_filter() {
         if !git_have() {
@@ -519,7 +712,7 @@ mod tests {
         std::fs::write(w.join("normal.txt"), "ok\n").unwrap();
         ws.git(&["add", "node_modules/pkg.js", "normal.txt"]);
 
-        assert!(checkpoint(w, "排除规则").unwrap().is_some());
+        assert!(checkpoint(w, "排除规则", "sess-test").unwrap().is_some());
         let files = shadow_files(w);
         assert!(files.contains(&"normal.txt".to_string()));
         assert!(!files.iter().any(|f| f.starts_with("node_modules")), "排除目录不进影子仓库: {files:?}");
@@ -527,7 +720,7 @@ mod tests {
         // 大文件跳过：影子仓库不跟踪它 → 相对上次检查点无可见变更 → None
         std::fs::write(w.join("huge.bin"), vec![0u8; 11 * 1024 * 1024]).unwrap();
         ws.git(&["add", "huge.bin"]);
-        assert!(checkpoint(w, "大文件前").unwrap().is_none(), "被排除的大文件不应触发检查点");
+        assert!(checkpoint(w, "大文件前", "sess-test").unwrap().is_none(), "被排除的大文件不应触发检查点");
         let files = shadow_files(w);
         assert!(!files.iter().any(|f| f == "huge.bin"), "超 10MB 文件不进影子仓库: {files:?}");
     }
@@ -544,14 +737,14 @@ mod tests {
 
         std::fs::write(w.join("a.txt"), "v1\n").unwrap();
         ws.git(&["add", "a.txt"]);
-        let cp = checkpoint(w, "基线").unwrap().expect("应有检查点");
+        let cp = checkpoint(w, "基线", "sess-test").unwrap().expect("应有检查点");
         assert_eq!(head_id(w).unwrap().as_deref(), Some(cp.id.as_str()));
 
         // 检查点之后改 2 个文件：结束快照提交进影子仓库后，diff_stat 相对基线应为 2 文件 +7 -1
         std::fs::write(w.join("a.txt"), "v2\nline2\nline3\nline4\n").unwrap();
         std::fs::write(w.join("b.txt"), "1\n2\n3\n4\n").unwrap();
         ws.git(&["add", "b.txt"]);
-        checkpoint(w, "任务结束快照").unwrap().expect("有变更应提交");
+        checkpoint(w, "任务结束快照", "sess-test").unwrap().expect("有变更应提交");
         let (files, adds, dels) = diff_stat(w, &cp.id).unwrap();
         assert_eq!(files, 2, "numstat 两行: {files}");
         assert_eq!((adds, dels), (8, 1), "a.txt +4/-1，b.txt 新文件 +4/-0: ({adds},{dels})");
@@ -573,11 +766,11 @@ mod tests {
         std::fs::write(w.join("a.txt"), "v1\n").unwrap();
         std::fs::write(w.join("b.txt"), "b1\n").unwrap();
         ws.git(&["add", "a.txt", "b.txt"]);
-        let cp1 = checkpoint(w, "基线").unwrap().expect("应有检查点");
+        let cp1 = checkpoint(w, "基线", "sess-test").unwrap().expect("应有检查点");
 
         // agent 只改 a.txt；b.txt 在快照里没变
         std::fs::write(w.join("a.txt"), "v2\n").unwrap();
-        checkpoint(w, "结束快照").unwrap().expect("应有提交");
+        checkpoint(w, "结束快照", "sess-test").unwrap().expect("应有提交");
 
         // 用户在快照之后自己改了 b.txt（影子仓库没见过这次改动）
         std::fs::write(w.join("b.txt"), "b2-user\n").unwrap();

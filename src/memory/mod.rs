@@ -8,6 +8,8 @@
 //!
 //! 语义记忆/向量检索留接口（P8 EMBEDDING 再补），本单只做"流水 + 摘要 + 约定"。
 
+pub mod library;
+
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
@@ -188,6 +190,14 @@ impl Memory {
     }
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
+    }
+    /// 全局层 AGENTS.md 路径（~/.agent/AGENTS.md）。
+    pub fn global_agents_path(&self) -> PathBuf {
+        self.global_dir.join("AGENTS.md")
+    }
+    /// 项目层 AGENTS.md 路径（工作区根 AGENTS.md）。
+    pub fn project_agents_path(&self) -> PathBuf {
+        self.ws.join("AGENTS.md")
     }
     /// 项目层 events.log 行数（无文件为 0）。
     pub fn events_lines(&self) -> usize {

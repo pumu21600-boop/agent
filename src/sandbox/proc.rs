@@ -29,6 +29,7 @@ use windows_sys::Win32::{
 };
 
 use anyhow::{anyhow, bail};
+use std::sync::{Mutex, OnceLock};
 
 use super::{job::JobGuard, token, SandboxOutput, SandboxSpec};
 use crate::observability::{self, EventType};
@@ -36,6 +37,27 @@ use crate::observability::{self, EventType};
 use serde_json::json;
 
 const WAIT_OBJECT_0: u32 = 0;
+
+/// 追加进沙箱子进程 PATH 的额外目录（如 git 所在目录：父进程 PATH 没有它时，
+/// 工具层发现 git.exe 后在此登记，shell 里按名字调 git / git 内部 helper 才可用）。
+fn extra_path_dirs() -> &'static Mutex<Vec<PathBuf>> {
+    static EXTRA: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+    EXTRA.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 登记一个要追加进沙箱 PATH 的目录（去重；目录不存在则忽略）。
+pub fn register_path_dir(dir: &Path) {
+    if !dir.is_dir() {
+        return;
+    }
+    let mut guard = match extra_path_dirs().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !guard.iter().any(|p| p == dir) {
+        guard.push(dir.to_path_buf());
+    }
+}
 
 /// 子进程环境白名单（探针与 /api/sandbox/selftest 共用；PROMPT 是 cmd 启动时自注入的）。
 pub(crate) const SANDBOX_ENV_VARS: &[&str] = &[
@@ -455,12 +477,22 @@ fn build_env_block() -> Vec<u16> {
         (
             "PATH".into(),
             // P4 起 shell/git 工具要能用用户装的工具链（git/cargo/node…），
-            // PATH 不是密钥，继承父进程；父进程没有再退回系统目录集
-            std::env::var("PATH").unwrap_or_else(|_| {
-                format!(
-                    "{sys_root}\\System32;{sys_root};{sys_root}\\System32\\Wbem;{sys_root}\\System32\\WindowsPowerShell\\v1.0;{sys_root}\\System32\\downlevel"
-                )
-            }),
+            // PATH 不是密钥，继承父进程；父进程没有再退回系统目录集；
+            // 工具层发现的外部工具目录（register_path_dir）追加在最后
+            {
+                let mut path = std::env::var("PATH").unwrap_or_else(|_| {
+                    format!(
+                        "{sys_root}\\System32;{sys_root};{sys_root}\\System32\\Wbem;{sys_root}\\System32\\WindowsPowerShell\\v1.0;{sys_root}\\System32\\downlevel"
+                    )
+                });
+                if let Ok(guard) = extra_path_dirs().lock() {
+                    for d in guard.iter() {
+                        path.push(';');
+                        path.push_str(&d.display().to_string());
+                    }
+                }
+                path
+            }
         ),
         ("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD;.VBS;.JS;.WSF;.MSC".into()),
         ("NUMBER_OF_PROCESSORS".into(), std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_else(|_| "1".into())),

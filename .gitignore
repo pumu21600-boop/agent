@@ -12,3 +12,4 @@ _check*.ps1
 HANDOFF.md
 .workbuddy/
 desktop/target/
+.attachments/

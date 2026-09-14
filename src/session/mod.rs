@@ -81,6 +81,13 @@ fn first_user_title(messages: &[Value]) -> String {
         .unwrap_or_else(|| "新对话".to_string())
 }
 
+/// RFC3339 → 本地「月-日 时:分」，给项目现状摘要用（解析失败原样返回，不报错）。
+fn fmt_ts(iso: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| iso.to_string())
+}
+
 impl SessionManager {
     /// dir 为日志目录，会话文件落 `<dir>/sessions/`。
     pub fn new(log_dir: &Path) -> Self {
@@ -91,9 +98,38 @@ impl SessionManager {
         self.dir.join(format!("{id}.json"))
     }
 
-    /// 新建对话：只发 id，首条消息落盘时才建文件（空会话不进列表）。
+    /// 新建对话 id（不落盘；首条消息时 save 才建文件）。
     pub fn new_id(&self) -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    /// 新建一条空会话并立即落盘：点「新会话」就在侧栏当前项目下留一条，
+    /// 不用等首条消息。同一工作区已存在空会话时直接复用，避免连点堆出一排空会话。
+    pub fn create_empty(&self, workspace: &str, title: &str) -> anyhow::Result<SessionFile> {
+        if let Some(m) = self
+            .list()
+            .into_iter()
+            .find(|m| m.count == 0 && !m.archived && m.workspace == workspace)
+        {
+            if let Some(f) = self.get(&m.id) {
+                return Ok(f);
+            }
+        }
+        std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
+        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let f = SessionFile {
+            id: self.new_id(),
+            title: title.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            messages: Vec::new(),
+            summary: None,
+            workspace: workspace.to_string(),
+            pinned: false,
+            archived: false,
+        };
+        self.write(&f)?;
+        Ok(f)
     }
 
     /// 原子写（临时文件 + rename），save / rename / set_meta / fork 共用。
@@ -223,6 +259,53 @@ impl SessionManager {
         self.write(&f)
     }
 
+    /// 同项目（workspace 相同）里最近更新的一条已落盘会话，排除 current_id。
+    /// 新会话开场「上次做到哪」的来源；没有则返回 None。
+    pub fn previous_in_workspace(&self, workspace: &str, current_id: &str) -> Option<SessionFile> {
+        if workspace.trim().is_empty() {
+            return None;
+        }
+        let mut best: Option<SessionFile> = None;
+        for m in self.list() {
+            if m.id == current_id || m.workspace != workspace {
+                continue;
+            }
+            let Some(f) = self.get(&m.id) else { continue };
+            if best.as_ref().map(|b| f.updated_at > b.updated_at).unwrap_or(true) {
+                best = Some(f);
+            }
+        }
+        best
+    }
+
+    /// 新会话开场的「项目现状」摘要：上一条同项目会话的标题/滚动摘要 + 工作区未提交改动量。
+    /// 没有任何可写事实时返回 None（不注入，避免占上下文）。
+    /// `changes` = (文件数, 新增行, 删除行)，相对影子仓库最近检查点。
+    pub fn project_brief(&self, current_id: &str, changes: Option<(usize, u64, u64)>) -> Option<String> {
+        let ws = crate::tools::workspace_root();
+        let ws_path = ws.display().to_string();
+        let ws_name = ws.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(p) = self.previous_in_workspace(&ws_path, current_id) {
+            lines.push(format!("- 上一条会话：「{}」（{}）", p.title, fmt_ts(&p.updated_at)));
+            if let Some(sm) = p.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                lines.push(format!("- 上次进展：{}", sm.chars().take(400).collect::<String>()));
+            }
+        }
+        if let Some((files, add, del)) = changes {
+            if files > 0 {
+                lines.push(format!("- 工作区已有 {files} 个文件改动（+{add}/-{del}，相对最近检查点），内容都在磁盘上"));
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "\n\n【项目现状 · 新对话接手】\n项目目录：{ws_path}（{ws_name}）\n{}\n这是同一项目里新开的对话，之前的改动已落盘。动手前先确认现状，不要重做上一条会话已完成的工作。\n",
+            lines.join("\n")
+        ))
+    }
+
     /// DSH 式侧边栏「分叉会话」：复制消息/摘要/工作区为新会话，标题加「（分叉）」。
     /// 返回新会话 id；分叉不带走置顶/归档状态。
     pub fn fork(&self, id: &str) -> anyhow::Result<String> {
@@ -333,6 +416,35 @@ mod tests {
         m.delete(&a).unwrap();
     }
 
+    /// 点「新会话」立即落盘并进列表；同工作区复用空会话，有消息的不算空。
+    #[test]
+    fn create_empty_session_is_listed_and_reused() {
+        let (_d, m) = mgr("empty-new");
+        let ws = "C:\\ws\\demo";
+        let f = m.create_empty(ws, "新会话").unwrap();
+        assert!(f.messages.is_empty());
+        assert_eq!(f.workspace, ws);
+        let list = m.list();
+        assert_eq!(list.len(), 1, "空会话也要进列表（侧栏立即可见）");
+        assert_eq!(list[0].count, 0);
+        assert_eq!(list[0].title, "新会话");
+
+        // 同工作区再次新建 → 复用同一条，连点不堆空会话
+        let f2 = m.create_empty(ws, "新会话").unwrap();
+        assert_eq!(f2.id, f.id);
+        assert_eq!(m.list().len(), 1);
+
+        // 换工作区 → 另建一条
+        let f3 = m.create_empty("C:\\ws\\other", "新会话").unwrap();
+        assert_ne!(f3.id, f.id);
+        assert_eq!(m.list().len(), 2);
+
+        // 有消息的会话不再被当作可复用空会话
+        m.save(&f.id, &[json!({"role":"user","content":"开始干活"})], None).unwrap();
+        let f4 = m.create_empty(ws, "新会话").unwrap();
+        assert_ne!(f4.id, f.id, "有消息的会话不该被复用");
+    }
+
     #[test]
     fn rejects_bad_ids_and_missing() {
         let _ = crate::observability::init(
@@ -391,5 +503,46 @@ mod tests {
         // 不存在的会话
         assert!(m.set_flags("ghost", Some(true), None).is_err());
         assert!(m.fork("ghost").is_err());
+    }
+
+    #[test]
+    fn project_brief_carries_prior_session() {
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("brief");
+        let ws = crate::tools::workspace_root().display().to_string();
+
+        // 项目里还没有别的会话：没有可写事实 → 不注入
+        let fresh = m.new_id();
+        assert!(m.project_brief(&fresh, None).is_none(), "空项目不该注入现状");
+
+        // 上一条会话有摘要 + 工作区有未提交改动 → 摘要里两者都要出现
+        let prev = m.new_id();
+        m.save(&prev, &[json!({"role":"user","content":"把登录接口改成 JWT"})], None).unwrap();
+        m.save(
+            &prev,
+            &[
+                json!({"role":"user","content":"把登录接口改成 JWT"}),
+                json!({"role":"assistant","content":"已改完"}),
+            ],
+            Some("任务目标：登录改 JWT；已完成签发与校验，待补刷新逻辑"),
+        )
+        .unwrap();
+
+        let brief = m.project_brief(&fresh, Some((2, 15, 4))).expect("应生成项目现状");
+        assert!(brief.contains("把登录接口改成 JWT"), "带上一条会话标题: {brief}");
+        assert!(brief.contains("待补刷新逻辑"), "带上一条会话摘要: {brief}");
+        assert!(brief.contains("2 个文件改动"), "带未提交改动量: {brief}");
+        assert!(brief.contains(&ws), "带项目目录: {brief}");
+
+        // 排除自己：当前会话不该被当成「上一条」
+        assert!(m.previous_in_workspace(&ws, &prev).is_none());
+
+        // 别的项目不算同项目
+        assert!(m.previous_in_workspace("C:\\somewhere\\else", &fresh).is_none());
+        assert!(m.project_brief(&fresh, None).is_some(), "换基线仍有上一条会话可写");
     }
 }

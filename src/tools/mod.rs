@@ -6,7 +6,7 @@
 //! shell / git 是阻塞的沙箱调用，包在 spawn_blocking 里。
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{OnceLock, RwLock},
 };
 
@@ -112,6 +112,18 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 0,
         },
         ToolSpec {
+            name: "read_skill",
+            description: "读取一个技能（Skill）的完整 SKILL.md。系统提示的「可用技能」索引列出全部技能；用户消息中出现 $技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "技能名（见系统提示「可用技能」索引，如 deploy）" }
+                },
+                "required": ["name"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
             name: "write_file",
             description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。",
             parameters: json!({
@@ -139,7 +151,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "git",
-            description: "在沙箱中对工作目录仓库执行 git 命令（如 status / log --oneline -5 / diff）。等价 shell 跑 git，但语义更明确。",
+            description: "在沙箱中对工作目录仓库执行 git 命令（如 status / log --oneline -5 / diff）。等价 shell 跑 git，但语义更明确。写操作与破坏性操作（push/clean/reset --hard/tag -d 等）按风险分级走审批，绝不静默执行。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -194,6 +206,14 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
     match name {
         "read_file" => read_file(args, cfg.max_chars),
         "read_page" => read_page(args, cfg.max_chars),
+        "read_skill" => {
+            let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+            let name = v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .ok_or("缺少 name 参数")?;
+            crate::skills::read(name)
+        }
         "write_file" => write_file(args),
         "search" => search(args, cfg.max_chars),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
@@ -295,8 +315,10 @@ fn write_file(args: &str) -> Result<String, String> {
 fn rg_available() -> bool {
     static RG: OnceLock<bool> = OnceLock::new();
     *RG.get_or_init(|| {
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("rg")
             .arg("--version")
+            .creation_flags(0x0800_0000) // 不闪控制台窗口
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -315,6 +337,7 @@ fn search(args: &str, max_chars: usize) -> Result<String, String> {
         return Err("path 请给目录（搜索整个文件请用 read_file）".to_string());
     }
 
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     let output = if rg_available() {
         Command::new("rg")
@@ -322,6 +345,7 @@ fn search(args: &str, max_chars: usize) -> Result<String, String> {
             .arg(&target)
             .current_dir(workspace_root())
             .stdin(Stdio::null())
+            .creation_flags(0x0800_0000) // 不闪控制台窗口
             .output()
     } else {
         // findstr 兜底：/s 递归 /n 行号 /i 忽略大小写；/c:<query> 必须为单参数
@@ -330,6 +354,7 @@ fn search(args: &str, max_chars: usize) -> Result<String, String> {
             .arg("*")
             .current_dir(&target)
             .stdin(Stdio::null())
+            .creation_flags(0x0800_0000) // 不闪控制台窗口
             .output()
     }
     .map_err(|e| format!("启动搜索失败: {e}"))?;
@@ -496,22 +521,141 @@ async fn shell(args: &str, cfg: &ExecConfig) -> Result<String, String> {
     run_in_sandbox(cfg, cmd, command_line, timeout_ms).await
 }
 
-/// git.exe 绝对路径（父进程 PATH 里找一次；沙箱 PATH 虽也含它，给 application 显式路径更稳）。
+/// git.exe 发现链（开箱即用）：AGENT_GIT_PATH 环境变量 → 父进程 PATH（where.exe）→
+/// 注册表（Git for Windows 安装时登记的 InstallPath）→ 常见安装位置 → 随分发捆绑的 tools/git。
+/// 找到后把相关目录登记进沙箱 PATH（shell 里按名调 git / git 内部 helper 才可用）。
 pub(crate) fn git_exe() -> Result<PathBuf, String> {
-    static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     GIT.get_or_init(|| {
-        use std::process::{Command, Stdio};
-        Command::new("where.exe")
-            .arg("git")
-            .stdin(Stdio::null())
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(String::from))
-            .map(PathBuf::from)
-            .filter(|p| p.exists())
+        // 1) 显式环境变量
+        if let Ok(p) = std::env::var("AGENT_GIT_PATH") {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                register_git_dirs(&pb);
+                return Ok(pb);
+            }
+        }
+        // 2) 父进程 PATH
+        if let Some(p) = where_git() {
+            register_git_dirs(&p);
+            return Ok(p);
+        }
+        // 3) 注册表：Git for Windows 的 InstallPath（HKLM / HKCU，含 Wow6432Node 兜底）
+        use std::os::windows::process::CommandExt;
+        for hive in [
+            "HKLM\\SOFTWARE\\GitForWindows",
+            "HKLM\\SOFTWARE\\WOW6432Node\\GitForWindows",
+            "HKCU\\SOFTWARE\\GitForWindows",
+        ] {
+            if let Ok(out) = std::process::Command::new("reg.exe")
+                .args(["query", hive, "/v", "InstallPath"])
+                .creation_flags(0x0800_0000) // 不闪控制台窗口
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(line) = text.lines().find(|l| l.contains("InstallPath")) {
+                    if let Some(dir) = line.split("REG_SZ").last().map(|s| s.trim()) {
+                        for sub in ["cmd\\git.exe", "bin\\git.exe"] {
+                            let pb = PathBuf::from(dir).join(sub);
+                            if pb.is_file() {
+                                register_git_dirs(&pb);
+                                return Ok(pb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 4) 常见安装位置（Git for Windows / PortableGit 习惯路径）
+        let program_files = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+        let program_files_x86 =
+            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".into());
+        let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for base in [&program_files, &program_files_x86, &local_appdata] {
+            if base.is_empty() {
+                continue;
+            }
+            for rel in [
+                "Git\\cmd\\git.exe",
+                "Git\\bin\\git.exe",
+                "PortableGit\\cmd\\git.exe",
+                "PortableGit\\bin\\git.exe",
+            ] {
+                candidates.push(PathBuf::from(base).join(rel));
+            }
+        }
+        // 4.5) 已知版本化便携布局：~/.workbuddy/binaries/PortableGit/versions/<最高版>/cmd/git.exe
+        //      与 scoop shim（current 链接在部分 API 下不可穿透，取最高版本号目录）
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            let vroot = PathBuf::from(&up).join(".workbuddy\\binaries\\PortableGit\\versions");
+            if let Ok(rd) = std::fs::read_dir(&vroot) {
+                let mut best: Option<(Vec<u32>, PathBuf)> = None;
+                for e in rd.filter_map(|e| e.ok()) {
+                    let fname = e.file_name().to_string_lossy().to_string();
+                    if !e.path().is_dir() {
+                        continue;
+                    }
+                    let ver: Vec<u32> = fname.split('.').filter_map(|x| x.parse::<u32>().ok()).collect();
+                    if ver.is_empty() {
+                        continue;
+                    }
+                    if best.as_ref().map(|(v, _)| ver > *v).unwrap_or(true) {
+                        best = Some((ver, e.path()));
+                    }
+                }
+                if let Some((_, dir)) = best {
+                    candidates.push(dir.join("cmd\\git.exe"));
+                    candidates.push(dir.join("bin\\git.exe"));
+                }
+            }
+            candidates.push(PathBuf::from(&up).join("scoop\\apps\\git\\current\\cmd\\git.exe"));
+        }
+        // 5) 随分发捆绑：exe 同级 tools/git/（放入 PortableGit 即开箱可用）
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for rel in ["tools\\git\\cmd\\git.exe", "tools\\git\\bin\\git.exe"] {
+                    candidates.push(dir.join(rel));
+                }
+            }
+        }
+        for p in candidates {
+            if p.is_file() {
+                register_git_dirs(&p);
+                return Ok(p);
+            }
+        }
+        Err("未找到 git.exe：请安装 Git for Windows（https://git-scm.com/downloads），或设置环境变量 AGENT_GIT_PATH 指向 git.exe 后重启服务".into())
     })
     .clone()
-    .ok_or_else(|| "找不到 git.exe（确认本机已安装 git 并在 PATH 中）".to_string())
+}
+
+fn where_git() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    Command::new("where.exe")
+        .arg("git")
+        .stdin(Stdio::null())
+        .creation_flags(0x0800_0000) // 不闪控制台窗口
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(String::from))
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+}
+
+/// 把 git.exe 相关目录登记进沙箱 PATH（cmd 为主，bin/mingw64 为 helper 兜底）。
+fn register_git_dirs(git_exe: &Path) {
+    let cmd_dir = git_exe.parent().map(Path::to_path_buf);
+    if let Some(d) = &cmd_dir {
+        crate::sandbox::register_path_dir(d);
+    }
+    if let Some(root) = git_exe.parent().and_then(Path::parent) {
+        for rel in ["bin", "mingw64\\bin", "usr\\bin"] {
+            crate::sandbox::register_path_dir(&root.join(rel));
+        }
+    }
 }
 
 async fn git(args: &str, cfg: &ExecConfig) -> Result<String, String> {
@@ -520,9 +664,9 @@ async fn git(args: &str, cfg: &ExecConfig) -> Result<String, String> {
     if gargs.trim().is_empty() {
         return Err("args 为空".to_string());
     }
-    if gargs.split_whitespace().next() == Some("push") {
-        return Err("push 请手动在终端执行（工具内禁止推送远端）".to_string());
-    }
+    // push / clean / rebase 这类破坏性操作不在工具层硬禁——那样只堵住 git 工具，
+    // 从 shell 跑 git 照样能绕过去，反而造成两套标准。统一交给风险引擎判高危 +
+    // 用户逐次审批（见 core/rules.rs risk_git），两条路径语义一致。
     let timeout_ms = cfg.sandbox.timeout_ms.clamp(1, 300_000);
     let git = git_exe()?;
     let command_line = format!("\"{}\" {gargs}", git.display());
@@ -590,12 +734,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_version_and_push_block() {
+    async fn git_version_runs() {
         init_logger();
         let r = execute(&cfg(), "git", r#"{"args":"--version"}"#).await;
         assert!(r.unwrap().contains("git version"));
-        let r = execute(&cfg(), "git", r#"{"args":"push origin main"}"#).await;
-        assert!(r.is_err() && r.unwrap_err().contains("push"), "push 应被工具层直接拒绝");
+        // push 的拦截归属：工具层不再硬禁（否则 shell 里跑 git push 能绕过，形成两套标准），
+        // 统一由 core::rules 判高危 + 逐次审批 —— 判定见 rules::tests::test_git_push_uniform_risk。
     }
 
     #[tokio::test]
