@@ -651,6 +651,67 @@ fn where_git() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
+/// 设置面板「插件」分区的 git 运行时状态：可用性 / 版本 / 来源 / 内置包情况。
+/// 每次调用实时取（git_exe 的结果本身是进程内缓存：新装 git 需重启服务才会重新检测）。
+pub fn git_info() -> Value {
+    let rt = bundled_runtime_dir();
+    let zip = bundled_zip_candidates().into_iter().find(|z| z.is_file());
+    let runtime_dir = rt.as_ref().map(|d| d.display().to_string());
+    let runtime_ready = rt
+        .as_ref()
+        .map(|d| d.join("cmd\\git.exe").is_file())
+        .unwrap_or(false);
+    match git_exe() {
+        Ok(p) => {
+            let path = p.display().to_string();
+            let source = if rt.as_ref().map(|d| path_is_under(&p, d)).unwrap_or(false) {
+                "bundled" // 内置 zip 解压出来的
+            } else if path.replace('/', "\\").contains("\\tools\\git\\") {
+                "portable" // 手动放在 exe 同级 tools\git\
+            } else {
+                "system" // 用户自己装的
+            };
+            json!({
+                "ok": true,
+                "path": path,
+                "version": git_version(&p),
+                "source": source,
+                "runtime_dir": runtime_dir,
+                "runtime_ready": runtime_ready,
+                "zip_available": zip.is_some(),
+            })
+        }
+        Err(e) => json!({
+            "ok": false,
+            "error": e,
+            "runtime_dir": runtime_dir,
+            "runtime_ready": runtime_ready,
+            "zip_available": zip.is_some(),
+        }),
+    }
+}
+
+/// 路径是否位于某目录下（Windows 大小写不敏感，分隔符归一）。
+fn path_is_under(child: &Path, parent: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().to_lowercase().replace('/', "\\");
+    norm(child).starts_with(&norm(parent))
+}
+
+/// `git --version` → 版本号字符串（失败返回 "unknown"）。
+fn git_version(git: &Path) -> String {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new(git)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .creation_flags(0x0800_0000) // 不闪控制台窗口
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|s| s.trim_start_matches("git version ").to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// 内置 git 运行时目录（懒解压目标）：`%LOCALAPPDATA%\agent\runtime\git`。
 /// 放用户目录而不是程序目录：程序可能装在只读位置（Program Files），且卸载重装不丢。
 fn bundled_runtime_dir() -> Option<PathBuf> {

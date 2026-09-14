@@ -288,6 +288,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/git/status", get(git_status))
+        .route("/api/git/info", get(git_runtime_info))
         .route("/api/git/commit", post(git_commit))
         .route("/api/checkpoints/restore", post(restore_checkpoint))
         .route("/api/trace", get(get_trace))
@@ -2522,6 +2523,11 @@ async fn git_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
         Ok(s) => (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_else(|_| json!({ "is_repo": false })))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
+}
+
+/// GET /api/git/info —— git 运行时状态（设置面板「插件」分区：可用性/版本/来源/内置包）。
+async fn git_runtime_info() -> Json<Value> {
+    Json(crate::tools::git_info())
 }
 
 #[derive(Debug, Deserialize)]

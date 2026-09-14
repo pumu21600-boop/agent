@@ -2299,6 +2299,7 @@
     settingsTab = t;
     localStorage.setItem('settingsTab', t);
     if (t === 'mcp' || t === 'plugins') loadMcp();
+    if (t === 'plugins') loadGitRuntime();
     if (t === 'skills') loadSkills();
   }
 
@@ -2447,6 +2448,15 @@
   let mcpForm = { name: '', command: '', args: '' };
   let mcpRiskChoice = 'normal';
   let wasmPlugins = [];
+  // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
+  let gitRuntime = null;
+  async function loadGitRuntime() {
+    try {
+      gitRuntime = await fetch('/api/git/info', { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      gitRuntime = null;
+    }
+  }
   async function loadMcp() {
     try {
       const r = await fetch('/api/mcp').then((r) => r.json());
@@ -3942,6 +3952,35 @@
         </div>
       {/if}
       {#if settingsTab === 'plugins'}
+        <div class="field mcp-card">
+          <div class="mcp-head">
+            <span class="dot" class:haskey={gitRuntime?.ok}></span>
+            <b>Git 运行时</b>
+            <span class="mcp-status">
+              {gitRuntime?.ok
+                ? gitRuntime.source === 'system'
+                  ? '系统 Git'
+                  : gitRuntime.source === 'portable'
+                    ? '便携版（exe 同级）'
+                    : '内置 Git'
+                : gitRuntime
+                  ? '不可用'
+                  : '读取中…'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={loadGitRuntime}>重新检测</button>
+          </div>
+          {#if gitRuntime?.ok}
+            <div class="mcp-cmd">版本 {gitRuntime.version} · {gitRuntime.path}</div>
+          {:else if gitRuntime}
+            <div class="mcp-cmd">{gitRuntime.error}</div>
+          {/if}
+          <div class="param-hint">
+            优先使用你机器上已装的 Git（PATH / 注册表 / 常见安装位置）；没装时才解压随包内置的
+            MinGit 到 {gitRuntime?.runtime_dir || '%LOCALAPPDATA%\\agent\\runtime\\git'}（无需联网、不要管理员）。
+            内置包{gitRuntime?.zip_available ? '已随发行包携带' : '未携带'}；新装 Git 后需重启服务才会重新检测。
+          </div>
+        </div>
         <div class="param-hint">WASM 插件：本地纯计算沙箱（无文件/网络），trap 不连坐；工具名以 wasm__插件__函数 下发，默认常规审批档。</div>
         {#if wasmPlugins.length}
           <div class="field">

@@ -90,6 +90,8 @@ cargo run                            # 前台调试运行（关终端即停）
   6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\agent\runtime\git` 再使用
      （只发生在没装 git 的机器上，解压一次记 `git.runtime_extracted`；之后启动直接复用）。
 - 覆盖 zip 位置可用环境变量 `AGENT_GIT_ZIP`（调试用）。
+- **界面上能看到**：设置 → 插件 分区顶部有「Git 运行时」卡片，显示当前用的是系统 Git 还是内置 Git、
+  版本与路径，以及内置包是否随包携带（「重新检测」按钮手动刷新）。
 - 已知差异：MinGit 不带 git-lfs / bash / 图形界面——agent 的提交、diff、撤销、检查点都不需要它们；
   用户项目若使用 LFS，需另装完整版 git。
 
@@ -160,6 +162,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/checkpoints` | 影子仓库检查点列表（≤20） |
 | POST | `/api/checkpoints/restore` | 撤销：逐文件回退检查点之后 agent 改过的文件 |
 | GET | `/api/git/status` | 工作区 git 概览（分支/头部/脏文件/领先落后） |
+| GET | `/api/git/info` | git 运行时状态（可用性/版本/来源：系统·便携·内置/内置包情况；设置→插件 卡片用） |
 | POST | `/api/git/commit` | 用户手动提交（按选中路径 stage + commit） |
 | GET | `/api/trace?limit=N` | 最近 N 个任务的事件流（时间线数据源） |
 | GET | `/api/workspace` | 当前工作区 + 最近项目列表 |
