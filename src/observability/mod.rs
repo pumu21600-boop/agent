@@ -216,6 +216,13 @@ pub fn event(event_type: EventType, payload: Value) {
     get().log(event_type, payload);
 }
 
+/// 安全入口：logger 未初始化时静默跳过（早期启动代码 / 单测里可用，不 panic）。
+pub fn try_event(event_type: EventType, payload: Value) {
+    if let Some(l) = LOGGER.get() {
+        l.log(event_type, payload);
+    }
+}
+
 /// P10-A：当前 JSONL 日志文件路径（logger 未初始化时 None）。
 pub fn log_path() -> Option<&'static Path> {
     LOGGER.get().map(|l| l.path())

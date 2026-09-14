@@ -76,6 +76,23 @@ cargo run                            # 前台调试运行（关终端即停）
 - **提交身份**：用户级 `~/.gitconfig` 写的是 `大脚 <dajiao@local>`（与仓库既有历史一致）；要换名字：
   `git config --global user.name "你的名字"`。
 
+## 分发：内置 git（用户不用装任何东西）
+
+产品自带一份 **MinGit**（最小 git，下载 37MB / 解压 90MB；不需要管理员、不需要联网）：
+
+- **打包**：`powershell -ExecutionPolicy Bypass -File scripts\bundle_git.ps1`
+  —— 首次从华为云镜像下载 MinGit（GitHub 兜底）、做体积 + 归档完整性双重校验，
+  然后放到 `<exe 同级>\tools\git-runtime.zip`（默认 `target\release\tools\`）。
+- **运行时发现顺序**（`src/tools/mod.rs::git_exe`）：
+  1. `AGENT_GIT_PATH` 环境变量；
+  2. 系统 PATH → 3. 注册表 → 4. 常见安装位置（用户自己装的 git，优先使用）；
+  5. exe 同级 `tools\git\`（想手动放便携版就放这）；
+  6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\agent\runtime\git` 再使用
+     （只发生在没装 git 的机器上，解压一次记 `git.runtime_extracted`；之后启动直接复用）。
+- 覆盖 zip 位置可用环境变量 `AGENT_GIT_ZIP`（调试用）。
+- 已知差异：MinGit 不带 git-lfs / bash / 图形界面——agent 的提交、diff、撤销、检查点都不需要它们；
+  用户项目若使用 LFS，需另装完整版 git。
+
 ## 模型设置（侧栏「设置 → 模型配置」，改动自动保存即时生效）
 
 - **配置 chips**：每个配置可起名，chip 显示名称 + key 状态圆点（绿=已存 key），点一下即切换；「＋ 新建配置」「✕ 删除当前」（至少保留一套）。

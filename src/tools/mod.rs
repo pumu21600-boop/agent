@@ -626,6 +626,12 @@ pub(crate) fn git_exe() -> Result<PathBuf, String> {
                 return Ok(p);
             }
         }
+        // 6) 内置运行时（懒解压）：以上都没有（用户机器上没装 git）时，把随包携带的 MinGit
+        //    压缩包释放到用户目录再用——不联网、不需要管理员；用户自己装了 git 就永远走不到这里。
+        if let Some(p) = ensure_bundled_git() {
+            register_git_dirs(&p);
+            return Ok(p);
+        }
         Err("未找到 git.exe：请安装 Git for Windows（https://git-scm.com/downloads），或设置环境变量 AGENT_GIT_PATH 指向 git.exe 后重启服务".into())
     })
     .clone()
@@ -643,6 +649,105 @@ fn where_git() -> Option<PathBuf> {
         .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(String::from))
         .map(PathBuf::from)
         .filter(|p| p.exists())
+}
+
+/// 内置 git 运行时目录（懒解压目标）：`%LOCALAPPDATA%\agent\runtime\git`。
+/// 放用户目录而不是程序目录：程序可能装在只读位置（Program Files），且卸载重装不丢。
+fn bundled_runtime_dir() -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|d| PathBuf::from(d).join("agent").join("runtime").join("git"))
+}
+
+/// 随包携带的 MinGit 压缩包候选位置：
+/// `AGENT_GIT_ZIP` 环境变量 → exe 同级 `tools\git-runtime.zip`（打包分发布局）
+/// → exe 上两级 `runtime\git-runtime.zip`（开发布局：target\release\agent.exe → 仓库根）。
+fn bundled_zip_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(p) = std::env::var("AGENT_GIT_ZIP") {
+        if !p.trim().is_empty() {
+            v.push(PathBuf::from(p));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("tools").join("git-runtime.zip"));
+            if let Some(root) = dir.parent().and_then(Path::parent) {
+                v.push(root.join("runtime").join("git-runtime.zip"));
+            }
+        }
+    }
+    v
+}
+
+/// 用系统 tar.exe（Win10 1803+ 自带 bsdtar）解压 zip：零新依赖，不引入 zip crate。
+fn extract_zip(zip: &Path, dest: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    std::fs::create_dir_all(dest).map_err(|e| format!("建目录失败: {e}"))?;
+    let tar = std::env::var("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+        .unwrap_or_else(|_| PathBuf::from("tar.exe"));
+    let out = std::process::Command::new(&tar)
+        .arg("-xf")
+        .arg(zip)
+        .arg("-C")
+        .arg(dest)
+        .stdin(std::process::Stdio::null())
+        .creation_flags(0x0800_0000) // 不闪控制台窗口
+        .output()
+        .map_err(|e| format!("tar 启动失败: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "解压失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// 第 6 步：确保内置 git 可用——已解压过直接用；否则解压随包压缩包（一次性，只发生在没装 git 的机器上）。
+fn ensure_bundled_git() -> Option<PathBuf> {
+    let rt = bundled_runtime_dir()?;
+    ensure_bundled_git_at(&rt, &bundled_zip_candidates())
+}
+
+/// 纯逻辑（可单测）：先看运行时目录是否已有 git；没有则用第一个存在的 zip 解压；返回可用的 git.exe。
+fn ensure_bundled_git_at(rt: &Path, zips: &[PathBuf]) -> Option<PathBuf> {
+    const RELS: [&str; 3] = ["cmd\\git.exe", "bin\\git.exe", "mingw64\\bin\\git.exe"];
+    for rel in RELS {
+        let p = rt.join(rel);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let zip = zips.iter().find(|z| z.is_file())?;
+    match extract_zip(zip, rt) {
+        Ok(()) => {
+            let found = RELS.iter().map(|rel| rt.join(rel)).find(|p| p.is_file());
+            crate::observability::try_event(
+                crate::observability::EventType::State,
+                json!({
+                    "kind": "git.runtime_extracted",
+                    "zip": zip.display().to_string(),
+                    "dest": rt.display().to_string(),
+                    "ok": found.is_some(),
+                }),
+            );
+            found
+        }
+        Err(e) => {
+            crate::observability::try_event(
+                crate::observability::EventType::State,
+                json!({
+                    "kind": "git.runtime_extract_failed",
+                    "zip": zip.display().to_string(),
+                    "error": e,
+                }),
+            );
+            None
+        }
+    }
 }
 
 /// 把 git.exe 相关目录登记进沙箱 PATH（cmd 为主，bin/mingw64 为 helper 兜底）。
@@ -777,5 +882,83 @@ mod tests {
             !out2.contains("local-run-ok"),
             "沙箱模式不得泄漏父环境变量: {out2}"
         );
+    }
+
+    #[test]
+    fn bundled_zip_candidates_cover_known_layouts() {
+        let cands = bundled_zip_candidates();
+        assert!(!cands.is_empty(), "至少应有 exe 相对布局候选");
+        let norm: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().replace('/', "\\"))
+            .collect();
+        assert!(
+            norm.iter().any(|p| p.ends_with("tools\\git-runtime.zip")),
+            "打包布局（exe 同级 tools\\git-runtime.zip）应在候选里: {norm:?}"
+        );
+        assert!(
+            norm.iter().any(|p| p.ends_with("runtime\\git-runtime.zip")),
+            "开发布局（上两级 runtime\\git-runtime.zip）应在候选里: {norm:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_runtime_dir_is_under_localappdata() {
+        if std::env::var("LOCALAPPDATA").map(|s| s.is_empty()).unwrap_or(true) {
+            return; // 无 LOCALAPPDATA 的环境跳过
+        }
+        let d = bundled_runtime_dir().expect("有 LOCALAPPDATA 就应有运行时目录");
+        assert!(d.ends_with(Path::new("agent").join("runtime").join("git")), "{d:?}");
+    }
+
+    #[test]
+    fn extract_zip_roundtrip_with_system_tar() {
+        let dir = std::env::temp_dir().join(format!("agent-zip-{}", uuid::Uuid::new_v4()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("hello.txt"), b"hi").unwrap();
+        let zip = dir.join("t.zip");
+        // 用系统 tar 造一个 zip（造不出来=环境无 bsdtar，直接跳过，不算失败）
+        let tar = std::env::var("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+            .unwrap_or_else(|_| PathBuf::from("tar.exe"));
+        let made = std::process::Command::new(&tar)
+            .arg("-a")
+            .arg("-cf")
+            .arg(&zip)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .output();
+        match made {
+            Ok(o) if o.status.success() && zip.is_file() => {}
+            _ => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return; // 环境不支持则跳过
+            }
+        }
+        let dest = dir.join("out");
+        extract_zip(&zip, &dest).expect("解压应成功");
+        assert!(dest.join("hello.txt").is_file(), "解压后应能看到文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_git_lazy_extract_end_to_end() {
+        // 用随包携带的真实 MinGit zip（开发机上有；干净克隆里没有就跳过）
+        let zip = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime")
+            .join("git-runtime.zip");
+        if !zip.is_file() {
+            return;
+        }
+        let rt = std::env::temp_dir().join(format!("agent-git-rt-{}", uuid::Uuid::new_v4()));
+        // 第一次：应解压并找到 git.exe
+        let found = ensure_bundled_git_at(&rt, &[zip]).expect("应能从随包 zip 解压出 git.exe");
+        assert!(found.is_file(), "{found:?}");
+        // 第二次：运行时目录已有，应直接复用（zips 传空也能命中）
+        let again = ensure_bundled_git_at(&rt, &[]).expect("第二次应复用已解压目录");
+        assert!(again.is_file(), "{again:?}");
+        let _ = std::fs::remove_dir_all(&rt);
     }
 }

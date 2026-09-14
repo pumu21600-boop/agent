@@ -13,3 +13,6 @@ HANDOFF.md
 .workbuddy/
 desktop/target/
 .attachments/
+
+# 内置运行时（随包携带的 MinGit 压缩包；打包时由 scripts/bundle_git.ps1 下载/校验）
+/runtime/
