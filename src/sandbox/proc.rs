@@ -214,7 +214,7 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         // 3) 属性列表 + SECURITY_CAPABILITIES（指向 sid_guard 内的 SID，须保活到 CreateProcess 后）
         let mut attr_size = 0usize;
         let _ = InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size);
-        let mut attr_buf = vec![0u8; attr_size];
+        let attr_buf = vec![0u8; attr_size];
         let attr_list = attr_buf.as_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
         if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
             bail!("InitializeProcThreadAttributeList 失败");
@@ -340,10 +340,6 @@ pub struct SandboxChild {
 }
 
 impl SandboxChild {
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
     /// 等待退出；timeout_ms 到点整树击杀并标记 timed_out。消费自身，句柄就地关闭。
     pub fn wait(mut self, timeout_ms: u32) -> anyhow::Result<SandboxOutput> {
         let (exit_code, timed_out) = unsafe {

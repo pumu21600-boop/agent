@@ -184,7 +184,8 @@ pub fn probe_timeout_kill(limits: SandboxLimits) -> ProbeResult {
 }
 
 /// kill-tree：cmd 里 start 出孙进程，SandboxChild Drop 后孙进程必须归零。
-/// 供 cargo test 调用（要数进程，较慢）。
+/// 供 cargo test 调用（要数进程，较慢）——快速自检 run_fast_suite 不含它。
+#[cfg(test)]
 pub fn probe_kill_tree(limits: SandboxLimits) -> ProbeResult {
     let count_pings = || {
         use std::os::windows::process::CommandExt;
@@ -238,6 +239,8 @@ pub fn probe_kill_tree(limits: SandboxLimits) -> ProbeResult {
 /// 对照组小分配宽限额成功，受限组超限分配必须失败。
 /// 不用 powershell：受限 token 下 .NET 启动即 0xC0000142，且 -Command 里
 /// 分配失败会当非终止错误吞掉继续跑，探针结论不可信。
+/// 供 cargo test 调用（要拉起 hog + 60s 限额）——快速自检 run_fast_suite 不含它。
+#[cfg(test)]
 pub fn probe_memory_cap(limits: SandboxLimits) -> ProbeResult {
     let Some(hog) = find_hog() else {
         return ProbeResult { name: "memory_cap", ok: false, detail: "找不到 sandbox_hog.exe（先 cargo build）".into() };
@@ -288,6 +291,7 @@ pub fn probe_memory_cap(limits: SandboxLimits) -> ProbeResult {
 }
 
 /// 定位 hog 可执行文件：测试二进制在 target/debug/deps/，hog 在 target/debug/。
+#[cfg(test)]
 fn find_hog() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AGENT_HOG_EXE") {
         let p = PathBuf::from(p);

@@ -453,8 +453,6 @@ async fn read_workspace_file(
         max_chars: 200_000,
         sandbox: sandbox_cfg,
         unsandboxed: false,
-        appcontainer: false,
-        allow_network: false,
     };
     match crate::tools::execute(
         &exec,
@@ -506,10 +504,8 @@ async fn run_shell(
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     let exec = crate::tools::ExecConfig {
         max_chars: 100_000,
-        sandbox: sandbox_cfg.clone(),
+        sandbox: sandbox_cfg,
         unsandboxed: false,
-        appcontainer: sandbox_cfg.mode == "appcontainer",
-        allow_network: sandbox_cfg.allow_network,
     };
     match crate::tools::execute(&exec, "shell", &json!({ "command": command }).to_string()).await {
         Ok(output) => Ok(Json(json!({ "ok": true, "output": output }))),

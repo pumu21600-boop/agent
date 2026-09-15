@@ -10,7 +10,7 @@
 //! 开关：config.toml `[sandbox] mode = "appcontainer"`（默认 "restricted" 向后兼容）；
 //! 实验特性，异常时切回 "restricted" 即可。
 
-use std::{ffi::c_void, path::Path, ptr};
+use std::{path::Path, ptr};
 
 use windows_sys::Win32::Foundation::{HANDLE, PSID};
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
@@ -31,7 +31,8 @@ unsafe extern "system" {
         capability_count: u32,
         out_sid: *mut PSID,
     ) -> i32;
-    fn DeriveAppContainerSidFromAppContainerName(app_container_name: *const u16, out_sid: *mut PSID) -> i32;
+    // 注：不用 DeriveAppContainerSidFromAppContainerName——它是纯数学运算，profile
+    // 不存在也返回成功（真机踩过），所以我们一律走 recreate_profile。
     fn DeleteAppContainerProfile(app_container_name: *const u16) -> i32;
 }
 #[link(name = "advapi32")]
@@ -57,13 +58,15 @@ fn wide(s: &str) -> Vec<u16> {
 /// profile 不存在也返回成功——CreateProcess 会报错误 2。所以这里总是重建 profile
 /// （幂等删除+创建；sandbox profile 无持久数据，代价可忽略）。
 pub unsafe fn ensure_sid(allow_network: bool) -> Result<SidGuard, String> {
-    recreate_profile(allow_network)
+    unsafe { recreate_profile(allow_network) }
 }
 
 /// 删除并重建 profile（能力按 allow_network），返回派生 SID。
 pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> {
     let name_w = wide(PROFILE_NAME);
-    let _ = DeleteAppContainerProfile(name_w.as_ptr());
+    unsafe {
+        let _ = DeleteAppContainerProfile(name_w.as_ptr());
+    }
 
     // 坑（真机踩过）：capabilities 空数组（count=0 + 非 NULL 指针）会 E_INVALIDARG——
     // 无网络能力时必须传 NULL 数组；有网络能力时传 INTERNET_CLIENT。
@@ -71,26 +74,28 @@ pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> 
     if allow_network {
         let s = wide(INTERNET_CLIENT_SID);
         let mut sid: PSID = ptr::null_mut();
-        if ConvertStringSidToSidW(s.as_ptr(), &mut sid) != 0 {
+        if unsafe { ConvertStringSidToSidW(s.as_ptr(), &mut sid) } != 0 {
             cap_sids.push(sid);
         }
     }
     let mut caps: Vec<SID_AND_ATTRIBUTES> = cap_sids
         .iter()
-        .map(|sid| SID_AND_ATTRIBUTES { Sid: *sid, Attributes: 0 })
+        .map(|sid| unsafe { SID_AND_ATTRIBUTES { Sid: *sid, Attributes: 0 } })
         .collect();
 
     let display = wide("Agent Local Sandbox");
     let desc = wide("agent 项目沙箱（LowBox，默认断网）");
     let mut sid: PSID = ptr::null_mut();
-    let hr = CreateAppContainerProfile(
-        name_w.as_ptr(),
-        display.as_ptr(),
-        desc.as_ptr(),
-        if caps.is_empty() { ptr::null_mut() } else { caps.as_mut_ptr() },
-        caps.len() as u32,
-        &mut sid,
-    );
+    let hr = unsafe {
+        CreateAppContainerProfile(
+            name_w.as_ptr(),
+            display.as_ptr(),
+            desc.as_ptr(),
+            if caps.is_empty() { ptr::null_mut() } else { caps.as_mut_ptr() },
+            caps.len() as u32,
+            &mut sid,
+        )
+    };
     if !ok(hr) {
         return Err(format!(
             "CreateAppContainerProfile 失败: hr=0x{hr:08X}（首次创建可能需要管理员权限）"
@@ -119,24 +124,27 @@ pub unsafe fn sid_to_string(sid: PSID) -> Option<String> {
     if sid.is_null() {
         return None;
     }
-    let p = sid as *const u8;
-    if *p != 1 {
-        return None; // 仅支持 SID_REVISION 1
+    // 指针解引用逐处显式 unsafe（edition 2024 要求，即使在 unsafe fn 体内）
+    unsafe {
+        let p = sid as *const u8;
+        if *p != 1 {
+            return None; // 仅支持 SID_REVISION 1
+        }
+        let count = *p.add(1) as usize;
+        if count > 15 {
+            return None;
+        }
+        let mut auth: u64 = 0;
+        for i in 0..6 {
+            auth = (auth << 8) | *p.add(2 + i) as u64;
+        }
+        let mut s = format!("S-1-{}", auth);
+        for i in 0..count {
+            let sub = (p.add(8 + i * 4) as *const u32).read_unaligned();
+            s.push_str(&format!("-{}", sub));
+        }
+        Some(s)
     }
-    let count = *p.add(1) as usize;
-    if count > 15 {
-        return None;
-    }
-    let mut auth: u64 = 0;
-    for i in 0..6 {
-        auth = (auth << 8) | *p.add(2 + i) as u64;
-    }
-    let mut s = format!("S-1-{}", auth);
-    for i in 0..count {
-        let sub = (p.add(8 + i * 4) as *const u32).read_unaligned();
-        s.push_str(&format!("-{}", sub));
-    }
-    Some(s)
 }
 
 /// 给目录授 AppContainer SID 的完全控制 ACE（icacls，幂等；递归继承 OI+CI）。

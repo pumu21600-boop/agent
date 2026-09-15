@@ -677,8 +677,6 @@ pub async fn run_task(
             sandbox: sandbox_cfg.clone(),
             max_chars: cfg.tool_result_max_chars,
             unsandboxed: !gate.sandbox_enabled(),
-            appcontainer: gate.sandbox_enabled() && sandbox_cfg.mode == "appcontainer",
-            allow_network: sandbox_cfg.allow_network,
         };
         use futures_util::StreamExt;
 

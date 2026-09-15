@@ -77,7 +77,7 @@ async fn main() {
         let ws: PathBuf = std::env::temp_dir().join(format!("agent_eval_ws_{}_{}", task.name, stamp));
         if let Err(e) = std::fs::create_dir_all(&ws) {
             reports.push(TaskReport {
-                name: task.name.clone(), passed: 0, failed: task.assertions.len(), details: vec![],
+                name: task.name.clone(), passed: 0, failed: task.assertions.len(),
                 duration_ms: t0.elapsed().as_millis() as u64,
                 drive_error: Some(format!("建临时工作区失败: {e}")),
             });
@@ -103,7 +103,7 @@ async fn main() {
             .await;
         if let Err(e) = switch {
             reports.push(TaskReport {
-                name: task.name.clone(), passed: 0, failed: task.assertions.len(), details: vec![],
+                name: task.name.clone(), passed: 0, failed: task.assertions.len(),
                 duration_ms: t0.elapsed().as_millis() as u64,
                 drive_error: Some(format!("切换工作区失败: {e}")),
             });
@@ -141,7 +141,6 @@ async fn main() {
             name: task.name.clone(),
             passed,
             failed,
-            details,
             duration_ms: t0.elapsed().as_millis() as u64,
             drive_error,
         });

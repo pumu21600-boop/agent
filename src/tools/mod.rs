@@ -51,11 +51,8 @@ pub struct ExecConfig {
     pub sandbox: SandboxConfig,
     pub max_chars: usize,
     /// 本机直跑（脱沙箱）：shell/git 用完整用户 token + 继承父环境
+    /// （AppContainer / 网络出向不在此重复存——run_in_sandbox 按 sandbox.mode 现算）
     pub unsandboxed: bool,
-    /// P12 019：AppContainer 模式（sandbox.mode=appcontainer 且未脱沙箱）
-    pub appcontainer: bool,
-    /// P12 019：AppContainer 网络出向
-    pub allow_network: bool,
 }
 
 fn builtin_tools() -> Vec<ToolSpec> {
@@ -853,7 +850,7 @@ mod tests {
     }
 
     fn cfg() -> ExecConfig {
-        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, appcontainer: false, allow_network: false }
+        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false }
     }
 
     #[tokio::test]

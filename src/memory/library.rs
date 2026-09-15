@@ -609,7 +609,8 @@ pub async fn sync(
     report
 }
 
-/// 无需外部渠道的同步（测试/离线）。
+/// 无需外部渠道的同步（测试/离线用；生产走 build_library 的有界增量同步）。
+#[cfg(test)]
 pub async fn sync_local(sessions: &SessionManager, log_dir: &Path, force: bool) -> SyncReport {
     sync(sessions, log_dir, None, force).await
 }

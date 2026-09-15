@@ -21,7 +21,6 @@ use std::{
     sync::{OnceLock, RwLock},
 };
 
-use anyhow::Context;
 use serde_json::{json, Value};
 use wasmtime::{Engine, Instance, Module, Store};
 
@@ -99,7 +98,7 @@ pub fn scan_and_load(dir: &Path) -> usize {
 
 /// 加载单个插件：编译 + 实例化 + describe。
 fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
-    match load_plugin_inner(stem, file) {
+    match load_plugin_inner(file) {
         Ok(tools) => PluginEntry { stem: stem.to_string(), file: file.to_path_buf(), tools, load_error: None },
         Err(e) => PluginEntry {
             stem: stem.to_string(),
@@ -110,7 +109,7 @@ fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
     }
 }
 
-fn load_plugin_inner(stem: &str, file: &Path) -> Result<Vec<(String, String, Value)>, String> {
+fn load_plugin_inner(file: &Path) -> Result<Vec<(String, String, Value)>, String> {
     let bytes = std::fs::read(file).map_err(|e| format!("读插件失败: {e}"))?;
     let module = Module::new(engine(), &bytes).map_err(|e| format!("编译失败: {e}"))?;
     let result = with_instance(&module, |store, inst| {

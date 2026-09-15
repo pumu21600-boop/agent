@@ -41,9 +41,13 @@ fn model_matches(id: &str, re: fn(&str) -> bool) -> bool {
     re(&normalize_model_id(id))
 }
 
+// 以下三个家族判定（5.4-mini / 5.5 / temperature 支持性）是 OpenClaw 逐行移植保留项，
+// 当前未接线（档位解析只用到 5.6 与 codex 分支）；保留以便跟上游对齐时不产生差异。
+#[allow(dead_code)]
 fn is_gpt_5_4_mini(id: &str) -> bool {
     id.strip_prefix("gpt-5.4-mini").map(|r| r.is_empty() || r.starts_with('-')).unwrap_or(false)
 }
+#[allow(dead_code)]
 fn is_gpt_5_5(id: &str) -> bool {
     id.strip_prefix("gpt-5.5").map(|r| r.is_empty() || r.starts_with('-')).unwrap_or(false)
 }
@@ -103,6 +107,8 @@ fn versioned_head(id: &str, pick: impl Fn(&str) -> &str) -> bool {
 }
 
 /// GPT-5.6 家族拒收 temperature（400），其余接受。上游 supportsOpenAITemperature。
+/// （移植保留项，当前未接线——请求体组装按端点 compat 决定，不按模型家族判）
+#[allow(dead_code)]
 pub fn supports_temperature(model_id: &str) -> bool {
     !model_matches(model_id, is_gpt_5_6)
 }
@@ -110,9 +116,11 @@ pub fn supports_temperature(model_id: &str) -> bool {
 pub fn is_gpt_5_6_model(model_id: &str) -> bool {
     model_matches(model_id, is_gpt_5_6)
 }
+#[allow(dead_code)]
 pub fn is_gpt_5_4_mini_model(model_id: &str) -> bool {
     model_matches(model_id, is_gpt_5_4_mini)
 }
+#[allow(dead_code)]
 pub fn is_gpt_5_5_model(model_id: &str) -> bool {
     model_matches(model_id, is_gpt_5_5)
 }

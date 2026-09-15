@@ -57,7 +57,8 @@ fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
     let md_path = dir.join("SKILL.md");
     let content = fs::read_to_string(&md_path).ok()?;
     let folder = dir.file_name()?.to_string_lossy().to_string();
-    let (fm_name, fm_desc, body) = parse_frontmatter(content.as_str());
+    // 正文不单独用：下面连 frontmatter 一起原样存（read_skill 给模型全文）
+    let (fm_name, fm_desc, _body) = parse_frontmatter(content.as_str());
     // frontmatter name 留空时回退文件夹名（空名字技能既没法删也会污染索引）
     let name = match fm_name {
         Some(n) if !n.trim().is_empty() => n,

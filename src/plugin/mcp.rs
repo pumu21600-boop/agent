@@ -16,7 +16,6 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Mutex, OnceLock},
 };
-use std::path::Path;
 
 use serde_json::{json, Value};
 
@@ -116,7 +115,10 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
     }
     let mut cmd = Command::new(&cfg.command);
     cmd.args(&cfg.args)
-        .envs(&cfg.env)
+        // 密钥不进子进程（与 P3 沙箱同一红线）：MCP server 不继承主服务环境，
+        // 白名单重建 + 用户在 server 配置里显式填的 env 才注入。
+        .env_clear()
+        .envs(sanitize_env(&cfg.env))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null()); // server 的日志走 stderr，丢弃避免干扰（Windows 句柄由 Child drop 关闭）
@@ -223,7 +225,9 @@ pub fn ensure_online_by_name(name: &str) -> Result<usize, String> {
 
 /// 公开：server 状态快照（UI 用）。
 pub fn status() -> Vec<(String, bool, Vec<(String, String)>)> {
-    let m = mgr().lock().expect("mcp 管理器锁毒化");
+    let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+    // 先回收已退出的进程：否则 server 崩了没人调用的话，界面会长期显示「在线」假状态
+    reap_dead_locked(&mut m);
     m.iter()
         .map(|(name, st)| {
             (
@@ -334,9 +338,8 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     })
 }
 
-/// 进程存活自检：把 wait() 已退出的 server 标记离线（供周期/读取时调用）。
-pub fn reap_dead() {
-    let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+/// 进程存活自检：把已退出的 server 标记离线。调用方须已持有管理器锁（status() 内用）。
+fn reap_dead_locked(m: &mut HashMap<String, ServerState>) {
     for st in m.values_mut() {
         if let Some(child) = st.child.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
@@ -351,10 +354,60 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(SEP) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// 按工作区无关的固定 env（MCP server 不继承主服务完整环境，白名单式注入）。
-pub fn sanitize_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    env.clone()
+/// Windows 子进程跑起来必需的最小环境集（PATH 让 npx/node/python 这类命令能找到自己）。
+const ENV_WHITELIST: [&str; 13] = [
+    "SystemRoot", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE",
+    "HOME", "APPDATA", "LOCALAPPDATA", "COMPUTERNAME", "USERNAME",
+];
+
+/// 白名单式子进程环境：只从主服务环境里挑上面那几项，再叠上用户在 server 配置里显式填的 env
+/// （用户项优先，可覆盖 PATH）。主服务环境里的密钥（DEEPSEEK_API_KEY 等）绝不进 MCP 子进程。
+pub fn sanitize_env(user: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    build_server_env(|k| std::env::var(k).ok(), user)
 }
 
-/// 兼容：路径透传（预留）。
-pub fn _unused(_p: &Path) {}
+/// 纯逻辑（可单测）：parent 取值函数 + 用户显式 env → 子进程环境。
+fn build_server_env(
+    parent: impl Fn(&str) -> Option<String>,
+    user: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for k in ENV_WHITELIST {
+        if let Some(v) = parent(k) {
+            out.insert(k.to_string(), v);
+        }
+    }
+    for (k, v) in user {
+        out.insert(k.clone(), v.clone());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn server_env_drops_secrets_keeps_whitelist() {
+        // 父环境模拟：既有必需的 PATH，也有密钥——密钥绝不能进子进程
+        let parent = map(&[("PATH", "C:\\x"), ("DEEPSEEK_API_KEY", "sk-secret"), ("FOO", "bar")]);
+        let out = build_server_env(|k| parent.get(k).cloned(), &BTreeMap::new());
+        assert_eq!(out.get("PATH").map(String::as_str), Some("C:\\x"));
+        assert!(!out.contains_key("DEEPSEEK_API_KEY"), "密钥泄漏进 MCP 子进程: {out:?}");
+        assert!(!out.contains_key("FOO"));
+    }
+
+    #[test]
+    fn server_env_user_entries_pass_through_and_override() {
+        let parent = map(&[("PATH", "parent-path")]);
+        let user = map(&[("PATH", "user-path"), ("API_TOKEN", "t-1")]);
+        let out = build_server_env(|k| parent.get(k).cloned(), &user);
+        // 用户显式配置优先
+        assert_eq!(out.get("PATH").map(String::as_str), Some("user-path"));
+        assert_eq!(out.get("API_TOKEN").map(String::as_str), Some("t-1"));
+    }
+}

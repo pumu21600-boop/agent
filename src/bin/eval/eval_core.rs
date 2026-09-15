@@ -240,14 +240,12 @@ pub async fn drive_chat(
     Ok(out)
 }
 
-/// 任务报告行。
+/// 任务报告行（逐条断言结果在跑的时候就已经打出来了，这里只留汇总数）。
 #[derive(Debug)]
 pub struct TaskReport {
     pub name: String,
     pub passed: usize,
     pub failed: usize,
-    /// (断言描述, 是否通过)
-    pub details: Vec<(String, bool)>,
     pub duration_ms: u64,
     /// 驱动层错误（服务不通/HTTP 错/超时）——出现时断言不计分
     pub drive_error: Option<String>,

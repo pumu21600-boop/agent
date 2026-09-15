@@ -85,6 +85,8 @@ impl ChatParams {
 
 /// 组装 /chat/completions 请求体（纯函数，单测覆盖各端点样式）。
 /// 硬约束：不含 api_key；思考参数按端点 compat 适配而非按 provider id 分支。
+/// 生产路径走 build_body_with_compat（发送前先探测一次 compat 并复用）；本包装只给单测用。
+#[cfg(test)]
 pub fn build_body(
     model: &str,
     messages: &Value,
@@ -251,13 +253,6 @@ fn build_client() -> reqwest::Client {
         .expect("构建 HTTP 客户端失败")
 }
 
-/// 流式请求的结局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamOutcome {
-    Done,
-    Cancelled,
-}
-
 /// 聚合后的模型回复（P2 核心循环用）：正文 / 思考 / 工具调用。
 #[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
@@ -330,7 +325,6 @@ impl Gateway {
         build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
         self.gate().await;
-        let mut rebuilt = false;
         let mut attempt_429 = 0u32;
         loop {
             let client = self.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client);
@@ -355,8 +349,8 @@ impl Gateway {
                     }
                     return Ok(r);
                 }
-                Err(e) if (e.is_connect() || e.is_timeout() || e.is_request()) && !rebuilt => {
-                    rebuilt = true;
+                Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
+                    // 网络类失败：热重建客户端再试一次（成败都收口，不回到循环头）
                     let fresh = self.rebuild_client();
                     match build(fresh).send().await {
                         Ok(r) => return Ok(r),
@@ -467,7 +461,7 @@ impl Gateway {
         // 反代 <think> 当正文吐：剥离标签，摘要只要正文
         let mut ts = TagSplit::default();
         let (_, mut clean) = ts.feed(&raw);
-        let (_, mut tail) = ts.finish();
+        let (_, tail) = ts.finish();
         clean.push_str(&tail);
         Ok(clean)
     }
