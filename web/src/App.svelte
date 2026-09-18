@@ -415,10 +415,11 @@
     approvalMode = m;
     approvalMenuOpen = false;
     localStorage.setItem('approvalMode', m);
+    // M1：带当前会话 id——多会话并发时只切本会话的档（不带 session 才改全局默认）
     fetch('/api/approval-mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: m }),
+      body: JSON.stringify({ mode: m, session: currentSessionId || '' }),
     });
   }
 

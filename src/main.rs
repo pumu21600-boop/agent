@@ -142,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
         approval_meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approved_scopes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
+        // M1：每会话审批档覆盖（并发会话各自独立）
+        session_approval: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         // P8 角色映射与网关级配置（降级链/限流参数）
         roles_cfg: Arc::new(config.roles.clone()),
         gateway_cfg: Arc::new(config.gateway.clone()),

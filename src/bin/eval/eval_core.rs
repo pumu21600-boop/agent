@@ -206,6 +206,8 @@ pub struct DriveResult {
     pub timed_out: bool,
     /// 累积的正文（content 分片拼接）——多轮任务把它当上一轮的 assistant 消息回填
     pub text: String,
+    /// 自动批准的审批次数（评测跑真模型用：审批门另有单测与真机矩阵覆盖）
+    pub auto_approved: usize,
 }
 
 /// 对服务发一轮 /api/chat 并收流至 done/error/超时（任务定义驱动）。
@@ -293,6 +295,22 @@ pub async fn drive_turn(
                         }
                         if key == "done" {
                             out.done = true;
+                        }
+                        // 评测跑真模型时自动批准：审批门另有单测与真机矩阵覆盖，评测测的是任务
+                        // 完成能力；不自动批的话 auto 档下每个 shell 调用都要等人点（120s 到点即拒）。
+                        if key == "approval_request"
+                            && let Some(id) = obj
+                                .get("approval_request")
+                                .and_then(|a| a.get("id"))
+                                .and_then(Value::as_str)
+                        {
+                            out.auto_approved += 1;
+                            let _ = client
+                                .post(format!("{base}/api/approvals"))
+                                .json(&json!({ "id": id, "approved": true, "remember": true }))
+                                .timeout(std::time::Duration::from_secs(5))
+                                .send()
+                                .await;
                         }
                     }
             }

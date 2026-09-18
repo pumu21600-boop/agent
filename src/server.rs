@@ -73,6 +73,9 @@ pub struct AppState {
     pub approved_scopes: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
     pub approval_mode: Arc<std::sync::RwLock<String>>,
+    /// 每会话审批档覆盖（M1）：并发多会话各跑各的档位，互不覆盖；
+    /// 没有条目的会话用上面的全局默认档。仅内存，重启即失效（与档位本身语义一致）。
+    pub session_approval: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// P8 角色映射（config.toml [roles]：summary/title/embedding 的配置名）
     pub roles_cfg: Arc<crate::config::RolesConfig>,
     /// P8 网关级配置（config.toml [gateway]：max_rpm / fallback_configs）
@@ -1172,7 +1175,10 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
     // 锁内（try_begin），并发请求不会双双通过检查；登记好的标志随任务移交 RAII 守卫
     // CancelRun，任务结束（含提前 return / panic）自动注销。
     // 例外：带附件的追加暂不支持（媒体流水线在轮首一次性构建），明确拒绝而不是悄悄丢附件。
-    let Some(run_flag) = state.cancel.try_begin(&session_id) else {
+    // M2：这里的 history 在「接管」分支里会被换成会话快照 + 队列消息，故为可变绑定。
+    let mut history = history;
+    let mut run_flag = state.cancel.try_begin(&session_id);
+    if run_flag.is_none() {
         if !attachments.is_empty() {
             observability::event(
                 EventType::State,
@@ -1221,11 +1227,30 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                 .to_string()
         };
         let flag = if immediate { "steered" } else { "queued" };
-        let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
-        let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
-        let _ = stx.send(Ok(json_event(json!({ "done": true }))));
-        return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
-    };
+        // M2 收口：入队的这一刻，上一轮可能刚好收尾（它的收尾 drain 已经跑过）——
+        // 那样这条就没人取了。再抢一次占位：抢到 = 确实已结束 → 本次请求直接把队列
+        // 里的消息跑掉（不让消息悬在队列里等下一次活动）；抢不到 = 真的还在跑，照常回执。
+        if let Some(f) = state.cancel.try_begin(&session_id) {
+            let extra = state.steer.drain_all(&session_id);
+            let snap = session.get(&session_id).map(|s| s.messages).unwrap_or_default();
+            let mut merged = if snap.is_empty() { history.clone() } else { snap };
+            for t in &extra {
+                merged.push(json!({ "role": "user", "content": t }));
+            }
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.takeover", "session": session_id, "count": extra.len() }),
+            );
+            history = merged;
+            run_flag = Some(f);
+        } else {
+            let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
+            let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
+            let _ = stx.send(Ok(json_event(json!({ "done": true }))));
+            return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
+        }
+    }
+    let run_flag = run_flag.expect("占位或接管必得其一");
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
     // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
@@ -1250,8 +1275,10 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             "notice": "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为沙箱内自动"
         }))));
     }
-    if let Ok(mut m) = state.approval_mode.write() {
-        *m = mode;
+    // M1：档位写进**本会话**（不再写全局默认，否则并发多会话会互相覆盖——
+    // 后到者生效可能让另一个会话以比预期更宽松的档位执行）
+    if let Ok(mut m) = state.session_approval.write() {
+        m.insert(session_id.clone(), mode.clone());
     }
 
     tokio::spawn(async move {
@@ -1261,8 +1288,9 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
         // D2：本轮取消标志（会话级）——新会话不再复位别人的标志，停止只停本会话。
         // N1：标志已在进入 handler 时占位登记（同会话并发在门口就 409）。
         // 守卫在任务结束（含提前 return / panic）时注销登记，不留「永远在跑」的僵尸会话。
-        let run = CancelRun::from_flag(cancel_registry, &session_id, run_flag);
-        let cancel = run.flag.clone();
+        // M2：run/cancel 可重绑——收尾时会先注销占位、再取队列续跑一轮
+        let mut run = CancelRun::from_flag(cancel_registry.clone(), &session_id, run_flag);
+        let mut cancel = run.flag.clone();
         // P7 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
         let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(prior_summary.clone()));
@@ -1678,6 +1706,7 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                 req.plan_mode,
                 &ChatGate {
                     mode: state.approval_mode.clone(),
+                    session_modes: state.session_approval.clone(),
                     allow_unsandboxed,
                     unsandboxed_approval: cfg.unsandboxed_approval,
                     pending: approvals.clone(),
@@ -1768,7 +1797,9 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             Ok(LoopOutcome::Done) => {}
             Ok(LoopOutcome::Cancelled) => {
                 send(json!({ "cancelled": true }));
-                // 用户点了停止：排队的追加消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）
+                // 用户点了停止：排队的消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）。
+                // 先注销占位再清队列（M2 同一顺序）：此后到达的消息会走正常路径自己跑，不会悬空。
+                drop(run);
                 steer_queue.drain_all(&session_id);
                 break;
             }
@@ -1779,6 +1810,10 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                 send(json!({ "error": e.to_string() }));
             }
         }
+        // M2 收尾顺序：**先注销占位、再取队列**。顺序反过来的话，「入队后没人取」的窗口
+        // 就会出现（消息在收尾 drain 之后到达 → 队列里没人消费）。先注销后，这一瞬之后
+        // 到达的消息会走正常路径自己起一轮（而不是排队等人取）。
+        drop(run);
         // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的）→
         // 用最后一轮快照当上下文，紧接着再跑一轮（同一个 SSE 流）：「进了队列的消息一定被处理」。
         let extra = steer_queue.drain_all(&session_id);
@@ -1786,23 +1821,34 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             send(json!({ "done": true }));
             break;
         }
-            let mut next: Vec<Value> = last_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if next.is_empty() {
-                // 理论上到不了（每轮至少落一次快照）；兜底退回本轮历史，别把整轮丢掉
-                next = history.clone();
+        // 还有排队的消息 → 抢回占位自己续跑；抢不到说明已有别的请求起来了，
+        // 把它们放回队列（那一轮的收尾会取走——入队与收尾的顺序保证不会悬空）。
+        let Some(f) = cancel_registry.try_begin(&session_id) else {
+            for t in extra {
+                steer_queue.push(&session_id, t, false);
             }
-            observability::event(
-                EventType::State,
-                json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
-            );
+            send(json!({ "done": true }));
+            break;
+        };
+        run = CancelRun::from_flag(cancel_registry.clone(), &session_id, f);
+        cancel = run.flag.clone();
+        let mut next: Vec<Value> = last_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if next.is_empty() {
+            // 理论上到不了（每轮至少落一次快照）；兜底退回本轮历史，别把整轮丢掉
+            next = history.clone();
+        }
+        observability::event(
+            EventType::State,
+            json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
+        );
         let turn_msgs: Vec<Value> =
             extra.iter().map(|t| json!({ "role": "user", "content": t })).collect();
         // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
         send(json!({ "turn": { "messages": turn_msgs } }));
         next.extend(turn_msgs);
         history = next;
-            // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
-            prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
+        prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
     });
 
@@ -2365,7 +2411,10 @@ async fn get_trace(Query(q): Query<TraceQuery>) -> (StatusCode, Json<Value>) {
 /// 120 秒不决定视为拒绝；用户点「停止」（取消标志）立即按拒绝返回。
 /// 档位读共享状态：侧栏切档即时生效（含进行中的请求）。
 struct ChatGate {
+    /// 全局默认档（本会话没显式切过档时用它）
     mode: Arc<std::sync::RwLock<String>>,
+    /// M1：每会话档位覆盖（与 AppState 同一份）——并发多会话各读各的
+    session_modes: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
     allow_unsandboxed: bool,
     unsandboxed_approval: bool,
     pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
@@ -2381,6 +2430,19 @@ struct ChatGate {
     cancel: Arc<CancelFlag>,
     /// 025：运行中追加消息队列（与 AppState 同一份）——每个决策点取一次并入本轮
     steer: Arc<crate::core::steer::SteerQueue>,
+}
+
+impl ChatGate {
+    /// 本会话生效的审批档（M1）：本会话显式切过档就用本会话的，否则全局默认。
+    /// 每次判定都现读——侧栏切档对**本会话**进行中的请求即时生效（原语义保留）。
+    fn effective_mode(&self) -> String {
+        if let Ok(m) = self.session_modes.read()
+            && let Some(v) = m.get(&self.session_id)
+        {
+            return v.clone();
+        }
+        self.mode.read().map(|m| m.clone()).unwrap_or_default()
+    }
 }
 
 impl agent::ApprovalGate for ChatGate {
@@ -2410,7 +2472,7 @@ impl agent::ApprovalGate for ChatGate {
     // 旧版按工具静态 danger_level 的 needs_approval(mode, danger_level) 已随
     // 施工单 013 A2 删除——两套判定并存会造成语义分裂，禁止再加回来。
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool {
-        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        let mode = self.effective_mode();
         let ws = crate::tools::workspace_root();
         let val: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
         let (risk, _reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
@@ -2437,7 +2499,7 @@ impl agent::ApprovalGate for ChatGate {
     }
 
     fn sandbox_enabled(&self) -> bool {
-        let mode = self.mode.read().map(|m| m.clone()).unwrap_or_default();
+        let mode = self.effective_mode();
         !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
     }
 
@@ -2513,11 +2575,20 @@ async fn set_approval_mode(
         "local" => "full-access",
         other => other,
     };
-    if let Ok(mut m) = state.approval_mode.write() {
-        *m = mode.to_string();
+    // M1：带 session 就只改这条会话的档（并发多会话各切各的）；不带 session 改全局默认档
+    let session = req.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if session.is_empty() {
+        if let Ok(mut m) = state.approval_mode.write() {
+            *m = mode.to_string();
+        }
+    } else if let Ok(mut m) = state.session_approval.write() {
+        m.insert(session.clone(), mode.to_string());
     }
-    observability::event(EventType::State, json!({ "kind": "approval.mode", "mode": mode }));
-    (StatusCode::OK, Json(json!({ "ok": true, "mode": mode })))
+    observability::event(
+        EventType::State,
+        json!({ "kind": "approval.mode", "mode": mode, "session": session }),
+    );
+    (StatusCode::OK, Json(json!({ "ok": true, "mode": mode, "session": session })))
 }
 
 /// POST /api/approvals —— 用户对审批请求的决定。
@@ -3285,6 +3356,42 @@ mod tests {
         // 端口缺省的显式写法：http 默认 80 与 Host 无端口同源
         assert!(check_origin("localhost", Some("http://localhost")).is_ok());
         assert!(check_origin("localhost:80", Some("http://localhost:80")).is_ok());
+    }
+
+    /// M1：审批档按会话存——A 会话切「完全访问」不得影响 B 会话（并发多会话互不覆盖）。
+    #[test]
+    fn approval_mode_is_per_session() {
+        let def = Arc::new(std::sync::RwLock::new("auto".to_string()));
+        let modes = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gate = |sid: &str| ChatGate {
+            mode: def.clone(),
+            session_modes: modes.clone(),
+            allow_unsandboxed: false,
+            unsandboxed_approval: false,
+            pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_id: sid.to_string(),
+            meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            approved: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            plan_mode: false,
+            tx: tx.clone(),
+            cancel: Arc::new(CancelFlag::new()),
+            steer: Arc::new(crate::core::steer::SteerQueue::new()),
+        };
+        let a = gate("sess-a");
+        let b = gate("sess-b");
+        assert_eq!(a.effective_mode(), "auto");
+        assert_eq!(b.effective_mode(), "auto");
+
+        // 只给 A 会话切「完全访问」
+        modes.write().unwrap_or_else(|e| e.into_inner()).insert("sess-a".into(), "full-access".into());
+        assert_eq!(a.effective_mode(), "full-access");
+        assert_eq!(b.effective_mode(), "auto", "别的会话不得被带着换档");
+
+        // 全局默认变了：没切过档的会话跟着变，切过档的会话仍用自己的
+        *def.write().unwrap_or_else(|e| e.into_inner()) = "read-only".into();
+        assert_eq!(a.effective_mode(), "full-access");
+        assert_eq!(b.effective_mode(), "read-only");
     }
 
     #[test]
