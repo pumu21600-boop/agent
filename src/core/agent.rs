@@ -43,6 +43,9 @@ pub enum AgentEvent {
     Summary(String),
     /// P9 B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
     PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
+    /// N1/025 运行中追加消息（steering）：这些用户消息已并入本轮对话（模型下一步可见），
+    /// server 收到即转前端补气泡 + 落盘。
+    Steer { messages: Vec<Value> },
 }
 
 /// P9 B3：Plan 档解析出的结构化计划。
@@ -229,6 +232,11 @@ pub trait ApprovalGate: Send + Sync {
     }
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    /// N1/025 运行中追加的用户消息（steering）：核心循环每个决策点取一次；
+    /// 默认无（测试与其它实现不受影响）。空表 = 本轮没有要追加的话。
+    fn take_steering(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,6 +430,20 @@ pub async fn run_task(
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
             emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             return Ok(LoopOutcome::Cancelled);
+        }
+        // N1/025 运行中追加消息：下一步决策前并入（模型这一步就能看到），原轮不打断。
+        // 落 Snapshot 让追加消息立刻进会话文件；前端按 Steer 事件补用户气泡。
+        let steer = gate.take_steering();
+        if !steer.is_empty() {
+            let added: Vec<Value> =
+                steer.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "steer", "count": added.len(), "step": step }),
+            );
+            msgs.extend(added.iter().cloned());
+            on_event(AgentEvent::Steer { messages: added });
+            on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
         }
         // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
         {

@@ -119,6 +119,9 @@
 | `attachments.gitignored` | 附件目录自动写入工作区 .gitignore | `path` |
 | `media.error` | 多模态理解调用失败（DSH 转接规范） | `modality`、`model`、`url`、`error` |
 | `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补；P16 起多份倒位） | `bytes`、`limit_bytes`、`keep` |
+| `steer` | 运行中追加的用户消息已并入本轮（025）：核心循环每个决策点取一次；迟到没赶上本轮的在收尾续跑一轮记 `phase: "followup"` | `count`、`step`（并入时所在步）；续跑时 `phase`、`session` |
+| `chat.steered` | 同会话运行中再发消息 → 进追加队列（025） | `session`、`pending`（积压条数） |
+| `chat.rejected` | 同会话运行中再发消息被拒（025：仅带附件的追加不支持） | `session`、`reason`（`session_busy_attachments`） |
 
 ### 4.5 error —— 错误
 

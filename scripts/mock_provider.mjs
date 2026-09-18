@@ -4,6 +4,7 @@
 //   「读 <路径>」  → read_file 工具调用（不写路径则读 prompts/system.md）
 //   「编辑 <路径>」→ edit_file 工具调用（old=「状态：TODO」→ new=「状态：已完成」）
 //   「死循环」     → 每轮都返回工具调用（验证步数上限 / 取消）
+//   「慢循环」     → 同死循环，但每步先等 1.5s（验证运行中插话 / steering）
 //   「慢流」       → 30 片 × 300ms 的长流（验证中途取消）
 //   其余          → 普通流式回复；已回填 tool 消息 → 返回最终回答
 // 注意：工具剧本必须**显式触发**（不能"带 tools 参数就吐工具调用"）——否则任何
@@ -11,6 +12,7 @@
 import http from 'node:http';
 
 const PORT = 9399;
+let readCalls = 0; // 慢循环交替路径用（避免撞核心循环的重复工具调用检测）
 const CHUNKS = ['你好，', '这是', '模拟渠道', '的流式回复。', '（中文测试 OK）'];
 
 function sendSSE(res, obj) {
@@ -82,8 +84,11 @@ http
         const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
         const lastText = lastUser?.content || '';
         const loopForever = /死循环/.test(lastText);
-        // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环剧本除外
-        const wantsTool = hasToolsParam && (loopForever || (!hasToolMsg && /读|编辑/.test(lastText)));
+        // 慢循环：同死循环，但每步先等 1.5s——留出「运行中插话」的窗口（验证 steering）
+        const slowLoop = /慢循环/.test(lastText);
+        // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环剧本除外
+        const wantsTool =
+          hasToolsParam && (loopForever || slowLoop || (!hasToolMsg && /读|编辑/.test(lastText)));
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -98,9 +103,16 @@ http
               new_string: '状态：已完成',
             });
           } else {
-            // read_file 剧本（含死循环：每轮都读同一个文件）
+            // read_file 剧本（含死循环/慢循环：每轮都读同一个文件）。
+            // 慢循环额外做两件事：每步等 1.5s（留插话窗口）、交替两个路径——
+            // 路径写死会让核心循环的「重复工具调用」检测提前终止，跑不满步数。
             const pathMatch = lastText.match(/读\s*([^\s，。]+)/);
-            emitToolCall(res, 'read_file', { path: pathMatch ? pathMatch[1] : 'prompts/system.md' });
+            const path = pathMatch ? pathMatch[1] : 'prompts/system.md';
+            readCalls += 1;
+            const alt = readCalls % 2 === 0 ? 'config.toml' : path;
+            const readCall = () => emitToolCall(res, 'read_file', { path: alt });
+            if (slowLoop) setTimeout(readCall, 1500);
+            else readCall();
           }
         } else if (hasToolMsg) {
           // 工具结果已回填 → 最终回答（附带 reasoning 分片，测 thought 事件）

@@ -86,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
     let gateway = Arc::new(gw);
     // D2：会话级取消注册表（每轮任务按 session_id 登记自己的取消标志）
     let cancel = Arc::new(core::cancel::CancelRegistry::new());
+    // 025：运行中追加消息队列（同会话再发消息 → 并入当前这一轮，不拒收）
+    let steer = Arc::new(core::steer::SteerQueue::new());
     let prompt_path = manifest.join("prompts").join("system.md");
     let system_prompt = std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
         observability::debug(&format!(
@@ -122,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     let state = server::AppState {
         gateway,
         cancel,
+        steer,
         settings: Arc::new(std::sync::RwLock::new(user_settings)),
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),

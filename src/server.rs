@@ -44,6 +44,8 @@ pub struct AppState {
     pub gateway: Arc<Gateway>,
     /// 会话级取消注册表（D2）：每轮任务 begin 登记、结束注销，停止按钮只停目标会话
     pub cancel: Arc<CancelRegistry>,
+    /// 运行中追加消息队列（025）：同会话已在跑时，新消息进这里并入当前一轮
+    pub steer: Arc<crate::core::steer::SteerQueue>,
     pub settings: Arc<std::sync::RwLock<Settings>>,
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
@@ -1132,6 +1134,7 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let gateway = state.gateway.clone();
     let cancel_registry = state.cancel.clone();
+    let steer_queue = state.steer.clone();
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let active_cfg = s.active_or_default().clone();
     let cfg = (*state.agent_cfg).clone();
@@ -1160,21 +1163,55 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
         if valid { sid } else { session.new_id() }
     };
-    // N1：同一会话已有在跑的一轮 → 409（多标签页 / 直接调 API 的并发双写防护）。
-    // 判定与登记在同一把锁内（try_begin），并发请求不会双双通过检查；登记好的标志
-    // 随任务移交 RAII 守卫 CancelRun，任务结束（含提前 return / panic）自动注销。
+    // 025：同一会话已在跑一轮 → **不拒收**：文本消息进追加队列，运行中的那一轮在下一个
+    // 决策点就会看到（原轮不打断、不另起一轮，会话文件保持单写者）。判定与登记仍在同一把
+    // 锁内（try_begin），并发请求不会双双通过检查；登记好的标志随任务移交 RAII 守卫
+    // CancelRun，任务结束（含提前 return / panic）自动注销。
+    // 例外：带附件的追加暂不支持（媒体流水线在轮首一次性构建），明确拒绝而不是悄悄丢附件。
     let Some(run_flag) = state.cancel.try_begin(&session_id) else {
+        if !attachments.is_empty() {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.rejected", "reason": "session_busy_attachments", "session": session_id }),
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("会话 {session_id} 正在运行中：追加消息暂不支持带附件，等这一轮跑完再发")
+                })),
+            )
+                .into_response();
+        }
+        let text = if !message.is_empty() {
+            message.clone()
+        } else {
+            history
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "user")
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        if text.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "消息为空" }))).into_response();
+        }
+        let pending = state.steer.push(&session_id, text);
         observability::event(
             EventType::State,
-            json!({ "kind": "chat.rejected", "reason": "session_busy", "session": session_id }),
+            json!({ "kind": "chat.steered", "session": session_id, "pending": pending }),
         );
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": format!("会话 {session_id} 正在运行中：先停止或等它跑完再发（同一会话不支持并发）")
-            })),
-        )
-            .into_response();
+        let (stx, srx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let notice = if pending > 1 {
+            format!("已并入正在运行的一轮（排队 {pending} 条，模型按顺序看到）")
+        } else {
+            "已并入正在运行的一轮（模型下一步就会看到）".to_string()
+        };
+        let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
+        let _ = stx.send(Ok(json_event(json!({ "notice": notice }))));
+        let _ = stx.send(Ok(json_event(json!({ "done": true }))));
+        return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
     };
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
@@ -1216,6 +1253,10 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
         // P7 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
         let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(prior_summary.clone()));
+        // 025：本任务最新一次会话快照（消息全量，不含 system）——迟到的追加消息
+        // 要接着再跑一轮时，用它当上下文，而不是重新问客户端要历史。
+        let last_snapshot: Arc<std::sync::Mutex<Vec<Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         if history.is_empty() {
             send(json!({ "error": "消息为空" }));
             return;
@@ -1244,6 +1285,8 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
 
         // P8.5 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
+        // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
+        let mut prior_summary = prior_summary;
         if !attachments.is_empty() {
             let roles = s.roles.as_ref();
             let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
@@ -1598,110 +1641,153 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             .iter()
             .filter_map(|n| find_channel(&s, n))
             .collect();
-        let outcome = agent::run_task(
-            &gateway,
-            &agent::LoopChannels { primary, summary, title, fallbacks },
-            // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
-            // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
-            &format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt()),
-            &history,
-            &cancel,
-            &cfg,
-            &sandbox_cfg,
-            &ctx_cfg,
-            &rec_cfg,
-            &mem,
-            prior_summary,
-            req.plan_mode,
-            &ChatGate {
-                mode: state.approval_mode.clone(),
-                allow_unsandboxed,
-                unsandboxed_approval: cfg.unsandboxed_approval,
-                pending: approvals,
-                // P9 A3：会话内同类允许的作用域与记忆存储
-                session_id: session_id.clone(),
-                meta: state.approval_meta.clone(),
-                approved: state.approved_scopes.clone(),
+        loop {
+            let outcome = agent::run_task(
+                &gateway,
+                // 续跑一轮时这些值复用（Channel 是克隆廉价的连接参数快照）
+                &agent::LoopChannels {
+                    primary: primary.clone(),
+                    summary: summary.clone(),
+                    title: title.clone(),
+                    fallbacks: fallbacks.clone(),
+                },
+                // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
+                // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
+                &format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt()),
+                &history,
+                &cancel,
+                &cfg,
+                &sandbox_cfg,
+                &ctx_cfg,
+                &rec_cfg,
+                &mem,
+                prior_summary.clone(),
+                req.plan_mode,
+                &ChatGate {
+                    mode: state.approval_mode.clone(),
+                    allow_unsandboxed,
+                    unsandboxed_approval: cfg.unsandboxed_approval,
+                    pending: approvals.clone(),
+                    // P9 A3：会话内同类允许的作用域与记忆存储
+                    session_id: session_id.clone(),
+                    meta: state.approval_meta.clone(),
+                    approved: state.approved_scopes.clone(),
                 plan_mode: req.plan_mode,
                 tx: tx.clone(),
                 cancel: cancel.clone(),
+                steer: steer_queue.clone(),
             },
-            |ev| match ev {
-                AgentEvent::Content(c) => send(json!({ "content": c })),
-                AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
-                AgentEvent::ToolCall { name, args } => {
-                    send(json!({ "tool_call": { "name": name, "args": args } }))
-                }
-                AgentEvent::ToolResult { name, ok, preview } => {
-                    send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
-                }
-                AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
-                AgentEvent::ContextUsage { tokens, budget, breakdown } => send(json!({
-                    "context_usage": {
-                        "tokens": tokens,
-                        "budget": budget,
-                        "breakdown": {
-                            "messages": breakdown.messages,
-                            "tools": breakdown.tools,
-                            "system": breakdown.system,
-                            "other": breakdown.other,
-                        },
+                |ev| match ev {
+                    AgentEvent::Content(c) => send(json!({ "content": c })),
+                    AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
+                    AgentEvent::ToolCall { name, args } => {
+                        send(json!({ "tool_call": { "name": name, "args": args } }))
                     }
-                })),
-                AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
-                    send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
-                }
-                // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
-                AgentEvent::Snapshot { messages } => {
-                    let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    match session.save(&session_id, &messages, cur_summary.as_deref()) {
-                        Ok(()) => observability::event(
-                            EventType::State,
-                            json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
-                        ),
-                        Err(e) => observability::event(
-                            EventType::Error,
-                            json!({ "message": format!("会话落盘失败: {e}") }),
-                        ),
+                    AgentEvent::ToolResult { name, ok, preview } => {
+                        send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
                     }
-                }
-                // P7 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
-                AgentEvent::Summary(s) => {
-                    *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-                    send(json!({ "summary": true }))
-                }
-                // P6.1 改动统计条：撤销按钮恢复到任务起点基线
-                AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
-                    send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
-                }
-                // P8 TITLE 角色：标题已生成 → 改会话文件并转前端
-                AgentEvent::Title(t) => {
-                    match session.rename(&session_id, &t) {
-                        Ok(()) => send(json!({ "title": t })),
-                        Err(e) => observability::event(
-                            EventType::Error,
-                            json!({ "message": format!("会话改名失败: {e}") }),
-                        ),
+                    AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
+                    AgentEvent::ContextUsage { tokens, budget, breakdown } => send(json!({
+                        "context_usage": {
+                            "tokens": tokens,
+                            "budget": budget,
+                            "breakdown": {
+                                "messages": breakdown.messages,
+                                "tools": breakdown.tools,
+                                "system": breakdown.system,
+                                "other": breakdown.other,
+                            },
+                        }
+                    })),
+                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
+                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                     }
-                }
-                // P9 B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
-                AgentEvent::PlanProposal { goal, steps, files } => {
-                    send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
-                }
-                AgentEvent::StepReset { content, reasoning } => {
-                    send(json!({ "reset": { "content": content, "reasoning": reasoning } }))
-                }
-                AgentEvent::Notice(n) => send(json!({ "notice": n }))
-            },
-        )
-        .await;
+                    // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
+                    AgentEvent::Snapshot { messages } => {
+                        *last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
+                        let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        match session.save(&session_id, &messages, cur_summary.as_deref()) {
+                            Ok(()) => observability::event(
+                                EventType::State,
+                                json!({ "kind": "session.saved", "session": session_id, "messages": messages.len() }),
+                            ),
+                            Err(e) => observability::event(
+                                EventType::Error,
+                                json!({ "message": format!("会话落盘失败: {e}") }),
+                            ),
+                        }
+                    }
+                    // P7 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
+                    AgentEvent::Summary(s) => {
+                        *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                        send(json!({ "summary": true }))
+                    }
+                    // P6.1 改动统计条：撤销按钮恢复到任务起点基线
+                    AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
+                        send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
+                    }
+                    // P8 TITLE 角色：标题已生成 → 改会话文件并转前端
+                    AgentEvent::Title(t) => {
+                        match session.rename(&session_id, &t) {
+                            Ok(()) => send(json!({ "title": t })),
+                            Err(e) => observability::event(
+                                EventType::Error,
+                                json!({ "message": format!("会话改名失败: {e}") }),
+                            ),
+                        }
+                    }
+                    // P9 B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
+                    AgentEvent::PlanProposal { goal, steps, files } => {
+                        send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
+                    }
+                    AgentEvent::StepReset { content, reasoning } => {
+                        send(json!({ "reset": { "content": content, "reasoning": reasoning } }))
+                    }
+                    // 025：运行中追加的用户消息已并入本轮 → 前端补用户气泡
+                    AgentEvent::Steer { messages } => {
+                        send(json!({ "steer": { "messages": messages } }))
+                    }
+                    AgentEvent::Notice(n) => send(json!({ "notice": n }))
+                },
+            )
+            .await;
         match outcome {
-            Ok(LoopOutcome::Done) => send(json!({ "done": true })),
-            Ok(LoopOutcome::Cancelled) => send(json!({ "cancelled": true })),
+            Ok(LoopOutcome::Done) => {}
+            Ok(LoopOutcome::Cancelled) => {
+                send(json!({ "cancelled": true }));
+                // 用户点了停止：排队的追加消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）
+                steer_queue.drain(&session_id);
+                break;
+            }
             Err(e) => {
+                // 出错也继续走下面的收尾：已排队的追加消息是用户发出去的话，不能因上一轮
+                // 失败被悄悄吞掉（若下一轮同样失败，会再报一次错，语义仍然清楚）
                 observability::event(EventType::Error, json!({ "message": e.to_string() }));
                 send(json!({ "error": e.to_string() }));
             }
+        }
+            // 025：一轮跑完后还有迟到的追加消息（最后一个决策点之后才到的）→ 用最后一轮
+            // 快照当上下文，紧接着再跑一轮（同一个 SSE 流）：「发出去的消息一定被处理」。
+            let extra = steer_queue.drain(&session_id);
+            if extra.is_empty() {
+                send(json!({ "done": true }));
+                break;
+            }
+            let mut next: Vec<Value> = last_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if next.is_empty() {
+                // 理论上到不了（每轮至少落一次快照）；兜底退回本轮历史，别把整轮丢掉
+                next = history.clone();
+            }
+            observability::event(
+                EventType::State,
+                json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
+            );
+            for t in extra {
+                next.push(json!({ "role": "user", "content": t }));
+            }
+            history = next;
+            // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
+            prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
     });
 
@@ -2278,9 +2364,16 @@ struct ChatGate {
     plan_mode: bool,
     tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     cancel: Arc<CancelFlag>,
+    /// 025：运行中追加消息队列（与 AppState 同一份）——每个决策点取一次并入本轮
+    steer: Arc<crate::core::steer::SteerQueue>,
 }
 
 impl agent::ApprovalGate for ChatGate {
+    /// 025：核心循环每个决策点取一次追加消息（取走即并入本轮对话，原轮不打断）
+    fn take_steering(&self) -> Vec<String> {
+        self.steer.drain(&self.session_id)
+    }
+
     /// P9 B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。
     /// 风险判定复用 rules::evaluate_risk 单点，与审批档位共用同一套语义。
     fn plan_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {

@@ -73,6 +73,9 @@
   let controller = null;
   let seq = 0;
   let chatBody;
+  // 运行中追加的消息（025）：本页发过的内容排队，服务端回执 steer 事件时按序配对，
+  // 避免自己发的那条被重复补成两个气泡
+  let localSteers = [];
 
   // —— P8.5 多模态媒体附件与大图预览 ——
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
@@ -1583,7 +1586,10 @@
   // —— 对话 ——
   async function send() {
     const msg = input.trim();
-    if ((!msg && pendingAttachments.length === 0) || streaming) return;
+    if (!msg && pendingAttachments.length === 0) return;
+    // 运行中再发（025）：并入正在跑的那一轮（模型下一步就看到，原轮不打断），
+    // 本页不另起助手气泡——回答会接在当前这条流里
+    if (streaming) return steer(msg);
     streaming = true;
     // 发送时收起所有输入区菜单
     plusMenuOpen = false;
@@ -1663,7 +1669,15 @@
                   content: m.content.slice(0, Math.max(0, m.content.length - (d.reset.content || 0))),
                   thinking: (m.thinking || '').slice(0, Math.max(0, (m.thinking || '').length - (d.reset.reasoning || 0))),
                 }));
-              else if (d.tool_call)
+              else if (d.steer) {
+                // 运行中追加的消息（025）：别的窗口发的在这里补用户气泡；本页自己发过的已补过
+                const add = [];
+                for (const m of d.steer.messages || []) {
+                  if (localSteers.length > 0 && localSteers[0] === m.content) localSteers.shift();
+                  else add.push({ id: nextId(), role: 'user', content: m.content });
+                }
+                if (add.length) messages = [...messages, ...add];
+              } else if (d.tool_call)
                 patch((m) => ({
                   ...m,
                   tools: [...(m.tools || []), { name: d.tool_call.name, args: d.tool_call.args, status: 'running' }],
@@ -1748,7 +1762,53 @@
     } finally {
       streaming = false;
       controller = null;
+      localSteers = [];
       loadSessions(); // 刷新会话列表（新会话出现/标题更新）
+    }
+  }
+
+  // 运行中追加消息（025）：同会话再发 → 服务端排进正在跑的那一轮，
+  // 模型下一个决策点就能看到；回答接在当前这条流里，不新开一条。
+  async function steer(msg) {
+    if (pendingAttachments.length > 0) {
+      messages = [
+        ...messages,
+        { id: nextId(), role: 'error', content: '运行中暂不支持追加带附件的消息：点上方的停止，或等这一轮跑完再发。' },
+      ];
+      return;
+    }
+    if (!msg) return;
+    const history = messages
+      .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
+      .map((m) => ({ role: m.role, content: m.content }));
+    history.push({ role: 'user', content: msg });
+    messages = [...messages, { id: nextId(), role: 'user', content: msg }];
+    localSteers.push(msg);
+    input = '';
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: history,
+          message: msg,
+          model,
+          base_url: baseUrl,
+          approval_mode: approvalMode,
+          session_id: currentSessionId || '',
+        }),
+      });
+      if (!res.ok) {
+        let detail = '';
+        try {
+          detail = (await res.json()).error || '';
+        } catch {}
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+      await res.text(); // 服务端回执很短（session/notice/done），内容本身在跑的那条流里
+    } catch (e) {
+      localSteers = localSteers.filter((t) => t !== msg);
+      messages = [...messages, { id: nextId(), role: 'error', content: `追加消息失败：${e.message || e}` }];
     }
   }
 
@@ -3169,7 +3229,6 @@
           on:paste={handlePaste}
           on:dragover|preventDefault
           on:drop={handleDrop}
-          disabled={streaming}
         ></textarea>
         <div class="composer-bar">
           <div class="composer-left">
