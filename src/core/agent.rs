@@ -232,8 +232,8 @@ pub trait ApprovalGate: Send + Sync {
     }
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
-    /// N1/025 运行中追加的用户消息（steering）：核心循环每个决策点取一次；
-    /// 默认无（测试与其它实现不受影响）。空表 = 本轮没有要追加的话。
+    /// N1/025「立即发送（引导）」的运行中消息：核心循环每个决策点取一次并入本轮；
+    /// 默认无（测试与其它实现不受影响）。只取「立即」的，排队的等本轮结束再发。
     fn take_steering(&self) -> Vec<String> {
         Vec::new()
     }

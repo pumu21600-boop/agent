@@ -206,6 +206,10 @@ pub struct ChatRequest {
     /// P6.1 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
     #[serde(default)]
     pub session_id: String,
+    /// 027：同会话正在跑时这条消息怎么处理——false（缺省）= 排队，等这一轮跑完自动发；
+    /// true = 立即（引导）：并进正在跑的那一轮，模型下一个决策点就看到（不打断、不另起一轮）
+    #[serde(default)]
+    pub steer: bool,
     /// P9 B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
     #[serde(default)]
     pub plan_mode: bool,
@@ -1197,19 +1201,28 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
         if text.is_empty() {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": "消息为空" }))).into_response();
         }
-        let pending = state.steer.push(&session_id, text);
+        // 027：缺省 = 排队（这一轮跑完自动接着发）；steer=true = 立即（引导当前这一轮）
+        let immediate = req.steer;
+        let pending = state.steer.push(&session_id, text, immediate);
         observability::event(
             EventType::State,
-            json!({ "kind": "chat.steered", "session": session_id, "pending": pending }),
+            json!({
+                "kind": "chat.steered",
+                "session": session_id,
+                "mode": if immediate { "immediate" } else { "queue" },
+                "pending": pending,
+            }),
         );
         let (stx, srx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
-        let notice = if pending > 1 {
-            format!("已并入正在运行的一轮（排队 {pending} 条，模型按顺序看到）")
+        let notice = if immediate {
+            "已并入正在运行的一轮：模型下一个决策点就会看到（引导当前回答，不打断）".to_string()
         } else {
-            "已并入正在运行的一轮（模型下一步就会看到）".to_string()
+            "已排队：当前这一轮结束后自动发送（想马上引导当前回答，点这条消息上的「立即发送」）"
+                .to_string()
         };
+        let flag = if immediate { "steered" } else { "queued" };
         let _ = stx.send(Ok(json_event(json!({ "session": session_id.clone() }))));
-        let _ = stx.send(Ok(json_event(json!({ "notice": notice }))));
+        let _ = stx.send(Ok(json_event(json!({ flag: true, "notice": notice }))));
         let _ = stx.send(Ok(json_event(json!({ "done": true }))));
         return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
     };
@@ -1756,7 +1769,7 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             Ok(LoopOutcome::Cancelled) => {
                 send(json!({ "cancelled": true }));
                 // 用户点了停止：排队的追加消息一并作废（「停」= 这一轮和还没轮上的话都别跑了）
-                steer_queue.drain(&session_id);
+                steer_queue.drain_all(&session_id);
                 break;
             }
             Err(e) => {
@@ -1766,13 +1779,13 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                 send(json!({ "error": e.to_string() }));
             }
         }
-            // 025：一轮跑完后还有迟到的追加消息（最后一个决策点之后才到的）→ 用最后一轮
-            // 快照当上下文，紧接着再跑一轮（同一个 SSE 流）：「发出去的消息一定被处理」。
-            let extra = steer_queue.drain(&session_id);
-            if extra.is_empty() {
-                send(json!({ "done": true }));
-                break;
-            }
+        // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的）→
+        // 用最后一轮快照当上下文，紧接着再跑一轮（同一个 SSE 流）：「进了队列的消息一定被处理」。
+        let extra = steer_queue.drain_all(&session_id);
+        if extra.is_empty() {
+            send(json!({ "done": true }));
+            break;
+        }
             let mut next: Vec<Value> = last_snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if next.is_empty() {
                 // 理论上到不了（每轮至少落一次快照）；兜底退回本轮历史，别把整轮丢掉
@@ -1782,10 +1795,12 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                 EventType::State,
                 json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
             );
-            for t in extra {
-                next.push(json!({ "role": "user", "content": t }));
-            }
-            history = next;
+        let turn_msgs: Vec<Value> =
+            extra.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+        // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
+        send(json!({ "turn": { "messages": turn_msgs } }));
+        next.extend(turn_msgs);
+        history = next;
             // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
             prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
@@ -2369,9 +2384,10 @@ struct ChatGate {
 }
 
 impl agent::ApprovalGate for ChatGate {
-    /// 025：核心循环每个决策点取一次追加消息（取走即并入本轮对话，原轮不打断）
+    /// 025：核心循环每个决策点取一次「立即发送（引导）」的消息并入本轮（原轮不打断）；
+    /// 排队等下一轮的那些留在队列里，由服务层收尾取走。
     fn take_steering(&self) -> Vec<String> {
-        self.steer.drain(&self.session_id)
+        self.steer.drain_immediate(&self.session_id)
     }
 
     /// P9 B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。

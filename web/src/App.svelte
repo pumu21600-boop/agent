@@ -66,16 +66,70 @@
     { cmd: '总结', text: '请总结以下内容的要点：\n' },
   ];
 
-  // —— 对话 ——
-  let messages = [];
+  // —— 对话（027：按会话隔离）——
+  // 每个会话各有自己的消息缓冲与运行流：A 会话在跑不影响切到 B 会话发消息，
+  // A 的流式内容也只写回 A 的缓冲（切走再切回不丢、不串台）。
+  let messages = []; // 当前显示会话的消息（sessionMsgs 的镜像）
+  let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
+  let streams = {}; // key → { asstId, controller } 正在跑的那条流
+  let outbox = {}; // key → [{ id, text, atts }] 排队待发（本轮结束后自动按序发出）
+  let streaming = false; // 当前显示会话是否在跑（syncCur 维护）
+  let controller = null; // 当前显示会话的 AbortController（停止按钮用）
   let input = '';
-  let streaming = false;
-  let controller = null;
   let seq = 0;
   let chatBody;
-  // 运行中追加的消息（025）：本页发过的内容排队，服务端回执 steer 事件时按序配对，
-  // 避免自己发的那条被重复补成两个气泡
+  // 本页发过的「立即发送」内容：服务端 steer 事件按序配对，避免自己发的那条被重复补气泡
   let localSteers = [];
+
+  const curKey = () => currentSessionId || '@new';
+  // 刷新「当前会话」的三个镜像变量（切会话、流开始/结束时调用）
+  function syncCur() {
+    const k = curKey();
+    streaming = !!streams[k];
+    controller = streams[k] ? streams[k].controller : null;
+    messages = sessionMsgs[k] || [];
+  }
+  function setMsgs(key, arr) {
+    sessionMsgs = { ...sessionMsgs, [key]: arr };
+    if (key === curKey()) messages = arr;
+  }
+  function updMsgs(key, fn) {
+    setMsgs(key, fn(sessionMsgs[key] || []));
+  }
+  function pushMsg(key, msg) {
+    updMsgs(key, (a) => [...a, msg]);
+  }
+  function patchAsst(key, asstId, fn) {
+    updMsgs(key, (a) => a.map((m) => (m.id === asstId ? fn({ ...m }) : m)));
+  }
+  // 会话 id 从 '@new' 变成服务端分配的 id：缓冲 / 流 / 队列一起挪过去
+  function rekey(from, to) {
+    if (!from || from === to) return;
+    const arr = sessionMsgs[from] || [];
+    const nextMsgs = { ...sessionMsgs };
+    delete nextMsgs[from];
+    nextMsgs[to] = arr;
+    sessionMsgs = nextMsgs;
+    if (streams[from]) {
+      const st = streams[from];
+      const nextStreams = { ...streams };
+      delete nextStreams[from];
+      nextStreams[to] = st;
+      streams = nextStreams;
+    }
+    if (outbox[from]) {
+      const q = outbox[from];
+      const nextOut = { ...outbox };
+      delete nextOut[from];
+      nextOut[to] = q;
+      outbox = nextOut;
+    }
+    if (curKey() === from) {
+      currentSessionId = to;
+      messages = arr;
+    }
+    syncCur();
+  }
 
   // —— P8.5 多模态媒体附件与大图预览 ——
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
@@ -266,9 +320,11 @@
       wsMsg = '';
       wsPath = '';
       wsModalOpen = false;
-      // 工作区变了：会话/消息/圆环全部重置，重新拉列表
+      // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
       currentSessionId = null;
-      messages = [];
+      sessionMsgs = {};
+      outbox = {};
+      syncCur();
       resetCtxUsage();
       await loadSettings();
       await loadSessions(true);
@@ -821,10 +877,7 @@
         return;
       }
       commitModal = null;
-      messages = [
-        ...messages,
-        { id: nextId(), role: 'system', content: `已提交 ${r.id}（${files.length} 个文件）: ${msg}` },
-      ];
+      pushMsg(curKey(), { id: nextId(), role: 'system', content: `已提交 ${r.id}（${files.length} 个文件）: ${msg}` });
       await refreshGit();
       refreshDock();
     } catch (e) {
@@ -1584,40 +1637,72 @@
   // (hmr-probe)
 
   // —— 对话 ——
+  // 发送（027）：当前显示会话没在跑 → 直接发；正在跑 → **排队**（不发出去），
+  // 气泡上出现「立即发送」按钮，点它 = 引导当前这一轮（并进去、不打断）。
+  // 别的会话在跑不影响这里（每条会话各有自己的流）。
   async function send() {
     const msg = input.trim();
-    if (!msg && pendingAttachments.length === 0) return;
-    // 运行中再发（025）：并入正在跑的那一轮（模型下一步就看到，原轮不打断），
-    // 本页不另起助手气泡——回答会接在当前这条流里
-    if (streaming) return steer(msg);
-    streaming = true;
+    const atts = [...pendingAttachments];
+    if (!msg && atts.length === 0) return;
+    const key = curKey();
+    input = '';
+    pendingAttachments = [];
+    if (streams[key]) {
+      queueOut(key, msg, atts);
+      return;
+    }
+    await deliver(key, msg, atts);
+  }
+
+  // 排队：先显示成「排队中」气泡，当前这一轮结束后自动按序发出
+  function queueOut(key, text, atts) {
+    const item = { id: nextId(), text, atts };
+    outbox = { ...outbox, [key]: [...(outbox[key] || []), item] };
+    pushMsg(key, { id: item.id, role: 'user', content: text, attachments: atts, queued: true });
+  }
+
+  // 把「已经上屏的那条用户气泡」转成排队（服务端说这个会话在跑时用；不新增气泡）
+  function markQueued(key, text, atts) {
+    const arr = sessionMsgs[key] || [];
+    const hit = [...arr].reverse().find((m) => m.role === 'user' && m.content === text && !m.queued);
+    const id = hit ? hit.id : nextId();
+    updMsgs(key, (a) =>
+      hit ? a.map((m) => (m.id === id ? { ...m, queued: true } : m)) : [...a, { id, role: 'user', content: text, attachments: atts, queued: true }]
+    );
+    outbox = { ...outbox, [key]: [...(outbox[key] || []), { id, text, atts }] };
+    return id;
+  }
+
+  // 真正发一轮（key 会话；调用时该会话没在跑）。返回 false = 这条没送进服务端。
+  async function deliver(key, text, atts, opts = {}) {
+    const effectiveMsg = text || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
+    if (!effectiveMsg) return true;
     // 发送时收起所有输入区菜单
     plusMenuOpen = false;
     abilityMenuOpen = false;
     skillMenuOpen = false;
     modelMenuOpen = false;
-    controller = new AbortController();
-    const effectiveMsg = msg || (pendingAttachments.length > 0 ? '请查看分析附带的媒体文件' : '');
     // 新会话：顶栏标题即时取首条消息（与后端初始标题一致），不等标题生成
-    if (!currentSessionId && effectiveMsg) {
-      currentTitle = effectiveMsg.slice(0, 50);
-    }
-    const sendingAttachments = [...pendingAttachments];
-    pendingAttachments = [];
-    const history = messages
-      .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
+    if (!currentSessionId && effectiveMsg) currentTitle = effectiveMsg.slice(0, 50);
+    const history = (sessionMsgs[key] || [])
+      .filter((m) => (m.role === 'user' && m.content && !m.queued) || (m.role === 'assistant' && m.content && !m.streaming))
       .map((m) => ({ role: m.role, content: m.content }));
     history.push({ role: 'user', content: effectiveMsg });
-    messages = [
-      ...messages,
-      { id: nextId(), role: 'user', content: effectiveMsg, attachments: sendingAttachments },
-      { id: nextId(), role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
-    ];
-    input = '';
-    const asstId = seq;
-    const patch = (fn) => {
-      messages = messages.map((m) => (m.id === asstId ? fn({ ...m }) : m));
-    };
+    const asstId = nextId();
+    // 出队 / 立即发送的那条：原地把「排队中」气泡转正（保持顺序），不新增用户气泡
+    const hasBubble = opts.bubbleId && (sessionMsgs[key] || []).some((m) => m.id === opts.bubbleId);
+    updMsgs(key, (a) => [
+      ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer } : m)),
+      ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: effectiveMsg, attachments: atts }]),
+      { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
+    ]);
+    const ac = new AbortController();
+    streams = { ...streams, [key]: { asstId, controller: ac } };
+    syncCur();
+    const stream = streams[key];
+    let skey = key; // 会话 id 到手后 key 会从 '@new' 变成真 id
+    const patch = (fn) => patchAsst(skey, stream.asstId, fn);
+    let ok = false;
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -1625,13 +1710,14 @@
         body: JSON.stringify({
           messages: history,
           message: effectiveMsg,
-          attachments: sendingAttachments.length > 0 ? sendingAttachments.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
+          attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
           model,
           base_url: baseUrl,
           approval_mode: approvalMode,
-          session_id: currentSessionId || '',
+          session_id: skey === '@new' ? '' : skey,
+          steer: opts.steer === true,
         }),
-        signal: controller.signal,
+        signal: ac.signal,
       });
       if (!res.ok) {
         // 服务端拒绝（如 409 同会话并发）：带出服务端文案，不伪装成连接错误
@@ -1643,6 +1729,7 @@
         err.busy = res.status === 409;
         throw err;
       }
+      ok = true;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -1659,7 +1746,27 @@
             try {
               const d = JSON.parse(line.slice(6));
               if (d.session) {
-                currentSessionId = d.session;
+                // 新会话：服务端分配了 id → 缓冲 / 流 / 队列挪到真 id 下（显示中的话直接切过去）
+                rekey(skey, d.session);
+                skey = d.session;
+              } else if (d.queued) {
+                // 服务端判成「这个会话在跑」（别的窗口刚起了一轮）：本条转排队、撤掉空回答气泡
+                updMsgs(skey, (a) => a.filter((m) => m.id !== stream.asstId));
+                markQueued(skey, effectiveMsg, atts);
+              } else if (d.steered) {
+                // 这条已被并进正在跑的一轮（引导）：本页不再给它单开回答气泡
+                updMsgs(skey, (a) => a.filter((m) => m.id !== stream.asstId));
+              } else if (d.turn) {
+                // 排队的消息开始跑了：气泡从「排队中」转正式 + 新开一个回答气泡
+                const adds = [];
+                for (const m of d.turn.messages || []) {
+                  const q = (sessionMsgs[skey] || []).find((x) => x.queued && x.role === 'user' && x.content === m.content);
+                  if (q) updMsgs(skey, (a) => a.map((x) => (x.id === q.id ? { ...x, queued: false } : x)));
+                  else adds.push({ id: nextId(), role: 'user', content: m.content });
+                }
+                const nid = nextId();
+                stream.asstId = nid;
+                updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], streaming: true }]);
               } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
               // 降级链换渠道重试：丢掉本步已推的半截内容（长度由服务端按 UTF-16 码元数给出）
@@ -1670,13 +1777,13 @@
                   thinking: (m.thinking || '').slice(0, Math.max(0, (m.thinking || '').length - (d.reset.reasoning || 0))),
                 }));
               else if (d.steer) {
-                // 运行中追加的消息（025）：别的窗口发的在这里补用户气泡；本页自己发过的已补过
+                // 「立即发送（引导）」的消息并入了本轮：别的窗口发的在这里补气泡；本页自己发过的已补过
                 const add = [];
                 for (const m of d.steer.messages || []) {
                   if (localSteers.length > 0 && localSteers[0] === m.content) localSteers.shift();
                   else add.push({ id: nextId(), role: 'user', content: m.content });
                 }
-                if (add.length) messages = [...messages, ...add];
+                if (add.length) updMsgs(skey, (a) => [...a, ...add]);
               } else if (d.tool_call)
                 patch((m) => ({
                   ...m,
@@ -1713,14 +1820,11 @@
                     : m
                 );
               else if (d.checkpoint) {
-                messages = [
-                  ...messages,
-                  { id: nextId(), role: 'cp', cp: d.checkpoint },
-                ];
+                pushMsg(skey, { id: nextId(), role: 'cp', cp: d.checkpoint });
                 refreshDock(); // 改动条数据更新
               }
               else if (d.notice)
-                messages = [...messages, { id: nextId(), role: 'system', content: '[通知] ' + d.notice }];
+                pushMsg(skey, { id: nextId(), role: 'system', content: '[通知] ' + d.notice });
               else if (d.title) {
                 loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
                 if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
@@ -1734,13 +1838,13 @@
                 };
               } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
-                messages = [...messages, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` }];
+                pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
               } else if (d.error) {
                 patch((m) => ({ ...m, streaming: false }));
-                messages = [...messages, { id: nextId(), role: 'error', content: d.error }];
+                pushMsg(skey, { id: nextId(), role: 'error', content: d.error });
               } else if (d.cancelled) {
                 patch((m) => ({ ...m, streaming: false }));
-                messages = [...messages, { id: nextId(), role: 'system', content: '已停止' }];
+                pushMsg(skey, { id: nextId(), role: 'system', content: '已停止' });
               } else if (d.done) {
                 patch((m) => ({ ...m, streaming: false }));
               }
@@ -1752,63 +1856,56 @@
       }
     } catch (e) {
       if (e.name !== 'AbortError') {
-        messages = [...messages, { id: nextId(), role: 'error', content: e.busy ? e.message : `[连接错误] ${e}` }];
+        pushMsg(skey, { id: nextId(), role: 'error', content: e.busy ? e.message : `[连接错误] ${e}` });
       }
       // 停止后把还挂着的审批框标为失效，避免界面停在「等待决定」
-      messages = messages.map((m) =>
-        m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m
+      updMsgs(skey, (a) =>
+        a.map((m) => (m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m))
       );
       patch((m) => ({ ...m, streaming: false }));
     } finally {
-      streaming = false;
-      controller = null;
+      // 这条流结束（本会话可再次发送）；只清本会话的流登记，别的会话在跑不受影响
+      const nextStreams = { ...streams };
+      delete nextStreams[skey];
+      streams = nextStreams;
       localSteers = [];
+      syncCur();
       loadSessions(); // 刷新会话列表（新会话出现/标题更新）
+      // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
+      const q = outbox[skey] || [];
+      if (q.length > 0 && !streams[skey]) {
+        const [item, ...rest] = q;
+        outbox = { ...outbox, [skey]: rest };
+        deliver(skey, item.text, item.atts, { bubbleId: item.id });
+      }
     }
+    return ok;
   }
 
-  // 运行中追加消息（025）：同会话再发 → 服务端排进正在跑的那一轮，
-  // 模型下一个决策点就能看到；回答接在当前这条流里，不新开一条。
-  async function steer(msg) {
-    if (pendingAttachments.length > 0) {
-      messages = [
-        ...messages,
-        { id: nextId(), role: 'error', content: '运行中暂不支持追加带附件的消息：点上方的停止，或等这一轮跑完再发。' },
-      ];
+  // 「立即发送」（027）：把排队的这条马上并进正在跑的那一轮——不打断对话，
+  // 模型下一个决策点就看到（引导当前回答）。跑完了/没送进去会自动退回队列。
+  async function sendNow(itemId) {
+    const key = curKey();
+    const item = (outbox[key] || []).find((x) => x.id === itemId);
+    if (!item) return;
+    if (item.atts && item.atts.length > 0) {
+      pushMsg(key, { id: nextId(), role: 'error', content: '「立即发送」暂不支持带附件的消息：这一轮结束后会自动发出去。' });
       return;
     }
-    if (!msg) return;
-    const history = messages
-      .filter((m) => (m.role === 'user' && m.content) || (m.role === 'assistant' && m.content && !m.streaming))
-      .map((m) => ({ role: m.role, content: m.content }));
-    history.push({ role: 'user', content: msg });
-    messages = [...messages, { id: nextId(), role: 'user', content: msg }];
-    localSteers.push(msg);
-    input = '';
-    try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: history,
-          message: msg,
-          model,
-          base_url: baseUrl,
-          approval_mode: approvalMode,
-          session_id: currentSessionId || '',
-        }),
-      });
-      if (!res.ok) {
-        let detail = '';
-        try {
-          detail = (await res.json()).error || '';
-        } catch {}
-        throw new Error(detail || `HTTP ${res.status}`);
-      }
-      await res.text(); // 服务端回执很短（session/notice/done），内容本身在跑的那条流里
-    } catch (e) {
-      localSteers = localSteers.filter((t) => t !== msg);
-      messages = [...messages, { id: nextId(), role: 'error', content: `追加消息失败：${e.message || e}` }];
+    // 先出队（免得本轮结束时又自动发一遍）
+    outbox = { ...outbox, [key]: (outbox[key] || []).filter((x) => x.id !== itemId) };
+    if (!streams[key]) {
+      // 这一轮已经跑完了：按正常一轮发出去
+      await deliver(key, item.text, item.atts, { bubbleId: item.id });
+      return;
+    }
+    localSteers.push(item.text);
+    const ok = await deliver(key, item.text, [], { bubbleId: item.id, steer: true });
+    if (!ok) {
+      // 没送进服务端：退回队列，等这一轮结束自动发
+      localSteers = localSteers.filter((t) => t !== item.text);
+      outbox = { ...outbox, [key]: [item, ...(outbox[key] || [])] };
+      updMsgs(key, (a) => a.map((m) => (m.id === item.id ? { ...m, queued: true, steered: false } : m)));
     }
   }
 
@@ -1863,7 +1960,17 @@
   // 打开会话：后端会在其所属项目与当前项目不同时先切过去（切会话 = 回到那个项目），
   // 所以走 /api/sessions/open 而不是只读的 /api/session。
   async function loadSession(id) {
-    if (streaming) return;
+    // 027：切会话不再被别的会话的运行挡住（不同对话互不影响）；
+    // 该会话自己有在跑的流 → 直接用本地缓冲（服务端文件此刻还没有最新内容）
+    if (streams[id]) {
+      currentSessionId = id;
+      currentTitle = sessions.find((x) => x.id === id)?.title ?? currentTitle;
+      syncCur();
+      resetCtxUsage();
+      dockCp = null;
+      refreshDock();
+      return;
+    }
     try {
       const r = await fetch('/api/sessions/open', {
         method: 'POST',
@@ -1876,7 +1983,8 @@
       }
       currentSessionId = id;
       currentTitle = r.title || (sessions.find((x) => x.id === id)?.title ?? '');
-      messages = rebuildFromSession(r.messages || []);
+      sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };
+      syncCur();
       resetCtxUsage();
       dockCp = null;
       if (r.warning) settingsMsg = r.warning;
@@ -1894,17 +2002,18 @@
   // 新建会话：立即在后端落一条空会话（侧栏当前项目下马上可见），首条消息写进同一条。
   // 同一项目已有一条空会话时后端会复用，连点不会堆出一排。
   async function startNewSession() {
-    if (streaming) return;
+    if (streams['@new']) return; // 还没落 id 的新会话正在跑：等它拿到 id 再说
     currentSessionId = null;
     currentTitle = '';
     dockCp = null;
-    messages = [];
+    sessionMsgs = { ...sessionMsgs, '@new': [] };
+    syncCur();
     resetCtxUsage();
     apiTotals = { prompt: 0, cached: 0 };
     try {
       const r = await fetch('/api/sessions/new', { method: 'POST' }).then((r) => r.json());
       if (r.ok && r.id) {
-        currentSessionId = r.id;
+        rekey('@new', r.id);
         currentTitle = r.title || '';
         if (workspace) {
           // 新会话就在当前项目下：展开该项目，马上能看到这条空会话
@@ -2051,8 +2160,9 @@
 
   async function switchProject(path) {
     if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) return;
-    if (streaming) {
-      settingsMsg = '正在流式输出，稍后再切换项目';
+    if (Object.keys(streams).length > 0) {
+      // 切项目会重置所有会话缓冲，等所有会话跑完再切
+      settingsMsg = '有会话正在运行，稍后再切换项目';
       return;
     }
     await applyWorkspace(path);
@@ -2220,17 +2330,14 @@
         body: JSON.stringify({ id: cp.id }),
       });
       const d = await r.json();
-      messages = [
-        ...messages,
-        {
-          id: nextId(),
-          role: 'system',
-          content: d.ok ? `已撤销：${cp.files} 个文件恢复到任务开始前` : `撤销失败：${d.error}`,
-        },
-      ];
+      pushMsg(curKey(), {
+        id: nextId(),
+        role: 'system',
+        content: d.ok ? `已撤销：${cp.files} 个文件恢复到任务开始前` : `撤销失败：${d.error}`,
+      });
       refreshDock(); // 撤销后改动数变化，刷新钉条
     } catch (e) {
-      messages = [...messages, { id: nextId(), role: 'error', content: `[撤销请求失败] ${e}` }];
+      pushMsg(curKey(), { id: nextId(), role: 'error', content: `[撤销请求失败] ${e}` });
     }
   }
 
@@ -2270,16 +2377,13 @@
     try {
       const r = await fetch('/api/handoff', { method: 'POST' });
       const d = await r.json();
-      messages = [
-        ...messages,
-        {
-          id: nextId(),
-          role: 'system',
-          content: d.ok ? `交接文档已生成：${d.path}` : `HANDOFF 生成失败：${d.error}`,
-        },
-      ];
+      pushMsg(curKey(), {
+        id: nextId(),
+        role: 'system',
+        content: d.ok ? `交接文档已生成：${d.path}` : `HANDOFF 生成失败：${d.error}`,
+      });
     } catch (e) {
-      messages = [...messages, { id: nextId(), role: 'error', content: `[HANDOFF 请求失败] ${e}` }];
+      pushMsg(curKey(), { id: nextId(), role: 'error', content: `[HANDOFF 请求失败] ${e}` });
     }
   }
 
@@ -2294,8 +2398,8 @@
     });
   }
   function patchMessageApproval(id, approved) {
-    messages = messages.map((m) =>
-      m.approval && m.approval.id === id ? { ...m, approval: { ...m.approval, decided: approved } } : m
+    updMsgs(curKey(), (a) =>
+      a.map((m) => (m.approval && m.approval.id === id ? { ...m, approval: { ...m.approval, decided: approved } } : m))
     );
   }
 
@@ -2813,7 +2917,7 @@
         </button>
       </div>
 
-      <button class="new-chat" on:click={startNewSession} disabled={streaming}>
+      <button class="new-chat" on:click={startNewSession}>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8" stroke-linecap="round"/></svg>
         新会话
       </button>
@@ -2830,7 +2934,7 @@
           <button class="icon-btn" class:on={viewMenuOpen} title="切换视图" on:click={() => (viewMenuOpen = !viewMenuOpen)}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="3.5" y1="6" x2="9.5" y2="6"/><line x1="14.5" y1="6" x2="20.5" y2="6"/><circle cx="12" cy="6" r="2"/><line x1="3.5" y1="12" x2="4" y2="12"/><line x1="8" y1="12" x2="20.5" y2="12"/><circle cx="6" cy="12" r="2"/><line x1="3.5" y1="18" x2="11.5" y2="18"/><line x1="16.5" y1="18" x2="20.5" y2="18"/><circle cx="14" cy="18" r="2"/></svg>
           </button>
-          <button class="icon-btn" title="添加项目" on:click={addProject} disabled={streaming}>
+          <button class="icon-btn" title="添加项目" on:click={addProject}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.2v5.8a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3.2l1.8 2H18a2 2 0 0 1 2 2v.2"/><line x1="17" y1="2.5" x2="17" y2="8"/><line x1="14.2" y1="5.2" x2="19.8" y2="5.2"/></svg>
           </button>
           <button class="icon-btn" title="时间线（最近任务的事件流）" on:click={openTrace}>
@@ -3058,6 +3162,14 @@
               {#if m.content}
                 <div class="user-text">{m.content}</div>
               {/if}
+              {#if m.queued}
+                <div class="queued-row">
+                  <span class="queued-badge">排队中 · 这一轮结束后自动发送</span>
+                  <button class="queued-send" on:click={() => sendNow(m.id)} title="并进正在跑的这一轮（引导当前回答，不打断）">立即发送</button>
+                </div>
+              {:else if m.steered}
+                <div class="queued-row"><span class="queued-badge steered">已引导当前回答</span></div>
+              {/if}
             </div>
           </div>
         {:else if m.role === 'assistant'}
@@ -3223,7 +3335,9 @@
           rows="1"
           bind:this={composerInputEl}
           bind:value={input}
-          placeholder="输入消息，Enter 发送，Shift+Enter 换行（支持粘贴截图、拖拽文件）"
+          placeholder={streaming
+            ? '当前会话运行中：Enter 发送会先排队（本轮结束后自动发出）；想马上引导当前回答，点气泡上的「立即发送」'
+            : '输入消息，Enter 发送，Shift+Enter 换行（支持粘贴截图、拖拽文件）'}
           on:keydown={handleKey}
           on:input={autoRows}
           on:paste={handlePaste}
@@ -3241,7 +3355,6 @@
                   abilityMenuOpen = false;
                   skillMenuOpen = false;
                 }}
-                disabled={streaming}
               ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
               {#if plusMenuOpen}
                 <div class="bar-dropdown">
@@ -3306,7 +3419,6 @@
               class="icon-btn"
               title="添加多模态媒体附件（图片/视频/音频）"
               on:click={() => fileInput && fileInput.click()}
-              disabled={streaming}
             >
               <svg class="att-ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>
             </button>
@@ -3486,9 +3598,8 @@
             </div>
             {#if streaming}
               <button class="send-btn stop" on:click={stop} title="停止" aria-label="停止"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg></button>
-            {:else}
-              <button class="send-btn" on:click={send} disabled={!input.trim()} title="发送（Enter）" aria-label="发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
             {/if}
+            <button class="send-btn" on:click={send} disabled={!input.trim()} title={streaming ? '发送（进入队列，这一轮结束后自动发出）' : '发送（Enter）'} aria-label="发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
           </div>
         </div>
       </div>
@@ -6035,6 +6146,35 @@
   }
   .msg.user {
     justify-content: flex-end;
+  }
+  /* 排队中的消息（027）：气泡里带「立即发送」按钮——并进正在跑的那一轮，引导它的回答 */
+  .queued-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--line, rgba(128, 128, 128, 0.35));
+  }
+  .queued-badge {
+    font-size: 12px;
+    opacity: 0.75;
+  }
+  .queued-badge.steered {
+    color: var(--accent, #4a9);
+  }
+  .queued-send {
+    font-size: 12px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--accent, #4a9);
+    color: var(--accent, #4a9);
+    background: transparent;
+    cursor: pointer;
+  }
+  .queued-send:hover {
+    background: color-mix(in srgb, var(--accent, #4a9) 14%, transparent);
   }
   .msg.assistant {
     justify-content: flex-start;
