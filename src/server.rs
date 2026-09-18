@@ -312,6 +312,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/mcp", get(get_mcp).post(post_mcp))
         .route("/api/version", get(get_version))
         .route("/api/ext", get(list_extensions))
+        .route("/api/ext/toggle", post(toggle_extension))
+        .route("/api/workspace/file", post(write_workspace_file))
         // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
         // 尾斜杠那条约等于目录首页：不带它请求会掉进 SPA 兜底，把整个应用套进 iframe
         .route("/ui-ext/{name}", get(ui_ext_entry))
@@ -2343,33 +2345,101 @@ async fn get_version() -> Json<Value> {
 }
 
 /// GET /api/ext —— 组件总线 v0：UI 扩展清单（应用根内置 + 当前工作区自带）。
-async fn list_extensions() -> Json<Value> {
+async fn list_extensions(State(state): State<AppState>) -> Json<Value> {
+    let disabled = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .disabled_extensions
+        .clone();
     Json(json!({
-        "extensions": crate::plugin::ui::scan(),
+        "extensions": crate::plugin::ui::scan(&disabled),
         "dir": crate::plugin::ui::DIR,
         "app_dir": crate::config::app_root().join(crate::plugin::ui::DIR).display().to_string(),
         "workspace_dir": crate::tools::workspace_root().join(crate::plugin::ui::DIR).display().to_string(),
     }))
 }
 
+/// POST /api/workspace/file —— UI 扩展写工作区文件（P17 组件总线写操作；宿主侧已按 manifest
+/// 权限 + 用户确认把关）。边界与工具的 write_file 一致：工作区内、512KB、原子写。
+async fn write_workspace_file(Json(req): Json<Value>) -> (StatusCode, Json<Value>) {
+    let path = req.get("path").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let content = req.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" })));
+    }
+    if content.len() > 512 * 1024 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "内容过大（上限 512KB）" })));
+    }
+    match crate::tools::write_workspace_relative(&path, &content) {
+        Ok(bytes) => {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "ext.workspace_write", "path": path, "bytes": bytes }),
+            );
+            (StatusCode::OK, Json(json!({ "ok": true, "path": path, "bytes": bytes })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    }
+}
+
+/// POST /api/ext/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
+async fn toggle_extension(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 name" })));
+    }
+    let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
+    s.disabled_extensions.retain(|d| d != &name);
+    if !enabled {
+        s.disabled_extensions.push(name.clone());
+    }
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    observability::event(
+        EventType::State,
+        json!({ "kind": "ext.toggle", "name": name, "enabled": enabled }),
+    );
+    let list = crate::plugin::ui::scan(&s.disabled_extensions);
+    (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+}
+
 /// GET /ui-ext/{name} —— 扩展入口页（entry 由 manifest 指定）。
-async fn ui_ext_entry(AxumPath(name): AxumPath<String>) -> Response {
-    serve_ext(&name, "")
+async fn ui_ext_entry(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
+    serve_ext(&state, &name, "")
 }
 
 /// GET /ui-ext/{name}/{*path} —— 扩展目录内的静态资源。
-async fn ui_ext_asset(AxumPath((name, path)): AxumPath<(String, String)>) -> Response {
-    serve_ext(&name, &path)
+async fn ui_ext_asset(
+    State(state): State<AppState>,
+    AxumPath((name, path)): AxumPath<(String, String)>,
+) -> Response {
+    serve_ext(&state, &name, &path)
 }
 
-/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）。
-fn serve_ext(name: &str, rel: &str) -> Response {
+/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用的扩展也 404。
+fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
+    let disabled = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .disabled_extensions
+        .clone();
+    if disabled.iter().any(|d| d == name) {
+        return (StatusCode::NOT_FOUND, "扩展已停用").into_response();
+    }
+    let entry = crate::plugin::ui::scan(&disabled)
+        .into_iter()
+        .find(|e| e.name == name)
+        .map(|e| e.entry);
     let rel = if rel.trim().is_empty() {
-        crate::plugin::ui::scan()
-            .into_iter()
-            .find(|e| e.name == name)
-            .map(|e| e.entry)
-            .unwrap_or_else(|| "index.html".to_string())
+        entry.unwrap_or_else(|| "index.html".to_string())
     } else {
         rel.to_string()
     };

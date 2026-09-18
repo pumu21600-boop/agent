@@ -51,22 +51,30 @@ pub struct UiExt {
     /// manifest 是否可用（false 时 error 有原因）
     pub ok: bool,
     pub error: Option<String>,
+    /// P17：启用状态（设置里的停用名单；停用的扩展不加载、不参与界面插槽与数据桥）
+    pub enabled: bool,
+    /// P17：宿主界面插槽声明（manifest `ui: [{slot, title}]`；v1 支持 toolbar / composer）
+    pub ui: Vec<serde_json::Value>,
+    /// P17：写操作权限声明（manifest `permissions: ["composer.insert", "workspace.write"]`）
+    /// ——宿主只认这里声明过的动作，没声明的请求一律拒绝
+    pub permissions: Vec<String>,
 }
 
 /// 扫描全部扩展（内置 + 当前工作区；工作区同名覆盖内置，顺序稳定）。
-pub fn scan() -> Vec<UiExt> {
+/// `disabled`：设置里的停用名单（停用的仍在清单里，只是 `enabled=false`）。
+pub fn scan(disabled: &[String]) -> Vec<UiExt> {
     let app = crate::config::app_root();
     let ws = crate::tools::workspace_root();
     let mut out: Vec<UiExt> = Vec::new();
-    collect(&app.join(DIR), "app", &mut out);
+    collect(&app.join(DIR), "app", &mut out, disabled);
     if ws != app {
-        collect(&ws.join(DIR), "workspace", &mut out);
+        collect(&ws.join(DIR), "workspace", &mut out, disabled);
     }
     out
 }
 
 /// 扫描单个根目录：同名后者覆盖前者（工作区覆盖内置）。
-fn collect(root: &Path, source: &str, out: &mut Vec<UiExt>) {
+fn collect(root: &Path, source: &str, out: &mut Vec<UiExt>, disabled: &[String]) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     let mut dirs: Vec<PathBuf> = rd
         .flatten()
@@ -76,7 +84,7 @@ fn collect(root: &Path, source: &str, out: &mut Vec<UiExt>) {
     dirs.sort();
     for dir in dirs {
         let Some(name) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else { continue };
-        let mut ext = load_one(&dir, &name, source);
+        let mut ext = load_one(&dir, &name, source, disabled);
         // 工作区同名者顶掉内置：给幸存的那个打标记（界面提示"覆盖内置"）
         if source == "workspace" && out.iter().any(|e| e.name == name) {
             ext.shadowed = true;
@@ -87,7 +95,7 @@ fn collect(root: &Path, source: &str, out: &mut Vec<UiExt>) {
 }
 
 /// 读一个扩展目录的 manifest，缺文件/字段不合法都记成 ok=false + error。
-fn load_one(dir: &Path, name: &str, source: &str) -> UiExt {
+fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt {
     let mut e = UiExt {
         name: name.to_string(),
         title: name.to_string(),
@@ -99,6 +107,9 @@ fn load_one(dir: &Path, name: &str, source: &str) -> UiExt {
         dir: dir.display().to_string(),
         ok: false,
         error: None,
+        enabled: !disabled.iter().any(|d| d == name),
+        ui: Vec::new(),
+        permissions: Vec::new(),
     };
     if !safe_segment(name) {
         e.error = Some("目录名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into());
@@ -130,6 +141,22 @@ fn load_one(dir: &Path, name: &str, source: &str) -> UiExt {
     }
     if let Some(en) = v.get("entry").and_then(|x| x.as_str()) {
         e.entry = en.to_string();
+    }
+    // P17：界面插槽与写操作权限（只认白名单里的插槽名与动作名）
+    if let Some(ui) = v.get("ui").and_then(|x| x.as_array()) {
+        e.ui = ui
+            .iter()
+            .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer")))
+            .cloned()
+            .collect();
+    }
+    if let Some(perms) = v.get("permissions").and_then(|x| x.as_array()) {
+        e.permissions = perms
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| matches!(*p, "composer.insert" | "workspace.write" | "bus.publish" | "notify"))
+            .map(str::to_string)
+            .collect();
     }
     // 入口必须真实存在且不出目录
     match resolve_in(dir, &e.entry) {
@@ -244,7 +271,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(d.join("index.html"), "<html></html>").unwrap();
-        let e = load_one(&d, "panel", "workspace");
+        let e = load_one(&d, "panel", "workspace", &[]);
         assert!(e.ok, "应加载成功: {e:?}");
         assert_eq!(e.title, "记忆看板");
         assert_eq!(e.version, "1.2.3");
@@ -252,7 +279,7 @@ mod tests {
 
         // 入口不存在 → 不 ok 且带原因（不静默）
         std::fs::write(d.join("manifest.json"), r#"{"entry":"missing.html"}"#).unwrap();
-        let bad = load_one(&d, "panel", "app");
+        let bad = load_one(&d, "panel", "app", &[]);
         assert!(!bad.ok);
         assert!(bad.error.is_some());
         let _ = std::fs::remove_dir_all(&root);
@@ -275,8 +302,8 @@ mod tests {
         std::fs::write(only_ws.join("index.html"), "x").unwrap();
 
         let mut out: Vec<UiExt> = Vec::new();
-        collect(&app, "app", &mut out);
-        collect(&ws, "workspace", &mut out);
+        collect(&app, "app", &mut out, &[]);
+        collect(&ws, "workspace", &mut out, &[]);
         assert_eq!(out.len(), 2, "同名只留一份（工作区覆盖内置）");
         let board = out.iter().find(|e| e.name == "board").unwrap();
         assert_eq!(board.title, "工作区看板");

@@ -270,6 +270,10 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
 
+    /// P17：停用的 UI 扩展名单（ui-ext 目录名；停用的不加载、不参与界面插槽与数据桥）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_extensions: Vec<String>,
+
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
     pub keys: BTreeMap<String, String>,

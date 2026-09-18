@@ -2734,7 +2734,7 @@
   let extInfo = { app_dir: '', workspace_dir: '' };
   let extOpen = false;
   let extCurrent = null; // 当前打开的扩展（{ name, title, ... }）
-  let extFrame = null; // iframe 元素
+  let extFrame = null; // 面板里那个 iframe 元素（当前打开的扩展）
   let extMsg = '';
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
@@ -2750,41 +2750,108 @@
     }
   }
 
-  function openExt(e) {
+  // 已启用的扩展（停用的不加载、不给按钮）
+  $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
+  // 声明了 toolbar 插槽的扩展 → 顶栏按钮
+  $: slotExts = enabledExts.flatMap((e) =>
+    (e.ui || []).filter((u) => u.slot === 'toolbar').map((u) => ({ ext: e, slot: u }))
+  );
+  // 面板打开时待投递的插槽事件（iframe 还没 load 完就先排队）
+  let extPendingMsgs = [];
+
+  function openExt(e, slotEvent) {
+    // 面板此刻是不是已经开着同一个扩展（决定插槽事件直接投还是排队等面板 iframe load）
+    const wasOpenSame = extOpen && extCurrent && extCurrent.name === e.name;
     extCurrent = e;
     extMsg = '';
     extOpen = true;
     // 与右侧产物面板互斥，避免三个面板挤在一起
     rightPanelOpen = false;
     terminalOpen = false;
+    if (slotEvent) {
+      const msg = { type: 'agent:slot', slot: slotEvent.slot, id: slotEvent.id || '', title: slotEvent.title || '' };
+      // 注意：打开的瞬间后台那个常驻 iframe 会被卸载，别往里投——排队等**面板** iframe load 时投
+      if (wasOpenSame && extFrameEls[e.name] && extFrameEls[e.name].contentWindow) postToName(e.name, msg);
+      else extPendingMsgs.push({ name: e.name, msg });
+    }
   }
 
-  function extInitPayload() {
+  /// 面板 iframe 加载完成：登记元素 + 发 init + 补投排队中的插槽事件
+  function onExtFrameLoad(name) {
+    // 面板那个 iframe 绑的是 extFrame，这里补登记：否则 postToName 找不到它，
+    // init / 插槽事件都投不进去（后台 iframe 此时已经卸载）
+    if (extFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = extFrame;
+    const ext = extList.find((e) => e.name === name);
+    postToName(name, { type: 'agent:init', payload: extInitPayload(ext) });
+    extPendingMsgs = extPendingMsgs.filter((p) => {
+      if (p.name !== name) return true;
+      postToName(name, p.msg);
+      return false;
+    });
+  }
+
+  /// 扩展插槽按钮点击：打开该扩展面板并把事件交给它（面板里自己决定做什么）
+  function clickSlot(entry) {
+    openExt(entry.ext, entry.slot);
+  }
+
+  /// 扩展启用/停用（P17）：写设置 + 刷新清单
+  async function toggleExt(e) {
+    try {
+      const r = await fetch('/api/ext/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: e.name, enabled: e.enabled === false }),
+      }).then((r) => r.json());
+      if (r.extensions) extList = r.extensions;
+      if (e.enabled !== false && extCurrent && extCurrent.name === e.name) extOpen = false; // 停用后关面板
+    } catch (err) {
+      extMsg = `切换失败: ${err.message || err}`;
+    }
+  }
+
+  function extInitPayload(ext) {
     return {
       version: appVersion?.version || '',
       root: appVersion?.root || '',
       theme: themeMode,
       sessionId: currentSessionId,
       title: displayTitle,
+      // P17：告诉扩展「你是谁」（权限 / 插槽声明它自己在 manifest 里写）
+      ext: ext ? { name: ext.name, title: ext.title, permissions: ext.permissions || [] } : null,
     };
   }
 
-  function postToExt(msg) {
-    if (extFrame && extFrame.contentWindow) extFrame.contentWindow.postMessage(msg, '*');
+  /// 扩展 iframe 元素表：面板里那个 + 后台常驻的那些（扩展间通信要它们都活着）。
+  let extFrameEls = {};
+  function extWindowName(win) {
+    for (const [name, el] of Object.entries(extFrameEls)) {
+      if (el && el.contentWindow === win) return name;
+    }
+    return null;
+  }
+  function postToName(name, msg) {
+    const el = extFrameEls[name];
+    if (el && el.contentWindow) el.contentWindow.postMessage(msg, '*');
   }
 
-  /// 扩展 → 宿主：只读白名单。任何写操作都不在这里（v0 只有只读桥）。
+  /// 扩展 → 宿主：只读白名单 + P17 写操作。写操作按 manifest 声明的 permissions 放行，
+  /// 没声明一律拒；写工作区文件额外弹一次确认（宿主替扩展问）。
   async function onExtMessage(ev) {
-    if (!extFrame || ev.source !== extFrame.contentWindow) return; // 只认自己那个 iframe
+    const from = extWindowName(ev.source);
+    if (!from) return; // 只认我们挂出去的扩展 iframe
+    const ext = extList.find((e) => e.name === from) || {};
+    if (ext.enabled === false) return; // 停用的扩展不服务
+    const perms = ext.permissions || [];
     const d = ev.data || {};
     if (d.type === 'agent:hello') {
-      postToExt({ type: 'agent:init', payload: extInitPayload() });
+      postToName(from, { type: 'agent:init', payload: extInitPayload(ext) });
       return;
     }
     if (d.type !== 'agent:request') return;
     const id = d.id;
     const params = d.params || {};
-    const reply = (ok, result) => postToExt({ type: 'agent:response', id, ok, result });
+    const reply = (ok, result) => postToName(from, { type: 'agent:response', id, ok, result });
     const get = (url) => fetch(url, { cache: 'no-store' }).then((r) => r.json());
     try {
       switch (d.method) {
@@ -2814,6 +2881,61 @@
         case 'session.info':
           reply(true, { id: currentSessionId, title: displayTitle });
           break;
+        // —— P17 写操作（都要 manifest 里先声明权限）——
+        case 'composer.insert': {
+          if (!perms.includes('composer.insert')) return reply(false, '未声明权限 composer.insert');
+          const text = String(params.text || '');
+          input = input ? `${input}\n${text}` : text;
+          reply(true, { ok: true });
+          break;
+        }
+        case 'notify': {
+          if (!perms.includes('notify')) return reply(false, '未声明权限 notify');
+          pushMsg(curKey(), {
+            id: nextId(),
+            role: 'system',
+            content: `[${ext.title || from}] ${String(params.text || '')}`,
+          });
+          reply(true, { ok: true });
+          break;
+        }
+        case 'bus.publish': {
+          // 扩展间通信：宿主转发给其它**已启用**扩展（发布者自己不发回）
+          if (!perms.includes('bus.publish')) return reply(false, '未声明权限 bus.publish');
+          const topic = String(params.topic || '').trim();
+          if (!topic) return reply(false, '缺少 topic');
+          let delivered = 0;
+          for (const e of enabledExts) {
+            if (e.name === from) continue;
+            const el = extFrameEls[e.name];
+            if (el && el.contentWindow) {
+              el.contentWindow.postMessage(
+                { type: 'bus.message', from, topic, payload: params.payload ?? null },
+                '*'
+              );
+              delivered += 1;
+            }
+          }
+          reply(true, { delivered });
+          break;
+        }
+        case 'workspace.write': {
+          if (!perms.includes('workspace.write')) return reply(false, '未声明权限 workspace.write');
+          const path = String(params.path || '').trim();
+          const content = String(params.content ?? '');
+          if (!path) return reply(false, '缺少 path');
+          // 写工作区是敏感动作：宿主替扩展问一次用户
+          if (!confirm(`扩展「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`)) {
+            return reply(false, '用户拒绝');
+          }
+          const r = await fetch('/api/workspace/file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path, content }),
+          }).then((r) => r.json());
+          reply(!!r.ok, r.ok ? { ok: true, path: r.path, bytes: r.bytes } : r.error || '写入失败');
+          break;
+        }
         default:
           reply(false, `未知方法: ${d.method}`);
       }
@@ -3100,6 +3222,17 @@
         <div class="chat-title">{displayTitle}</div>
       </div>
       <div class="head-side">
+        <!-- P17：扩展声明的顶栏插槽（点击打开该扩展并把事件交给它） -->
+        {#each slotExts as s (s.ext.name + ':' + (s.slot.id || s.slot.slot))}
+          <button
+            class="head-btn"
+            class:active={extOpen && extCurrent && extCurrent.name === s.ext.name}
+            title={`扩展：${s.slot.title || s.ext.title}`}
+            on:click={() => clickSlot(s)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M14 17.5h7M17.5 14v7"/></svg>
+          </button>
+        {/each}
         <button
           class="head-btn"
           class:active={terminalOpen}
@@ -3704,10 +3837,24 @@
         title={extCurrent.title}
         sandbox="allow-scripts"
         src={`/ui-ext/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
-        on:load={() => postToExt({ type: 'agent:init', payload: extInitPayload() })}
+        on:load={() => onExtFrameLoad(extCurrent.name)}
       ></iframe>
     </aside>
   {/if}
+
+  <!-- P17 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
+  {#each enabledExts as e (e.name)}
+    {#if !(extOpen && extCurrent && extCurrent.name === e.name)}
+      <iframe
+        class="ext-hidden"
+        title={`扩展后台：${e.title}`}
+        sandbox="allow-scripts"
+        bind:this={extFrameEls[e.name]}
+        src={`/ui-ext/${encodeURIComponent(e.name)}/${e.entry || 'index.html'}`}
+        on:load={() => onExtFrameLoad(e.name)}
+      ></iframe>
+    {/if}
+  {/each}
 
 </div>
 
@@ -4468,10 +4615,18 @@
                   class="mcp-status"
                   title={e.shadowed ? '同名内置扩展存在，被当前工作区的这一份覆盖' : ''}
                 >{e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : '内置'}</span>
+                {#if e.enabled === false}<span class="mcp-risk">已停用</span>{/if}
                 <span class="flex-sp"></span>
-                <button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok}>打开</button>
+                <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
+                <button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>
               </div>
               {#if e.description}<div class="mcp-cmd">{e.description}</div>{/if}
+              {#if e.permissions && e.permissions.length}
+                <div class="mcp-cmd">权限：{e.permissions.join('、')}（未声明的写操作一律拒绝）</div>
+              {/if}
+              {#if e.ui && e.ui.length}
+                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}（顶栏按钮 → 扩展收到 agent:slot 事件）</div>
+              {/if}
               {#if e.error}
                 <div class="mcp-cmd">{e.error}</div>
               {:else}
@@ -5738,6 +5893,16 @@
     gap: 4px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--g3);
+  }
+  /* P17：常驻后台的扩展 iframe（扩展间通信要用；不显示但保持运行） */
+  .ext-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    border: 0;
+    opacity: 0;
+    pointer-events: none;
+    left: -9999px;
   }
   /* 021 组件总线：UI 扩展面板（iframe 插槽；与产物面板同构，但不共用滚动容器） */
   .ext-panel {

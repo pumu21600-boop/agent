@@ -247,6 +247,17 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
     }
 }
 
+/// 供服务层复用（P17 组件总线写操作）：在工作区内写一个相对路径的文件。
+/// 边界与 write_file 工具一致——越界硬拦、512KB 上限、原子写。
+pub fn write_workspace_relative(rel: &str, content: &str) -> Result<usize, String> {
+    if content.len() > MAX_FILE_BYTES {
+        return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
+    }
+    let full = resolve_in_workspace(rel, false)?;
+    crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(content.len())
+}
+
 fn cap(s: &str, max: usize) -> String {
     // P5 起工具结果统一走头尾压缩（替代旧的单向硬截断）
     crate::context::compress(s, max)

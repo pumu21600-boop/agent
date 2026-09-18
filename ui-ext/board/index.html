@@ -132,6 +132,20 @@
       <div id="hits"></div>
     </div>
 
+    <div class="card">
+      <div class="muted">P17 写操作与扩展间通信（权限在 manifest.json 里声明）：</div>
+      <div class="row">
+        <button id="b-insert">往输入框插一句</button>
+        <button id="b-notify">发一条通知</button>
+        <button id="b-bus">广播 bus 事件</button>
+      </div>
+      <div class="row">
+        <input id="wpath" value="board-note.txt" />
+        <button id="b-write">写工作区文件</button>
+      </div>
+      <div id="wout" class="muted"></div>
+    </div>
+
     <div id="err"></div>
 
     <script>
@@ -223,6 +237,53 @@
           })
           .catch(fail);
       };
+
+      // —— P17 写操作 / 插槽 / 扩展间通信 ——
+      const wout = document.getElementById('wout');
+      document.getElementById('b-insert').onclick = () =>
+        call('composer.insert', { text: '（来自「项目速览」扩展）帮我看下工作区里最近改了什么' })
+          .then(() => {
+            wout.textContent = '已插入宿主输入框';
+          })
+          .catch(fail);
+
+      document.getElementById('b-notify').onclick = () =>
+        call('notify', { text: '扩展广播：我还在呢' })
+          .then(() => {
+            wout.textContent = '已发通知（聊天流里可见）';
+          })
+          .catch(fail);
+
+      document.getElementById('b-bus').onclick = () =>
+        call('bus.publish', { topic: 'board.ping', payload: { at: Date.now() } })
+          .then((r) => {
+            wout.textContent = 'bus 事件已投递给 ' + ((r && r.delivered) || 0) + ' 个扩展';
+          })
+          .catch(fail);
+
+      document.getElementById('b-write').onclick = () => {
+        const path = document.getElementById('wpath').value.trim();
+        if (!path) return;
+        call('workspace.write', { path, content: '由「项目速览」扩展写入：' + new Date().toISOString() + '\n' })
+          .then((r) => {
+            wout.textContent = '已写入 ' + ((r && r.path) || path) + '（' + ((r && r.bytes) || 0) + ' 字节）';
+          })
+          .catch(fail);
+      };
+
+      window.addEventListener('message', (ev) => {
+        const d = ev.data || {};
+        // 宿主转发的扩展间消息 / 顶栏插槽点击
+        if (d.type === 'bus.message') {
+          wout.textContent = '收到来自 ' + d.from + ' 的 bus 事件：' + d.topic;
+        }
+        if (d.type === 'agent:slot') {
+          // 顶栏插槽点击（P17）：扩展收到事件后自己决定做什么。这里演示「插一句 + 通知」。
+          wout.textContent = '顶栏插槽被点击：' + (d.title || d.slot);
+          call('composer.insert', { text: '（项目速览扩展）帮我看下工作区里最近改了什么' }).catch(fail);
+          call('notify', { text: '顶栏插槽被点了，我插了一句话到输入框' }).catch(fail);
+        }
+      });
 
       // 握手：宿主会回 agent:init
       parent.postMessage({ type: 'agent:hello' }, '*');
