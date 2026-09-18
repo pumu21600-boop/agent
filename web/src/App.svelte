@@ -2746,7 +2746,7 @@
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
     } catch (e) {
       extList = [];
-      extMsg = `读取扩展失败: ${e.message || e}`;
+      extMsg = `读取插件失败: ${e.message || e}`;
     }
   }
 
@@ -2807,6 +2807,34 @@
       if (e.enabled !== false && extCurrent && extCurrent.name === e.name) extOpen = false; // 停用后关面板
     } catch (err) {
       extMsg = `切换失败: ${err.message || err}`;
+    }
+  }
+
+  // P18 契约 v1（027）：draft 转正（落盘持久化、来源改 user）/ 丢弃（内存即清）
+  async function promoteExt(e) {
+    try {
+      const r = await fetch('/api/ext/promote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: e.name }),
+      }).then((r) => r.json());
+      if (r.error) extMsg = `转正失败: ${r.error}`;
+      else extMsg = `已转正「${e.title || e.name}」（来源已改为 user，重启后仍在）`;
+      if (r.extensions) extList = r.extensions;
+    } catch (err) {
+      extMsg = `转正失败: ${err.message || err}`;
+    }
+  }
+
+  async function discardExt(e) {
+    if (!confirm(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`)) return;
+    try {
+      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
+      if (r.error) extMsg = `丢弃失败: ${r.error}`;
+      else extMsg = `已丢弃「${e.title || e.name}」`;
+      if (r.extensions) extList = r.extensions;
+    } catch (err) {
+      extMsg = `丢弃失败: ${err.message || err}`;
     }
   }
 
@@ -2925,7 +2953,7 @@
           const content = String(params.content ?? '');
           if (!path) return reply(false, '缺少 path');
           // 写工作区是敏感动作：宿主替扩展问一次用户
-          if (!confirm(`扩展「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`)) {
+          if (!confirm(`插件「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`)) {
             return reply(false, '用户拒绝');
           }
           const r = await fetch('/api/workspace/file', {
@@ -2934,6 +2962,38 @@
             body: JSON.stringify({ path, content }),
           }).then((r) => r.json());
           reply(!!r.ok, r.ok ? { ok: true, path: r.path, bytes: r.bytes } : r.error || '写入失败');
+          break;
+        }
+        // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
+        // 后端按插件名隔离目录（plugin_data/<name>/），内核保留区（会话/设置/记忆）不在任何
+        // 插件写路径上；键名白名单在前后端双重校验。
+        case 'storage.read': {
+          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
+          const key = String(params.key || '');
+          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { cache: 'no-store' });
+          if (r.status === 404) return reply(true, null); // 键不存在 = 空值，不算错
+          const j = await r.json();
+          reply(r.ok && j.ok, j.ok ? j.value : j.error || '读取失败');
+          break;
+        }
+        case 'storage.write': {
+          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
+          const key = String(params.key || '');
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
+          const r = await fetch('/api/plugin/data', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: from, key, value: params.value ?? null }),
+          }).then((r) => r.json());
+          reply(!!r.ok, r.ok ? { ok: true, bytes: r.bytes } : r.error || '写入失败');
+          break;
+        }
+        case 'storage.delete': {
+          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
+          const key = String(params.key || '');
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
+          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' }).then((r) => r.json());
+          reply(!!r.ok, r.ok ? { ok: true, found: r.found } : r.error || '删除失败');
           break;
         }
         default:
@@ -3227,7 +3287,7 @@
           <button
             class="head-btn"
             class:active={extOpen && extCurrent && extCurrent.name === s.ext.name}
-            title={`扩展：${s.slot.title || s.ext.title}`}
+            title={`插件：${s.slot.title || s.ext.title}`}
             on:click={() => clickSlot(s)}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M14 17.5h7M17.5 14v7"/></svg>
@@ -3824,7 +3884,7 @@
         <span class="flex-sp"></span>
         <button
           class="rp-refresh"
-          title="重新加载扩展"
+          title="重新加载插件"
           on:click={() => {
             if (extFrame) extFrame.src = extFrame.src;
           }}>↻</button
@@ -3843,11 +3903,11 @@
   {/if}
 
   <!-- P17 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
-  {#each enabledExts as e (e.name)}
+  {#each enabledExts.filter((e) => e.entry) as e (e.name)}
     {#if !(extOpen && extCurrent && extCurrent.name === e.name)}
       <iframe
         class="ext-hidden"
-        title={`扩展后台：${e.title}`}
+        title={`插件后台：${e.title}`}
         sandbox="allow-scripts"
         bind:this={extFrameEls[e.name]}
         src={`/ui-ext/${encodeURIComponent(e.name)}/${e.entry || 'index.html'}`}
@@ -3952,8 +4012,8 @@
           <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆</button>
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
-          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="8" height="8" rx="1.5"/><path d="M10 8V4.5M14 8V4.5M10 19.5V16M14 19.5V16M4.5 10H8M4.5 14H8M16 10h3.5M16 14h3.5"/></svg> 插件</button>
-          <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 扩展</button>
+          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="8" height="8" rx="1.5"/><path d="M10 8V4.5M14 8V4.5M10 19.5V16M14 19.5V16M4.5 10H8M4.5 14H8M16 10h3.5M16 14h3.5"/></svg> 运行时</button>
+          <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
@@ -4542,7 +4602,7 @@
             内置包{gitRuntime?.zip_available ? '已随发行包携带' : '未携带'}；新装 Git 后需重启服务才会重新检测。
           </div>
         </div>
-        <div class="param-hint">WASM 插件：本地纯计算沙箱（无文件/网络），trap 不连坐；工具名以 wasm__插件__函数 下发，默认常规审批档。</div>
+        <div class="param-hint">工具插件（WASM 引擎，契约 v1 后是插件的一种工具实现）：本地纯计算沙箱（无文件/网络），trap 不连坐；工具名以 wasm__插件__函数 下发，默认常规审批档。</div>
         {#if wasmPlugins.length}
           <div class="field">
             <label>已加载插件（plugins/ 目录）</label>
@@ -4598,10 +4658,11 @@
       {/if}
       {#if settingsTab === 'ext'}
         <div class="param-hint">
-          UI 扩展（组件总线 v0）：一个目录 = 一个面板。<b>应用根 ui-ext/</b> 放随包扩展，
-          <b>当前工作区 ui-ext/</b> 放项目自带扩展（同名时工作区优先）。扩展在
-          <code>sandbox="allow-scripts"</code> 的 iframe 里跑——不透明源、读不到宿主 DOM 与
-          localStorage，只能通过白名单只读接口拿数据。
+          插件（契约 v1）：一个目录 + 一份 manifest.json = 一个插件，面板与工具都在清单里声明，
+          不分类型。<b>应用根 ui-ext/</b> 放随包插件，<b>当前工作区 ui-ext/</b> 放项目自带插件
+          （同名时工作区优先）；工具文件放 <b>plugins/</b>（.wasm/.wat 或 目录 + manifest）。
+          面板在 <code>sandbox="allow-scripts"</code> 的 iframe 里跑——不透明源、读不到宿主 DOM
+          与 localStorage，只能通过白名单接口拿数据。
         </div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
         {#if extList.length}
@@ -4613,19 +4674,28 @@
                 {#if e.version}<span class="mcp-risk">v{e.version}</span>{/if}
                 <span
                   class="mcp-status"
-                  title={e.shadowed ? '同名内置扩展存在，被当前工作区的这一份覆盖' : ''}
-                >{e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : '内置'}</span>
+                  title={e.shadowed ? '同名内置插件存在，被当前工作区的这一份覆盖' : ''}
+                >{e.draft ? '草稿 · 未转正' : e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : (e.tools && e.tools.length ? '工具插件' : '内置')}</span>
+                {#if e.origin === 'model_generated'}<span class="mcp-risk">模型自产</span>{/if}
                 {#if e.enabled === false}<span class="mcp-risk">已停用</span>{/if}
                 <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
-                <button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>
+                {#if e.draft}
+                  <button class="btn primary" on:click={() => promoteExt(e)}>转正</button>
+                  <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
+                {:else}
+                  <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
+                  {#if e.entry}<button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+                {/if}
               </div>
               {#if e.description}<div class="mcp-cmd">{e.description}</div>{/if}
+              {#if e.tools && e.tools.length}
+                <div class="mcp-cmd">工具：{e.tools.map((t) => `wasm__${e.name}__${t[0] ?? t.name}`).join('、')}</div>
+              {/if}
               {#if e.permissions && e.permissions.length}
                 <div class="mcp-cmd">权限：{e.permissions.join('、')}（未声明的写操作一律拒绝）</div>
               {/if}
               {#if e.ui && e.ui.length}
-                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}（顶栏按钮 → 扩展收到 agent:slot 事件）</div>
+                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}（顶栏按钮 → 插件收到 agent:slot 事件）</div>
               {/if}
               {#if e.error}
                 <div class="mcp-cmd">{e.error}</div>
@@ -4636,18 +4706,22 @@
           {/each}
         {:else}
           <div class="menu-empty">
-            还没有扩展。在 <code>{extInfo.workspace_dir}</code> 下建一个目录（内含 manifest.json
+            还没有插件。在 <code>{extInfo.workspace_dir}</code> 下建一个目录（内含 manifest.json
             与 index.html）即可。
           </div>
         {/if}
         <div class="field">
-          <label>扩展目录约定</label>
+          <label>插件目录约定</label>
           <div class="mcp-cmd">内置：{extInfo.app_dir || '（读取中）'}</div>
           <div class="mcp-cmd">工作区：{extInfo.workspace_dir || '（读取中）'}</div>
           <div class="param-hint">
-            manifest.json 形如 {`{"title":"记忆看板","description":"…","version":"0.1.0","entry":"index.html"}`}；
+            manifest.json 形如 {`{"apiVersion":1,"source":"user","title":"记忆看板","description":"…","version":"0.1.0","entry":"index.html","ui":[],"permissions":[]}`}；
+            apiVersion 不匹配的插件会被拒载并提示升级；permissions 可声明
+            composer.insert / workspace.write / bus.publish / notify / storage（storage =
+            插件自己命名空间内的读写，碰不到会话与设置）。
             入口页里用 <code>postMessage({'{'}type:'agent:hello'{'}'})</code> 握手，之后可调
-            app.info / workspace.info / workspace.files / git.status / memory.search / session.info。
+            app.info / workspace.info / workspace.files / git.status / memory.search / session.info /
+            storage.read / storage.write / storage.delete。
           </div>
         </div>
       {/if}
