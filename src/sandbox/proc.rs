@@ -203,14 +203,13 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         let sid_guard = appcontainer::ensure_sid(spec.allow_network)
             .map_err(|e| anyhow!("AppContainer profile 失败: {e}"))?;
         // 2) 工作区目录 ACE（AppContainer 默认对任意目录无权限；失败仅告警不阻断）
-        if let Some(sid_str) = appcontainer::sid_to_string(sid_guard.sid) {
-            if let Err(e) = appcontainer::grant_dir_access(&spec.working_dir, &sid_str) {
+        if let Some(sid_str) = appcontainer::sid_to_string(sid_guard.sid)
+            && let Err(e) = appcontainer::grant_dir_access(&spec.working_dir, &sid_str) {
                 observability::event(
                     EventType::State,
                     json!({ "kind": "sandbox.appcontainer.warn", "message": e }),
                 );
             }
-        }
         // 3) 属性列表 + SECURITY_CAPABILITIES（指向 sid_guard 内的 SID，须保活到 CreateProcess 后）
         let mut attr_size = 0usize;
         let _ = InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut attr_size);
@@ -285,7 +284,7 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
             env.as_ptr() as *const c_void,
             cwd.as_ptr(),
-            &mut six.StartupInfo,
+            &six.StartupInfo,
             &mut pi,
         ) == 0
         {

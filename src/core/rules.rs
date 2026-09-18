@@ -50,7 +50,8 @@ impl RiskLevel {
 /// 否则未登记工具会走 Dangerous 默认策略（见 `evaluate_risk` 末尾分支）。
 /// P11 的 MCP 工具接入时同样在此登记。
 const KNOWN_TOOLS: &[&str] = &[
-    "read_file", "read_page", "read_skill", "search", "web_fetch", "write_file", "shell", "git",
+    "read_file", "read_page", "read_skill", "search", "web_fetch", "write_file", "edit_file",
+    "shell", "git",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -146,8 +147,8 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         // 读技能：只读 SKILL.md，恒定 Safe
         "read_skill" => (RiskLevel::Safe, "读取技能文件（只读）".into()),
 
-        // 写文件：区分工作区内/越界/敏感文件
-        "write_file" => risk_write_file(args, workspace_root),
+        // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
+        "write_file" | "edit_file" => risk_write_file(args, workspace_root),
 
         // Git 操作：区分只读、常规提交与破坏性命令
         "git" => {
@@ -171,7 +172,7 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
     }
 }
 
-/// write_file 风险判定：敏感文件 > 路径遍历 > 越界 > 常规。
+/// write_file / edit_file 风险判定：敏感文件 > 路径遍历 > 越界 > 常规。
 fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
     let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     if path_str.is_empty() {
@@ -194,13 +195,11 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
 
     // 3) 绝对路径越界（Windows 大小写不敏感比较，避免盘符/目录名大小写差异误判）
     let target_path = workspace_root.join(path_str);
-    if let Ok(canon_target) = target_path.canonicalize() {
-        if let Ok(canon_root) = workspace_root.canonicalize() {
-            if !is_within_root(&canon_root, &canon_target) {
+    if let Ok(canon_target) = target_path.canonicalize()
+        && let Ok(canon_root) = workspace_root.canonicalize()
+            && !is_within_root(&canon_root, &canon_target) {
                 return (RiskLevel::Dangerous, format!("试图修改工作区外部文件: {path_str}"));
             }
-        }
-    }
 
     (RiskLevel::Normal, format!("项目工作区文件改写: {path_str}"))
 }
@@ -451,12 +450,12 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
 
     // 2) 高危程序（精确 token 匹配，避免正文/参数里的同名子串误伤）
     if DANGEROUS_PROGRAMS.contains(&prog.as_str()) {
-        return (RiskLevel::Dangerous, format!("检测到高危系统/删除命令"));
+        return (RiskLevel::Dangerous, "检测到高危系统/删除命令".to_string());
     }
 
     // 3) SQL 类破坏性语句（非程序名场景，保留子串兜底）
     if lower.contains("drop table") || lower.contains("drop database") {
-        return (RiskLevel::Dangerous, format!("检测到高危数据库删除语句"));
+        return (RiskLevel::Dangerous, "检测到高危数据库删除语句".to_string());
     }
 
     // 4) 重定向/管道写文件：即便程序只读也算常规改动（可能覆盖文件）
@@ -470,18 +469,17 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
             .any(|(p, s, t)| prog == *p && second == *s && third_token.starts_with(t));
 
     if safe && !writes {
-        return (RiskLevel::Safe, format!("安全只读或自动化测试命令"));
+        return (RiskLevel::Safe, "安全只读或自动化测试命令".to_string());
     }
 
     // 6) 其余命令（含安全程序带重定向、cargo build 等）
-    (RiskLevel::Normal, format!("沙箱命令执行"))
+    (RiskLevel::Normal, "沙箱命令执行".to_string())
 }
 
 /// 取子命令的程序名：剥离路径与扩展名，小写。
 /// `C:\Tools\Del.EXE /f x` → `del`；`del/f x` → `del`；`dirname x` → `dirname`。
 fn program_name(cmd: &str) -> String {
     let tok = cmd
-        .trim()
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -580,21 +578,21 @@ pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String 
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             format!("shell:{tag}:{}", program_name(cmd))
         }
-        "write_file" => {
+        // 写文件与局部修改：按文件所在目录归类（两者分开记：放行「改」不等于放行「整文件重写」）
+        "write_file" | "edit_file" => {
             let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let dir = p
                 .replace('\\', "/")
                 .rsplit_once('/')
                 .map(|(d, _)| d.to_string())
                 .unwrap_or_default();
-            format!("write_file:{tag}:{dir}")
+            format!("{tool_name}:{tag}:{dir}")
         }
         "git" => {
             let sub = args
                 .get("args")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .trim()
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
@@ -773,6 +771,19 @@ mod tests {
         assert_eq!(evaluate_risk("write_file", &json!({"path": ".git/config", "content": "..."}), &ws()).0, RiskLevel::Dangerous);
     }
 
+    // —— P16：edit_file 与 write_file 共用同一套路径判定（敏感/遍历/越界）——
+    #[test]
+    fn test_edit_file_path_rules_match_write_file() {
+        let args = |p: &str| json!({"path": p, "old_string": "a", "new_string": "b"});
+        assert_eq!(evaluate_risk("edit_file", &args("src/lib.rs"), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("edit_file", &args("../secret.txt"), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("edit_file", &args(".git/config"), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("edit_file", &args("deploy/key.pem"), &ws()).0, RiskLevel::Dangerous);
+        // 审批档位语义与 write_file 一致：read-only 档 Normal 也要问，auto 档静默
+        assert!(should_ask_approval("read-only", RiskLevel::Normal));
+        assert!(!should_ask_approval("auto", RiskLevel::Normal));
+    }
+
     // —— v1 修复 6：write_file 敏感清单扩展 ——
     #[test]
     fn test_write_file_sensitive_expanded() {
@@ -800,7 +811,8 @@ mod tests {
         assert_eq!(evaluate_risk("mystery_tool", &json!({}), &ws()).0, RiskLevel::Dangerous);
         // 已登记但无专门规则的工具（登记表里存在）按常规处理，不再一律高危
         assert!(KNOWN_TOOLS.contains(&"write_file"));
-        assert_eq!(KNOWN_TOOLS.len(), 8, "新增内置工具须同步登记到 KNOWN_TOOLS");
+        assert!(KNOWN_TOOLS.contains(&"edit_file"));
+        assert_eq!(KNOWN_TOOLS.len(), 9, "新增内置工具须同步登记到 KNOWN_TOOLS");
     }
 
     #[test]
@@ -856,6 +868,16 @@ mod tests {
         assert_ne!(
             approval_scope("write_file", &json!({"path": "src/a.rs"}), n),
             approval_scope("write_file", &json!({"path": "docs/x.md"}), n)
+        );
+        // edit_file：按目录归类，且与 write_file 分开记（放行「改」不等于放行「整文件重写」）
+        assert_eq!(
+            approval_scope("edit_file", &json!({"path": "src/a.rs", "old_string": "x"}), n),
+            approval_scope("edit_file", &json!({"path": "src/b.rs", "old_string": "y"}), n)
+        );
+        assert_ne!(
+            approval_scope("edit_file", &json!({"path": "src/a.rs", "old_string": "x"}), n),
+            approval_scope("write_file", &json!({"path": "src/a.rs"}), n),
+            "两种写工具不得归为同类"
         );
         // git：按子命令归类
         assert_eq!(

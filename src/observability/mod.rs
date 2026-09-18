@@ -3,8 +3,9 @@
 //! 约定：后续所有代码统一走本模块落日志，业务数据禁止直接 println。
 //! 每条记录固定 4 个字段：ts / session_id / event_type / payload。
 //! 写盘方式：追加写、单行一条 JSON + '\n'、写完立即 flush（落盘即完整，不许半行）。
-//! 轮转（2026-09-14 补）：单文件超过上限就归档成 `<file>.1`（只留一份）再开新文件——
-//! 启动时检查一次，运行中每 500 条复查一次；上限走 config.toml [logging].max_mb。
+//! 轮转（2026-09-14 补，P16 多份归档）：单文件超过上限就归档成 `<file>.1`（最新），
+//! 旧归档依次倒位为 `.2`…`.N`、超出 N 份的最旧归档丢弃——启动时检查一次，
+//! 运行中每 500 条复查一次；上限与保留份数走 config.toml [logging].max_mb / keep_archives。
 //! schema 见 docs/jsonl-schema.md。
 
 use std::{
@@ -60,6 +61,8 @@ pub struct Logger {
     path: PathBuf,
     /// 轮转上限（字节），0 = 不轮转
     max_bytes: u64,
+    /// 归档保留份数（`<file>.1` 最新 … `<file>.N` 最旧；0 = 归档即删）
+    keep: usize,
     /// 已写入条数（周期性体积复查用）
     writes: AtomicU64,
 }
@@ -71,12 +74,13 @@ impl Logger {
         file_name: &str,
         session_id: String,
         max_bytes: u64,
+        keep: usize,
     ) -> anyhow::Result<Arc<Self>> {
         fs::create_dir_all(dir)?;
         let path = dir.join(file_name);
-        // 启动即查：超限先把旧文件归档成 .1（只留一份），本次从新文件开始写
+        // 启动即查：超限先把旧文件倒位归档，本次从新文件开始写
         let rotated_from = if max_bytes > 0 {
-            rotate_file(&path, max_bytes).ok().flatten()
+            rotate_file(&path, max_bytes, keep).ok().flatten()
         } else {
             None
         };
@@ -86,12 +90,13 @@ impl Logger {
             session_id,
             path,
             max_bytes,
+            keep,
             writes: AtomicU64::new(0),
         });
         if let Some(bytes) = rotated_from {
             logger.log(
                 EventType::State,
-                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": max_bytes }),
+                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": max_bytes, "keep": keep }),
             );
         }
         Ok(logger)
@@ -128,21 +133,16 @@ impl Logger {
                 let _ = f.write_all(line.as_bytes());
                 let _ = f.flush();
                 let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
-                if self.max_bytes > 0 && n % ROTATE_CHECK_EVERY == 0 {
+                if self.max_bytes > 0 && n.is_multiple_of(ROTATE_CHECK_EVERY) {
                     // 持锁检查 + 轮转，避免并发写者踩到换文件
-                    if let Ok(meta) = fs::metadata(&self.path) {
-                        if meta.len() > self.max_bytes {
-                            let backup = backup_path(&self.path);
-                            let _ = fs::remove_file(&backup);
-                            if fs::rename(&self.path, &backup).is_ok() {
-                                if let Ok(nf) =
-                                    OpenOptions::new().create(true).append(true).open(&self.path)
-                                {
-                                    *f = nf;
-                                    rotated = Some(meta.len());
-                                }
-                            }
-                        }
+                    if let Ok(meta) = fs::metadata(&self.path)
+                        && meta.len() > self.max_bytes
+                        && archive_current(&self.path, self.keep).is_ok()
+                        && let Ok(nf) =
+                            OpenOptions::new().create(true).append(true).open(&self.path)
+                    {
+                        *f = nf;
+                        rotated = Some(meta.len());
                     }
                 }
             }
@@ -152,7 +152,7 @@ impl Logger {
             // 锁已释放，补一条轮转事件（新文件体积极小，不会再次触发）
             self.log(
                 EventType::State,
-                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": self.max_bytes }),
+                json!({ "kind": "log.rotated", "bytes": bytes, "limit_bytes": self.max_bytes, "keep": self.keep }),
             );
         }
     }
@@ -167,13 +167,36 @@ impl Logger {
     }
 }
 
-/// 归档路径：`<file>.1`。
-fn backup_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.1", path.display()))
+/// 归档路径：`<file>.1` 最新、`<file>.N` 最旧。
+fn backup_path(path: &Path, n: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{n}", path.display()))
 }
 
-/// 超限则把 path 归档为 `<file>.1`（覆盖旧归档），返回被归档的体积；未超限/不存在返回 None。
-fn rotate_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<u64>> {
+/// 旧归档倒位：`.N` 丢弃，`.N-1`→`.N` … `.1`→`.2`，把 `.1` 腾给刚归档的当前文件。
+fn shift_archives(path: &Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let _ = fs::remove_file(backup_path(path, keep));
+    for i in (1..keep).rev() {
+        let from = backup_path(path, i);
+        if from.exists() {
+            let _ = fs::rename(&from, backup_path(path, i + 1));
+        }
+    }
+}
+
+/// 把当前文件转成归档 `.1`（旧归档倒位）；keep = 0 时直接删除。
+fn archive_current(path: &Path, keep: usize) -> std::io::Result<()> {
+    if keep == 0 {
+        return fs::remove_file(path);
+    }
+    shift_archives(path, keep);
+    fs::rename(path, backup_path(path, 1))
+}
+
+/// 超限则归档当前文件（保留 keep 份，更旧的丢弃），返回被归档的体积；未超限/不存在返回 None。
+fn rotate_file(path: &Path, max_bytes: u64, keep: usize) -> std::io::Result<Option<u64>> {
     let size = match fs::metadata(path) {
         Ok(m) => m.len(),
         Err(_) => return Ok(None), // 文件还不存在
@@ -181,28 +204,30 @@ fn rotate_file(path: &Path, max_bytes: u64) -> std::io::Result<Option<u64>> {
     if size <= max_bytes {
         return Ok(None);
     }
-    let backup = backup_path(path);
-    let _ = fs::remove_file(&backup);
-    fs::rename(path, &backup)?;
+    archive_current(path, keep)?;
     Ok(Some(size))
 }
 
 static LOGGER: OnceLock<Arc<Logger>> = OnceLock::new();
 
-/// 进程启动时调用一次（默认轮转上限 20MB；生产走 init_with_max，本入口供测试用）。
+/// 归档保留默认份数（config.toml [logging].keep_archives 缺省值）。
+pub const DEFAULT_KEEP_ARCHIVES: usize = 3;
+
+/// 进程启动时调用一次（默认轮转上限 20MB；生产走 init_full，本入口供测试用）。
 #[cfg(test)]
 pub fn init(dir: &Path, file_name: &str, session_id: String) -> anyhow::Result<()> {
-    init_with_max(dir, file_name, session_id, 20 * 1024 * 1024)
+    init_full(dir, file_name, session_id, 20 * 1024 * 1024, DEFAULT_KEEP_ARCHIVES)
 }
 
-/// 带轮转上限的初始化；max_bytes = 0 表示不轮转。
-pub fn init_with_max(
+/// 初始化：轮转上限 + 归档保留份数（生产入口，走 config.toml [logging]）。
+pub fn init_full(
     dir: &Path,
     file_name: &str,
     session_id: String,
     max_bytes: u64,
+    keep: usize,
 ) -> anyhow::Result<()> {
-    let logger = Logger::open(dir, file_name, session_id, max_bytes)?;
+    let logger = Logger::open(dir, file_name, session_id, max_bytes, keep)?;
     let _ = LOGGER.set(logger);
     Ok(())
 }
@@ -250,9 +275,9 @@ mod tests {
     fn rotate_over_limit_archives_and_reports_size() {
         let path = tmp_path("over");
         fs::write(&path, vec![b'x'; 100]).unwrap();
-        assert_eq!(rotate_file(&path, 50).unwrap(), Some(100));
+        assert_eq!(rotate_file(&path, 50, 3).unwrap(), Some(100));
         assert!(!path.exists(), "原文件应已被归档");
-        assert!(backup_path(&path).exists(), "归档文件 <file>.1 应存在");
+        assert!(backup_path(&path, 1).exists(), "归档文件 <file>.1 应存在");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -260,7 +285,7 @@ mod tests {
     fn rotate_under_limit_keeps_file() {
         let path = tmp_path("under");
         fs::write(&path, b"short").unwrap();
-        assert_eq!(rotate_file(&path, 5000).unwrap(), None);
+        assert_eq!(rotate_file(&path, 5000, 3).unwrap(), None);
         assert!(path.exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -268,7 +293,32 @@ mod tests {
     #[test]
     fn rotate_missing_file_is_noop() {
         let path = tmp_path("missing");
-        assert_eq!(rotate_file(&path, 10).unwrap(), None);
+        assert_eq!(rotate_file(&path, 10, 3).unwrap(), None);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // —— P16（报告 E4）：保留多份归档，最旧的按份数上限丢弃 ——
+    #[test]
+    fn rotate_keeps_multiple_archives_and_drops_oldest() {
+        let path = tmp_path("multi");
+        for i in 1..=4u8 {
+            fs::write(&path, vec![b'a' + i; 100]).unwrap();
+            assert_eq!(rotate_file(&path, 50, 3).unwrap(), Some(100));
+        }
+        assert!(!path.exists());
+        assert_eq!(fs::read(backup_path(&path, 1)).unwrap(), vec![b'e'; 100], ".1 应是最新归档");
+        assert_eq!(fs::read(backup_path(&path, 2)).unwrap(), vec![b'd'; 100]);
+        assert_eq!(fs::read(backup_path(&path, 3)).unwrap(), vec![b'c'; 100]);
+        assert!(!backup_path(&path, 4).exists(), "超上限的最旧归档应被丢弃");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_with_zero_keep_deletes_old_file() {
+        let path = tmp_path("keep0");
+        fs::write(&path, vec![b'x'; 100]).unwrap();
+        assert_eq!(rotate_file(&path, 50, 0).unwrap(), Some(100));
+        assert!(!path.exists() && !backup_path(&path, 1).exists(), "keep=0 应直接删除不留归档");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

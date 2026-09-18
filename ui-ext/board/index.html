@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>项目速览</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 12px 14px;
+        font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: #17181c;
+        color: #d8dbe2;
+      }
+      h2 {
+        margin: 0 0 10px;
+        font-size: 13px;
+        font-weight: 600;
+        color: #e8ebf2;
+      }
+      .card {
+        border: 1px solid #2c2f38;
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-bottom: 10px;
+        background: #1c1e24;
+      }
+      .kv {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        margin: 2px 0;
+        word-break: break-all;
+      }
+      .k {
+        flex: none;
+        width: 62px;
+        color: #858b98;
+      }
+      .v {
+        color: #d8dbe2;
+      }
+      .muted {
+        color: #858b98;
+      }
+      button {
+        padding: 5px 12px;
+        border-radius: 7px;
+        border: 1px solid #2c2f38;
+        background: transparent;
+        color: #b9bfca;
+        font-size: 12px;
+        cursor: pointer;
+        margin-right: 6px;
+      }
+      button:hover {
+        color: #fff;
+        border-color: #3a3e49;
+      }
+      input {
+        flex: 1;
+        padding: 5px 9px;
+        border-radius: 7px;
+        border: 1px solid #2c2f38;
+        background: #121317;
+        color: #d8dbe2;
+        font-size: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .hit {
+        border-top: 1px solid #24272f;
+        padding: 6px 0;
+      }
+      .hit b {
+        color: #e8ebf2;
+        font-weight: 600;
+      }
+      code {
+        color: #9fd0ff;
+      }
+      #err {
+        color: #ff9b9b;
+        min-height: 18px;
+      }
+      ul {
+        margin: 4px 0 0;
+        padding-left: 18px;
+        color: #b9bfca;
+      }
+      li {
+        word-break: break-all;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      组件总线 v0 参考扩展：本页跑在 sandbox="allow-scripts" 的 iframe 里（不透明源），
+      拿不到宿主 DOM / localStorage，也 fetch 不到 /api（跨源）。数据一律走 postMessage 白名单：
+      可用方法 = app.info / workspace.info / workspace.files / git.status / memory.search / session.info。
+    -->
+    <h2>项目速览</h2>
+
+    <div class="card">
+      <div class="kv"><span class="k">版本</span><span class="v" id="ver">…</span></div>
+      <div class="kv"><span class="k">运行根</span><span class="v" id="root">…</span></div>
+      <div class="kv"><span class="k">会话</span><span class="v" id="sess">…</span></div>
+      <div class="kv"><span class="k">工作区</span><span class="v" id="ws">…</span></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="b-git">查 Git 状态</button>
+        <button id="b-files">列工作区文件</button>
+      </div>
+      <div id="out" class="muted">点上面的按钮取数据（每次都要走宿主桥）。</div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <input id="q" placeholder="搜记忆，如「沙箱」「并行」" />
+        <button id="b-search">搜索</button>
+      </div>
+      <div id="hits"></div>
+    </div>
+
+    <div id="err"></div>
+
+    <script>
+      const pending = new Map();
+      let seq = 0;
+
+      function call(method, params) {
+        return new Promise((resolve, reject) => {
+          const id = ++seq;
+          pending.set(id, { resolve, reject });
+          parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+          setTimeout(() => {
+            if (pending.has(id)) {
+              pending.delete(id);
+              reject(new Error('宿主未响应（超时）'));
+            }
+          }, 8000);
+        });
+      }
+
+      window.addEventListener('message', (ev) => {
+        const d = ev.data || {};
+        if (d.type === 'agent:init') {
+          const p = d.payload || {};
+          document.getElementById('ver').textContent = 'v' + (p.version || '?');
+          document.getElementById('root').textContent = p.root || '(未知)';
+          document.getElementById('sess').textContent =
+            (p.title || '(未命名)') + (p.sessionId ? ' · ' + String(p.sessionId).slice(0, 8) : '');
+          call('workspace.info')
+            .then((w) => {
+              document.getElementById('ws').textContent = (w && w.current) || '(未知)';
+            })
+            .catch(() => {
+              document.getElementById('ws').textContent = '(未知)';
+            });
+          return;
+        }
+        if (d.type === 'agent:response' && pending.has(d.id)) {
+          const p = pending.get(d.id);
+          pending.delete(d.id);
+          d.ok ? p.resolve(d.result) : p.reject(new Error(String(d.result)));
+        }
+      });
+
+      function fail(e) {
+        document.getElementById('err').textContent = String((e && e.message) || e);
+      }
+
+      document.getElementById('b-git').onclick = () =>
+        call('git.status')
+          .then((g) => {
+            document.getElementById('err').textContent = '';
+            document.getElementById('out').innerHTML = g.is_repo
+              ? '<div>分支 <code>' + (g.branch || '?') + '</code> · 脏文件 ' + (g.dirty || 0) + ' · 领先 ' + (g.ahead || 0) + ' / 落后 ' + (g.behind || 0) + '</div>'
+              : '<div>当前工作区不是 Git 仓库</div>';
+          })
+          .catch(fail);
+
+      document.getElementById('b-files').onclick = () =>
+        call('workspace.files')
+          .then((r) => {
+            document.getElementById('err').textContent = '';
+            const files = (r && r.files) || [];
+            document.getElementById('out').innerHTML =
+              '<div>' + files.length + ' 个文件：</div><ul>' +
+              files.slice(0, 20).map((f) => '<li>' + f + '</li>').join('') +
+              '</ul>' + (files.length > 20 ? '<div class="muted">…还有 ' + (files.length - 20) + ' 个</div>' : '');
+          })
+          .catch(fail);
+
+      document.getElementById('b-search').onclick = () => {
+        const q = document.getElementById('q').value.trim();
+        if (!q) return;
+        call('memory.search', { query: q, top_k: 5 })
+          .then((r) => {
+            document.getElementById('err').textContent = '';
+            const hits = (r && r.results) || [];
+            document.getElementById('hits').innerHTML = hits.length
+              ? hits
+                  .map(
+                    (h) =>
+                      '<div class="hit"><b>' + (h.id || '?') + '</b>' +
+                      (h.score != null ? ' <span class="muted">score ' + Number(h.score).toFixed(3) + '</span>' : '') +
+                      (h.snippet ? '<div class="muted">' + h.snippet + '</div>' : '') +
+                      '</div>',
+                  )
+                  .join('') + (r.notice ? '<div class="muted">' + r.notice + '</div>' : '')
+              : '<div class="muted">没有命中' + (r && r.notice ? '（' + r.notice + '）' : '') + '</div>';
+          })
+          .catch(fail);
+      };
+
+      // 握手：宿主会回 agent:init
+      parent.postMessage({ type: 'agent:hello' }, '*');
+    </script>
+  </body>
+</html>

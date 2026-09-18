@@ -80,7 +80,7 @@ pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> 
     }
     let mut caps: Vec<SID_AND_ATTRIBUTES> = cap_sids
         .iter()
-        .map(|sid| unsafe { SID_AND_ATTRIBUTES { Sid: *sid, Attributes: 0 } })
+        .map(|sid| SID_AND_ATTRIBUTES { Sid: *sid, Attributes: 0 })
         .collect();
 
     let display = wide("Agent Local Sandbox");

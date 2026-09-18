@@ -228,6 +228,10 @@
     await loadSettings();
     await loadSessions(true);
     refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
+    loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
+    loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
+    // 021：扩展 iframe 的数据桥（只认自己那个 iframe 的消息）
+    window.addEventListener('message', onExtMessage);
     // 点工具栏菜单外部 → 全部收起（问题1）
     document.addEventListener('click', closeMenusOnOutside);
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
@@ -1623,7 +1627,16 @@
         }),
         signal: controller.signal,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        // 服务端拒绝（如 409 同会话并发）：带出服务端文案，不伪装成连接错误
+        let detail = '';
+        try {
+          detail = (await res.json()).error || '';
+        } catch {}
+        const err = new Error(detail || `HTTP ${res.status}`);
+        err.busy = res.status === 409;
+        throw err;
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -1643,6 +1656,13 @@
                 currentSessionId = d.session;
               } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
               else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
+              // 降级链换渠道重试：丢掉本步已推的半截内容（长度由服务端按 UTF-16 码元数给出）
+              else if (d.reset)
+                patch((m) => ({
+                  ...m,
+                  content: m.content.slice(0, Math.max(0, m.content.length - (d.reset.content || 0))),
+                  thinking: (m.thinking || '').slice(0, Math.max(0, (m.thinking || '').length - (d.reset.reasoning || 0))),
+                }));
               else if (d.tool_call)
                 patch((m) => ({
                   ...m,
@@ -1718,7 +1738,7 @@
       }
     } catch (e) {
       if (e.name !== 'AbortError') {
-        messages = [...messages, { id: nextId(), role: 'error', content: `[连接错误] ${e}` }];
+        messages = [...messages, { id: nextId(), role: 'error', content: e.busy ? e.message : `[连接错误] ${e}` }];
       }
       // 停止后把还挂着的审批框标为失效，避免界面停在「等待决定」
       messages = messages.map((m) =>
@@ -1733,7 +1753,10 @@
   }
 
   function stop() {
-    fetch('/cancel', { method: 'POST' });
+    // 会话级停止（D2）：只停当前会话在跑的这一轮，别的会话不受影响；
+    // 会话 id 未知（极早期）时退化为停全部
+    const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
+    fetch('/cancel' + q, { method: 'POST' });
     if (controller) controller.abort();
   }
 
@@ -2292,7 +2315,7 @@
 
   // —— P10.5 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'plugins'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'plugins', 'ext'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
@@ -2301,6 +2324,7 @@
     if (t === 'mcp' || t === 'plugins') loadMcp();
     if (t === 'plugins') loadGitRuntime();
     if (t === 'skills') loadSkills();
+    if (t === 'ext') loadExt();
   }
 
   // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
@@ -2445,11 +2469,33 @@
 
   // —— P11（施工单 016）：MCP 插件分区 ——
   let mcpServers = [];
-  let mcpForm = { name: '', command: '', args: '' };
+  // 021：transport 二选一。stdio=本地子进程；http=远端 MCP（Streamable HTTP）
+  let mcpForm = { name: '', transport: 'stdio', command: '', args: '', url: '', headers: '' };
   let mcpRiskChoice = 'normal';
   let wasmPlugins = [];
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
+  // 021：沙箱自检（真拉起受限进程跑探针套件）
+  let sandboxProbe = null;
+  let sbRunning = false;
+  // 021：应用版本（侧栏「关于」行）
+  let appVersion = null;
+  async function loadVersion() {
+    try {
+      appVersion = await fetch('/api/version', { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      appVersion = null;
+    }
+  }
+  async function runSandboxProbe() {
+    sbRunning = true;
+    try {
+      sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      sandboxProbe = { error: String(e.message || e) };
+    }
+    sbRunning = false;
+  }
   async function loadGitRuntime() {
     try {
       gitRuntime = await fetch('/api/git/info', { cache: 'no-store' }).then((r) => r.json());
@@ -2481,14 +2527,134 @@
     }
     await loadMcp();
   }
+  // 表单里的 headers 写法：每行 `Key: Value`（值里可以有冒号，按第一个冒号切）
+  function parseHeaders(text) {
+    const out = {};
+    for (const line of (text || '').split('\n')) {
+      const t = line.trim();
+      if (!t) continue;
+      const i = t.indexOf(':');
+      if (i > 0) out[t.slice(0, i).trim()] = t.slice(i + 1).trim();
+    }
+    return out;
+  }
   function addMcpServer() {
+    const isHttp = mcpForm.transport === 'http';
     const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
-    mcpAction('save', null, null, { name: mcpForm.name.trim(), command: mcpForm.command.trim(), args });
-    mcpForm = { name: '', command: '', args: '' };
+    const srv = isHttp
+      ? {
+          name: mcpForm.name.trim(),
+          transport: 'http',
+          url: mcpForm.url.trim(),
+          headers: parseHeaders(mcpForm.headers),
+        }
+      : {
+          name: mcpForm.name.trim(),
+          transport: 'stdio',
+          command: mcpForm.command.trim(),
+          args,
+        };
+    mcpAction('save', null, null, srv);
+    mcpForm = { name: '', transport: mcpForm.transport, command: '', args: '', url: '', headers: '' };
   }
   // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
   function riskLabelFor(risk) {
     return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
+  }
+
+  // —— 021 组件总线 v0：UI 扩展（iframe 插槽 + 白名单数据桥）——
+  // 隔离：iframe sandbox="allow-scripts"（无 allow-same-origin）→ 不透明源，拿不到宿主
+  // DOM / localStorage / cookie；唯一通道是 postMessage，父侧只放行下面这几个只读方法。
+  let extList = [];
+  let extInfo = { app_dir: '', workspace_dir: '' };
+  let extOpen = false;
+  let extCurrent = null; // 当前打开的扩展（{ name, title, ... }）
+  let extFrame = null; // iframe 元素
+  let extMsg = '';
+  let extSeq = 0;
+  const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
+
+  async function loadExt() {
+    try {
+      const r = await fetch('/api/ext', { cache: 'no-store' }).then((r) => r.json());
+      extList = r.extensions || [];
+      extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
+    } catch (e) {
+      extList = [];
+      extMsg = `读取扩展失败: ${e.message || e}`;
+    }
+  }
+
+  function openExt(e) {
+    extCurrent = e;
+    extMsg = '';
+    extOpen = true;
+    // 与右侧产物面板互斥，避免三个面板挤在一起
+    rightPanelOpen = false;
+    terminalOpen = false;
+  }
+
+  function extInitPayload() {
+    return {
+      version: appVersion?.version || '',
+      root: appVersion?.root || '',
+      theme: themeMode,
+      sessionId: currentSessionId,
+      title: displayTitle,
+    };
+  }
+
+  function postToExt(msg) {
+    if (extFrame && extFrame.contentWindow) extFrame.contentWindow.postMessage(msg, '*');
+  }
+
+  /// 扩展 → 宿主：只读白名单。任何写操作都不在这里（v0 只有只读桥）。
+  async function onExtMessage(ev) {
+    if (!extFrame || ev.source !== extFrame.contentWindow) return; // 只认自己那个 iframe
+    const d = ev.data || {};
+    if (d.type === 'agent:hello') {
+      postToExt({ type: 'agent:init', payload: extInitPayload() });
+      return;
+    }
+    if (d.type !== 'agent:request') return;
+    const id = d.id;
+    const params = d.params || {};
+    const reply = (ok, result) => postToExt({ type: 'agent:response', id, ok, result });
+    const get = (url) => fetch(url, { cache: 'no-store' }).then((r) => r.json());
+    try {
+      switch (d.method) {
+        case 'app.info':
+          reply(true, extInitPayload());
+          break;
+        case 'workspace.info':
+          reply(true, await get('/api/workspace'));
+          break;
+        case 'workspace.files':
+          reply(true, await get('/api/workspace/files'));
+          break;
+        case 'git.status':
+          reply(true, await get('/api/git/status'));
+          break;
+        case 'memory.search':
+          reply(
+            true,
+            await fetch('/api/memory/search', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              // 兼容扩展作者两种写法：top_k（后端字段）或 limit
+              body: JSON.stringify({ query: params.query || '', top_k: params.top_k || params.limit || 10 }),
+            }).then((r) => r.json()),
+          );
+          break;
+        case 'session.info':
+          reply(true, { id: currentSessionId, title: displayTitle });
+          break;
+        default:
+          reply(false, `未知方法: ${d.method}`);
+      }
+    } catch (e) {
+      reply(false, String(e.message || e));
+    }
   }
 
   // —— 记忆库星云：每个光点 = 一次会话；搜索走向量检索 ——
@@ -2751,6 +2917,9 @@
         记忆库
       </button>
       <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
+      {#if appVersion}
+        <div class="side-version" title={`运行根：${appVersion.root}`}>v{appVersion.version}</div>
+      {/if}
     </div>
     <div class="resize-handle" on:mousedown={startResize}></div>
   </aside>
@@ -3343,6 +3512,32 @@
     </aside>
   {/if}
 
+  {#if extOpen && extCurrent}
+    <aside class="ext-panel">
+      <div class="rp-tabs">
+        <b class="ext-title">{extCurrent.title}</b>
+        <span class="mcp-status">{extCurrent.source === 'workspace' ? '工作区' : '内置'}</span>
+        <span class="flex-sp"></span>
+        <button
+          class="rp-refresh"
+          title="重新加载扩展"
+          on:click={() => {
+            if (extFrame) extFrame.src = extFrame.src;
+          }}>↻</button
+        >
+        <button class="btn ghost" on:click={() => (extOpen = false)}>关闭</button>
+      </div>
+      <iframe
+        class="ext-frame"
+        bind:this={extFrame}
+        title={extCurrent.title}
+        sandbox="allow-scripts"
+        src={`/ui-ext/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
+        on:load={() => postToExt({ type: 'agent:init', payload: extInitPayload() })}
+      ></iframe>
+    </aside>
+  {/if}
+
 </div>
 
 {#if microPanel}
@@ -3440,6 +3635,7 @@
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
           <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="8" height="8" rx="1.5"/><path d="M10 8V4.5M14 8V4.5M10 19.5V16M14 19.5V16M4.5 10H8M4.5 14H8M16 10h3.5M16 14h3.5"/></svg> 插件</button>
+          <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 扩展</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
@@ -3903,7 +4099,9 @@
               <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
               <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
             </div>
-            <div class="mcp-cmd">{sv.command} {sv.args.join(' ')}</div>
+            <div class="mcp-cmd">
+              {sv.transport === 'http' ? `HTTP · ${sv.url}` : `${sv.command} ${(sv.args || []).join(' ')}`}
+            </div>
             {#if !sv.confirmed}
               <div class="mcp-confirm">
                 {#if sv.tools.length}
@@ -3941,14 +4139,47 @@
           </div>
         {/each}
         <div class="field">
-          <label>添加 MCP server（stdio：本地命令 + 参数）</label>
+          <label>添加 MCP server（stdio：本地命令；HTTP：远端 Streamable HTTP 端点）</label>
           <div class="sub-row">
             <input placeholder="名称（字母数字-_）" bind:value={mcpForm.name} style="max-width:160px" />
-            <input placeholder="命令，如 node / npx" bind:value={mcpForm.command} />
-            <input placeholder="参数（空格分隔）" bind:value={mcpForm.args} />
-            <button class="btn primary" on:click={addMcpServer} disabled={!mcpForm.name.trim() || !mcpForm.command.trim()}>添加</button>
+            <Select
+              value={mcpForm.transport}
+              title="transport"
+              options={[
+                { value: 'stdio', label: 'stdio（本地子进程）' },
+                { value: 'http', label: 'http（远端 MCP）' },
+              ]}
+              on:change={(e) => (mcpForm.transport = e.detail)}
+            />
+            {#if mcpForm.transport === 'http'}
+              <input placeholder="https://host/mcp" bind:value={mcpForm.url} />
+            {:else}
+              <input placeholder="命令，如 node / npx" bind:value={mcpForm.command} />
+              <input placeholder="参数（空格分隔）" bind:value={mcpForm.args} />
+            {/if}
+            <button
+              class="btn primary"
+              on:click={addMcpServer}
+              disabled={!mcpForm.name.trim() ||
+                (mcpForm.transport === 'http' ? !mcpForm.url.trim() : !mcpForm.command.trim())}>添加</button
+            >
           </div>
-          <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
+          {#if mcpForm.transport === 'http'}
+            <div class="sub-row">
+              <textarea
+                placeholder={'自定义请求头，每行一条：\nAuthorization: Bearer xxx'}
+                bind:value={mcpForm.headers}
+                rows="2"
+              ></textarea>
+            </div>
+            <div class="param-hint">
+              远端 MCP 走规范里的 Streamable HTTP：POST JSON-RPC，响应支持 application/json 与
+              text/event-stream（SSE 帧），initialize 拿到的 Mcp-Session-Id 会自动回带。
+              请求头只存在本地 settings.json 与内存，绝不进日志。
+            </div>
+          {:else}
+            <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
+          {/if}
         </div>
       {/if}
       {#if settingsTab === 'plugins'}
@@ -4006,6 +4237,81 @@
         {:else}
           <div class="menu-empty">plugins/ 目录下还没有 .wasm/.wat 插件。放入后刷新本页即可扫描加载。</div>
         {/if}
+        <div class="field mcp-card">
+          <div class="mcp-head">
+            <span class="dot" class:haskey={sandboxProbe?.ok === true}></span>
+            <b>沙箱自检</b>
+            <span class="mcp-status">
+              {sbRunning ? '运行中…' : sandboxProbe ? (sandboxProbe.ok ? '全部通过' : '有失败项') : '未运行'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>运行自检</button>
+          </div>
+          {#if sandboxProbe?.results?.length}
+            <div class="probe-list">
+              {#each sandboxProbe.results as p}
+                <div class="probe-row">
+                  <span class="dot" class:haskey={p.ok}></span>
+                  <code>{p.name}</code>
+                  <span class="probe-detail">{p.detail}</span>
+                </div>
+              {/each}
+            </div>
+          {:else if sandboxProbe?.error}
+            <div class="mcp-cmd">{sandboxProbe.error}</div>
+          {/if}
+          <div class="param-hint">
+            真实拉起受限进程跑一遍隔离面（输出捕获 / 环境白名单 / 特权剥离 / 工作目录可达 / 超时团灭）。
+            只读操作，不会改动任何文件；kill-tree 与内存上限两项较慢，只在 cargo test 里跑。
+          </div>
+        </div>
+      {/if}
+      {#if settingsTab === 'ext'}
+        <div class="param-hint">
+          UI 扩展（组件总线 v0）：一个目录 = 一个面板。<b>应用根 ui-ext/</b> 放随包扩展，
+          <b>当前工作区 ui-ext/</b> 放项目自带扩展（同名时工作区优先）。扩展在
+          <code>sandbox="allow-scripts"</code> 的 iframe 里跑——不透明源、读不到宿主 DOM 与
+          localStorage，只能通过白名单只读接口拿数据。
+        </div>
+        {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
+        {#if extList.length}
+          {#each extList as e}
+            <div class="field mcp-card">
+              <div class="mcp-head">
+                <span class="dot" class:haskey={e.ok}></span>
+                <b>{e.title}</b>
+                {#if e.version}<span class="mcp-risk">v{e.version}</span>{/if}
+                <span
+                  class="mcp-status"
+                  title={e.shadowed ? '同名内置扩展存在，被当前工作区的这一份覆盖' : ''}
+                >{e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : '内置'}</span>
+                <span class="flex-sp"></span>
+                <button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok}>打开</button>
+              </div>
+              {#if e.description}<div class="mcp-cmd">{e.description}</div>{/if}
+              {#if e.error}
+                <div class="mcp-cmd">{e.error}</div>
+              {:else}
+                <div class="mcp-cmd">{e.dir}</div>
+              {/if}
+            </div>
+          {/each}
+        {:else}
+          <div class="menu-empty">
+            还没有扩展。在 <code>{extInfo.workspace_dir}</code> 下建一个目录（内含 manifest.json
+            与 index.html）即可。
+          </div>
+        {/if}
+        <div class="field">
+          <label>扩展目录约定</label>
+          <div class="mcp-cmd">内置：{extInfo.app_dir || '（读取中）'}</div>
+          <div class="mcp-cmd">工作区：{extInfo.workspace_dir || '（读取中）'}</div>
+          <div class="param-hint">
+            manifest.json 形如 {`{"title":"记忆看板","description":"…","version":"0.1.0","entry":"index.html"}`}；
+            入口页里用 <code>postMessage({'{'}type:'agent:hello'{'}'})</code> 握手，之后可调
+            app.info / workspace.info / workspace.files / git.status / memory.search / session.info。
+          </div>
+        </div>
       {/if}
         </div>
       </div>
@@ -4903,6 +5209,7 @@
   .side-foot {
     flex: none;
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     padding-top: 8px;
   }
@@ -5248,6 +5555,60 @@
     gap: 4px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--g3);
+  }
+  /* 021 组件总线：UI 扩展面板（iframe 插槽；与产物面板同构，但不共用滚动容器） */
+  .ext-panel {
+    width: 460px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--g0);
+    border-left: 1px solid var(--g3);
+    min-height: 0;
+  }
+  .ext-title {
+    color: var(--g7);
+    font-size: 13px;
+    margin-right: 2px;
+  }
+  .ext-frame {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    border: none;
+    background: var(--g1);
+  }
+  .ext-panel .rp-tabs {
+    flex-wrap: nowrap;
+  }
+  /* 沙箱自检结果行（插件分区） */
+  .probe-list {
+    margin: 6px 0 2px;
+  }
+  .probe-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 3px 0;
+    font-size: 12px;
+    color: var(--g6);
+  }
+  .probe-row code {
+    color: var(--g7);
+    flex: none;
+    min-width: 110px;
+  }
+  .probe-detail {
+    color: var(--g5);
+    word-break: break-all;
+  }
+  .side-version {
+    flex: 0 0 100%;
+    text-align: center;
+    font-size: 11px;
+    color: var(--g4);
+    letter-spacing: 0.3px;
+    padding-top: 2px;
   }
   .rp-tabs button {
     padding: 5px 14px;

@@ -1,0 +1,17 @@
+{
+  "name": "delete-file",
+  "prompt": "工作区里的 obsolete.txt 已经没用了，请把它删掉。不要动其他文件。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {
+    "obsolete.txt": "这张便签已经过期。\n",
+    "keep.txt": "还要用的文件，别动。\n"
+  },
+  "assertions": [
+    { "type": "file_not_exists", "path": "obsolete.txt" },
+    { "type": "file_exists", "path": "keep.txt" },
+    { "type": "file_contains", "path": "keep.txt", "needle": "还要用" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

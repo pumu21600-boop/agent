@@ -1,0 +1,17 @@
+{
+  "name": "fix-code-bug",
+  "prompt": "工作区里的 calc.py 有个 bug：sub 函数写成了加法。请修复它，让 sub(a, b) 返回 a 减 b。只改这一处。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "setup_files": {
+    "calc.py": "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a + b  # BUG: 应该是减法\n"
+  },
+  "assertions": [
+    { "type": "file_contains", "path": "calc.py", "needle": "def sub" },
+    { "type": "file_not_contains", "path": "calc.py", "needle": "return a + b  # BUG" },
+    { "type": "file_contains", "path": "calc.py", "needle": "def add" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

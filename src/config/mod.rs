@@ -10,7 +10,39 @@ use serde::{Deserialize, Serialize};
 
 pub mod settings;
 
+/// 应用根目录：**打包分发的唯一形态是「exe 同级目录」**，开发形态回退编译期源码目录。
+///
+/// 判定：exe 同级存在 `config.toml` 或 `web` 目录 ⇒ 认定随包运行，一切相对资源
+/// （config.toml / settings.json / providers.json / prompts / web/dist / plugins / logs）
+/// 都落在 exe 同级。`cargo run` 与 `target\release\agent.exe` 直接跑时同级没有这些
+/// 目录，行为与从前（CARGO_MANIFEST_DIR）完全一致，开发流程不受影响。
+pub fn app_root() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && (dir.join("config.toml").is_file() || dir.join("web").is_dir())
+    {
+        return dir.to_path_buf();
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[cfg(test)]
+mod app_root_tests {
+    use super::*;
+
+    /// 开发形态（test exe 在 target/debug/deps 下）必须回落到源码目录，
+    /// 否则 config.toml / providers.json / web/dist 全部读不到，整个服务起不来。
+    #[test]
+    fn dev_layout_falls_back_to_manifest_dir() {
+        let root = app_root();
+        assert_eq!(root, std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        assert!(root.join("config.toml").is_file(), "源码根应有 config.toml");
+        assert!(root.join("providers.json").is_file(), "源码根应有 providers.json");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -180,9 +212,16 @@ pub struct LoggingConfig {
     pub dir: String,
     #[serde(default = "default_log_file")]
     pub file: String,
-    /// 单文件轮转上限（MB）：超过就归档成 `<file>.1`（只留一份），0 = 不轮转
+    /// 单文件轮转上限（MB）：超过就归档成 `<file>.1`，0 = 不轮转
     #[serde(default = "default_log_max_mb")]
     pub max_mb: u64,
+    /// 归档保留份数：`<file>.1`（最新）… `<file>.N`（最旧），更旧的丢弃；0 = 归档即删
+    #[serde(default = "default_log_keep_archives")]
+    pub keep_archives: usize,
+}
+
+fn default_log_keep_archives() -> usize {
+    crate::observability::DEFAULT_KEEP_ARCHIVES
 }
 
 fn default_host() -> String {
@@ -207,7 +246,9 @@ fn default_log_max_mb() -> u64 {
     20
 }
 fn default_max_steps() -> u32 {
-    8
+    // 16：8 步在「读文件 → 改文件 → 跑测试 → 修 → 再跑」这类真实工程任务上会撞顶中断
+    // （施工单 022 采纳审查建议上调；config.toml 里显式值优先）
+    16
 }
 fn default_tool_result_max_chars() -> usize {
     8000
@@ -252,6 +293,7 @@ impl Default for LoggingConfig {
             dir: default_log_dir(),
             file: default_log_file(),
             max_mb: default_log_max_mb(),
+            keep_archives: default_log_keep_archives(),
         }
     }
 }
@@ -286,28 +328,13 @@ impl Default for ContextConfig {
         }
     }
 }
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            gateway: GatewayConfig::default(),
-            roles: RolesConfig::default(),
-            logging: LoggingConfig::default(),
-            agent: AgentConfig::default(),
-            sandbox: SandboxConfig::default(),
-            context: ContextConfig::default(),
-            recovery: RecoveryConfig::default(),
-            memory: MemoryConfig::default(),
-        }
-    }
-}
 
 /// 读取 config.toml（不存在则落一份默认），再应用环境变量覆盖。
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     if !path.exists() {
         let default_text =
             toml::to_string_pretty(&Config::default()).context("生成默认配置失败")?;
-        std::fs::write(path, default_text)
+        crate::fsx::write_atomic_str(path, &default_text)
             .with_context(|| format!("写默认配置失败: {}", path.display()))?;
         eprintln!("[config] 已生成默认 config.toml: {}", path.display());
     }

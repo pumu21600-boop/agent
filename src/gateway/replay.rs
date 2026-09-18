@@ -89,8 +89,8 @@ pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &
         if is_assistant {
             if preserve {
                 // reasoning_details(string) → reasoning 合并，其余非法形态删除（上游 sanitize 同款）
-                if let Some(obj) = msg.as_object_mut() {
-                    if let Some(details) = obj.get("reasoning_details") {
+                if let Some(obj) = msg.as_object_mut()
+                    && let Some(details) = obj.get("reasoning_details") {
                         match details {
                             Value::String(s) => {
                                 if !s.is_empty()
@@ -106,7 +106,6 @@ pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &
                             }
                         }
                     }
-                }
             } else if let Some(obj) = msg.as_object_mut() {
                 for field in REPLAY_FIELDS {
                     obj.remove(field);
@@ -125,11 +124,10 @@ pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &
     // developer 改写（放循环外，避免借用冲突）
     if compat.thinking_format == ThinkingFormat::Openai && developer_role_for_model(model_id) {
         for msg in arr.iter_mut() {
-            if msg.get("role").and_then(Value::as_str) == Some("system") {
-                if let Some(obj) = msg.as_object_mut() {
+            if msg.get("role").and_then(Value::as_str) == Some("system")
+                && let Some(obj) = msg.as_object_mut() {
                     obj.insert("role".into(), Value::String("developer".into()));
                 }
-            }
         }
     }
 

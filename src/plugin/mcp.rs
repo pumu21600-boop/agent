@@ -1,13 +1,19 @@
-//! MCP client（施工单 016，P11）—— stdio transport 最小闭环
+//! MCP client（施工单 016/021，P11/P15）—— stdio 与 streamable HTTP 双 transport
 //!
 //! 总架构 §7：MCP 借生态省自研；进程级隔离天然防崩；tool poisoning 用
 //! 「首装确认 + 同级审批」对冲（确认前一律 Dangerous）。
 //!
-//! 协议：JSON-RPC 2.0 over stdio（换行分隔），只做 tools 子集：
+//! 协议：JSON-RPC 2.0，只做 tools 子集：
 //! initialize → notifications/initialized → tools/list → tools/call。
 //!
-//! 线程模型：每个 server 串行 Mutex（工具调用本就串行）；读行为阻塞读，
-//! 整体调用包 tokio timeout（超时放弃等待，残留行由「id 不匹配即跳过」自愈）。
+//! - **stdio**（016）：换行分隔，子进程 stdin/stdout。
+//! - **http**（021）：MCP Streamable HTTP —— POST JSON-RPC 到 url，响应可以是
+//!   `application/json` 单包，也可以是 `text/event-stream`（读 `data:` 帧、按 id 取
+//!   匹配帧）；`Mcp-Session-Id` 响应头拿到后在同 server 的后续请求里回带；
+//!   通知（无 id）只校验 2xx/202 不看响应体。
+//!
+//! 线程模型：每个 server 串行 Mutex（工具调用本就串行）；两种 transport 都是阻塞
+//! IO，整体调用包 tokio timeout（超时放弃等待，残留响应由「id 不匹配即跳过」自愈）。
 //! 子进程 kill_on_drop，崩溃只标记离线，绝不拖垮主服务。
 
 use std::{
@@ -15,16 +21,31 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 use serde_json::{json, Value};
 
 use crate::config::settings::McpServerCfg;
+use crate::plugin::ToolBrief;
 
 /// 工具全名前缀（mcp__<server>__<tool>）。
 pub const PREFIX: &str = "mcp__";
 /// server 与 tool 的分隔（server 名禁止包含它，配置层校验）。
 pub const SEP: &str = "__";
+
+/// 该 server 是否走 HTTP transport。
+fn is_http(cfg: &McpServerCfg) -> bool {
+    cfg.transport.eq_ignore_ascii_case("http")
+}
+
+/// HTTP transport 运行态（stdio 不用）。
+#[derive(Debug, Clone)]
+struct HttpState {
+    client: reqwest::blocking::Client,
+    /// initialize 响应头 `Mcp-Session-Id`；有则后续请求回带
+    session_id: Option<String>,
+}
 
 /// 单个 server 的运行态。
 #[derive(Debug, Default)]
@@ -36,10 +57,13 @@ struct ServerState {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     reader: Option<BufReader<ChildStdout>>,
+    /// HTTP transport 态（Some 即代表该 server 走 http）
+    http: Option<HttpState>,
     next_id: u64,
 }
 
 impl ServerState {
+    /// 断开连接（两种 transport 通用）：杀子进程 / 丢 HTTP 会话，标记离线。
     fn reset_proc(&mut self) {
         if let Some(c) = self.child.as_mut() {
             let _ = c.kill();
@@ -47,6 +71,7 @@ impl ServerState {
         self.child = None;
         self.stdin = None;
         self.reader = None;
+        self.http = None;
         self.online = false;
     }
 }
@@ -70,7 +95,7 @@ pub fn split_full_name(full: &str) -> Option<(String, String)> {
 /// settings 加载/保存后同步配置：新增的占位、删除的杀进程下线。
 /// 不在这里主动 spawn（首次工具调用/refresh 时按需启动）。
 pub fn sync_configs(cfgs: &[McpServerCfg]) {
-    let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+    let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     // 下线被删除/禁用的
     let names: Vec<String> = cfgs.iter().map(|c| c.name.clone()).collect();
     for (name, st) in m.iter_mut() {
@@ -82,10 +107,17 @@ pub fn sync_configs(cfgs: &[McpServerCfg]) {
             let changed = st
                 .cfg
                 .as_ref()
-                .map(|old| old.command != c.command || old.args != c.args || old.env != c.env)
+                .map(|old| {
+                    old.command != c.command
+                        || old.args != c.args
+                        || old.env != c.env
+                        || old.transport != c.transport
+                        || old.url != c.url
+                        || old.headers != c.headers
+                })
                 .unwrap_or(true);
             if changed {
-                st.reset_proc(); // 命令变了要重启
+                st.reset_proc(); // 命令/传输变了要重连
                 st.tools.clear();
             }
             st.cfg = Some(c.clone());
@@ -96,20 +128,80 @@ pub fn sync_configs(cfgs: &[McpServerCfg]) {
     }
 }
 
-/// 启动子进程并握手（initialize → initialized → tools/list）。
-/// 已在线则直接返回；失败重置进程并返回 Err（离线）。
+/// 拉起（或重连）并握手（initialize → initialized → tools/list）。
+/// 已在线则直接返回；失败断开并返回 Err（离线）。两种 transport 共用同一握手序列。
 fn ensure_online(st: &mut ServerState) -> Result<(), String> {
-    // 先收割已退出的子进程（崩溃自愈：标记离线，走下方重启路径）
-    if let Some(child) = st.child.as_mut() {
-        if matches!(child.try_wait(), Ok(Some(_))) {
+    // 先收割已退出的子进程（崩溃自愈：标记离线，走下方重连路径）
+    if let Some(child) = st.child.as_mut()
+        && matches!(child.try_wait(), Ok(Some(_))) {
             st.reset_proc();
         }
-    }
-    if st.online && st.stdin.is_some() && st.reader.is_some() {
+    if st.online && (st.http.is_some() || (st.stdin.is_some() && st.reader.is_some())) {
         return Ok(());
     }
     st.reset_proc();
     let cfg = st.cfg.clone().ok_or("无配置")?;
+    if is_http(&cfg) {
+        let url = cfg.url.trim().to_string();
+        if url.is_empty() {
+            return Err("transport=http 但 url 为空".into());
+        }
+        let client = reqwest::blocking::Client::builder()
+            // 单请求超时由 http_round 逐次设置；这里给的是整体上限兜底
+            .timeout(Duration::from_secs(300))
+            .build()
+            .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?;
+        st.http = Some(HttpState { client, session_id: None });
+    } else {
+        spawn_stdio(st, &cfg)?;
+    }
+
+    // —— 握手：initialize ——
+    let init = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "agent-local", "version": env!("CARGO_PKG_VERSION") }
+        }
+    });
+    rpc_round(st, &init, Some(0), 15_000).map_err(|e| {
+        st.reset_proc();
+        format!("initialize 失败: {e}")
+    })?;
+    // initialized 通知（无 id，无响应体）
+    let _ = rpc_round(
+        st,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        None,
+        15_000,
+    );
+    // —— tools/list ——
+    let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    let resp = rpc_round(st, &list_req, Some(1), 15_000).map_err(|e| {
+        st.reset_proc();
+        format!("tools/list 失败: {e}")
+    })?;
+    let tools = resp
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    st.tools = tools
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str)?.to_string();
+            let desc = t.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+            let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type":"object"}));
+            Some((name, desc, schema))
+        })
+        .collect();
+    st.online = true;
+    Ok(())
+}
+
+/// stdio transport：起子进程并把 stdin/stdout 挂到运行态。
+fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
     if cfg.command.trim().is_empty() {
         return Err("command 为空".into());
     }
@@ -133,60 +225,28 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
     st.stdin = Some(stdin);
     st.reader = Some(BufReader::new(stdout));
     st.child = Some(child);
-
-    // —— 握手：initialize ——
-    let init = json!({
-        "jsonrpc": "2.0", "id": 0, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "agent-local", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-    rpc_round(st, &init, 0, 15_000).map_err(|e| {
-        st.reset_proc();
-        format!("initialize 失败: {e}")
-    })?;
-    // initialized 通知（无 id，无响应）
-    if let Some(w) = st.stdin.as_mut() {
-        let _ = w.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
-        let _ = w.flush();
-    }
-    // —— tools/list ——
-    let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
-    let resp = rpc_round(st, &list_req, 1, 15_000).map_err(|e| {
-        st.reset_proc();
-        format!("tools/list 失败: {e}")
-    })?;
-    let tools = resp
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    st.tools = tools
-        .iter()
-        .filter_map(|t| {
-            let name = t.get("name").and_then(Value::as_str)?.to_string();
-            let desc = t.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-            let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type":"object"}));
-            Some((name, desc, schema))
-        })
-        .collect();
-    st.online = true;
     Ok(())
 }
 
-/// 写一行请求并阻塞读响应行（跳过 id 不匹配的 notification/log 行）。
+/// 一轮 JSON-RPC：按 transport 分发。
+/// `expect_id = None` 表示通知（无响应体，只确认送达）。
 fn rpc_round(
     st: &mut ServerState,
     req: &Value,
-    expect_id: u64,
+    expect_id: Option<u64>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    if st.http.is_some() {
+        return http_round(st, req, expect_id, timeout_ms);
+    }
     let line = format!("{}\n", serde_json::to_string(req).map_err(|e| e.to_string())?);
+    // 写与读分两段拿走借用，避免同时持有 stdin/reader 的可变借用
     let stdin = st.stdin.as_mut().ok_or("进程未启动")?;
     stdin.write_all(line.as_bytes()).map_err(|e| format!("写 stdin: {e}"))?;
     stdin.flush().map_err(|e| format!("flush stdin: {e}"))?;
+    let Some(expect_id) = expect_id else {
+        return Ok(Value::Null); // 通知：stdio 侧无需等待
+    };
 
     let reader = st.reader.as_mut().ok_or("进程未启动")?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -215,17 +275,130 @@ fn rpc_round(
     }
 }
 
+/// HTTP（MCP Streamable HTTP）：POST JSON-RPC。响应可以是 application/json 单包，
+/// 也可以是 text/event-stream（读 `data:` 帧、取 id 匹配的那一帧）。
+/// 会话头 `Mcp-Session-Id` 一旦从响应里拿到，同 server 后续请求回带。
+/// 传输层失败（连不上/非 2xx/解析不出）标记离线 → 下次调用重连重握手；协议层错误
+/// （JSON-RPC error）不标记离线，调用方能看见 server 的真实报错。
+fn http_round(
+    st: &mut ServerState,
+    req: &Value,
+    expect_id: Option<u64>,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let cfg = st.cfg.clone().ok_or("无配置")?;
+    let url = cfg.url.trim().to_string();
+    let (client, session_id) = {
+        let h = st.http.as_ref().ok_or("HTTP 会话未建立")?;
+        (h.client.clone(), h.session_id.clone())
+    };
+    let mut rb = client
+        .post(&url)
+        .timeout(Duration::from_millis(timeout_ms))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(req);
+    if let Some(sid) = &session_id {
+        rb = rb.header("Mcp-Session-Id", sid.as_str());
+    }
+    for (k, v) in &cfg.headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    let resp = rb
+        .send()
+        .map_err(|e| offline(st, format!("HTTP 请求失败（{url}）: {e}")))?;
+    // 会话头：initialize 响应里带，之后每次都要回带（规范 2025-03-26）
+    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok())
+        && let Some(h) = st.http.as_mut()
+    {
+        h.session_id = Some(sid.to_string());
+    }
+    let status = resp.status();
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        let snip: String = body.chars().take(300).collect();
+        return Err(offline(st, format!("HTTP {}: {snip}", status.as_u16())));
+    }
+    let Some(expect_id) = expect_id else {
+        return Ok(Value::Null); // 通知：2xx/202 即视为已送达
+    };
+    let body = resp.text().map_err(|e| offline(st, format!("读响应体失败: {e}")))?;
+    let frames: Vec<Value> = if ctype.contains("text/event-stream") {
+        parse_sse_frames(&body)
+    } else if body.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![serde_json::from_str(body.trim())
+            .map_err(|e| offline(st, format!("响应不是合法 JSON: {e}")))?]
+    };
+    for v in frames {
+        if v.get("id").and_then(Value::as_u64) != Some(expect_id) {
+            continue; // 心跳/进度通知/别的响应帧
+        }
+        if let Some(err) = v.get("error") {
+            return Err(format!("server 错误: {err}"));
+        }
+        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+    }
+    Err(offline(st, format!("响应里没有 id={expect_id} 的结果帧")))
+}
+
+/// 传输层失败统一出口：标记离线（下次 ensure_online 重连重握手）并回原错误串。
+fn offline(st: &mut ServerState, msg: String) -> String {
+    st.online = false;
+    msg
+}
+
+/// 解析 SSE 响应体：把 `data:` 帧拼回 JSON 值（多行 data 以换行连接）。
+/// 注释行（`:` 开头）、心跳空帧、非 JSON 帧一律跳过——HTTP MCP server 普遍夹这些。
+/// 纯函数（可单测）：不碰网络。
+fn parse_sse_frames(body: &str) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut buf = String::new();
+    let flush = |buf: &mut String, out: &mut Vec<Value>| {
+        let t = buf.trim();
+        if !t.is_empty()
+            && let Ok(v) = serde_json::from_str::<Value>(t)
+        {
+            out.push(v);
+        }
+        buf.clear();
+    };
+    for raw in body.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() {
+            flush(&mut buf, &mut out); // 空行 = 帧结束
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(rest.trim_start());
+        }
+        // 其余字段（event:/id:/retry:/注释）v0 不需要
+    }
+    flush(&mut buf, &mut out); // 末尾无空行也收一帧
+    out
+}
+
 /// 公开：拉起（或重连）一个 server 并刷新工具清单。
 pub fn ensure_online_by_name(name: &str) -> Result<usize, String> {
-    let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+    let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     let st = m.get_mut(name).ok_or("未知 server")?;
     ensure_online(st)?;
     Ok(st.tools.len())
 }
 
 /// 公开：server 状态快照（UI 用）。
-pub fn status() -> Vec<(String, bool, Vec<(String, String)>)> {
-    let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+pub fn status() -> Vec<(String, bool, Vec<ToolBrief>)> {
+    let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     // 先回收已退出的进程：否则 server 崩了没人调用的话，界面会长期显示「在线」假状态
     reap_dead_locked(&mut m);
     m.iter()
@@ -243,7 +416,7 @@ pub fn status() -> Vec<(String, bool, Vec<(String, String)>)> {
 /// 未确认 → Dangerous；禁用 → Dangerous；确认后按 server 配置档。
 pub fn risk_for(full_name: &str) -> Option<u8> {
     let (srv, _tool) = split_full_name(full_name)?;
-    let m = mgr().lock().expect("mcp 管理器锁毒化");
+    let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     let st = m.get(&srv)?;
     let cfg = st.cfg.as_ref()?;
     if !cfg.enabled || !cfg.confirmed {
@@ -257,7 +430,7 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
 
 /// 已启用 + 已确认 + 在线工具的 OpenAI function 定义。
 pub fn tool_definitions() -> Vec<Value> {
-    let m = mgr().lock().expect("mcp 管理器锁毒化");
+    let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for (srv, st) in m.iter() {
         if !st.online {
@@ -293,7 +466,7 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     // 阻塞 IO 丢进 blocking 线程池；外层 timeout 到点放弃（残留行由 id 过滤自愈）
     let full = full_name.to_string();
     let fut = tokio::task::spawn_blocking(move || {
-        let mut m = mgr().lock().expect("mcp 管理器锁毒化");
+        let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
         let st = m.get_mut(&srv).ok_or_else(|| format!("未知 server: {srv}"))?;
         ensure_online(st)?;
         let req = json!({
@@ -302,17 +475,16 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
         });
         let id = st.next_id;
         st.next_id += 1;
-        let resp = rpc_round(st, &req, id, 120_000)?;
+        let resp = rpc_round(st, &req, Some(id), 120_000)?;
         // 拼接 content 里全部 text 段
         let mut texts: Vec<String> = Vec::new();
         let mut is_err = false;
         if let Some(arr) = resp.get("content").and_then(Value::as_array) {
             for c in arr {
-                if c.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = c.get("text").and_then(Value::as_str) {
+                if c.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(t) = c.get("text").and_then(Value::as_str) {
                         texts.push(t.to_string());
                     }
-                }
             }
         }
         if resp.get("isError").and_then(Value::as_bool) == Some(true) {
@@ -332,20 +504,18 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
         Ok(r) => r.map_err(|e| format!("MCP 调用任务失败: {e}"))?,
         Err(_) => Err("MCP 调用超时（120s）".into()),
     }
-    .map(|r| {
+    .inspect(|_r| {
         let _ = &full;
-        r
     })
 }
 
 /// 进程存活自检：把已退出的 server 标记离线。调用方须已持有管理器锁（status() 内用）。
 fn reap_dead_locked(m: &mut HashMap<String, ServerState>) {
     for st in m.values_mut() {
-        if let Some(child) = st.child.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
+        if let Some(child) = st.child.as_mut()
+            && let Ok(Some(_)) = child.try_wait() {
                 st.reset_proc();
             }
-        }
     }
 }
 
@@ -409,5 +579,225 @@ mod tests {
         // 用户显式配置优先
         assert_eq!(out.get("PATH").map(String::as_str), Some("user-path"));
         assert_eq!(out.get("API_TOKEN").map(String::as_str), Some("t-1"));
+    }
+
+    // ——— HTTP transport（021） ———
+
+    #[test]
+    fn sse_frames_parsed_and_junk_skipped() {
+        // 真实 server 会在帧里夹注释、心跳空帧、event 名，且末尾可能没有空行
+        let body = ": ping\n\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\ndata: not-json\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\n\
+data: \"result\":{\"n\":7}}";
+        let frames = parse_sse_frames(body);
+        assert_eq!(frames.len(), 2, " комментарий/非 JSON 帧应被跳过: {frames:?}");
+        assert_eq!(frames[0]["id"], 1);
+        assert_eq!(frames[0]["result"]["ok"], true);
+        // 多行 data 按换行拼接后仍是合法 JSON
+        assert_eq!(frames[1]["id"], 2);
+        assert_eq!(frames[1]["result"]["n"], 7);
+        assert!(parse_sse_frames("").is_empty());
+        assert!(parse_sse_frames("event: message\n").is_empty());
+    }
+
+    #[test]
+    fn name_and_full_name_rules() {
+        assert!(valid_name("fs-tools"));
+        assert!(!valid_name("fs__tools"), "禁止包含分隔符");
+        assert!(!valid_name(""));
+        assert_eq!(split_full_name("mcp__srv__tool"), Some(("srv".into(), "tool".into())));
+        assert_eq!(split_full_name("mcp__srv"), None);
+        assert_eq!(split_full_name("wasm__x__y"), None);
+    }
+
+    /// 极简 HTTP/1.1 mock（只服务测试）：读请求头 + Content-Length 体 → 交给闭包出响应。
+    /// 闭包拿到 (path, headers, body)；返回 base url。线程随测试进程结束，不做优雅退出。
+    fn mock_http(f: impl Fn(&str, &[(String, String)], &Value) -> MockResp + Send + 'static) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定随机端口");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let req_body;
+                let headers: Vec<(String, String)>;
+                let path;
+                {
+                    use std::io::{BufRead, BufReader, Read};
+                    let Ok(clone) = s.try_clone() else { continue };
+                    let mut r = BufReader::new(clone);
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    path = line.split(' ').nth(1).unwrap_or("/").to_string();
+                    let mut len = 0usize;
+                    let mut hs: Vec<(String, String)> = Vec::new();
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let t = h.trim_end().to_string();
+                        if t.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = t.split_once(':') {
+                            let k = k.trim().to_ascii_lowercase();
+                            let v = v.trim().to_string();
+                            if k == "content-length" {
+                                len = v.parse().unwrap_or(0);
+                            }
+                            hs.push((k, v));
+                        }
+                    }
+                    headers = hs;
+                    let mut body = vec![0u8; len];
+                    if len > 0 && r.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    req_body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                }
+                let r = f(&path, &headers, &req_body);
+                use std::io::Write;
+                let reason = if r.status == 200 { "OK" } else { "Accepted" };
+                let mut head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    r.status,
+                    reason,
+                    r.ctype,
+                    r.body.len()
+                );
+                for (k, v) in &r.extra {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(r.body.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    struct MockResp {
+        status: u16,
+        ctype: &'static str,
+        body: String,
+        extra: Vec<(&'static str, String)>,
+    }
+
+    impl MockResp {
+        /// SSE 帧响应（每帧 `event: message` + `data:`，另夹一个心跳注释帧）
+        fn sse(frames: &[Value]) -> Self {
+            let mut body = String::from(": keep-alive\n\n");
+            for f in frames {
+                body.push_str(&format!("event: message\ndata: {f}\n\n"));
+            }
+            Self { status: 200, ctype: "text/event-stream", body, extra: Vec::new() }
+        }
+        fn accepted() -> Self {
+            Self { status: 202, ctype: "application/json", body: String::new(), extra: Vec::new() }
+        }
+    }
+
+    /// HTTP transport 端到端：initialize（JSON + 会话头）→ initialized（202 通知）
+    /// → tools/list（SSE 帧）→ tools/call（SSE 帧，夹心跳与串扰帧）。同时断言会话头被回带。
+    #[test]
+    fn http_transport_handshake_and_call() {
+        // (method, 该请求带的 Mcp-Session-Id)
+        let seen: std::sync::Arc<Mutex<Vec<(String, String)>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let rec = seen.clone();
+        let url = mock_http(move |_path, headers, req| {
+            let method = req.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            let sid = headers
+                .iter()
+                .find(|(k, _)| k == "mcp-session-id")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "-".into());
+            rec.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), sid));
+            match method.as_str() {
+                "initialize" => MockResp {
+                    status: 200,
+                    ctype: "application/json",
+                    body: json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": "2024-11-05" } }).to_string(),
+                    extra: vec![("Mcp-Session-Id", "sess-1".to_string())],
+                },
+                "notifications/initialized" => MockResp::accepted(),
+                "tools/list" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": [
+                        { "name": "echo", "description": "echo it", "inputSchema": { "type": "object" } },
+                        { "name": "ping", "description": "ping", "inputSchema": { "type": "object" } }
+                    ] }
+                })]),
+                "tools/call" => MockResp::sse(&[
+                    // 串扰帧：id 对不上，必须被跳过
+                    json!({ "jsonrpc": "2.0", "id": 999, "result": { "content": [{ "type": "text", "text": "wrong" }] } }),
+                    json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "content": [{ "type": "text", "text": "echo:7" }] }
+                    }),
+                ]),
+                _ => MockResp { status: 400, ctype: "text/plain", body: "unknown".into(), extra: Vec::new() },
+            }
+        });
+
+        let cfg = McpServerCfg {
+            name: "mockhttp".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: url.clone(),
+            headers: BTreeMap::from([("X-Test".to_string(), "1".to_string())]),
+            enabled: true,
+            confirmed: true,
+            risk: "normal".into(),
+        };
+        sync_configs(std::slice::from_ref(&cfg));
+
+        let n = ensure_online_by_name("mockhttp").expect("HTTP 握手应成功");
+        assert_eq!(n, 2, "tools/list 应发现 2 个工具");
+        assert_eq!(risk_for("mcp__mockhttp__echo"), Some(1), "已确认 server 默认 Normal 档");
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt
+            .block_on(call_tool("mcp__mockhttp__echo", r#"{"v":7}"#))
+            .expect("HTTP tools/call 应成功");
+        assert_eq!(out, "echo:7", "应取 id 匹配的那一帧，忽略串扰帧");
+
+        // 会话头回带：initialize 之后的每个请求都要带 Mcp-Session-Id: sess-1
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let after_init: Vec<&(String, String)> = seen.iter().filter(|(m, _)| m != "initialize").collect();
+        assert!(after_init.len() >= 3, "应有 initialized/tools/list/tools/call 记录: {seen:?}");
+        assert!(
+            after_init.iter().all(|(_, sid)| sid == "sess-1"),
+            "initialize 之后的请求应全部回带会话头: {seen:?}"
+        );
+        let init_sid = seen.iter().find(|(m, _)| m == "initialize").map(|(_, s)| s.clone());
+        assert_eq!(init_sid.as_deref(), Some("-"), "首个请求不该自带会话头");
+    }
+
+    /// 出错路径：URL 打不通 → 报错且标记离线（下次调用重连，而不是假装在线）。
+    #[test]
+    fn http_transport_failure_marks_offline() {
+        let cfg = McpServerCfg {
+            name: "deadhttp".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: BTreeMap::new(),
+            enabled: true,
+            confirmed: true,
+            risk: "normal".into(),
+        };
+        sync_configs(std::slice::from_ref(&cfg));
+        let e = ensure_online_by_name("deadhttp").expect_err("连不上必须报错");
+        assert!(e.starts_with("initialize 失败"), "错误串应指明握手失败: {e}");
+        let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!m.get("deadhttp").unwrap().online, "失败后不得留在「在线」态");
     }
 }

@@ -13,7 +13,7 @@
 
 mod eval_core;
 
-use eval_core::{load_tasks, list_files, run_assertion, drive_chat, TaskReport};
+use eval_core::{load_tasks, run_assertion, snapshot, drive_chat, drive_turn, TaskReport};
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -40,7 +40,7 @@ async fn main() {
     };
     let tasks: Vec<_> = all
         .into_iter()
-        .filter(|t| filter.is_empty() || filter.iter().any(|f| t.name == *f))
+        .filter(|t| filter.is_empty() || filter.contains(&t.name))
         .collect();
     if tasks.is_empty() {
         eprintln!("[eval] 没有匹配的任务（目录 {}）", tasks_dir.display());
@@ -92,7 +92,7 @@ async fn main() {
                 eprintln!("[eval] 写 setup 文件 {rel} 失败: {e}");
             }
         }
-        let files_before = list_files(&ws);
+        let files_before = snapshot(&ws);
 
         // 2) 切换服务工作区
         let switch = client
@@ -110,10 +110,44 @@ async fn main() {
             continue;
         }
 
-        // 3) 真实对话 + 收流
+        // 3) 真实对话 + 收流（多轮任务：第二轮模拟「批准后执行」）
         let session_id = format!("eval-{}-{stamp}", task.name);
-        let drive = drive_chat(&base, task, &session_id).await;
-        let (sse, drive_error) = match drive {
+        let mut drive = drive_chat(&base, task, &session_id).await;
+        if let Some(fu) = task.followup_prompt.clone() {
+            println!("[eval]   ↳ 第二轮（followup，plan_mode={}）", task.followup_plan_mode);
+            // 第二轮要带完整历史（含第一轮的 assistant 文本）——服务端以 messages 为消息源，
+            // 只发一句「计划已批准」会丢计划上下文（真机踩过：模型答「任务信息不足」）
+            let mut history: Vec<serde_json::Value> = vec![serde_json::json!({ "role": "user", "content": task.prompt })];
+            if let Ok(first) = &drive
+                && !first.text.trim().is_empty() {
+                    history.push(serde_json::json!({ "role": "assistant", "content": first.text }));
+                }
+            history.push(serde_json::json!({ "role": "user", "content": fu }));
+            let first_events = drive.as_ref().map(|d| d.sse_events.clone()).unwrap_or_default();
+            let first_timed_out = drive.as_ref().map(|d| d.timed_out).unwrap_or(false);
+            let second = drive_turn(
+                &base,
+                &history,
+                task.followup_plan_mode,
+                &task.approval_mode,
+                task.timeout_secs,
+                &session_id,
+            )
+            .await;
+            drive = match (drive, second) {
+                (Ok(mut a), Ok(b)) => {
+                    a.sse_events.extend(first_events);
+                    a.sse_events.extend(b.sse_events);
+                    a.done = b.done;
+                    a.timed_out = first_timed_out || b.timed_out;
+                    a.error = b.error;
+                    Ok(a)
+                }
+                (Ok(a), Err(e)) => Err(anyhow::anyhow!("第二轮失败: {e:#}（第一轮 {a:?}）")),
+                (Err(e), _) => Err(e),
+            };
+        }
+        let (sse, d_err) = match drive {
             Ok(d) => {
                 if let Some(err) = &d.error {
                     eprintln!("[eval]   服务端报错: {err}");
@@ -125,6 +159,7 @@ async fn main() {
             }
             Err(e) => (Default::default(), Some(format!("{e:#}"))),
         };
+        let drive_error = d_err;
 
         // 4) 断言
         let mut details: Vec<(String, bool)> = Vec::new();
@@ -177,7 +212,7 @@ async fn main() {
             all_ok = false;
             format!("通过 {}/{}（有失败）", r.passed, r.passed + r.failed)
         };
-        println!("{:<20} {:>8}  {}", r.name, verdict, format!("{}ms", r.duration_ms));
+        println!("{:<20} {:>8}  {}ms", r.name, verdict, r.duration_ms);
     }
     let total_pass: usize = reports.iter().map(|r| r.passed).sum();
     let total_fail: usize = reports.iter().map(|r| r.failed).sum();

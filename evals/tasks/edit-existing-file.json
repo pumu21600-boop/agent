@@ -1,0 +1,17 @@
+{
+  "name": "edit-existing-file",
+  "prompt": "工作区里的 notes.md 有一行写着「状态：TODO」。请把这一行改成「状态：已完成」，只改这一处，不要新建文件。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {
+    "notes.md": "# 发布清单\n\n- 状态：TODO\n- 负责人：大脚\n"
+  },
+  "assertions": [
+    { "type": "file_contains", "path": "notes.md", "needle": "状态：已完成" },
+    { "type": "file_not_contains", "path": "notes.md", "needle": "状态：TODO" },
+    { "type": "file_contains", "path": "notes.md", "needle": "负责人：大脚" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

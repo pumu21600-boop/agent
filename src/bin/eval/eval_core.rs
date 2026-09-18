@@ -3,8 +3,8 @@
 //! **HTTP 黑盒驱动**：对运行中的服务发真实对话（/api/chat SSE），断言文件系统与
 //! SSE 事件流。主服务代码零改动——本模块只被 `src/bin/eval.rs`（CLI 壳）引用。
 //!
-//! 断言 5 种（留口扩展）：file_exists / file_not_exists / file_contains /
-//! no_new_files / sse_event。
+//! 断言 7 种：file_exists / file_not_exists / file_contains / file_not_contains /
+//! no_new_files / files_unchanged / sse_event。
 //!
 //! 任务定义（evals/tasks/*.json）：
 //! `name / prompt / plan_mode / approval_mode / timeout_secs / setup_files / assertions`
@@ -35,6 +35,13 @@ pub struct EvalTask {
     /// 相对路径 → 文件内容（跑前写入临时工作区）
     #[serde(default)]
     pub setup_files: BTreeMap<String, String>,
+    /// 第二轮提示词（可选）：第一轮跑完在同一会话里再发一轮——
+    /// 用来验证「Plan 档出计划 →（模拟点批准）切 Act 执行」这类多轮链路。
+    #[serde(default)]
+    pub followup_prompt: Option<String>,
+    /// 第二轮是否仍用 Plan 档（默认 false = 切回 Act，模拟「批准」按钮的效果）
+    #[serde(default)]
+    pub followup_plan_mode: bool,
     #[serde(default)]
     pub assertions: Vec<Assertion>,
 }
@@ -47,7 +54,8 @@ fn default_timeout() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Assertion {
-    /// file_exists | file_not_exists | file_contains | no_new_files | sse_event
+    /// file_exists | file_not_exists | file_contains | file_not_contains |
+    /// no_new_files | files_unchanged | sse_event
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
@@ -65,7 +73,9 @@ impl Assertion {
             "file_exists" => format!("文件存在: {}", self.path),
             "file_not_exists" => format!("文件不存在: {}", self.path),
             "file_contains" => format!("{} 包含 {:?}", self.path, self.needle),
+            "file_not_contains" => format!("{} 不含 {:?}", self.path, self.needle),
             "no_new_files" => "无新增文件".into(),
+            "files_unchanged" => "已有文件内容未被改动".into(),
             "sse_event" => format!("SSE 出现事件: {}", self.event),
             other => format!("未知断言类型: {other}"),
         }
@@ -116,7 +126,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
 pub fn run_assertion(
     a: &Assertion,
     ws_dir: &Path,
-    files_before: &BTreeSet<String>,
+    before: &BTreeMap<String, u64>,
     sse_events: &BTreeSet<String>,
 ) -> (bool, String) {
     let desc = a.describe();
@@ -126,16 +136,48 @@ pub fn run_assertion(
         "file_contains" => fs::read_to_string(ws_dir.join(&a.path))
             .map(|c| c.contains(&a.needle))
             .unwrap_or(false),
+        // 谓词语义：文件不存在也算「不含该串」成立（该不该存在由 file_exists 断言负责）
+        "file_not_contains" => fs::read_to_string(ws_dir.join(&a.path))
+            .map(|c| !c.contains(&a.needle))
+            .unwrap_or(true),
         "no_new_files" => {
             let now = list_files(ws_dir);
-            now.iter().all(|f| {
-                files_before.contains(f) || is_runtime_file(f)
-            })
+            now.iter().all(|f| before.contains_key(f) || is_runtime_file(f))
         }
+        "files_unchanged" => before.iter().all(|(f, h)| {
+            if is_runtime_file(f) {
+                return true; // 服务自己维护的文件（.agent/ 等）不算任务改动
+            }
+            match fs::read(ws_dir.join(f)) {
+                Ok(bytes) => hash_bytes(&bytes) == *h,
+                Err(_) => false, // 被删掉也算改动
+            }
+        }),
         "sse_event" => sse_events.contains(&a.event),
         _ => false, // 未知类型一律失败（防任务集手滑静默通过）
     };
     (ok, desc)
+}
+
+/// 工作区内容快照（相对路径 → 内容指纹）：files_unchanged 的基线。
+pub fn snapshot(root: &Path) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for rel in list_files(root) {
+        if let Ok(bytes) = fs::read(root.join(&rel)) {
+            out.insert(rel, hash_bytes(&bytes));
+        }
+    }
+    out
+}
+
+/// FNV-1a 64（零依赖；只做「变没变」判定，不做安全用途）。
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// 服务自身管理的运行时文件（eval 断言应忽略，不算「任务改动」）：
@@ -162,27 +204,49 @@ pub struct DriveResult {
     pub done: bool,
     /// 是否被整体超时打断
     pub timed_out: bool,
+    /// 累积的正文（content 分片拼接）——多轮任务把它当上一轮的 assistant 消息回填
+    pub text: String,
 }
 
-/// 对服务发一轮 /api/chat 并收流至 done/error/超时。
-pub async fn drive_chat(
+/// 对服务发一轮 /api/chat 并收流至 done/error/超时（任务定义驱动）。
+pub async fn drive_chat(base: &str, task: &EvalTask, session_id: &str) -> anyhow::Result<DriveResult> {
+    let history = vec![json!({ "role": "user", "content": task.prompt })];
+    drive_turn(base, &history, task.plan_mode, &task.approval_mode, task.timeout_secs, session_id).await
+}
+
+/// 同上，但把「带什么历史、什么档」都作为参数——多轮任务（第一轮出计划、第二轮批准后执行）
+/// 与单轮任务共用这一条驱动路径。
+///
+/// 注意 `history` 要带**完整对话**（含上一轮的 assistant 文本）：服务端把它当消息源，
+/// 只发一句「计划已批准」而丢掉计划本身，模型会答「任务信息不足」（真机踩过）。
+pub async fn drive_turn(
     base: &str,
-    task: &EvalTask,
+    history: &[Value],
+    plan_mode: bool,
+    approval_mode: &str,
+    timeout_secs: u64,
     session_id: &str,
 ) -> anyhow::Result<DriveResult> {
+    let last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
     let url = format!("{base}/api/chat");
     let body = json!({
-        "messages": [{ "role": "user", "content": task.prompt }],
-        "message": task.prompt,
-        "plan_mode": task.plan_mode,
-        "approval_mode": task.approval_mode,
+        "messages": history,
+        "message": last_user,
+        "plan_mode": plan_mode,
+        "approval_mode": approval_mode,
         "session_id": session_id,
     });
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(task.timeout_secs + 10))
+        .timeout(std::time::Duration::from_secs(timeout_secs + 10))
         .send()
         .await
         .context("请求 /api/chat 失败（服务未启动？）")?;
@@ -193,7 +257,7 @@ pub async fn drive_chat(
     let mut out = DriveResult::default();
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(task.timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
         let chunk = tokio::select! {
@@ -214,9 +278,13 @@ pub async fn drive_chat(
             for line in raw.split('\n') {
                 let Some(data) = line.strip_prefix("data: ") else { continue };
                 let Ok(ev) = serde_json::from_str::<Value>(data) else { continue };
-                if let Some(obj) = ev.as_object() {
-                    if let Some(key) = obj.keys().next() {
+                if let Some(obj) = ev.as_object()
+                    && let Some(key) = obj.keys().next() {
                         out.sse_events.insert(key.clone());
+                        if key == "content"
+                            && let Some(t) = obj.get("content").and_then(Value::as_str) {
+                                out.text.push_str(t);
+                            }
                         if key == "error" {
                             out.error = obj
                                 .get("error")
@@ -227,7 +295,6 @@ pub async fn drive_chat(
                             out.done = true;
                         }
                     }
-                }
             }
             if out.done || out.error.is_some() {
                 break;
@@ -291,7 +358,7 @@ mod tests {
     #[test]
     fn file_assertions() {
         let (_g, ws) = ws_with("file_assertions", &[("hello.txt", "hello eval\n"), ("sub/b.json", "{\"ok\":true}")]);
-        let before = list_files(&ws);
+        let before = snapshot(&ws);
         let mut sse = BTreeSet::new();
         sse.insert("done".to_string());
 
@@ -300,16 +367,47 @@ mod tests {
         assert!(run_assertion(&a("file_contains", "hello.txt", "hello eval", ""), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("file_contains", "hello.txt", "missing", ""), &ws, &before, &sse).0);
         assert!(run_assertion(&a("file_contains", "sub/b.json", "ok", ""), &ws, &before, &sse).0);
+        assert!(run_assertion(&a("file_not_contains", "hello.txt", "missing", ""), &ws, &before, &sse).0);
+        assert!(!run_assertion(&a("file_not_contains", "hello.txt", "hello eval", ""), &ws, &before, &sse).0);
+        // 文件不存在时 file_not_contains 视为通过（没有「含有」这回事）
+        assert!(run_assertion(&a("file_not_contains", "nope.txt", "x", ""), &ws, &before, &sse).0);
         assert!(run_assertion(&a("no_new_files", "", "", ""), &ws, &before, &sse).0);
+        assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &sse).0);
         assert!(run_assertion(&a("sse_event", "", "", "done"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("sse_event", "", "", "plan_proposal"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("unknown_kind", "", "", ""), &ws, &before, &sse).0, "未知断言类型必须失败");
     }
 
+    /// files_unchanged：改内容 / 删文件 / 新增文件三种「脏」都要抓到。
+    #[test]
+    fn files_unchanged_detects_modification_and_deletion() {
+        let (_g, ws) = ws_with("unchanged", &[("a.txt", "1"), ("b.txt", "2")]);
+        let before = snapshot(&ws);
+
+        // 只新增文件：files_unchanged 仍应通过（新增由 no_new_files 负责）
+        std::fs::write(ws.join("c.txt"), "3").unwrap();
+        assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+
+        // 改内容：必须失败
+        std::fs::write(ws.join("a.txt"), "1 modified").unwrap();
+        assert!(!run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+
+        // 只删不改：也必须失败（删除同样是「改了工作区」）
+        std::fs::write(ws.join("a.txt"), "1").unwrap();
+        std::fs::remove_file(ws.join("b.txt")).unwrap();
+        assert!(!run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+
+        // 运行时文件（.agent/ 等）怎么动都不算任务改动
+        std::fs::write(ws.join("b.txt"), "2").unwrap();
+        std::fs::create_dir_all(ws.join(".agent")).unwrap();
+        std::fs::write(ws.join(".agent").join("events.log"), "changed").unwrap();
+        assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+    }
+
     #[test]
     fn no_new_files_detects_newcomer_but_skips_runtime_files() {
         let (_g, ws) = ws_with("newcomer", &[("base.txt", "x")]);
-        let before = list_files(&ws);
+        let before = snapshot(&ws);
         std::fs::write(ws.join("new.txt"), "y").unwrap();
         assert!(!run_assertion(&a("no_new_files", "", "", ""), &ws, &before, &BTreeSet::new()).0);
         std::fs::remove_file(ws.join("new.txt")).unwrap(); // 移除非法新增后再验证运行时文件豁免
@@ -351,5 +449,35 @@ mod tests {
         assert_eq!(tasks[0].approval_mode, "auto");
         assert_eq!(tasks[0].timeout_secs, 180);
         assert_eq!(tasks[1].timeout_secs, 60);
+    }
+
+    /// 仓库真实任务集必须整体可解析、断言类型全在册、任务名唯一——
+    /// 新增任务时手滑写错断言类型 / 重名，CI 就会红（而不是跑评测时才发现）。
+    #[test]
+    fn repo_task_set_is_valid() {
+        const KNOWN: [&str; 7] = [
+            "file_exists",
+            "file_not_exists",
+            "file_contains",
+            "file_not_contains",
+            "no_new_files",
+            "files_unchanged",
+            "sse_event",
+        ];
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals").join("tasks");
+        let tasks = load_tasks(&dir).expect("仓库任务集应能全部解析");
+        assert!(tasks.len() >= 8, "任务集应已扩充，当前只有 {} 个", tasks.len());
+        for t in &tasks {
+            assert!(!t.assertions.is_empty(), "任务 {} 没有任何断言（跑不出结论）", t.name);
+            assert!(!t.prompt.trim().is_empty(), "任务 {} 提示词为空", t.name);
+            for a in &t.assertions {
+                assert!(KNOWN.contains(&a.kind.as_str()), "任务 {} 用了未知断言类型 {}", t.name, a.kind);
+            }
+        }
+        let mut names: Vec<&str> = tasks.iter().map(|t| t.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "任务名必须唯一（--filter 按名字匹配）");
     }
 }

@@ -1,0 +1,58 @@
+name: CI
+
+# 提交/PR 自动跑三件事：clippy 零告警、全量测试、前端构建。
+# 本地等价命令（提交前自查）：
+#   cargo clippy --all-targets -- -D warnings
+#   cargo test --no-fail-fast
+#   cd web && npm ci && npm run build
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust（clippy + 测试）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链由 rust-toolchain.toml 钉死（stable-x86_64-pc-windows-msvc）
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy（告警即失败）
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 沙箱探针要真拉起受限进程（内存上限探针 60s），单独给时间预算
+      - name: 测试（全量，不 fail-fast）
+        run: cargo test --no-fail-fast
+        timeout-minutes: 25
+
+  frontend:
+    name: 前端（构建）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci
+
+      - name: 构建（产物 web/dist，服务直接托管）
+        working-directory: web
+        run: npm run build

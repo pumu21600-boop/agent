@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{run, SandboxLimits, SandboxOutput, SandboxSpec};
+use super::{run, SandboxLimits, SandboxSpec};
+// 仅测试路径（probe_memory_cap）用到，放这里避免非测试构建的 unused import 告警
+#[cfg(test)]
+use super::SandboxOutput;
 use crate::{config::SandboxConfig, tools::workspace_root};
 
 /// 探针结果（SSE/HTTP 直出 JSON）。
@@ -145,18 +148,37 @@ pub fn probe_privilege_strip(_limits: SandboxLimits) -> ProbeResult {
     }
 }
 
-/// 工作目录可达：cwd=工程根 type Cargo.toml 成功（隔离不能过头，正常读写面必须保留）。
+/// 工作目录可达：沙箱内进程能在工作目录里读到宿主刚写的文件（隔离不能过头，
+/// 正常读面必须保留）。
+///
+/// 探针**自带标记文件**，不依赖工作区里恰好存在某个仓库文件——早先写死读 `Cargo.toml`，
+/// 一旦按打包形态分发（exe 同级没有源码）就必然假失败（真机抓到）。
 pub fn probe_workspace_read(limits: SandboxLimits) -> ProbeResult {
+    const TOKEN: &str = "agent-sandbox-read-probe";
+    // 标记名带进程号 + 自增序号：并发自检（测试并行 / 界面同时点两次）互不踩——
+    // 固定名曾出现同进程两个探针互相删标记的「file not found」假失败。
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let marker_name = format!(".agent_probe_read_{}_{seq}.txt", std::process::id());
     let root = workspace_root();
-    let out = run(&cmd_spec("/C type Cargo.toml", &root, limits));
+    let marker = root.join(&marker_name);
+    if let Err(e) = std::fs::write(&marker, TOKEN) {
+        return ProbeResult {
+            name: "workspace_read",
+            ok: false,
+            detail: format!("写标记文件失败（工作区不可写）: {e}"),
+        };
+    }
+    let out = run(&cmd_spec(&format!("/C type {marker_name}"), &root, limits));
+    let _ = std::fs::remove_file(&marker);
     match out {
-        Ok(o) if o.stdout.contains("[package]") => {
+        Ok(o) if o.stdout.contains(TOKEN) => {
             ProbeResult { name: "workspace_read", ok: true, detail: "工作目录内文件可读".into() }
         }
         Ok(o) => ProbeResult {
             name: "workspace_read",
             ok: false,
-            detail: format!("type Cargo.toml 异常: exit={:?} out={:?}", o.exit_code, o.stderr),
+            detail: format!("type {marker_name} 异常: exit={:?} out={:?}", o.exit_code, o.stderr),
         },
         Err(e) => ProbeResult { name: "workspace_read", ok: false, detail: e.to_string() },
     }
@@ -300,12 +322,9 @@ fn find_hog() -> Option<PathBuf> {
         }
     }
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    for cand in [dir.join("sandbox_hog.exe"), dir.join("..").join("sandbox_hog.exe")] {
-        if cand.exists() {
-            return Some(cand);
-        }
-    }
-    None
+    [dir.join("sandbox_hog.exe"), dir.join("..").join("sandbox_hog.exe")]
+        .into_iter()
+        .find(|cand| cand.exists())
 }
 
 /// 测试内 logger 初始化（sandbox 事件落 JSONL，探针依赖它）。

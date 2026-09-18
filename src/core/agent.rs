@@ -31,6 +31,10 @@ pub enum AgentEvent {
     Snapshot { messages: Vec<Value> },
     /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
     Notice(String),
+    /// 本步作废重来（P15/022 降级链）：主渠道流到一半失败、换渠道重试时发出。
+    /// 前端应把当前消息尾部各丢掉 `content` / `reasoning` 个 UTF-16 码元
+    /// （与 JS String.length 同口径），否则半截回答会与重试后的完整回答叠在一起。
+    StepReset { content: usize, reasoning: usize },
     /// P8 TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
     Title(String),
     /// 任务改动统计条（P6.1）：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
@@ -205,7 +209,7 @@ async fn emit_checkpoint_bar(
 /// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在 P9 施工单 013 A2 中删除——
 /// 两套判定并存会造成语义分裂，此后再无第二处审批判定入口。
 /// （工具静态 danger_level 现仅用于「是否拍影子仓库检查点」，不参与审批判定。）
-
+///
 /// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
 pub trait ApprovalGate: Send + Sync {
     /// P9 细粒度审批：结合工具名与具体参数进行风险研判
@@ -519,6 +523,10 @@ pub async fn run_task(
         chain.push(primary);
         chain.extend(channels.fallbacks.iter());
         let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
+        // 本步当前这次尝试已经推给前端的字符数（UTF-16 码元，与 JS String.length 同口径）。
+        // 换渠道重试时前端要按这个数把半截内容丢掉——否则界面会出现「半截 + 完整」叠着显示。
+        let streamed_content = std::sync::atomic::AtomicUsize::new(0);
+        let streamed_reasoning = std::sync::atomic::AtomicUsize::new(0);
         for (i, ch) in chain.iter().enumerate() {
             if i > 0 {
                 observability::event(
@@ -526,6 +534,10 @@ pub async fn run_task(
                     json!({ "kind": "gateway.fallback", "step": step, "from": primary.model, "to": ch.model, "base_url": ch.base_url }),
                 );
                 let last_err = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+                on_event(AgentEvent::StepReset {
+                    content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
+                    reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
+                });
                 on_event(AgentEvent::Notice(format!(
                     "主渠道调用失败（{last_err}），已切换到降级渠道「{}」",
                     ch.model
@@ -540,13 +552,20 @@ pub async fn run_task(
                     |chunk| {
                         let delta = extract_delta(chunk);
                         if !delta.content.is_empty() {
+                            streamed_content.fetch_add(
+                                delta.content.encode_utf16().count(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             on_event(AgentEvent::Content(delta.content));
                         }
-                        if let Some(r) = delta.reasoning {
-                            if !r.is_empty() {
+                        if let Some(r) = delta.reasoning
+                            && !r.is_empty() {
+                                streamed_reasoning.fetch_add(
+                                    r.encode_utf16().count(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 on_event(AgentEvent::Reasoning(r));
                             }
-                        }
                     },
                 )
                 .await;
@@ -630,15 +649,14 @@ pub async fn run_task(
             // P7 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
             // P8 TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
-            if let Some(tch) = &channels.title {
-                if let Some(title) = generate_title(gateway, tch, &final_text).await {
+            if let Some(tch) = &channels.title
+                && let Some(title) = generate_title(gateway, tch, &final_text).await {
                     observability::event(
                         EventType::State,
                         json!({ "kind": "session.titled", "title": title }),
                     );
                     on_event(AgentEvent::Title(title));
                 }
-            }
             return Ok(LoopOutcome::Done);
         }
 

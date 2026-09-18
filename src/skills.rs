@@ -143,7 +143,7 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     };
     let dir = crate::tools::workspace_root().join("skills").join(name);
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    fs::write(dir.join("SKILL.md"), full).map_err(|e| format!("写入失败: {e}"))?;
+    crate::fsx::write_atomic_str(&dir.join("SKILL.md"), &full).map_err(|e| format!("写入失败: {e}"))?;
     Ok(dir.to_string_lossy().to_string())
 }
 

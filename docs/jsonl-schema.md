@@ -3,10 +3,11 @@
 ## 1. 文件位置
 
 - 默认：`logs/agent.jsonl`（相对工程根目录）
-- 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file` / `max_mb`
+- 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file` / `max_mb` / `keep_archives`
 - 追加写（append-only），进程每次启动生成新的 `session_id`
-- **轮转**（2026-09-14 补）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成 `agent.jsonl.1`
-  （覆盖上一份归档、只留一份）再开新文件；启动时检查一次，运行中每 500 条复查一次，
+- **轮转**（2026-09-14 补，P16 起多份归档）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成
+  `agent.jsonl.1`（最新）再开新文件，旧归档依次倒位成 `.2`…`.N`，保留份数走 `[logging].keep_archives`
+  （默认 3，0 = 归档即删）；启动时检查一次，运行中每 500 条复查一次，
   轮转本身记一条 `state / log.rotated`；`max_mb = 0` 关闭轮转
 
 ## 2. 记录格式（每条一行）
@@ -117,7 +118,7 @@
 | `git.committed` | 界面手动提交（P10.5） | `id`、`files`、`manual` |
 | `attachments.gitignored` | 附件目录自动写入工作区 .gitignore | `path` |
 | `media.error` | 多模态理解调用失败（DSH 转接规范） | `modality`、`model`、`url`、`error` |
-| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补） | `bytes`、`limit_bytes` |
+| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补；P16 起多份倒位） | `bytes`、`limit_bytes`、`keep` |
 
 ### 4.5 error —— 错误
 

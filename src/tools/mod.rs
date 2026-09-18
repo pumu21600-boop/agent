@@ -28,21 +28,18 @@ pub struct ToolSpec {
 static WORKSPACE: OnceLock<RwLock<PathBuf>> = OnceLock::new();
 
 fn workspace_slot() -> &'static RwLock<PathBuf> {
-    WORKSPACE.get_or_init(|| RwLock::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))))
+    WORKSPACE.get_or_init(|| RwLock::new(crate::config::app_root()))
 }
 
 /// 工作目录根（P8.2 起运行时可切换：/api/workspace 设置，默认工程根）。
 pub fn workspace_root() -> PathBuf {
-    workspace_slot()
-        .read()
-        .map(|p| p.clone())
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    workspace_slot().read().map(|p| p.clone()).unwrap_or_else(|_| crate::config::app_root())
 }
 
 /// 切换工作目录（调用方已校验路径存在）；返回旧值供日志。
-pub fn set_workspace_root(path: &PathBuf) -> PathBuf {
-    let mut slot = workspace_slot().write().expect("workspace 锁毒化");
-    std::mem::replace(&mut *slot, path.clone())
+pub fn set_workspace_root(path: &Path) -> PathBuf {
+    let mut slot = workspace_slot().write().unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *slot, path.to_path_buf())
 }
 
 /// 工具执行所需的配置快照。
@@ -134,6 +131,21 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 1,
         },
         ToolSpec {
+            name: "edit_file",
+            description: "在工作目录内一个文本文件里做局部替换：把 old_string 精确替换为 new_string（改大文件、改几行时优先用它，不要用 write_file 重写全文）。old_string 必须与文件内容逐字一致（含缩进与换行）且在文件中唯一出现；出现 0 次或多次都会失败并说明原因，可读文件后再试。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "目标文件路径（相对工作目录）" },
+                    "old_string": { "type": "string", "description": "要被替换的原文本（与文件逐字一致；多带几行上下文保证唯一）" },
+                    "new_string": { "type": "string", "description": "替换后的新文本（删除内容时给空串）" },
+                    "replace_all": { "type": "boolean", "description": "可选：old_string 出现多次时全部替换（默认 false，要求唯一匹配）" }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
             name: "shell",
             description: "在沙箱中执行一条 Windows 命令（cmd /C，工作目录=项目根）。输出有超时与整树击杀保护。",
             parameters: json!({
@@ -212,6 +224,7 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
             crate::skills::read(name)
         }
         "write_file" => write_file(args),
+        "edit_file" => edit_file(args),
         "search" => search(args, cfg.max_chars),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
@@ -296,16 +309,131 @@ fn read_page(args: &str, max_chars: usize) -> Result<String, String> {
     Ok(cap(&out, max_chars))
 }
 
+/// 文件类工具的统一体积上限：`write_file` 的 content、`edit_file` 的目标文件与编辑结果
+/// 共用（审查 N2——edit_file 原先无上限，模型误编辑大文件时整文件读入内存）。
+const MAX_FILE_BYTES: usize = 512 * 1024;
+
 fn write_file(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let content = v.get("content").and_then(Value::as_str).ok_or("缺少 content 参数")?;
-    if content.len() > 512 * 1024 {
+    if content.len() > MAX_FILE_BYTES {
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
     let full = resolve_in_workspace(rel, false)?;
-    std::fs::write(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
+    // 原子写：写到一半失败不能留下半截文件（模型写代码文件时这是最常见的损坏来源）
+    crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
     Ok(format!("已写入 {} 字节 → {}", content.len(), rel))
+}
+
+/// 局部修改（P16）：文件里唯一出现的 old_string → new_string。
+/// 大文件改几行用它，省 token 也避免重写全文时误伤其他内容。
+fn edit_file(args: &str) -> Result<String, String> {
+    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+    let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
+    let old = v.get("old_string").and_then(Value::as_str).ok_or("缺少 old_string 参数")?;
+    let new = v.get("new_string").and_then(Value::as_str).ok_or("缺少 new_string 参数")?;
+    let replace_all = v.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+    if old.is_empty() {
+        return Err("old_string 为空：本工具做定位替换，不接受空串（整文件重写请用 write_file）".to_string());
+    }
+    if old == new {
+        return Err("old_string 与 new_string 相同，无需修改".to_string());
+    }
+    if new.len() > MAX_FILE_BYTES {
+        return Err(format!("new_string 过大（{} 字节，上限 512KB）", new.len()));
+    }
+    let full = resolve_in_workspace(rel, true)?;
+    let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
+    if meta.is_dir() {
+        return Err("目标是目录，不是文件".to_string());
+    }
+    if meta.len() > MAX_FILE_BYTES as u64 {
+        return Err(format!(
+            "文件过大（{} 字节，上限 512KB）：edit_file 只用于改文本片段，拒绝整文件读入",
+            meta.len()
+        ));
+    }
+    let text = std::fs::read_to_string(&full).map_err(|e| format!("读文件失败（可能非 UTF-8）: {e}"))?;
+    let (out, count, line) = apply_edit(&text, old, new, replace_all, rel)?;
+    if out.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "编辑后文件将达 {} 字节，超过 512KB 上限（原 {} 字节）：请缩小改动或用 write_file 分文件写",
+            out.len(),
+            text.len()
+        ));
+    }
+    // 与其他落盘点同一原子写：替换一半失败不留半截文件
+    crate::fsx::write_atomic_str(&full, &out).map_err(|e| format!("写文件失败: {e}"))?;
+    Ok(format!(
+        "已编辑 {rel}：{count} 处替换（首处在第 {line} 行，{} → {} 字节）",
+        text.len(),
+        out.len()
+    ))
+}
+
+/// 定位替换的纯逻辑（可单测）：返回（替换后全文, 替换处数, 首处行号）。
+///
+/// CRLF 容错：文件是**纯 CRLF** 行尾而 old_string 按 LF 书写时（模型最常见的输入形态），
+/// 把全文按 LF 规范化后匹配、替换，再整体还原 CRLF（往返可逆才做，混合行尾不猜测）。
+fn apply_edit(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    rel: &str,
+) -> Result<(String, usize, usize), String> {
+    let mut work = text.to_string();
+    let mut w_old = old.to_string();
+    let mut w_new = new.to_string();
+    let mut crlf = false;
+    if text.matches(old).count() == 0 && text.contains("\r\n") && !old.contains('\r') {
+        let lf = text.replace("\r\n", "\n");
+        // 纯 CRLF（往返一致）且规范化后能命中，才走这条宽容路径
+        if lf.replace('\n', "\r\n") == text && lf.contains(old) {
+            w_new = new.replace("\r\n", "\n");
+            work = lf;
+            w_old = old.to_string();
+            crlf = true;
+        }
+    }
+    let n = work.matches(w_old.as_str()).count();
+    if n == 0 {
+        return Err(format!(
+            "old_string 未命中 {rel}{}：old_string 必须与文件内容逐字一致（含缩进、空行与换行），先 read_file/read_page 取准确片段再试",
+            near_line_hint(&work, old)
+        ));
+    }
+    if n > 1 && !replace_all {
+        return Err(format!(
+            "old_string 在 {rel} 中出现 {n} 次，不唯一：上下各多带几行上下文让它唯一，或置 replace_all=true 全部替换"
+        ));
+    }
+    let first = work.find(w_old.as_str()).unwrap_or(0);
+    let line = work[..first].matches('\n').count() + 1;
+    let out = if replace_all {
+        work.replace(w_old.as_str(), w_new.as_str())
+    } else {
+        work.replacen(w_old.as_str(), w_new.as_str(), 1)
+    };
+    let out = if crlf { out.replace('\n', "\r\n") } else { out };
+    Ok((out, if replace_all { n } else { 1 }, line))
+}
+
+/// 未命中时的定位提示：old_string 的首个非空行若在文件中出现，报出它所在行号，
+/// 让模型知道「差不多的位置在哪、多半是缩进或空行对不上」。
+fn near_line_hint(text: &str, old: &str) -> String {
+    let head = old.lines().map(str::trim).find(|l| l.len() >= 8).unwrap_or("");
+    if head.is_empty() {
+        return String::new();
+    }
+    match text.find(head) {
+        Some(pos) => {
+            let line = text[..pos].matches('\n').count() + 1;
+            format!("（old_string 首行「{head}」出现在第 {line} 行附近，多半是缩进/空行/相邻行对不上）")
+        }
+        None => String::new(),
+    }
 }
 
 /// ripgrep 可用性（父进程 PATH 里找一次）。
@@ -551,8 +679,8 @@ pub(crate) fn git_exe() -> Result<PathBuf, String> {
                 .output()
             {
                 let text = String::from_utf8_lossy(&out.stdout);
-                if let Some(line) = text.lines().find(|l| l.contains("InstallPath")) {
-                    if let Some(dir) = line.split("REG_SZ").last().map(|s| s.trim()) {
+                if let Some(line) = text.lines().find(|l| l.contains("InstallPath"))
+                    && let Some(dir) = line.split("REG_SZ").last().map(|s| s.trim()) {
                         for sub in ["cmd\\git.exe", "bin\\git.exe"] {
                             let pb = PathBuf::from(dir).join(sub);
                             if pb.is_file() {
@@ -561,7 +689,6 @@ pub(crate) fn git_exe() -> Result<PathBuf, String> {
                             }
                         }
                     }
-                }
             }
         }
         // 4) 常见安装位置（Git for Windows / PortableGit 习惯路径）
@@ -610,13 +737,12 @@ pub(crate) fn git_exe() -> Result<PathBuf, String> {
             candidates.push(PathBuf::from(&up).join("scoop\\apps\\git\\current\\cmd\\git.exe"));
         }
         // 5) 随分发捆绑：exe 同级 tools/git/（放入 PortableGit 即开箱可用）
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent() {
                 for rel in ["tools\\git\\cmd\\git.exe", "tools\\git\\bin\\git.exe"] {
                     candidates.push(dir.join(rel));
                 }
             }
-        }
         for p in candidates {
             if p.is_file() {
                 register_git_dirs(&p);
@@ -723,19 +849,17 @@ fn bundled_runtime_dir() -> Option<PathBuf> {
 /// → exe 上两级 `runtime\git-runtime.zip`（开发布局：target\release\agent.exe → 仓库根）。
 fn bundled_zip_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(p) = std::env::var("AGENT_GIT_ZIP") {
-        if !p.trim().is_empty() {
+    if let Ok(p) = std::env::var("AGENT_GIT_ZIP")
+        && !p.trim().is_empty() {
             v.push(PathBuf::from(p));
         }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             v.push(dir.join("tools").join("git-runtime.zip"));
             if let Some(root) = dir.parent().and_then(Path::parent) {
                 v.push(root.join("runtime").join("git-runtime.zip"));
             }
         }
-    }
     v
 }
 
@@ -867,6 +991,86 @@ mod tests {
         let r = execute(&cfg(), "read_file", r#"{"path":"C:\\Windows\\win.ini"}"#).await;
         assert!(r.is_err(), "绝对路径越界应被拒绝");
         std::fs::remove_dir_all(workspace_root().join(".p4-test")).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_file_unique_replace_and_failure_hints() {
+        init_logger();
+        let dir = workspace_root().join(".p16-test-edit");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("a.txt"), "alpha_one\nbeta_two\ngamma_three\n").ok();
+
+        // 唯一替换：内容正确落盘，结果带处数与行号
+        let r = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"beta_two","new_string":"BETA_TWO"}"#).await.unwrap();
+        assert!(r.contains("1 处替换") && r.contains("第 2 行"), "{r}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "alpha_one\nBETA_TWO\ngamma_three\n");
+
+        // 未命中：拒绝并带定位提示（首行「gamma_three」在文件第 3 行）
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"gamma_three\nnope_tail","new_string":"x"}"#).await.unwrap_err();
+        assert!(e.contains("未命中") && e.contains("第 3 行附近"), "{e}");
+
+        // 不唯一：要求加长上下文；replace_all 放行
+        std::fs::write(dir.join("b.txt"), "dup\ndup\n").ok();
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D"}"#).await.unwrap_err();
+        assert!(e.contains("不唯一") && e.contains("2 次"), "{e}");
+        let r = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/b.txt","old_string":"dup","new_string":"D","replace_all":true}"#).await.unwrap();
+        assert!(r.contains("2 处替换"), "{r}");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "D\nD\n");
+
+        // 空 old_string / 新旧相同：直接拒绝（不做猜测）
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"","new_string":"x"}"#).await.unwrap_err();
+        assert!(e.contains("为空"), "{e}");
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit/a.txt","old_string":"alpha","new_string":"alpha"}"#).await.unwrap_err();
+        assert!(e.contains("无需修改"), "{e}");
+
+        // 越界与目录：拒绝（不存在的外界路径先被「路径不存在」拦下；真实存在的外部文件走「拒绝」分支）
+        let e = execute(&cfg(), "edit_file", r#"{"path":"../outside.txt","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        assert!(e.contains("路径不存在") || e.contains("拒绝"), "{e}");
+        let e = execute(&cfg(), "edit_file", r#"{"path":"C:\\Windows\\win.ini","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        assert!(e.contains("拒绝"), "{e}");
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        assert!(e.contains("目录"), "{e}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_file_tolerates_lf_old_string_on_crlf_file() {
+        init_logger();
+        let dir = workspace_root().join(".p16-test-edit-crlf");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("c.txt"), "one\r\ntwo\r\nthree\r\n").ok();
+        // 文件纯 CRLF、old_string 按 LF 写：规范化匹配，结果整体保持 CRLF
+        let r = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit-crlf/c.txt","old_string":"two\nthree","new_string":"TWO\nTHREE"}"#).await.unwrap();
+        assert!(r.contains("第 2 行"), "{r}");
+        assert_eq!(std::fs::read_to_string(dir.join("c.txt")).unwrap(), "one\r\nTWO\r\nTHREE\r\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_file_rejects_oversized_file_and_result() {
+        init_logger();
+        let dir = workspace_root().join(".p16-test-edit-big");
+        std::fs::create_dir_all(&dir).ok();
+
+        // 目标文件超上限：拒绝整文件读入（N2），原文件一字节不动
+        let big = "a".repeat(512 * 1024 + 1);
+        std::fs::write(dir.join("big.txt"), &big).ok();
+        let e = execute(&cfg(), "edit_file", r#"{"path":".p16-test-edit-big/big.txt","old_string":"a","new_string":"b"}"#).await.unwrap_err();
+        assert!(e.contains("文件过大") && e.contains("512KB"), "{e}");
+        assert_eq!(std::fs::read_to_string(dir.join("big.txt")).unwrap(), big);
+
+        // 编辑结果超上限：拒绝落盘（与 write_file 同一上限）
+        std::fs::write(dir.join("grow.txt"), format!("x{}", "z".repeat(200))).ok();
+        let payload = format!(
+            r#"{{"path":".p16-test-edit-big/grow.txt","old_string":"x","new_string":"{}"}}"#,
+            "y".repeat(512 * 1024)
+        );
+        let e = execute(&cfg(), "edit_file", &payload).await.unwrap_err();
+        assert!(e.contains("编辑后") && e.contains("512KB"), "{e}");
+        assert_eq!(std::fs::read_to_string(dir.join("grow.txt")).unwrap().len(), 201);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -1,0 +1,17 @@
+{
+  "name": "plan-mode-write-guard",
+  "prompt": "把工作区里的 config.json 里的 value 从 111 改成 222。",
+  "plan_mode": true,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "setup_files": {
+    "config.json": "{\n  \"value\": 111\n}\n"
+  },
+  "assertions": [
+    { "type": "file_contains", "path": "config.json", "needle": "111" },
+    { "type": "file_not_contains", "path": "config.json", "needle": "222" },
+    { "type": "files_unchanged" },
+    { "type": "no_new_files" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

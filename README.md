@@ -1,37 +1,41 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P14 完成**（记忆库星云 + Skills + 服务自管理 + 设置-记忆补丁）；P13 桌面壳按用户指示搁置（web 定稿后启用）。
+当前进度：**P16 完成**（第二轮审查整改：取消模型会话化 / `edit_file` 局部修改工具 / 日志多份归档 /
+扩展覆盖标记）；P15 缺口补齐（组件总线 v0 / MCP http transport / WASM ABI v1 / 发布打包 / CI）；
+P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用）。
 逐阶段排产与踩坑记录见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
 ## 功能总览
 
-- **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、取消贯通；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
-- **工具**：`read_file` / `read_page` / `search`(rg) / `web_fetch` / `write_file` / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`）与 WASM 插件（`wasm__<plugin>__<tool>`）。
-- **审批与 Plan**：三档 `read-only` / `auto` / `full-access`（侧栏即时切换、请求级可覆盖），风险分级引擎逐条判定，「本会话同类允许」记忆授权范围；Plan 档只放行只读操作，最终回答可产出结构化计划卡（批准后自动转 Act 执行）。
-- **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）。
+- **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、**取消会话化**（停止只停当前会话的这一轮，别的会话不受影响）；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
+- **工具**：`read_file` / `read_page` / `search`(rg) / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`）与 WASM 插件（`wasm__<plugin>__<tool>`）。
+- **审批与 Plan**：三档 `read-only` / `auto` / `full-access`（侧栏即时切换、请求级可覆盖），风险分级引擎逐条判定，「本会话同类允许」记忆授权范围。Plan 档是**接口层能力**（请求级 `plan_mode`：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划，最终回答可产出结构化计划块）——P14 起**界面不再提供 Plan/Act 手动切换**（改由模型按系统约定在任务里自己列步骤），该档保留给 API 与 eval 使用。
+- **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）；设置 → 插件 有「沙箱自检」卡片可一键跑探针套件。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
 - **恢复与撤销**：danger≥1 工具执行前拍影子仓库检查点；撤销只回退本任务改过的文件（绝不整树 reset）；对话流内显示「N 个文件已更改 +x −y ↩ 撤销」。
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）；HANDOFF 交接文档（手动或上下文 ≥80% 自动）。
 - **记忆**：双层存储（全局 `~/.agent` + 项目 `<workspace>/.agent/memory`）、events.log 事件流水（默认脱敏）、AGENTS.md 双层注入、滚动摘要；系统约定（`prompts/system.md`）**每轮任务实时读盘**，面板保存即生效。
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
+- **插件**：MCP 双 transport（本地 **stdio** 子进程 / 远端 **Streamable HTTP**，后者支持 SSE 帧与会话头）；WASM 插件（ABI v1，纯计算沙箱、零 host function）；**组件总线 v0（UI 插槽）**——`ui-ext/` 目录里的静态面板跑在沙箱 iframe 里，经 postMessage 只读白名单取数据。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
-- **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板六分区（外观 / 模型配置 / 模型参数 / 角色分工 / 记忆 / 插件 / 工作区）。
+- **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，11 个任务）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / 扩展）。
+- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测 152 项（含沙箱 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
 
 ```
 agent/
 ├── src/                  # Rust 后端
-│   ├── main.rs           # 启动（配置/日志/工作区/记忆层装配）
+│   ├── main.rs           # 启动（app_root 定位资源 → 配置/日志/工作区/记忆层装配）
 │   ├── server.rs         # axum：静态页 + 全部 HTTP/SSE 接口 + 审批门 + 网关装配
 │   ├── service.rs        # 服务自管理（start/stop/status/--install/双击智能启动）
 │   ├── skills.rs         # SKILL.md 目录约定（frontmatter 解析、索引注入、读写）
-│   ├── core/             # 核心循环、取消标志、审批规则引擎（rules.rs）
+│   ├── core/             # 核心循环、取消注册表（会话级）、审批规则引擎（rules.rs）
 │   ├── gateway/          # 模型网关：providers 数据加载、端点/思考形态探测、降级链
-│   ├── config/           # config.toml + settings.json（DPAPI 存 key）
+│   ├── config/           # config.toml + settings.json（DPAPI 存 key）+ app_root 运行形态
 │   ├── observability/    # JSONL 日志（6 类事件 + 轮转）+ trace 读取
 │   ├── sandbox/          # 执行沙箱：Job Objects + 受限 token + AppContainer + 探针
 │   ├── context/          # 上下文工程：token 估算/压缩/裁剪
@@ -39,18 +43,38 @@ agent/
 │   ├── session/          # 会话落盘与恢复
 │   ├── tools/            # 工具系统（内置 + 并行调度 + git 发现链）
 │   ├── memory/           # 记忆 v1（events.log/AGENTS.md/摘要）+ library.rs 记忆库索引
-│   └── plugin/           # mcp.rs（MCP stdio client）+ wasm.rs（WASM 插件宿主）
+│   └── plugin/           # mcp.rs（stdio + Streamable HTTP）+ wasm.rs（ABI v1 宿主）+ ui.rs（组件总线 v0）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
+├── ui-ext/               # 组件总线扩展（每个目录 = 一块 UI 面板，如 board/ 项目速览）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
-├── evals/                # eval 评测：tasks/ 任务集 + mcp-mini-server.mjs 冒烟工具
+├── evals/                # eval 评测：tasks/ 11 个任务 + mcp-mini-server.mjs（stdio）/ mcp-http-server.mjs（http）冒烟工具
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
 ├── plugins/              # WASM 插件（*.wat 零工具链依赖）
 ├── prompts/system.md     # 系统约定（每轮任务实时读盘）
 ├── providers.json        # 供应商预设（数据驱动）
 ├── docs/                 # ROADMAP / jsonl-schema / workorders/ / 交接文档
+├── scripts/              # package_release.ps1（发布打包）/ bundle_git.ps1（内置 git）/ mock_provider.mjs
+├── .github/workflows/    # CI：clippy -D warnings + 全量测试 + 前端构建
 ├── config.toml           # 服务/网关/审批/沙箱/上下文/恢复/记忆配置
-└── scripts/mock_provider.mjs  # 无 key 冒烟用的本地模拟渠道（测试工具，非 provider）
+└── LICENSE               # MIT
 ```
+
+## 运行形态（开发 / 打包两态）
+
+资源定位只有一条规则（`config::app_root()`）：
+
+- **开发形态**：`cargo run` 或直接跑 `target\release\agent.exe` —— exe 同级没有 `config.toml` / `web`，
+  一律回落**编译期源码目录**（改动前的老行为，开发流程零变化）。
+- **打包形态**：exe 同级有 `config.toml` 或 `web/` —— 认定随包运行，`config.toml` /
+  `settings.json` / `providers.json` / `prompts/` / `web/dist/` / `plugins/` / `ui-ext/` / `logs/`
+  全落在 **exe 同级目录**。所以整个目录可以拷到任何地方（含没装 Rust/Node 的机器）直接双击 `start.bat`。
+
+侧栏底部的版本行（鼠标悬停显示「运行根」）就是用来一眼确认当前读的是哪一份资源。
+
+**来源校验**：服务只接受本机来源的请求（`Host` 必须是 `localhost` / `127.x` / `[::1]`；
+带 `Origin` 时必须同源同端口）——绑定 127.0.0.1 挡不住 DNS rebinding（恶意页面把自己的域名
+解析到本机就变成「同源」），这层校验补的就是它。不带 `Origin` 的命令行客户端（curl、eval
+驱动器、服务自管理）照常可用；前端热更（vite 5174）由代理把 Origin 改写成主服务地址。
 
 ## 快速启动
 
@@ -95,6 +119,36 @@ cargo run                            # 前台调试运行（关终端即停）
 - 已知差异：MinGit 不带 git-lfs / bash / 图形界面——agent 的提交、diff、撤销、检查点都不需要它们；
   用户项目若使用 LFS，需另装完整版 git。
 
+## 打包发布（一键出可独立运行的目录）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
+# 只组装不重编译：-SkipBuild -SkipFrontend / 只出目录不打 zip：-SkipZip
+```
+
+产出 `dist\agent-<版本>-win64\`（+ 同名 zip，约 43MB）：
+
+```
+agent.exe            服务二进制（start/stop/status 自管理内置）
+config.toml  providers.json  prompts\  plugins\  ui-ext\
+web\dist\            前端产物（由 exe 托管）
+tools\git-runtime.zip 内置 MinGit（未跑 bundle_git.ps1 时缺，缺了就要系统 git）
+start.bat  stop.bat  README.md  LICENSE
+```
+
+**验证过的用法**：把整个目录拷到任意位置（含没装 Rust/Node 的机器）双击 `start.bat` 即用——
+exe 同级就是运行根，配置、会话、日志、扩展全落在那个目录里，不碰源码树。
+
+## CI
+
+`.github/workflows/ci.yml`（windows-latest）三步，提交前本地等价自查：
+
+```powershell
+cargo clippy --all-targets -- -D warnings
+cargo test --no-fail-fast
+cd web; npm ci; npm run build
+```
+
 ## 模型设置（侧栏「设置 → 模型配置」，改动自动保存即时生效）
 
 - **配置 chips**：每个配置可起名，chip 显示名称 + key 状态圆点（绿=已存 key），点一下即切换；「＋ 新建配置」「✕ 删除当前」（至少保留一套）。
@@ -115,12 +169,13 @@ cargo run                            # 前台调试运行（关终端即停）
 | `full-access` | 自动 | 自动 | 自动 | 脱沙箱直跑，需 `config.toml [agent] allow_unsandboxed = true`；`unsandboxed_approval = true` 可保留执行审批 |
 
 - 审批卡片显示风险档位徽章与判定依据，可勾「本会话同类允许」；120s 超时视为拒绝。
-- Plan 档（输入框 Plan/Act 切换）只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划。
+- Plan 档是接口层能力（请求级 `plan_mode`，见上）：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划。**界面已无手动切换入口**（P14 起模型自己在任务里列步骤），要复现/验证用 `/api/chat` 的 `plan_mode` 字段或 `cargo run --bin eval -- plan-mode-write-guard`。
 
 ## 日志与排查
 
 - **进程日志**：`logs/agent.jsonl`（单行 JSON，六类事件）。超过 `[logging].max_mb`（默认 20MB）自动归档成
-  `agent.jsonl.1`（只留一份）并开新文件；`max_mb = 0` 关闭轮转。
+  `agent.jsonl.1`（最新）并开新文件，旧归档依次倒位为 `.2`…`.N`，保留份数走 `[logging].keep_archives`
+  （默认 3，0=归档即删）；`max_mb = 0` 关闭轮转。
 - **时间线**：侧栏「时间线」面板（`GET /api/trace`）按任务切分展示事件流、分片聚合、工具配对耗时。
 - **项目记忆流水**：`<workspace>/.agent/memory/events.log`（跟 git 仓库走，默认脱敏），与本条目的进程日志是两回事。
 - **会话**：`logs/sessions/<id>.json`，每条会话一个文件。
@@ -139,9 +194,9 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | Svelte 页面（未构建时内置页） |
-| POST | `/api/chat` | 对话主入口，SSE 流式（content / reasoning / tool_call / tool_result / approval_request / plan_proposal / notice / error / done） |
-| POST | `/cancel` | 置位全局取消标志 |
-| GET | `/api/cancel` | 查询取消标志 |
+| POST | `/api/chat` | 对话主入口，SSE 流式（content / reasoning / tool_call / tool_result / approval_request / plan_proposal / notice / **reset** / error / done；`reset` = 降级链换渠道重试，前端按给的长度丢掉本步已推的半截内容） |
+| POST | `/cancel?session=<id>` | 停止指定会话当前这一轮（不带 `session` = 停全部在跑任务） |
+| GET | `/api/cancel?session=<id>` | 查询取消状态：带 `session` 看该会话（`cancelled`/`running`），不带看全部（`cancelled`/`active`） |
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/approvals` | 审批决定（允许/拒绝 + 本会话同类允许） |
 | POST | `/api/approval-mode` | 切换审批档（对进行中的请求即时生效） |
@@ -177,9 +232,58 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/memory/library` | 记忆库光点数据（每次调用做有界增量同步） |
 | POST | `/api/memory/library/reindex` | 强制重建向量 |
 | POST | `/api/memory/search` | 检索（`query` 或 `like=<会话id>`） |
-| GET / POST | `/api/mcp` | MCP server + WASM 插件状态 / 配置管理与生命周期动作 |
+| GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ WASM 插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
+| GET | `/api/ext` | 组件总线 v0：UI 扩展清单（应用根 + 当前工作区） |
+| GET | `/ui-ext/{name}[/{path}]` | 扩展静态资源（入口页由 manifest 指定；路径穿越一律 404） |
+| GET | `/api/version` | 版本与运行形态（`root` = 当前生效的应用根） |
 | GET | `/api/sandbox/selftest` | 沙箱探针套件（真实拉起受限进程） |
+
+## MCP 双 transport
+
+设置 → MCP → 添加 server，transport 二选一：
+
+| transport | 配置 | 说明 |
+| --- | --- | --- |
+| `stdio` | 命令 + 参数（+ 可选 env） | 本地子进程，换行分隔 JSON-RPC；子进程环境是白名单重建的，主服务的密钥绝不进去 |
+| `http` | url（+ 可选自定义请求头） | 远端 **Streamable HTTP**：POST JSON-RPC，响应支持 `application/json` 与 `text/event-stream`（读 `data:` 帧、按 id 取匹配帧，心跳与串扰帧跳过）；`initialize` 响应里的 `Mcp-Session-Id` 会自动回带 |
+
+- 请求头（如 `Authorization: Bearer …`）按每行一条 `Key: Value` 填，只存在本地 `settings.json` 与内存，**不进日志**。
+- 传输层失败（连不上 / 非 2xx / 解析不出）标记离线，下次调用自动重连重握手；server 自己报的协议错误照实显示。
+- 本地冒烟：`node evals/mcp-http-server.mjs`（加 `--sse` 走 SSE 响应），然后按上表添加 `http://127.0.0.1:9401/mcp`。
+
+## 组件总线 v0（UI 扩展）
+
+一个目录 = 一块面板，两个来源（同名时工作区优先）：
+
+```
+<应用根>/ui-ext/<名字>/           # 随包/内置扩展
+<当前工作区>/ui-ext/<名字>/       # 项目自带扩展
+    manifest.json                # {"title":"项目速览","description":"…","version":"0.1.0","entry":"index.html"}
+    index.html                   # 入口页（相对路径的 js/css 都能直接用）
+```
+
+- 打开：设置 → 扩展 → 打开（或侧栏/设置里的入口），面板停靠在右侧。
+- **隔离**：iframe 用 `sandbox="allow-scripts"` → 不透明源，读不到宿主 DOM、localStorage、cookie，
+  也 fetch 不到 `/api`（跨源无 CORS）。唯一通道是 postMessage。
+- **数据桥（只读白名单）**：入口页先 `postMessage({type:'agent:hello'})` 握手，宿主回
+  `{type:'agent:init', payload:{version, root, theme, sessionId, title}}`；之后用
+  `{type:'agent:request', id, method, params}` 调用下列方法，宿主回 `{type:'agent:response', id, ok, result}`：
+
+  | method | 说明 |
+  | --- | --- |
+  | `app.info` | 版本 / 运行根 / 主题 / 当前会话 |
+  | `workspace.info` | 当前工作区与最近项目 |
+  | `workspace.files` | 工作区文件相对路径列表（同「@ 添加上下文」数据源） |
+  | `git.status` | 分支 / 头部 / 脏文件 / 领先落后 |
+  | `memory.search` | `{query, top_k}` 记忆库检索（返回 results/notice） |
+  | `session.info` | 当前会话 id 与标题 |
+
+  **白名单里没有任何写操作**——v0 只读；扩展拿不到 shell、写文件、审批入口。
+- 参考实现：`ui-ext/board/`（项目速览：显示版本/运行根/会话/工作区，可查 Git 状态与文件清单、搜记忆）。
+- 扩展写坏（manifest 非法 / 入口缺失）不会静默：清单里标红并给出原因，且「打开」按钮禁用。
+- 清单里每个扩展标**来源徽章**（内置 / 工作区）；工作区同名扩展顶掉内置时显示「工作区 · 覆盖内置」，
+  避免把「项目自带的那份」误当内置扩展。
 
 ## 无 key 冒烟（可选）
 
@@ -197,8 +301,15 @@ cargo run                                # 终端 2：127.0.0.1:5173
 ## 已知边界（未做 / 搁置）
 
 - **P13 桌面壳**：`desktop/` 脚手架已入库（窗口 + 托盘 + 服务保活），运行时冒烟未验证——按用户指示等 web 定稿后启用。
-- **组件总线（UI 插槽）**：仅设计留口，尚未开工（需要运行时动态组件加载方案）。
-- **MCP**：只做了 stdio transport + tools；HTTP/SSE transport、resources/prompts 未做。
-- **WASM 插件**：单函数 ABI（alloc/describe/run）、零 host function 的纯计算沙箱。
-- **eval 任务集**：首批 3 个（hello-file / fix-json / read-only-plan），后续功能未覆盖。
+- **MCP**：只做 tools 子集（stdio + Streamable HTTP 双 transport 都有）；`resources` / `prompts`、
+  OAuth 授权流程未做。
+- **WASM 插件**：ABI v1（alloc/describe/run，action 与 payload 分缓冲），仍是**零 host function** 的
+  纯计算沙箱——插件碰不到文件/网络/UI，只能做纯函数工具。
+- **组件总线 v0**：静态 UI + 只读数据桥。写操作、宿主 UI 注入点（菜单/消息流插槽）、扩展间通信、
+  扩展的启用/禁用管理都未做（放扩展目录里即生效，删目录即消失）。
+- **eval 任务集**：11 个任务（hello-file / fix-json / read-only-plan / edit-existing-file / delete-file /
+  multi-file-scaffold / fix-code-bug / search-and-report / plan-mode-write-guard / run-tests-and-report /
+  plan-approve-execute），
+  但**尚未在真实渠道上跑过一遍**——首次跑建议 `cargo run --bin eval` 观察提示词是否需要微调。
+- **CI**：只在 GitHub Actions 上跑（本机没有 hook 强制）。
 - **远端备份**：已推送到 GitHub 私有仓库 `https://github.com/pumu21600-boop/agent`（origin：`dev` 为主线 + 8 个历史阶段分支 + 全部标签）。

@@ -229,7 +229,7 @@ impl Memory {
             }
             _ => self.ws.join("AGENTS.md"),
         };
-        std::fs::write(&path, content)?;
+        crate::fsx::write_atomic_str(&path, content)?;
         Ok(path)
     }
 
@@ -242,7 +242,7 @@ impl Memory {
         if path.exists() {
             return;
         }
-        if let Err(e) = std::fs::write(&path, AGENTS_TEMPLATE) {
+        if let Err(e) = crate::fsx::write_atomic_str(&path, AGENTS_TEMPLATE) {
             crate::observability::debug(&format!("[memory] 生成 AGENTS.md 模板失败: {e}"));
         }
     }

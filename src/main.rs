@@ -5,17 +5,18 @@
 mod config;
 mod context;
 mod core;
+mod fsx;
 mod gateway;
 mod memory;
 mod observability;
 mod plugin;
- mod recovery;
- mod sandbox;
- mod server;
- mod service;
- mod session;
- mod skills;
- mod tools;
+mod recovery;
+mod sandbox;
+mod server;
+mod service;
+mod session;
+mod skills;
+mod tools;
 
 use std::{
     path::{Path, PathBuf},
@@ -24,7 +25,7 @@ use std::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = config::app_root();
 
     // —— 配置：config.toml（server/logging/gateway 种子）——
     let config = config::load(&manifest.join("config.toml"))?;
@@ -46,11 +47,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         manifest.join(&config.logging.dir)
     };
-    observability::init_with_max(
+    observability::init_full(
         &log_dir,
         &config.logging.file,
         session_id.clone(),
         config.logging.max_mb.saturating_mul(1024 * 1024),
+        config.logging.keep_archives,
     )?;
     observability::debug(&format!(
         "logger ready: {}",
@@ -82,7 +84,8 @@ async fn main() -> anyhow::Result<()> {
         observability::debug(&format!("[gateway] 本地限流已开启: {} rpm", config.gateway.max_rpm));
     }
     let gateway = Arc::new(gw);
-    let cancel = Arc::new(core::cancel::CancelFlag::new());
+    // D2：会话级取消注册表（每轮任务按 session_id 登记自己的取消标志）
+    let cancel = Arc::new(core::cancel::CancelRegistry::new());
     let prompt_path = manifest.join("prompts").join("system.md");
     let system_prompt = std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
         observability::debug(&format!(
@@ -115,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     let memory = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
         memory::Memory::open(&ws, &mem_cfg),
     )));
-    memory.read().unwrap().ensure_agents_template(&ws);
+    memory.read().unwrap_or_else(|e| e.into_inner()).ensure_agents_template(&ws);
     let state = server::AppState {
         gateway,
         cancel,

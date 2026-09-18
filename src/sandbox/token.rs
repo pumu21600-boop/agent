@@ -215,3 +215,41 @@ pub(crate) fn enabled_privilege_names(token: HANDLE) -> anyhow::Result<Vec<Strin
         Ok(names)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 权限笼的核心断言：受限 token 里**不该有任何启用特权**（系统固定保留的
+    /// SeChangeNotifyPrivilege 除外——坑 9：DISABLE_MAX_PRIVILEGE 只是把特权置禁用，
+    /// 名字仍在，所以按名字白名单判定，不能数个数）。
+    #[test]
+    fn restricted_token_has_no_enabled_privileges() {
+        let t = create_restricted_token().expect("受限 token 构造应成功");
+        let names = enabled_privilege_names(t.handle()).expect("读特权列表应成功");
+        let leaked: Vec<&String> =
+            names.iter().filter(|n| n.as_str() != "SeChangeNotifyPrivilege").collect();
+        assert!(leaked.is_empty(), "受限 token 仍启用特权（权限笼破口）: {leaked:?}");
+    }
+
+    /// 完整 token 可读（对照组基线），且登录会话 SID 真实存在——
+    /// 缺了它 .NET 类进程起手 0xC0000142（坑 8），必须能取到。
+    #[test]
+    fn full_token_readable_and_has_logon_sid() {
+        let t = base_token().expect("打开当前进程 token 应成功");
+        assert!(enabled_privilege_names(t.handle()).is_ok());
+        assert!(logon_sid(t.handle()).expect("查 TokenGroups 应成功").is_some(), "token 里应有 SE_GROUP_LOGON_ID");
+        assert!(current_user_sid(t.handle()).expect("取用户 SID 应成功").len() >= 8, "用户 SID 不应是空壳");
+    }
+
+    /// 受限 token 与完整 token 必须是两个不同句柄（曾出现过「假成功」的事故形态：
+    /// DeriveSid 纯数学假成功，真机才发现 profile 没建起来）。
+    #[test]
+    fn restricted_token_is_a_distinct_handle() {
+        let a = create_restricted_token().unwrap();
+        let b = create_restricted_token().unwrap();
+        assert_ne!(a.handle(), b.handle());
+        assert_ne!(a.handle(), 0);
+        assert_ne!(b.handle(), 0);
+    }
+}

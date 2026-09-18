@@ -1,0 +1,16 @@
+{
+  "name": "run-tests-and-report",
+  "prompt": "工作区里有一个 check.py，里面用 assert 写了几条自检。请用 shell 运行它（python check.py 或 py check.py），把运行结果告诉我，不要修改文件。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "setup_files": {
+    "check.py": "assert 1 + 1 == 2\nassert 'a' in 'abc'\nprint('ALL CHECKS PASSED')\n"
+  },
+  "assertions": [
+    { "type": "files_unchanged" },
+    { "type": "no_new_files" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

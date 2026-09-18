@@ -587,7 +587,8 @@ pub fn write_handoff(ws: &Path, input: &HandoffInput) -> anyhow::Result<PathBuf>
     md.push_str("- 会话消息在 `<日志目录>/session.json`，新会话用 DELETE /api/session。\n");
 
     let path = ws.join("HANDOFF.md");
-    std::fs::write(&path, md).with_context(|| format!("写 HANDOFF 失败: {}", path.display()))?;
+    crate::fsx::write_atomic_str(&path, &md)
+        .with_context(|| format!("写 HANDOFF 失败: {}", path.display()))?;
     Ok(path)
 }
 

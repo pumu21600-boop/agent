@@ -6,7 +6,7 @@
 //! 3. **RolesSettings 角色路由**：支持主力模型、会话摘要、标题生成及多模态视觉/视频/音频解析路由。
 //! 4. **DPAPI 密钥隔离**：按配置独立加密保存（CryptProtectData），不入日志、不出内存。
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
@@ -240,6 +240,7 @@ pub fn infer_protocol_preset(model_id: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Settings {
     /// 当前激活配置 ID（兼容旧 active_profile_id 字段）
     #[serde(default, alias = "active_profile_id")]
@@ -276,33 +277,28 @@ pub struct Settings {
     pub key_cipher: Option<String>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            active_config_id: None,
-            configs: Vec::new(),
-            roles: None,
-            workspace: None,
-            recent_workspaces: Vec::new(),
-            workspace_aliases: BTreeMap::new(),
-            keys: BTreeMap::new(),
-            key_cipher: None,
-            mcp_servers: Vec::new(),
-        }
-    }
-}
 
 /// P11：单个 MCP server 的连接与策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerCfg {
     /// 服务名（工具名 mcp__<name>__<tool>；禁止包含 "__"）
     pub name: String,
-    /// 启动命令（如 npx / node / 绝对路径 exe）
+    /// transport："stdio"（默认，本地子进程）| "http"（MCP Streamable HTTP 远端）
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// stdio：启动命令（如 npx / node / 绝对路径 exe）；http 时忽略
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// http：服务端点（形如 https://host/mcp）；stdio 时忽略
+    #[serde(default)]
+    pub url: String,
+    /// http：自定义请求头（鉴权等；值只在内存与 settings.json，绝不进日志）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     /// 启停（false 时工具不下发、不可调用）
     #[serde(default = "crate::config::settings::yes")]
     pub enabled: bool,
@@ -318,6 +314,9 @@ fn yes() -> bool {
 }
 fn default_risk() -> String {
     "normal".into()
+}
+fn default_transport() -> String {
+    "stdio".into()
 }
 
 /// key 存储作用域归一化：小写、去首尾空白与尾部 '/'。
@@ -358,8 +357,8 @@ impl Settings {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
                 // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
-                if s.configs.is_empty() {
-                    if let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text) {
+                if s.configs.is_empty()
+                    && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text) {
                         let provider_id = legacy.provider_id.unwrap_or_else(|| "deepseek".to_string());
                         let base_url = legacy.base_url.unwrap_or_default();
                         let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
@@ -383,15 +382,13 @@ impl Settings {
                             capabilities_user_set: false,
                         });
                     }
-                }
 
                 // v1 -> v2：key_cipher 挂到当前 provider 作用域
-                if s.keys.is_empty() {
-                    if let Some(cipher) = s.key_cipher.take() {
+                if s.keys.is_empty()
+                    && let Some(cipher) = s.key_cipher.take() {
                         let pid = s.configs.first().map(|c| c.provider_id.clone()).unwrap_or_else(|| "deepseek".to_string());
                         s.keys.insert(pid, cipher);
                     }
-                }
                 // v2 -> v2.2：provider 作用域 key 归位到 base_url 作用域
                 s.migrate_provider_keys_to_urls();
                 // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
@@ -435,11 +432,12 @@ impl Settings {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(Self::path(), json).context("写 settings.json 失败")
+        // 原子写：settings.json 里有全部配置与密文 key，写坏一次等于配置全丢
+        crate::fsx::write_atomic_str(&Self::path(), &json).context("写 settings.json 失败")
     }
 
     fn path() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("settings.json")
+        crate::config::app_root().join("settings.json")
     }
 
     /// 迁移历史按 provider 存储的 key 到 base_url

@@ -32,24 +32,27 @@ pub fn port_open(host: &str, port: u16) -> bool {
 #[cfg(windows)]
 fn sibling_pids() -> Vec<u32> {
     use std::os::windows::process::CommandExt;
-    let me = std::process::id();
-    let mut out = Vec::new();
     // 用 tasklist 兜底枚举（零新依赖；沙箱探针里 tasklist 受限，但自管理跑在用户干净环境）
     let list = std::process::Command::new("tasklist")
         .args(["/FI", "IMAGENAME eq agent.exe", "/FO", "CSV", "/NH"])
         .creation_flags(0x0800_0000) // 不闪控制台窗口
         .output();
-    let Ok(list) = list else { return out };
-    let text = String::from_utf8_lossy(&list.stdout);
+    let Ok(list) = list else { return Vec::new() };
+    parse_pids(&String::from_utf8_lossy(&list.stdout), std::process::id())
+}
+
+/// 解析 `tasklist /FO CSV /NH` 输出里的 PID（排除自己）。纯函数（可单测）：
+/// 停止/启动判断全靠它，解析错了就会误杀或误判「没在跑」。
+fn parse_pids(text: &str, me: u32) -> Vec<u32> {
+    let mut out = Vec::new();
     for line in text.lines() {
         // "agent.exe","1234","Console","1","17,280 K"
         let cols: Vec<&str> = line.split("\",\"").collect();
-        if cols.len() >= 2 {
-            if let Ok(pid) = cols[1].trim_matches('"').parse::<u32>() {
-                if pid != me {
-                    out.push(pid);
-                }
-            }
+        if cols.len() >= 2
+            && let Ok(pid) = cols[1].trim_matches('"').parse::<u32>()
+            && pid != me
+        {
+            out.push(pid);
         }
     }
     out
@@ -258,5 +261,49 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
             eprintln!("[agent] unknown arg: {arg1} (usage: start / stop / status / --install / --uninstall)");
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pids_reads_csv_and_skips_self() {
+        let text = "\"agent.exe\",\"1234\",\"Console\",\"1\",\"17,280 K\"\r\n\
+                    \"agent.exe\",\"4321\",\"Console\",\"1\",\"20,000 K\"\r\n\
+                    \r\n";
+        // 自己（1234）必须被排除，否则 stop 会把自己也杀掉
+        assert_eq!(parse_pids(text, 1234), vec![4321]);
+        assert_eq!(parse_pids(text, 9999), vec![1234, 4321]);
+        // tasklist 查无结果时的固定文案不产生 PID
+        assert!(parse_pids("INFO: No tasks are running which match the specified criteria.", 1).is_empty());
+        assert!(parse_pids("", 1).is_empty());
+        // 只有一列（异常输出）不 panic、不产 PID
+        assert!(parse_pids("\"agent.exe\"", 1).is_empty());
+    }
+
+    #[test]
+    fn port_open_detects_listener() {
+        // 起一个真监听：探针必须报 true
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(port_open("127.0.0.1", port), "有监听时应为 true");
+        drop(l);
+        // 未监听的端口：报 false（超时 200ms 内返回，不会卡住 status/start 判断）
+        let free = {
+            let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = t.local_addr().unwrap().port();
+            drop(t);
+            p
+        };
+        assert!(!port_open("127.0.0.1", free), "无监听时应为 false");
+    }
+
+    /// status 分支是只读的（打印 + 探针），可以在测试里安全跑通，确认没有 panic。
+    #[test]
+    fn status_command_takes_over_without_side_effects() {
+        let argv = vec!["agent.exe".to_string(), "status".to_string()];
+        assert!(handle(&argv, "127.0.0.1", 1), "status 应接管并立刻返回");
     }
 }

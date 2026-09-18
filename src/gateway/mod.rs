@@ -127,11 +127,10 @@ pub fn build_body_with_compat(
     if let Some(mt) = params.max_tokens {
         body[compat.max_tokens_field] = json!(mt);
     }
-    if let Some(t) = params.temperature {
-        if compat.supports_temperature {
+    if let Some(t) = params.temperature
+        && compat.supports_temperature {
             body["temperature"] = json!(t);
         }
-    }
     if let Some(t) = params.top_p {
         body["top_p"] = json!(t);
     }
@@ -246,11 +245,19 @@ impl Throttle {
 }
 
 fn build_client() -> reqwest::Client {
+    // 构建失败（TLS 后端异常等）不该 panic 拖垮整个服务：退回默认配置的客户端，
+    // 超时/连接超时用默认值，比「网关起不来」好得多。
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()
-        .expect("构建 HTTP 客户端失败")
+        .unwrap_or_else(|e| {
+            crate::observability::try_event(
+                crate::observability::EventType::State,
+                serde_json::json!({ "kind": "gateway.client_fallback", "error": e.to_string() }),
+            );
+            reqwest::Client::new()
+        })
 }
 
 /// 聚合后的模型回复（P2 核心循环用）：正文 / 思考 / 工具调用。
@@ -534,8 +541,9 @@ impl Channel {
 }
 
 impl Gateway {
-    /// 一轮模型调用 → 流式输出并聚合结果。每个分片：
-    /// 1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
+    /// 一轮模型调用 → 流式输出并聚合结果。
+    ///
+    /// 每个分片：1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
     /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
     pub async fn stream_chat(
         self: &Arc<Self>,
@@ -652,15 +660,14 @@ impl Gateway {
                     }
                     // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
                     // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示用）
-                    if let Some(u) = chunk.get("usage") {
-                        if let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                    if let Some(u) = chunk.get("usage")
+                        && let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
                             turn.prompt_tokens = Some(p);
                             turn.cached_tokens = u
                                 .pointer("/prompt_tokens_details/cached_tokens")
                                 .and_then(Value::as_u64)
                                 .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
                         }
-                    }
                     let mut delta = extract_delta(&chunk);
                     // 反代思考标签剥离：标签内文字改道思考通道；
                     // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
@@ -767,21 +774,19 @@ pub fn extract_delta(chunk: &Value) -> Delta {
 /// OpenAI Completions 系思考字段（上游 OPENAI_COMPLETIONS_REASONING_FIELDS 顺序）。
 fn extract_reasoning(delta: &Value) -> Option<String> {
     for field in ["reasoning_content", "reasoning", "reasoning_text"] {
-        if let Some(s) = delta.get(field).and_then(Value::as_str) {
-            if !s.is_empty() {
+        if let Some(s) = delta.get(field).and_then(Value::as_str)
+            && !s.is_empty() {
                 return Some(s.to_string());
             }
-        }
     }
     // OpenRouter：delta.reasoning_details 数组里的 reasoning.text 块
     if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
         let mut buf = String::new();
         for d in details {
-            if d.get("type").and_then(Value::as_str) == Some("reasoning.text") {
-                if let Some(t) = d.get("text").and_then(Value::as_str) {
+            if d.get("type").and_then(Value::as_str) == Some("reasoning.text")
+                && let Some(t) = d.get("text").and_then(Value::as_str) {
                     buf.push_str(t);
                 }
-            }
         }
         if !buf.is_empty() {
             return Some(buf);
@@ -897,9 +902,7 @@ mod tests {
             assert!(b.get("thinking").is_none(), "Zai 默认不注入参数");
         }
         // 采样参数：有值才发
-        let mut p = ChatParams::default();
-        p.temperature = Some(0.3);
-        p.top_p = Some(0.9);
+        let p = ChatParams { temperature: Some(0.3), top_p: Some(0.9), ..Default::default() };
         let b = build_body("m", &msgs, true, &p, None);
         assert_eq!(b["temperature"], json!(0.3));
         assert_eq!(b["top_p"], json!(0.9));

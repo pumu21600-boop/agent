@@ -27,12 +27,15 @@ max_rpm = 0
 [logging]
 dir = "logs"
 file = "agent.jsonl"
-# 单文件轮转上限（MB）：超过就归档成 agent.jsonl.1（只留一份）再开新文件；0=不轮转
+# 单文件轮转上限（MB）：超过就归档成 agent.jsonl.1 再开新文件；0=不轮转
 max_mb = 20
+# 归档保留份数：agent.jsonl.1（最新）… agent.jsonl.N（最旧），更旧的丢弃；0=归档即删
+keep_archives = 3
 
 [agent]
 # 核心循环（施工单 003）
-max_steps = 8
+# 单任务最多几步模型决策（022 由 8 上调：读→改→跑测试→修→再跑就会撞顶）
+max_steps = 16
 tool_result_max_chars = 8000
 # 审批默认档（Codex 式三档，前端可即时切换）：read-only / auto / full-access
 default_approval = "auto"

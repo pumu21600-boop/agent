@@ -148,3 +148,91 @@ impl Drop for JobGuard {
         unsafe { CloseHandle(self.handle) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+        JobObjectBasicUIRestrictions, QueryInformationJobObject,
+    };
+
+    use super::*;
+
+    fn limits() -> SandboxLimits {
+        SandboxLimits { timeout_ms: 5_000, memory_mb: 256, active_processes: 4 }
+    }
+
+    fn read_limits(job: &JobGuard) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+            let mut ret = 0u32;
+            let ok = QueryInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut _,
+                mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                &mut ret,
+            );
+            assert_ne!(ok, 0, "QueryInformationJobObject 失败: {}", GetLastError());
+            info
+        }
+    }
+
+    /// 权限笼：不只「设置调用没报错」，而是**回读内核里的实际值**——
+    /// SetInformationJobObject 静默失败（或 flags 拼错）这类事故只有回读才拦得住。
+    #[test]
+    fn restricted_job_limits_are_really_applied() {
+        let l = limits();
+        let job = JobGuard::new(&l, true).expect("建受限 Job 应成功");
+        let info = read_limits(&job);
+        let f = info.BasicLimitInformation.LimitFlags;
+        for (flag, name) in [
+            (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, "KILL_ON_JOB_CLOSE"),
+            (JOB_OBJECT_LIMIT_PROCESS_MEMORY, "PROCESS_MEMORY"),
+            (JOB_OBJECT_LIMIT_ACTIVE_PROCESS, "ACTIVE_PROCESS"),
+            (JOB_OBJECT_LIMIT_PROCESS_TIME, "PROCESS_TIME"),
+        ] {
+            assert_ne!(f & flag, 0, "{name} 未落进 Job（flags={f:#x}）");
+        }
+        assert_eq!(info.ProcessMemoryLimit, 256 * 1024 * 1024, "内存上限字节数要精确");
+        assert_eq!(info.BasicLimitInformation.ActiveProcessLimit, 4);
+        // CPU 兜底 = 墙钟超时（100ns 单位）；漏了这条就会有无超时的吃核 runaway
+        assert_eq!(info.BasicLimitInformation.PerProcessUserTimeLimit, 5_000 * 10_000);
+
+        // UI 限制是独立信息类，单独回读
+        unsafe {
+            let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = mem::zeroed();
+            let mut ret = 0u32;
+            let ok = QueryInformationJobObject(
+                job.handle,
+                JobObjectBasicUIRestrictions,
+                &mut ui as *mut _ as *mut _,
+                mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                &mut ret,
+            );
+            assert_ne!(ok, 0, "回读 UI 限制失败: {}", GetLastError());
+            for flag in [
+                JOB_OBJECT_UILIMIT_READCLIPBOARD,
+                JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+                JOB_OBJECT_UILIMIT_HANDLES,
+                JOB_OBJECT_UILIMIT_EXITWINDOWS,
+            ] {
+                assert_ne!(ui.UIRestrictionsClass & flag, 0, "UI 限制缺位（{:#x}）", ui.UIRestrictionsClass);
+            }
+        }
+    }
+
+    /// 本机直跑：只留生命周期保险丝，不带资源笼（内存/进程数上限都不设）。
+    #[test]
+    fn unrestricted_job_keeps_only_kill_on_close() {
+        let job = JobGuard::new(&limits(), false).expect("建直跑 Job 应成功");
+        let info = read_limits(&job);
+        assert_eq!(
+            info.BasicLimitInformation.LimitFlags,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            "脱笼模式不该带资源上限"
+        );
+        assert_eq!(info.ProcessMemoryLimit, 0);
+        assert_eq!(info.BasicLimitInformation.ActiveProcessLimit, 0);
+    }
+}

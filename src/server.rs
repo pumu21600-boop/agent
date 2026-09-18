@@ -5,20 +5,20 @@
 //! - GET/PUT /api/settings  设置读写（key 用 DPAPI 加密持久化）
 //! - /api/models        按当前 base_url+key 拉取渠道模型列表
 //! - /api/chat          按已保存设置流式对话
-//! - /cancel /api/cancel 取消标志
+//! - /cancel /api/cancel 取消标志（会话级：?session=<id> 只停该会话；不带 = 停全部）
 
 use std::{convert::Infallible, path::PathBuf, pin::Pin, sync::Arc};
 
 use axum::{
     Json, Router,
-    extract::{Query, Request, State},
+    extract::{Path as AxumPath, Query, Request, State},
     http::{
         HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE},
+        header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN},
     },
     middleware::{self, Next},
     response::{
-        Html, Response,
+        Html, IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
@@ -31,7 +31,7 @@ use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
     config::settings::Settings,
-    core::cancel::CancelFlag,
+    core::cancel::{CancelFlag, CancelRegistry},
     gateway::{self, Gateway},
     observability::{self, EventType},
 };
@@ -42,7 +42,8 @@ use crate::core::agent::{self, AgentEvent, LoopOutcome};
 #[derive(Clone)]
 pub struct AppState {
     pub gateway: Arc<Gateway>,
-    pub cancel: Arc<CancelFlag>,
+    /// 会话级取消注册表（D2）：每轮任务 begin 登记、结束注销，停止按钮只停目标会话
+    pub cancel: Arc<CancelRegistry>,
     pub settings: Arc<std::sync::RwLock<Settings>>,
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
@@ -216,10 +217,12 @@ pub struct ModelsRequest {
     pub api_key: String,
 }
 /// 设置更新请求。B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
+///
 /// - `0` = 清除长度类（context_length / max_output_tokens）
 /// - 负数 = 清除采样类（temperature / top_p）
 /// - 空串 / auto = 清除思考类（thinking / thinking_style）
 /// - clear_key=true = 清 key
+///
 /// 其余字段：null / 缺省 = 不动。
 #[derive(Debug, Deserialize, Default)]
 pub struct SettingsUpdate {
@@ -298,6 +301,13 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/memory/library/reindex", post(reindex_memory_library))
         .route("/api/memory/search", post(search_memory))
         .route("/api/mcp", get(get_mcp).post(post_mcp))
+        .route("/api/version", get(get_version))
+        .route("/api/ext", get(list_extensions))
+        // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
+        // 尾斜杠那条约等于目录首页：不带它请求会掉进 SPA 兜底，把整个应用套进 iframe
+        .route("/ui-ext/{name}", get(ui_ext_entry))
+        .route("/ui-ext/{name}/", get(ui_ext_entry))
+        .route("/ui-ext/{name}/{*path}", get(ui_ext_asset))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
@@ -319,8 +329,94 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         app = app.route("/", get(embedded_index));
     }
     // index.html 不缓存：前端重建后普通刷新即可拿到新入口（带 hash 的 assets 不受影响）
+    // 来源校验在最外层：非本机来源的请求在进任何 handler 之前就被挡掉
     app = app.layer(middleware::from_fn(no_cache_html));
+    app = app.layer(middleware::from_fn(guard_local_only));
     app
+}
+
+/// 本机服务的来源校验（施工单 022）。
+///
+/// 绑定 `127.0.0.1` 只挡得住网络来的连接，挡不住 **DNS rebinding**：恶意页面把自己的域名
+/// 解析到 127.0.0.1，浏览器就当成同源、不触发 CORS 预检，于是能直接读 `/api/settings`、
+/// 或者 POST `/api/shell` 在本机执行命令。三道规则覆盖浏览器与命令行两类客户端：
+///
+/// 1. `Host` 必须是回环地址（`localhost` / `127.x.x.x` / `[::1]`）—— rebinding 时 Host 是
+///    攻击者域名，这一条直接 403；
+/// 2. 带 `Origin` 头（浏览器一定会带）时，Origin 必须是回环主机且**端口与 Host 一致**——
+///    挡住「同一个本机、另一个端口上的恶意页面」；浏览器发来的 `Origin: null`（沙箱 iframe /
+///    file://）一律拒；
+/// 3. 不带 `Origin` 的请求放行 —— curl、eval 驱动器、服务自管理都不发这个头。
+///
+/// 开发热更（vite 5174）是代理转发：`web/vite.config.js` 里把 Origin 改写成主服务地址，
+/// 规则 2 自然成立。
+async fn guard_local_only(req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let origin = req
+        .headers()
+        .get(ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match check_origin(&host, origin.as_deref()) {
+        Ok(()) => next.run(req).await,
+        Err(msg) => (
+            StatusCode::FORBIDDEN,
+            format!("拒绝访问：{msg}（本服务只接受本机来源的请求）"),
+        )
+            .into_response(),
+    }
+}
+
+/// 来源判定（纯函数，可单测）。`origin = None` 表示请求没带 Origin 头。
+fn check_origin(host_header: &str, origin: Option<&str>) -> Result<(), String> {
+    let (host_name, host_port) = split_host(host_header);
+    if host_name.is_empty() {
+        return Err("缺少 Host 头".into());
+    }
+    if !is_loopback_host(host_name) {
+        return Err(format!("Host 不是本机地址: {host_name}"));
+    }
+    let Some(origin) = origin else {
+        return Ok(()); // 非浏览器客户端（curl / eval / 服务自管理）
+    };
+    let rest = origin.split_once("://").map(|(_, r)| r).ok_or_else(|| format!("Origin 不合法: {origin}"))?;
+    let (o_host, o_port) = split_host(rest);
+    if !is_loopback_host(o_host) {
+        return Err(format!("Origin 不是本机地址: {origin}"));
+    }
+    let norm = |p: Option<u16>, scheme: &str| p.unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let scheme = origin.split_once("://").map(|(s, _)| s).unwrap_or("http");
+    if norm(o_port, scheme) != norm(host_port, "http") {
+        return Err(format!("Origin 与 Host 端口不一致: {origin} vs {host_header}"));
+    }
+    Ok(())
+}
+
+/// 拆 `主机名` + 可选端口：`127.0.0.1:5173` / `localhost` / `[::1]:5173` 都能认。
+fn split_host(h: &str) -> (&str, Option<u16>) {
+    let h = h.trim();
+    if let Some(rest) = h.strip_prefix('[')
+        && let Some((host, tail)) = rest.split_once(']')
+    {
+        return (host, tail.strip_prefix(':').and_then(|p| p.parse().ok()));
+    }
+    match h.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, port.parse().ok())
+        }
+        _ => (h, None),
+    }
+}
+
+/// 回环主机名（大小写不敏感）：`localhost` / `127.0.0.0/8` / `::1`。
+fn is_loopback_host(h: &str) -> bool {
+    let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost" || h == "::1" || h == "0:0:0:0:0:0:0:1" || h.starts_with("127.")
 }
 
 /// 给 text/html 响应加 Cache-Control: no-cache，防止 index.html 缓存旧入口引用旧资源
@@ -613,7 +709,8 @@ fn ensure_attachments_ignored(ws: &std::path::Path) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, add.as_bytes()))
         .is_ok();
     if ok {
-        observability::event(
+        // try_event：这条路径会在单测里被直接调用，logger 未初始化时不该 panic
+        observability::try_event(
             EventType::State,
             json!({ "kind": "attachments.gitignored", "path": gi.display().to_string() }),
         );
@@ -650,7 +747,7 @@ fn key_hint_of(key: Option<String>) -> String {
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<Value> {
-    let s = state.settings.read().unwrap().clone();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let mut v = config_state_json(&s);
     v["env_key"] = json!(std::env::var("DEEPSEEK_API_KEY").is_ok());
     Json(v)
@@ -668,11 +765,10 @@ fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, Strin
     let mut result = (false, "deepseek".to_string(), "deepseek-chat".to_string());
     if let Some(c) = s.active_mut() {
         let url_before = crate::config::settings::normalize_base(&c.effective_base_url());
-        if let Some(v) = &req.provider_id {
-            if !v.trim().is_empty() {
+        if let Some(v) = &req.provider_id
+            && !v.trim().is_empty() {
                 c.provider_id = v.trim().to_string();
             }
-        }
         if let Some(v) = &req.base_url {
             c.base_url = v.trim().to_string();
         }
@@ -738,7 +834,7 @@ async fn put_settings(
     State(state): State<AppState>,
     Json(req): Json<SettingsUpdate>,
 ) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.write().unwrap().clone();
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     let (url_changed, pid, eff_model) = apply_settings_update(&mut s, &req);
 
     if url_changed {
@@ -751,13 +847,11 @@ async fn put_settings(
         if let Err(e) = s.clear_key() {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
         }
-    } else if let Some(k) = &req.api_key {
-        if !k.trim().is_empty() {
-            if let Err(e) = s.set_key(k.trim()) {
+    } else if let Some(k) = &req.api_key
+        && !k.trim().is_empty()
+            && let Err(e) = s.set_key(k.trim()) {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
             }
-        }
-    }
 
     if let Some(roles) = req.roles {
         s.roles = Some(roles);
@@ -766,7 +860,7 @@ async fn put_settings(
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -780,7 +874,7 @@ async fn list_models(
     State(state): State<AppState>,
     Json(req): Json<ModelsRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let s = state.settings.read().unwrap().clone();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let base_url = if req.base_url.trim().is_empty() { s.effective_base_url() } else { req.base_url.trim().to_string() };
     // B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
     // key 永不出日志、永不出 JSONL。
@@ -817,7 +911,7 @@ async fn manage_configs(
     State(state): State<AppState>,
     Json(req): Json<ConfigRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.write().unwrap().clone();
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     let err =
         |m: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     match req.action.as_str() {
@@ -843,7 +937,7 @@ async fn manage_configs(
     }
     let pid = s.provider_id();
     let model = s.effective_model();
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -859,7 +953,7 @@ pub struct WorkspaceRequest {
 
 /// GET /api/workspace —— 当前工作区 + 最近列表（P8.2）。
 async fn get_workspace(State(state): State<AppState>) -> Json<Value> {
-    let s = state.settings.read().unwrap();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner());
     Json(json!({
         "current": crate::tools::workspace_root().display().to_string(),
         "recent": s.recent_workspaces,
@@ -893,20 +987,20 @@ fn same_workspace(a: &str, b: &str) -> bool {
 /// 切换工作区（/api/workspace 与「打开会话」共用）：改全局根 → 记忆层热重开
 /// → settings 持久化 + 最近列表 → MCP 同步 → 事件。调用方负责校验目录存在。
 fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Result<(), String> {
-    let old = crate::tools::set_workspace_root(&canon.to_path_buf());
+    let old = crate::tools::set_workspace_root(canon);
     // 记忆层重开：新项目的双层存储/index 登记/AGENTS.md 模板
     let new_mem = Arc::new(crate::memory::Memory::open(canon, &state.mem_cfg));
     new_mem.ensure_agents_template(canon);
-    *state.memory.write().unwrap() = new_mem;
+    *state.memory.write().unwrap_or_else(|e| e.into_inner()) = new_mem;
     // 持久化 + 最近列表（去重、新→旧、最多 8）
     let cur = canon.display().to_string();
-    let mut s = state.settings.write().unwrap().clone();
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     s.workspace = Some(cur.clone());
     s.recent_workspaces.retain(|w| *w != cur);
     s.recent_workspaces.insert(0, cur.clone());
     s.recent_workspaces.truncate(8);
     s.save().map_err(|e| e.to_string())?;
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -934,7 +1028,7 @@ async fn set_workspace(
     if let Err(e) = apply_workspace(&state, &canon) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })));
     }
-    let recent = state.settings.read().unwrap().recent_workspaces.clone();
+    let recent = state.settings.read().unwrap_or_else(|e| e.into_inner()).recent_workspaces.clone();
     (StatusCode::OK, Json(json!({ "ok": true, "current": canon.display().to_string(), "recent": recent })))
 }
 
@@ -1019,10 +1113,7 @@ fn effective_thinking_style(
 }
 
 /// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
-async fn chat(
-    State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
-) -> Sse<UnboundedReceiverStream<Result<Event, Infallible>>> {
+async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
     let message = req.message.trim().to_string();
     let req_model = req.model.trim().to_string();
     let req_base_url = req.base_url.trim().to_string();
@@ -1040,8 +1131,8 @@ async fn chat(
     };
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
     let gateway = state.gateway.clone();
-    let cancel = state.cancel.clone();
-    let s = state.settings.read().unwrap().clone();
+    let cancel_registry = state.cancel.clone();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let active_cfg = s.active_or_default().clone();
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
@@ -1056,10 +1147,10 @@ async fn chat(
     // 系统约定每轮实时读盘（面板保存 prompts/system.md 后无需重启即生效）
     let prompt = read_system_prompt(&state);
     // P7 AGENTS.md 双层注入（全局在前、项目在后）；P8.2 记忆层随工作区热重开
-    let agents_md = state.memory.read().unwrap().agents_md();
+    let agents_md = state.memory.read().unwrap_or_else(|e| e.into_inner()).agents_md();
     let approvals = state.approvals.clone();
     let session = state.session.clone();
-    let mem = state.memory.read().unwrap().clone();
+    let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let rec_cfg = (*state.recovery_cfg).clone();
     // P6.1 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
     let session_id = {
@@ -1068,6 +1159,22 @@ async fn chat(
             && sid.len() <= 64
             && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
         if valid { sid } else { session.new_id() }
+    };
+    // N1：同一会话已有在跑的一轮 → 409（多标签页 / 直接调 API 的并发双写防护）。
+    // 判定与登记在同一把锁内（try_begin），并发请求不会双双通过检查；登记好的标志
+    // 随任务移交 RAII 守卫 CancelRun，任务结束（含提前 return / panic）自动注销。
+    let Some(run_flag) = state.cancel.try_begin(&session_id) else {
+        observability::event(
+            EventType::State,
+            json!({ "kind": "chat.rejected", "reason": "session_busy", "session": session_id }),
+        );
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("会话 {session_id} 正在运行中：先停止或等它跑完再发（同一会话不支持并发）")
+            })),
+        )
+            .into_response();
     };
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
@@ -1097,13 +1204,15 @@ async fn chat(
         *m = mode;
     }
 
-    // 新一轮开始：复位取消标志
-    cancel.clear();
-
     tokio::spawn(async move {
         let send = |payload: Value| {
             let _ = tx.send(Ok(json_event(payload)));
         };
+        // D2：本轮取消标志（会话级）——新会话不再复位别人的标志，停止只停本会话。
+        // N1：标志已在进入 handler 时占位登记（同会话并发在门口就 409）。
+        // 守卫在任务结束（含提前 return / panic）时注销登记，不留「永远在跑」的僵尸会话。
+        let run = CancelRun::from_flag(cancel_registry, &session_id, run_flag);
+        let cancel = run.flag.clone();
         // P7 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
         let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(prior_summary.clone()));
@@ -1157,8 +1266,8 @@ async fn chat(
             }
 
             // 1. 对于主模型原生支持的媒体类型，挂载原生多模态结构
-            if !native_attachments.is_empty() {
-                if let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+            if !native_attachments.is_empty()
+                && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
                     let mut parts = Vec::new();
                     if let Some(txt) = last_msg["content"].as_str() {
                         parts.push(json!({ "type": "text", "text": txt }));
@@ -1181,7 +1290,6 @@ async fn chat(
                     }
                     last_msg["content"] = json!(parts);
                 }
-            }
 
             // 2. 对于主模型不支持的媒体类型，走专职转接与确定性文本投影（对齐 DSH media-understanding 规范）
             if !forward_attachments.is_empty() {
@@ -1226,11 +1334,10 @@ async fn chat(
                     };
 
                     let mut candidates: Vec<gateway::Channel> = Vec::new();
-                    if let Some(n) = role_target.filter(|n| !n.trim().is_empty()) {
-                        if let Some(ch) = find_channel(&s, n) {
+                    if let Some(n) = role_target.filter(|n| !n.trim().is_empty())
+                        && let Some(ch) = find_channel(&s, n) {
                             candidates.push(ch);
                         }
-                    }
 
                     // 2) 若该模态未配置路由或无可用候选：对齐 DSH 替换为确定性占位文本（deterministic placeholder），绝不发起注定失败的请求
                     if candidates.is_empty() {
@@ -1433,8 +1540,8 @@ async fn chat(
                 }
 
                 // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型
-                if !projections.is_empty() {
-                    if let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                if !projections.is_empty()
+                    && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
                         let orig = match &last_msg["content"] {
                             Value::String(s) => s.clone(),
                             Value::Array(arr) => {
@@ -1449,7 +1556,6 @@ async fn chat(
                         };
                         last_msg["content"] = json!(combined);
                     }
-                }
             }
         }
         // 请求级覆盖优先：页面当前选择即时生效，不等保存
@@ -1475,16 +1581,14 @@ async fn chat(
             .or_else(|| state.roles_cfg.title.as_deref());
         let summary = summary_name.and_then(|n| find_channel(&s, n));
         let title = title_name.and_then(|n| find_channel(&s, n));
-        if let Some(n) = summary_name {
-            if summary.is_none() {
+        if let Some(n) = summary_name
+            && summary.is_none() {
                 send(json!({ "notice": format!("角色「会话摘要」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
             }
-        }
-        if let Some(n) = title_name {
-            if title.is_none() {
+        if let Some(n) = title_name
+            && title.is_none() {
                 send(json!({ "notice": format!("角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
             }
-        }
         // P8/P8.5 降级链：优先使用 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
         let fallback_names: Vec<String> = roles
             .map(|r| r.fallbacks.clone())
@@ -1549,7 +1653,7 @@ async fn chat(
                 }
                 // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                 AgentEvent::Snapshot { messages } => {
-                    let cur_summary = summary_slot.lock().unwrap().clone();
+                    let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     match session.save(&session_id, &messages, cur_summary.as_deref()) {
                         Ok(()) => observability::event(
                             EventType::State,
@@ -1563,7 +1667,7 @@ async fn chat(
                 }
                 // P7 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
                 AgentEvent::Summary(s) => {
-                    *summary_slot.lock().unwrap() = Some(s);
+                    *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
                     send(json!({ "summary": true }))
                 }
                 // P6.1 改动统计条：撤销按钮恢复到任务起点基线
@@ -1584,6 +1688,9 @@ async fn chat(
                 AgentEvent::PlanProposal { goal, steps, files } => {
                     send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
                 }
+                AgentEvent::StepReset { content, reasoning } => {
+                    send(json!({ "reset": { "content": content, "reasoning": reasoning } }))
+                }
                 AgentEvent::Notice(n) => send(json!({ "notice": n }))
             },
         )
@@ -1598,19 +1705,73 @@ async fn chat(
         }
     });
 
-    Sse::new(UnboundedReceiverStream::new(rx))
+    Sse::new(UnboundedReceiverStream::new(rx)).into_response()
 }
 
-/// POST /cancel —— 置位全局取消标志。
-async fn cancel(State(state): State<AppState>) -> Json<Value> {
-    state.cancel.set();
-    observability::event(EventType::State, json!({ "kind": "cancel", "flag": true }));
-    Json(json!({ "cancelled": true }))
+/// 本轮任务的取消标志守卫（D2）：登记即持标志，Drop 即注销。
+/// 任务正常结束、提前 return 或 panic 都会走到 Drop，注册表不留僵尸登记。
+struct CancelRun {
+    registry: Arc<CancelRegistry>,
+    session: String,
+    flag: Arc<CancelFlag>,
 }
 
-/// GET /api/cancel —— 查询取消标志当前状态。
-async fn cancel_status(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "cancelled": state.cancel.is_set() }))
+impl CancelRun {
+    /// 接管一个**已登记**的标志（登记在 handler 入口由 `try_begin` 完成，
+    /// 这样「拒并发」与「占位」是同一个原子动作）。
+    fn from_flag(registry: Arc<CancelRegistry>, session_id: &str, flag: Arc<CancelFlag>) -> Self {
+        Self { registry, session: session_id.to_string(), flag }
+    }
+}
+
+impl Drop for CancelRun {
+    fn drop(&mut self) {
+        self.registry.end(&self.session, &self.flag);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelQuery {
+    /// 目标会话（可空：不带 = 停全部在跑任务，命令行客户端与内置页的兼容语义）
+    #[serde(default)]
+    pub session: String,
+}
+
+/// POST /cancel[?session=<id>] —— 会话级停止：只停指定会话当前这一轮；
+/// 不带 session 时停全部在跑任务。
+async fn cancel(State(state): State<AppState>, Query(q): Query<CancelQuery>) -> Json<Value> {
+    let session = q.session.trim();
+    if session.is_empty() {
+        let count = state.cancel.cancel_all();
+        observability::event(
+            EventType::State,
+            json!({ "kind": "cancel", "scope": "all", "count": count }),
+        );
+        Json(json!({ "cancelled": true, "scope": "all", "count": count }))
+    } else {
+        let hit = state.cancel.cancel(session);
+        observability::event(
+            EventType::State,
+            json!({ "kind": "cancel", "scope": "session", "session": session, "active": hit }),
+        );
+        Json(json!({ "cancelled": true, "scope": "session", "session": session, "active": hit }))
+    }
+}
+
+/// GET /api/cancel[?session=<id>] —— 带 session 查该会话；不带查「是否有在跑会话被取消」。
+async fn cancel_status(State(state): State<AppState>, Query(q): Query<CancelQuery>) -> Json<Value> {
+    let session = q.session.trim();
+    if session.is_empty() {
+        Json(json!({
+            "cancelled": state.cancel.any_cancelled(),
+            "active": state.cancel.active_count(),
+        }))
+    } else {
+        Json(json!({
+            "cancelled": state.cancel.is_set(session),
+            "running": state.cancel.is_active(session),
+        }))
+    }
 }
 
 // —— P10-A（施工单 014）：trace 时间线 ——
@@ -1639,13 +1800,13 @@ fn save_system_prompt(state: &AppState, content: &str) -> anyhow::Result<PathBuf
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, content)?;
+    crate::fsx::write_atomic_str(&path, content)?;
     Ok(path)
 }
 
 /// GET /api/memory —— 记忆层状态 + 三类约定文件原文（编辑器数据源，每次调用读盘 = 显示文件实时内容）。
 async fn get_memory(State(state): State<AppState>) -> Json<Value> {
-    let mem = state.memory.read().unwrap().clone();
+    let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let projects_registered = mem.load_index().projects.len();
     Json(json!({
         "enabled": mem.enabled,
@@ -1678,7 +1839,7 @@ async fn save_memory_agents(
     if !matches!(req.scope.as_str(), "system" | "global" | "project") {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "scope 须为 system / global / project" })));
     }
-    let mem = state.memory.read().unwrap().clone();
+    let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let saved = if req.scope == "system" {
         save_system_prompt(&state, &req.content)
     } else {
@@ -1721,7 +1882,7 @@ fn resolve_embedder<'a>(state: &'a AppState, s: &Settings) -> Option<crate::memo
 /// 增量同步索引 → 记忆库 JSON（光点列表 + 项目聚合 + 索引状态）。
 async fn build_library(state: &AppState, force: bool) -> Value {
     use crate::memory::library as lb;
-    let settings = state.settings.read().unwrap().clone();
+    let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let embedder = resolve_embedder(state, &settings);
     let report = lb::sync(&state.session, &state.log_dir, embedder, force).await;
     let lib = lb::load(&state.log_dir);
@@ -1755,7 +1916,7 @@ async fn build_library(state: &AppState, force: bool) -> Value {
         .map(|(name, (ws, n))| json!({ "name": name, "workspace": ws, "count": n }))
         .collect();
     let indexed = lib.entries.iter().filter(|e| !e.vec.is_empty()).count();
-    let mem = state.memory.read().unwrap().clone();
+    let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     json!({
         "items": items,
         "projects": projects,
@@ -1825,7 +1986,7 @@ async fn search_memory(State(state): State<AppState>, Json(req): Json<MemorySear
     let qvec = if lib.model.is_empty() || lib.model == lb::LOCAL_MODEL {
         lb::local_vec(&query)
     } else {
-        let settings = state.settings.read().unwrap().clone();
+        let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
         match resolve_embedder(&state, &settings) {
             Some(emb) => {
                 match emb.gw.embed(&emb.base_url, &emb.model, &emb.api_key, std::slice::from_ref(&query)).await {
@@ -1891,7 +2052,7 @@ async fn post_mcp(
     State(state): State<AppState>,
     Json(req): Json<McpActionRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.read().unwrap().clone();
+    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     match req.action.as_str() {
         "save" => {
@@ -1904,6 +2065,20 @@ async fn post_mcp(
             };
             if !crate::plugin::mcp::valid_name(&cfg.name) {
                 return err("名称非法（非空、仅字母数字-_、禁止包含 __）".into());
+            }
+            // transport 合法性 + 该 transport 的必需字段（早失败好过调用时才报错）
+            match cfg.transport.as_str() {
+                "http" | "HTTP" | "Http" => {
+                    if !cfg.url.trim().starts_with("http://") && !cfg.url.trim().starts_with("https://") {
+                        return err("http transport 需要 http(s):// 开头的 url".into());
+                    }
+                }
+                "stdio" | "STDIO" | "Stdio" => {
+                    if cfg.command.trim().is_empty() {
+                        return err("stdio transport 需要 command".into());
+                    }
+                }
+                other => return err(format!("未知 transport: {other}（stdio | http）")),
             }
             s.mcp_servers.retain(|c| c.name != cfg.name);
             s.mcp_servers.push(cfg);
@@ -1918,11 +2093,10 @@ async fn post_mcp(
                 return err(format!("未知 server: {name}"));
             };
             c.confirmed = true;
-            if let Some(r) = &req.risk {
-                if r == "dangerous" || r == "normal" {
+            if let Some(r) = &req.risk
+                && (r == "dangerous" || r == "normal") {
                     c.risk = r.clone();
                 }
-            }
         }
         "toggle" => {
             let Some(name) = &req.name else { return err("缺少 name".into()) };
@@ -1944,7 +2118,7 @@ async fn post_mcp(
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
@@ -1978,7 +2152,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             })
         })
         .collect();
-    let s = state.settings.read().unwrap().clone();
+    let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
         crate::plugin::mcp::status()
             .into_iter()
@@ -1993,7 +2167,8 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 .cloned()
                 .unwrap_or((false, Vec::new()));
             json!({
-                "name": c.name, "command": c.command, "args": c.args, "env": c.env,
+                "name": c.name, "transport": c.transport, "command": c.command, "args": c.args,
+                "env": c.env, "url": c.url, "headers": c.headers,
                 "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
                 "online": online,
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
@@ -2001,6 +2176,58 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
         })
         .collect();
     Json(json!({ "servers": servers, "wasm": wasm_list }))
+}
+
+/// GET /api/version —— 版本与运行形态（界面「关于」卡片用）。
+/// root 是**运行时认定的应用根**（打包形态=exe 同级，开发形态=源码目录），
+/// 是排查「配置/扩展/前端产物读到哪一份」的第一手线索。
+async fn get_version() -> Json<Value> {
+    Json(json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "root": crate::config::app_root().display().to_string(),
+        "exe": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+    }))
+}
+
+/// GET /api/ext —— 组件总线 v0：UI 扩展清单（应用根内置 + 当前工作区自带）。
+async fn list_extensions() -> Json<Value> {
+    Json(json!({
+        "extensions": crate::plugin::ui::scan(),
+        "dir": crate::plugin::ui::DIR,
+        "app_dir": crate::config::app_root().join(crate::plugin::ui::DIR).display().to_string(),
+        "workspace_dir": crate::tools::workspace_root().join(crate::plugin::ui::DIR).display().to_string(),
+    }))
+}
+
+/// GET /ui-ext/{name} —— 扩展入口页（entry 由 manifest 指定）。
+async fn ui_ext_entry(AxumPath(name): AxumPath<String>) -> Response {
+    serve_ext(&name, "")
+}
+
+/// GET /ui-ext/{name}/{*path} —— 扩展目录内的静态资源。
+async fn ui_ext_asset(AxumPath((name, path)): AxumPath<(String, String)>) -> Response {
+    serve_ext(&name, &path)
+}
+
+/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）。
+fn serve_ext(name: &str, rel: &str) -> Response {
+    let rel = if rel.trim().is_empty() {
+        crate::plugin::ui::scan()
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.entry)
+            .unwrap_or_else(|| "index.html".to_string())
+    } else {
+        rel.to_string()
+    };
+    match crate::plugin::ui::resolve_asset(name, &rel) {
+        Ok(p) => match std::fs::read(&p) {
+            Ok(bytes) => ([(CONTENT_TYPE, crate::plugin::ui::content_type(&p))], bytes).into_response(),
+            Err(e) => (StatusCode::NOT_FOUND, format!("读文件失败: {e}")).into_response(),
+        },
+        Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
 }
 
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
@@ -2112,7 +2339,7 @@ impl agent::ApprovalGate for ChatGate {
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
-        self.pending.lock().unwrap().insert(id.clone(), otx);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), otx);
         let ws = crate::tools::workspace_root();
         let val: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
         let (risk, reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
@@ -2149,7 +2376,7 @@ impl agent::ApprovalGate for ChatGate {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
                 _ = wait_cancelled(cancel) => false,
             };
-            pending.lock().unwrap().remove(&id);
+            pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             observability::event(
                 EventType::State,
                 json!({ "kind": "approval.decided", "id": id, "approved": decision }),
@@ -2196,20 +2423,18 @@ async fn decide_approval(
     // P9 A3：remember=true 表示「本会话内同类操作不再询问」
     let remember = req.get("remember").and_then(Value::as_bool).unwrap_or(false);
     let meta = state.approval_meta.lock().ok().and_then(|mut m| m.remove(id));
-    let sender = state.approvals.lock().unwrap().remove(id);
+    let sender = state.approvals.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     match sender {
         Some(tx) => {
             // 会话内同类允许：Dangerous 档不记忆（needs_approval_for 已拒记，此处二次兜底）
-            if approved && remember {
-                if let Some((scope, session)) = meta {
+            if approved && remember
+                && let Some((scope, session)) = meta {
                     let dangerous = scope.contains(":2:") || scope.ends_with(":2");
-                    if !dangerous {
-                        if let Ok(mut m) = state.approved_scopes.lock() {
+                    if !dangerous
+                        && let Ok(mut m) = state.approved_scopes.lock() {
                             m.entry(session).or_default().insert(scope);
                         }
-                    }
                 }
-            }
             let _ = tx.send(approved);
             (StatusCode::OK, Json(json!({ "ok": true })))
         }
@@ -2346,12 +2571,12 @@ async fn remove_workspace(
     if path.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
     }
-    let mut s = state.settings.write().unwrap().clone();
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     s.recent_workspaces.retain(|w| w != path);
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
@@ -2366,7 +2591,7 @@ async fn alias_workspace(
     if path.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
     }
-    let mut s = state.settings.write().unwrap().clone();
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     let name = req.name.trim().to_string();
     if name.is_empty() {
         s.workspace_aliases.remove(path);
@@ -2376,7 +2601,7 @@ async fn alias_workspace(
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
-    *state.settings.write().unwrap() = s.clone();
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -2902,6 +3127,55 @@ mod tests {
         s.configs.push(test_config());
         s.active_config_id = Some("cfg-t".into());
         s
+    }
+
+    // —— 来源校验（施工单 022）：堵 DNS rebinding 的那三条规则 ——
+
+    #[test]
+    fn host_parsing_covers_ipv4_ipv6_and_bare_names() {
+        assert_eq!(split_host("127.0.0.1:5173"), ("127.0.0.1", Some(5173)));
+        assert_eq!(split_host("localhost"), ("localhost", None));
+        assert_eq!(split_host("[::1]:5173"), ("::1", Some(5173)));
+        assert_eq!(split_host("[::1]"), ("::1", None));
+        assert_eq!(split_host("example.com:80"), ("example.com", Some(80)));
+        // 非数字「端口」不当端口解析（否则 example.com:abc 会被当成主机 example.com）
+        assert_eq!(split_host("example.com:abc"), ("example.com:abc", None));
+    }
+
+    #[test]
+    fn loopback_detection() {
+        for ok in ["localhost", "LOCALHOST", "127.0.0.1", "127.1.2.3", "::1", "localhost."] {
+            assert!(is_loopback_host(ok), "{ok} 应判为回环");
+        }
+        for bad in ["example.com", "evil.test", "0.0.0.0", "10.0.0.5", "192.168.1.9", ""] {
+            assert!(!is_loopback_host(bad), "{bad} 不应判为回环");
+        }
+    }
+
+    /// 核心场景：rebinding 时 Host 是攻击者域名 → 拒；正常本机访问 → 放行。
+    #[test]
+    fn rebinding_host_is_rejected() {
+        let e = check_origin("evil.example.com:5173", None).expect_err("非本机 Host 必须拒");
+        assert!(e.contains("不是本机地址"), "{e}");
+        assert!(check_origin("127.0.0.1:5173", None).is_ok());
+        assert!(check_origin("localhost:5173", Some("http://localhost:5173")).is_ok());
+        // 不带 Origin 的命令行客户端（curl / eval）放行
+        assert!(check_origin("127.0.0.1:5173", None).is_ok());
+        // 缺 Host 头：拒（HTTP/1.0 老客户端）
+        assert!(check_origin("", None).is_err());
+    }
+
+    #[test]
+    fn cross_origin_and_opaque_origins_are_rejected() {
+        // 外站页面的 AJAX
+        assert!(check_origin("127.0.0.1:5173", Some("http://evil.example.com")).is_err());
+        // 本机另一个端口上的页面（也是跨源）
+        assert!(check_origin("127.0.0.1:5173", Some("http://127.0.0.1:9999")).is_err());
+        // 沙箱 iframe / file:// 的不透明源
+        assert!(check_origin("127.0.0.1:5173", Some("null")).is_err());
+        // 端口缺省的显式写法：http 默认 80 与 Host 无端口同源
+        assert!(check_origin("localhost", Some("http://localhost")).is_ok());
+        assert!(check_origin("localhost:80", Some("http://localhost:80")).is_ok());
     }
 
     #[test]

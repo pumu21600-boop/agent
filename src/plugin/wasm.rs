@@ -1,8 +1,8 @@
-//! WASM 插件宿主（施工单 017，P11）—— 总架构 §7「WASM 保深度定制，自带沙箱即边界」
+//! WASM 插件宿主（施工单 017 + 021，P11/P15）—— 总架构 §7「WASM 保深度定制，自带沙箱即边界」
 //!
 //! 插件形态：`plugins/` 目录下的 .wasm / .wat 文件（wat 由 wasmtime 内置解析，零工具链依赖）。
 //!
-//! ABI（窄而刚，单函数协议）：
+//! ABI v1（窄而刚，单函数协议）：
 //! - 导出 `memory`
 //! - 导出 `alloc(size: i32) -> i32`（宿主写输入参数用；插件可忽略）
 //! - 导出 `describe() -> i64`（高 32 位=ptr，低 32 位=len；len==0 表示 0 终止字符串）
@@ -10,7 +10,12 @@
 //! - 导出 `run(action_ptr, action_len, payload_ptr, payload_len) -> i64`
 //!   action 固定 "call"；payload JSON：{"tool","args"}；返回 JSON：{"text":"..."}（或 {"error"}）
 //!
-//! 隔离模型：**每次调用新建实例**（无共享状态、无并发问题）；v0 不提供任何 host function
+//! **v0 → v1**：v0 把 action 与 payload 写在同一个缓冲区、四个参数传 (ptr,len,ptr,len)，
+//! 于是「读第 1/2 个参数」与「读第 3/4 个参数」拿到的都是 payload —— action 形同虚设。
+//! v1 用一次 alloc 申请 `action+payload` 连续区（action 在前），四个参数各指其位；
+//! 读第 3/4 个参数的插件（含随包 hello.wat，它忽略全部参数）行为不变。
+//!
+//! 隔离模型：**每次调用新建实例**（无共享状态、无并发问题）；v1 仍不提供任何 host function
 //! ——插件是纯计算沙箱，天然无文件/网络边界问题。trap 一律捕获为 Err，绝不连坐宿主。
 //!
 //! 信任模型：plugins/ 目录文件由用户主动放置（本地可信），工具默认 Normal 档；
@@ -23,6 +28,8 @@ use std::{
 
 use serde_json::{json, Value};
 use wasmtime::{Engine, Instance, Module, Store};
+
+use crate::plugin::ToolBrief;
 
 /// 工具全名前缀（wasm__<plugin>__<tool>）。
 pub const PREFIX: &str = "wasm__";
@@ -123,7 +130,7 @@ fn load_plugin_inner(file: &Path) -> Result<Vec<(String, String, Value)>, String
             .map_err(|e| format!("缺少 describe 导出: {e}"))?;
         let packed = describe.call(&mut *store, ()).map_err(|e| format!("describe trap: {e}"))?;
         let (ptr, len) = unpack(packed);
-        let text = read_cstr(&mem, &store, ptr, len)?;
+        let text = read_cstr(&mem, store, ptr, len)?;
         // 解析工具清单
         let v: Value = serde_json::from_str(&text).map_err(|e| format!("describe JSON 不合法: {e}"))?;
         let tools = v
@@ -164,7 +171,7 @@ fn with_instance<T>(
 pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, String> {
     let (stem, tool) = split_full_name(full_name).ok_or("非法 WASM 工具名")?;
     let (module, _entry) = {
-        let reg = registry().read().expect("wasm 注册表锁毒化");
+        let reg = registry().read().unwrap_or_else(|e| e.into_inner());
         let e = reg.iter().find(|e| e.stem == stem).ok_or_else(|| format!("未知 WASM 插件: {stem}"))?;
         if let Some(err) = &e.load_error {
             return Err(format!("插件加载失败（{stem}）: {err}"));
@@ -194,16 +201,25 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
             let run = inst
                 .get_typed_func::<(i32, i32, i32, i32), i64>(&mut *store, "run")
                 .map_err(|e| format!("缺少 run 导出: {e}"))?;
-            // 写 payload（alloc 分配的缓冲）
-            let pb = payload.as_bytes();
-            let ptr = alloc.call(&mut *store, pb.len() as i32).map_err(|e| format!("alloc trap: {e}"))?;
-            pipe_write(&mem, &mut *store, ptr, pb).map_err(|e| format!("写 payload: {e}"))?;
-            // action "call"（v0 插件通常忽略 action，直接执行内建逻辑）
+            // ABI v1：一次 alloc 申请 action+payload 连续区，四个参数各指其位
+            let (a_off, a_len, p_off, p_len, buf) = abi_layout("call", &payload);
+            let ptr = alloc
+                .call(&mut *store, buf.len() as i32)
+                .map_err(|e| format!("alloc trap: {e}"))?;
+            pipe_write(&mem, &mut *store, ptr, &buf).map_err(|e| format!("写 action/payload: {e}"))?;
             let packed = run
-                .call(&mut *store, (ptr, pb.len() as i32, ptr, pb.len() as i32))
+                .call(
+                    &mut *store,
+                    (
+                        ptr + a_off as i32,
+                        a_len as i32,
+                        ptr + p_off as i32,
+                        p_len as i32,
+                    ),
+                )
                 .map_err(|e| format!("run trap: {e}"))?;
             let (rptr, rlen) = unpack(packed);
-            let text = read_cstr(&mem, &store, rptr, rlen)?;
+            let text = read_cstr(&mem, store, rptr, rlen)?;
             let v: Value = serde_json::from_str(&text).map_err(|e| format!("run JSON 不合法: {e}"))?;
             if let Some(err) = v.get("error").and_then(Value::as_str) {
                 return Err(format!("WASM 工具报告失败: {err}"));
@@ -231,14 +247,26 @@ fn read_cstr(mem: &wasmtime::Memory, store: &wasmtime::Store<()>, ptr: i32, len:
         (vec![0u8; len as usize], ptr as usize)
     } else {
         // 0 终止：从 ptr 读到页尾，找 0
-        let size = mem.size(&store) as usize * 65536;
+        let size = mem.size(store) as usize * 65536;
         let start = ptr as usize;
         (vec![0u8; size.saturating_sub(start)], start)
     };
-    mem.read(&store, start, &mut buf)
+    mem.read(store, start, &mut buf)
         .map_err(|e| format!("memory.read: {e}"))?;
     let end = if len > 0 { buf.len() } else { buf.iter().position(|&b| b == 0).unwrap_or(buf.len()) };
     String::from_utf8(buf[..end].to_vec()).map_err(|e| format!("非 UTF-8: {e}"))
+}
+
+/// ABI v1 缓冲区布局：`action` 在前、`payload` 紧随其后，返回
+/// (action_off, action_len, payload_off, payload_len, 连续区字节)。
+/// 纯函数（可单测）：宿主只 alloc 一次，两次写内存合成一次写完。
+fn abi_layout(action: &str, payload: &str) -> (usize, usize, usize, usize, Vec<u8>) {
+    let a = action.as_bytes();
+    let p = payload.as_bytes();
+    let mut buf = Vec::with_capacity(a.len() + p.len());
+    buf.extend_from_slice(a);
+    buf.extend_from_slice(p);
+    (0, a.len(), a.len(), p.len(), buf)
 }
 
 fn unpack(packed: i64) -> (i32, i32) {
@@ -260,7 +288,7 @@ pub fn split_full_name(full: &str) -> Option<(String, String)> {
 /// 审批档判定（rules.rs wasm__ 分支）：本地可信目录默认 Normal；未知 None → rules 落 Dangerous。
 pub fn risk_for(full_name: &str) -> Option<u8> {
     let (stem, _tool) = split_full_name(full_name)?;
-    let reg = registry().read().expect("wasm 注册表锁毒化");
+    let reg = registry().read().unwrap_or_else(|e| e.into_inner());
     let e = reg.iter().find(|e| e.stem == stem)?;
     if e.load_error.is_some() {
         return Some(2); // 加载失败的插件不可静默执行
@@ -270,7 +298,7 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
 
 /// 已加载插件的 OpenAI function 定义。
 pub fn tool_definitions() -> Vec<Value> {
-    let reg = registry().read().expect("wasm 注册表锁毒化");
+    let reg = registry().read().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for e in reg.iter() {
         if e.load_error.is_some() {
@@ -290,9 +318,9 @@ pub fn tool_definitions() -> Vec<Value> {
     }
     out
 }
-/// UI 状态快照。
-pub fn status() -> Vec<(String, bool, Vec<(String, String)>, Option<String>)> {
-    let reg = registry().read().expect("wasm 注册表锁毒化");
+/// UI 状态快照：(插件名, 加载成功, 工具清单, 加载错误)。
+pub fn status() -> Vec<(String, bool, Vec<ToolBrief>, Option<String>)> {
+    let reg = registry().read().unwrap_or_else(|e| e.into_inner());
     reg.iter()
         .map(|e| {
             (
@@ -303,4 +331,73 @@ pub fn status() -> Vec<(String, bool, Vec<(String, String)>, Option<String>)> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试插件：describe 声明 echo 工具；run 把 payload（第 3/4 个参数指到的那段）
+    /// 逐字节抄到 8192 再按显式长度返回——不掺任何业务逻辑，专门用来验证 ABI 契约。
+    const ECHO_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{\"tools\":[{\"name\":\"echo\",\"description\":\"echo payload\",\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}}]}\00")
+  (func (export "alloc") (param $n i32) (result i32) (i32.const 4096))
+  (func $pack (param $p i32) (param $l i32) (result i64)
+    (i64.or (i64.shl (i64.extend_i32_u (local.get $p)) (i64.const 32))
+            (i64.extend_i32_u (local.get $l))))
+  (func (export "describe") (result i64)
+    (call $pack (i32.const 1024) (i32.const 0)))
+  (func (export "run") (param $a1 i32) (param $a2 i32) (param $p1 i32) (param $p2 i32) (result i64)
+    (local $i i32)
+    (block $done
+      (loop $copy
+        (br_if $done (i32.ge_u (local.get $i) (local.get $p2)))
+        (i32.store8 (i32.add (i32.const 8192) (local.get $i))
+                    (i32.load8_u (i32.add (local.get $p1) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $copy)))
+    (call $pack (i32.const 8192) (local.get $p2))))
+"#;
+
+    #[test]
+    fn abi_layout_separates_action_and_payload() {
+        let (a_off, a_len, p_off, p_len, buf) = abi_layout("call", "{\"a\":1}");
+        assert_eq!((a_off, a_len), (0, 4));
+        assert_eq!((p_off, p_len), (4, 7), "payload 紧跟 action 之后，两段不重叠");
+        assert_eq!(&buf[a_off..a_off + a_len], b"call");
+        assert_eq!(&buf[p_off..p_off + p_len], b"{\"a\":1}");
+        assert_eq!(buf.len(), a_len + p_len);
+    }
+
+    /// 端到端（真 wasmtime 实例）：临时目录写 wat → scan_and_load → call_tool。
+    /// 插件回吐 payload，宿主必须拿回完整 {"tool","args"}——一次覆盖 describe 解析、
+    /// 工具登记、alloc/写内存/参数布局、run 调用、结果回读全链路。
+    #[test]
+    fn wat_plugin_end_to_end_round_trips_payload() {
+        let dir = std::env::temp_dir().join(format!("agent-wasm-abi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
+
+        let n = scan_and_load(&dir);
+        assert_eq!(n, 1, "应扫描到 1 个插件");
+        let entry = registry().read().unwrap_or_else(|e| e.into_inner()).first().cloned().expect("注册表应有 echo");
+        assert!(entry.load_error.is_none(), "加载不应失败: {:?}", entry.load_error);
+        assert_eq!(entry.tools.len(), 1);
+        assert_eq!(entry.tools[0].0, "echo");
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt
+            .block_on(call_tool("wasm__echo__echo", r#"{"x":1}"#))
+            .expect("插件调用应成功");
+        // payload 里的键序由 serde_json 决定，按值断言（同时证明 action 没混进来：
+        // 若两段共用指针，这里会回吐 "call" 而解析失败）
+        let got: Value = serde_json::from_str(&out).expect("回吐的应是 JSON");
+        assert_eq!(got["tool"], "echo");
+        assert_eq!(got["args"]["x"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

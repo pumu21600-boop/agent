@@ -1,0 +1,19 @@
+{
+  "name": "search-and-report",
+  "prompt": "工作区里有几个文件，其中只有一个包含关键词 SPARKLE-42。请用检索工具找出它在哪个文件里，然后把文件名告诉我。不要修改或新建任何文件。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "setup_files": {
+    "docs/a.md": "普通文档，没有任何特殊标记。\n",
+    "docs/b.md": "这一篇里藏着 SPARKLE-42 这个标记。\n",
+    "docs/c.md": "另一篇普通文档。\n",
+    "src/app.txt": "应用源码占位。\n"
+  },
+  "assertions": [
+    { "type": "files_unchanged" },
+    { "type": "no_new_files" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

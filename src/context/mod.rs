@@ -164,8 +164,8 @@ pub fn compact_messages(messages: &[Value], cfg: &CompactConfig) -> (Vec<Value>,
     if after > cfg.budget_tokens {
         let mut groups: Vec<(usize, usize)> = Vec::new(); // [start, end)
         let mut start = 1usize; // 0 是 system
-        for i in 2..out.len() {
-            if out[i].get("role").and_then(Value::as_str) == Some("user") {
+        for (i, m) in out.iter().enumerate().skip(2) {
+            if m.get("role").and_then(Value::as_str) == Some("user") {
                 groups.push((start, i));
                 start = i;
             }
@@ -182,7 +182,7 @@ pub fn compact_messages(messages: &[Value], cfg: &CompactConfig) -> (Vec<Value>,
             .iter()
             .take(groups.len().saturating_sub(1)) // 最后一组不折
             .copied()
-            .filter(|(_, gend)| protected_start.map_or(true, |ps| ps >= *gend))
+            .filter(|(_, gend)| protected_start.is_none_or(|ps| ps >= *gend))
             .collect();
 
         let mut folded_ranges: Vec<(usize, usize)> = Vec::new();
@@ -190,8 +190,8 @@ pub fn compact_messages(messages: &[Value], cfg: &CompactConfig) -> (Vec<Value>,
             if after <= cfg.budget_tokens {
                 break;
             }
-            for i in gstart..gend {
-                after -= estimate_message(&out[i]);
+            for m in &out[gstart..gend] {
+                after -= estimate_message(m);
                 stats.folded_messages += 1;
             }
             folded_ranges.push((gstart, gend));

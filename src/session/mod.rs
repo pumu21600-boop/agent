@@ -110,11 +110,9 @@ impl SessionManager {
             .list()
             .into_iter()
             .find(|m| m.count == 0 && !m.archived && m.workspace == workspace)
-        {
-            if let Some(f) = self.get(&m.id) {
+            && let Some(f) = self.get(&m.id) {
                 return Ok(f);
             }
-        }
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let f = SessionFile {
@@ -292,11 +290,10 @@ impl SessionManager {
                 lines.push(format!("- 上次进展：{}", sm.chars().take(400).collect::<String>()));
             }
         }
-        if let Some((files, add, del)) = changes {
-            if files > 0 {
+        if let Some((files, add, del)) = changes
+            && files > 0 {
                 lines.push(format!("- 工作区已有 {files} 个文件改动（+{add}/-{del}，相对最近检查点），内容都在磁盘上"));
             }
-        }
         if lines.is_empty() {
             return None;
         }

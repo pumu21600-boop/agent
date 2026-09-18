@@ -1,0 +1,17 @@
+{
+  "name": "plan-approve-execute",
+  "prompt": "在工作区创建文件 report.md，内容为一行：季度报告已生成。先给我一份执行计划（不要动文件），我确认后你再动手。",
+  "plan_mode": true,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "followup_prompt": "计划已批准，请按计划执行。",
+  "followup_plan_mode": false,
+  "setup_files": {},
+  "assertions": [
+    { "type": "sse_event", "event": "plan_proposal" },
+    { "type": "file_exists", "path": "report.md" },
+    { "type": "file_contains", "path": "report.md", "needle": "季度报告已生成" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

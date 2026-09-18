@@ -1,0 +1,16 @@
+{
+  "name": "multi-file-scaffold",
+  "prompt": "在工作区创建两个文件：pkg/util.py（内容含一行 def add(a, b): 的加法函数实现）和 pkg/main.py（第一行 import util，然后调用它）。只创建这两个文件。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 240,
+  "setup_files": {},
+  "assertions": [
+    { "type": "file_exists", "path": "pkg/util.py" },
+    { "type": "file_exists", "path": "pkg/main.py" },
+    { "type": "file_contains", "path": "pkg/util.py", "needle": "def add" },
+    { "type": "file_contains", "path": "pkg/main.py", "needle": "import util" },
+    { "type": "sse_event", "event": "tool_call" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

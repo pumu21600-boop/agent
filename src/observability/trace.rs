@@ -91,11 +91,10 @@ pub fn read_tasks(path: &Path, limit: usize) -> anyhow::Result<Vec<TaskTrace>> {
             t.end_ts = ts.clone();
             t.events.push(TraceEvent { ts: ts.clone(), etype, payload });
         }
-        if is_task_end {
-            if let Some(t) = cur.take() {
+        if is_task_end
+            && let Some(t) = cur.take() {
                 tasks.push(t);
             }
-        }
         // 边界之前的孤儿事件（进程启动/config.changed 等）不归属任何任务，丢弃
     }
     if let Some(t) = cur.take() {
