@@ -9,7 +9,7 @@ P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用�
 ## 功能总览
 
 - **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、**取消会话化**（停止只停当前会话的这一轮，别的会话不受影响）；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
-- **工具**：`read_file` / `read_page` / `search`(rg) / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`）与 WASM 插件（`wasm__<plugin>__<tool>`）。
+- **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与 WASM 插件（`wasm__<plugin>__<tool>`）。
 - **审批与 Plan**：三档 `read-only` / `auto` / `full-access`（侧栏即时切换、请求级可覆盖），风险分级引擎逐条判定，「本会话同类允许」记忆授权范围。Plan 档是**接口层能力**（请求级 `plan_mode`：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划，最终回答可产出结构化计划块）——P14 起**界面不再提供 Plan/Act 手动切换**（改由模型按系统约定在任务里自己列步骤），该档保留给 API 与 eval 使用。
 - **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）；设置 → 插件 有「沙箱自检」卡片可一键跑探针套件。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
@@ -308,8 +308,10 @@ cargo run                                # 终端 2：127.0.0.1:5173
   头的配置接）。
 - **WASM 插件**：ABI v1（alloc/describe/run，action 与 payload 分缓冲），仍是**零 host function** 的
   纯计算沙箱——插件碰不到文件/网络/UI，只能做纯函数工具。
-- **组件总线 v0**：静态 UI + 只读数据桥。写操作、宿主 UI 注入点（菜单/消息流插槽）、扩展间通信、
-  扩展的启用/禁用管理都未做（放扩展目录里即生效，删目录即消失）。
+- **组件总线**：v1 —— 静态 UI + 只读数据桥 + `manifest.json` 声明的 **界面插槽**（顶栏按钮）
+  与**写操作权限**（`composer.insert` / `workspace.write` / `bus.publish` / `notify`；未声明一律拒，
+  写工作区文件还会替扩展弹一次确认）+ **扩展间通信**（宿主转发 `bus.message`）+ 启用/停用管理
+  （设置→插件 里开关；停用的扩展不出页面、不加载、不服务）。宿主/扩展只能通过 postMessage 白名单往来。
 - **eval 任务集**：11 个任务（hello-file / fix-json / read-only-plan / edit-existing-file / delete-file /
   multi-file-scaffold / fix-code-bug / search-and-report / plan-mode-write-guard / run-tests-and-report /
   plan-approve-execute），
