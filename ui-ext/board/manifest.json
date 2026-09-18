@@ -1,6 +1,6 @@
 {
   "title": "项目速览",
-  "description": "看当前工作区、Git 状态与最近记忆 —— 组件总线 v0 的参考扩展（演示白名单只读桥）",
+  "description": "看当前工作区、Git 状态与最近记忆 —— 组件总线参考扩展（只读桥 + 写操作 + 顶栏插槽 + 扩展间通信演示）",
   "version": "0.2.0",
   "entry": "index.html",
   "ui": [{ "slot": "toolbar", "id": "board", "title": "项目速览" }],
