@@ -1,7 +1,7 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P16 完成**（第二轮审查整改：取消模型会话化 / `edit_file` 局部修改工具 / 日志多份归档 /
+当前进度：**P18 完成**（契约收敛：插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；P15 缺口补齐（MCP http transport / WASM ABI v1 / 发布打包 / CI）；
 扩展覆盖标记）；P15 缺口补齐（组件总线 v0 / MCP http transport / WASM ABI v1 / 发布打包 / CI）；
 P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用）。
 逐阶段排产与踩坑记录见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
@@ -9,20 +9,20 @@ P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用�
 ## 功能总览
 
 - **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、**取消会话化**（停止只停当前会话的这一轮，别的会话不受影响）；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
-- **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与 WASM 插件（`wasm__<plugin>__<tool>`）。
+- **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与插件工具（`wasm__<plugin>__<tool>`；契约 v1 起 WASM 是插件工具的一种实现，见 `docs/plugin-contract-v1.md`）。
 - **审批与 Plan**：三档 `read-only` / `auto` / `full-access`（侧栏即时切换、请求级可覆盖），风险分级引擎逐条判定，「本会话同类允许」记忆授权范围。Plan 档是**接口层能力**（请求级 `plan_mode`：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划，最终回答可产出结构化计划块）——P14 起**界面不再提供 Plan/Act 手动切换**（改由模型按系统约定在任务里自己列步骤），该档保留给 API 与 eval 使用。
-- **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）；设置 → 插件 有「沙箱自检」卡片可一键跑探针套件。
+- **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）；设置 → 运行时 有「沙箱自检」卡片可一键跑探针套件。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
 - **恢复与撤销**：danger≥1 工具执行前拍影子仓库检查点；撤销只回退本任务改过的文件（绝不整树 reset）；对话流内显示「N 个文件已更改 +x −y ↩ 撤销」。
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）；HANDOFF 交接文档（手动或上下文 ≥80% 自动）。
 - **记忆**：双层存储（全局 `~/.agent` + 项目 `<workspace>/.agent/memory`）、events.log 事件流水（默认脱敏）、AGENTS.md 双层注入、滚动摘要；系统约定（`prompts/system.md`）**每轮任务实时读盘**，面板保存即生效。
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
-- **插件**：MCP 双 transport（本地 **stdio** 子进程 / 远端 **Streamable HTTP**，后者支持 SSE 帧与会话头）；WASM 插件（ABI v1，纯计算沙箱、零 host function）；**组件总线 v0（UI 插槽）**——`ui-ext/` 目录里的静态面板跑在沙箱 iframe 里，经 postMessage 只读白名单取数据。
+- **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，11 个任务）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / 扩展）。
-- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测 152 项（含沙箱 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 运行时 / 插件）。
+- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测 174 项（含沙箱 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
 
@@ -43,19 +43,21 @@ agent/
 │   ├── session/          # 会话落盘与恢复
 │   ├── tools/            # 工具系统（内置 + 并行调度 + git 发现链）
 │   ├── memory/           # 记忆 v1（events.log/AGENTS.md/摘要）+ library.rs 记忆库索引
-│   └── plugin/           # mcp.rs（stdio + Streamable HTTP）+ wasm.rs（ABI v1 宿主）+ ui.rs（组件总线 v0）
+│   ├── plugin/           # contract.rs（契约 v1）+ mcp.rs + wasm.rs（工具引擎）+ ui.rs（面板）+ draft.rs（隔离区）
+│   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
+│   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── ui-ext/               # 组件总线扩展（每个目录 = 一块 UI 面板，如 board/ 项目速览）
+├── ui-ext/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 11 个任务 + mcp-mini-server.mjs（stdio）/ mcp-http-server.mjs（http）冒烟工具
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
-├── plugins/              # WASM 插件（*.wat 零工具链依赖）
+├── plugins/              # 插件工具（*.wat / 目录+manifest，WASM 引擎执行）
 ├── prompts/system.md     # 系统约定（每轮任务实时读盘）
 ├── providers.json        # 供应商预设（数据驱动）
 ├── docs/                 # ROADMAP / jsonl-schema / workorders/ / 交接文档
 ├── scripts/              # package_release.ps1（发布打包）/ bundle_git.ps1（内置 git）/ mock_provider.mjs
 ├── .github/workflows/    # CI：clippy -D warnings + 全量测试 + 前端构建
-├── config.toml           # 服务/网关/审批/沙箱/上下文/恢复/记忆配置
+├── config.toml           # 服务/网关/审批/沙箱/上下文/恢复/记忆/钩子配置
 └── LICENSE               # MIT
 ```
 
@@ -114,7 +116,7 @@ cargo run                            # 前台调试运行（关终端即停）
   6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\agent\runtime\git` 再使用
      （只发生在没装 git 的机器上，解压一次记 `git.runtime_extracted`；之后启动直接复用）。
 - 覆盖 zip 位置可用环境变量 `AGENT_GIT_ZIP`（调试用）。
-- **界面上能看到**：设置 → 插件 分区顶部有「Git 运行时」卡片，显示当前用的是系统 Git 还是内置 Git、
+- **界面上能看到**：设置 → 插件 分区顶部有「Git 运行时」卡片（设置 → 运行时），显示当前用的是系统 Git 还是内置 Git、
   版本与路径，以及内置包是否随包携带（「重新检测」按钮手动刷新）。
 - 已知差异：MinGit 不带 git-lfs / bash / 图形界面——agent 的提交、diff、撤销、检查点都不需要它们；
   用户项目若使用 LFS，需另装完整版 git。
@@ -137,7 +139,7 @@ start.bat  stop.bat  README.md  LICENSE
 ```
 
 **验证过的用法**：把整个目录拷到任意位置（含没装 Rust/Node 的机器）双击 `start.bat` 即用——
-exe 同级就是运行根，配置、会话、日志、扩展全落在那个目录里，不碰源码树。
+exe 同级就是运行根，配置、会话、日志、插件全落在那个目录里，不碰源码树。
 
 ## CI
 
@@ -217,7 +219,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/checkpoints` | 影子仓库检查点列表（≤20） |
 | POST | `/api/checkpoints/restore` | 撤销：逐文件回退检查点之后 agent 改过的文件 |
 | GET | `/api/git/status` | 工作区 git 概览（分支/头部/脏文件/领先落后） |
-| GET | `/api/git/info` | git 运行时状态（可用性/版本/来源：系统·便携·内置/内置包情况；设置→插件 卡片用） |
+| GET | `/api/git/info` | git 运行时状态（可用性/版本/来源：系统·便携·内置/内置包情况；设置→运行时 卡片用） |
 | POST | `/api/git/commit` | 用户手动提交（按选中路径 stage + commit） |
 | GET | `/api/trace?limit=N` | 最近 N 个任务的事件流（时间线数据源） |
 | GET | `/api/workspace` | 当前工作区 + 最近项目列表 |
@@ -232,10 +234,14 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/memory/library` | 记忆库光点数据（每次调用做有界增量同步） |
 | POST | `/api/memory/library/reindex` | 强制重建向量 |
 | POST | `/api/memory/search` | 检索（`query` 或 `like=<会话id>`） |
-| GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ WASM 插件状态 / 配置管理与生命周期动作 |
+| GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
-| GET | `/api/ext` | 组件总线 v0：UI 扩展清单（应用根 + 当前工作区） |
-| GET | `/ui-ext/{name}[/{path}]` | 扩展静态资源（入口页由 manifest 指定；路径穿越一律 404） |
+| GET | `/api/ext` | 插件统一清单（面板 + 工具 + draft，一份列表）|
+| POST | `/api/ext/toggle` | 启用/停用插件（停用 = 拒新调用 + 等完）|
+| POST | `/api/ext/draft` / DELETE | 模型自产插件提交 draft 隔离区 / 丢弃 |
+| POST | `/api/ext/promote` | draft 一键转正（落盘持久化、来源改 user）|
+| GET / PUT / DELETE | `/api/plugin/data` | 插件命名空间数据读写删（存储一门；键名白名单 ≤64 字符，值 ≤64KB）|
+| GET | `/ui-ext/{name}[/{path}]` | 插件面板静态资源（入口页由 manifest 指定；路径穿越一律 404） |
 | GET | `/api/version` | 版本与运行形态（`root` = 当前生效的应用根） |
 | GET | `/api/sandbox/selftest` | 沙箱探针套件（真实拉起受限进程） |
 
@@ -252,38 +258,45 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - 传输层失败（连不上 / 非 2xx / 解析不出）标记离线，下次调用自动重连重握手；server 自己报的协议错误照实显示。
 - 本地冒烟：`node evals/mcp-http-server.mjs`（加 `--sse` 走 SSE 响应），然后按上表添加 `http://127.0.0.1:9401/mcp`。
 
-## 组件总线 v0（UI 扩展）
+# 插件（契约 v1，二合一）
 
-一个目录 = 一块面板，两个来源（同名时工作区优先）：
+一个插件 = 一个目录 + 一份 manifest.json，清单里**只声明「有什么」**（面板 / 工具 / 权限），不分类型。对外只留四个词：**Skill / MCP / 插件 / 沙箱**。契约全文见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)。
 
 ```
-<应用根>/ui-ext/<名字>/           # 随包/内置扩展
-<当前工作区>/ui-ext/<名字>/       # 项目自带扩展
-    manifest.json                # {"title":"项目速览","description":"…","version":"0.1.0","entry":"index.html"}
-    index.html                   # 入口页（相对路径的 js/css 都能直接用）
+<应用根>/ui-ext/<名字>/           # 面板（随包/内置）
+<当前工作区>/ui-ext/<名字>/       # 面板（项目自带；同名顶掉内置）
+<plugins 目录>/x.wat             # 工具（旧形态：裸文件）
+<plugins 目录>/x/manifest.json   # 工具（目录形态：manifest + 恰好一个 .wasm/.wat）
+    manifest.json                # {"apiVersion":1,"source":"user","title":"…","entry":"index.html","ui":[],"permissions":[]}
 ```
 
-- 打开：设置 → 扩展 → 打开（或侧栏/设置里的入口），面板停靠在右侧。
+- 打开：设置 → 插件 → 打开（面板停靠在右侧）；纯工具插件显示工具清单，无「打开」按钮。
 - **隔离**：iframe 用 `sandbox="allow-scripts"` → 不透明源，读不到宿主 DOM、localStorage、cookie，
   也 fetch 不到 `/api`（跨源无 CORS）。唯一通道是 postMessage。
-- **数据桥（只读白名单）**：入口页先 `postMessage({type:'agent:hello'})` 握手，宿主回
-  `{type:'agent:init', payload:{version, root, theme, sessionId, title}}`；之后用
+- **数据桥（白名单）**：入口页先 `postMessage({type:'agent:hello'})` 握手，宿主回
+  `{type:'agent:init', payload:{version, root, theme, sessionId, title, ext}}`；之后用
   `{type:'agent:request', id, method, params}` 调用下列方法，宿主回 `{type:'agent:response', id, ok, result}`：
 
-  | method | 说明 |
-  | --- | --- |
-  | `app.info` | 版本 / 运行根 / 主题 / 当前会话 |
-  | `workspace.info` | 当前工作区与最近项目 |
-  | `workspace.files` | 工作区文件相对路径列表（同「@ 添加上下文」数据源） |
-  | `git.status` | 分支 / 头部 / 脏文件 / 领先落后 |
-  | `memory.search` | `{query, top_k}` 记忆库检索（返回 results/notice） |
-  | `session.info` | 当前会话 id 与标题 |
+  | method | 权限 | 说明 |
+  | --- | --- | --- |
+  | `app.info` | — | 版本 / 运行根 / 主题 / 当前会话 |
+  | `workspace.info` | — | 当前工作区与最近项目 |
+  | `workspace.files` | — | 工作区文件相对路径列表 |
+  | `git.status` | — | 分支 / 头部 / 脏文件 / 领先落后 |
+  | `memory.search` | — | `{query, top_k}` 记忆库检索 |
+  | `session.info` | — | 当前会话 id 与标题 |
+  | `composer.insert` | composer.insert | 往输入框插文本 |
+  | `notify` | notify | 注入一条系统消息 |
+  | `bus.publish` | bus.publish | 插件间通信（宿主转发 `bus.message`）|
+  | `workspace.write` | workspace.write | 写工作区文件（宿主弹确认；工作区内 / 512KB / 原子写）|
+  | `storage.read / write / delete` | storage | **插件命名空间数据**（`plugin_data/<插件名>/`，键名白名单 ≤64 字符、值 ≤64KB；会话/设置/记忆等内核保留区不在任何插件写路径上）|
 
-  **白名单里没有任何写操作**——v0 只读；扩展拿不到 shell、写文件、审批入口。
-- 参考实现：`ui-ext/board/`（项目速览：显示版本/运行根/会话/工作区，可查 Git 状态与文件清单、搜记忆）。
-- 扩展写坏（manifest 非法 / 入口缺失）不会静默：清单里标红并给出原因，且「打开」按钮禁用。
-- 清单里每个扩展标**来源徽章**（内置 / 工作区）；工作区同名扩展顶掉内置时显示「工作区 · 覆盖内置」，
-  避免把「项目自带的那份」误当内置扩展。
+- **来源与版本**：manifest `source` 三值 built_in / user / model_generated；`apiVersion` 不匹配 →
+  拒载并提示升级（不做 shim；v0.x 期间不保证插件兼容）。未知字段一律忽略（只增不删 = 向后兼容）。
+- **draft 隔离区**（模型自产，`source=model_generated`）：只在内存（重启即失）、权限一律清空；
+  设置 → 插件 里「转正」（落盘持久化、来源改 user）或「丢弃」。
+- **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
+- 参考实现：`ui-ext/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。
 
 ## 无 key 冒烟（可选）
 
@@ -303,15 +316,15 @@ cargo run                                # 终端 2：127.0.0.1:5173
 - **P13 桌面壳**：`desktop/` 脚手架已入库（窗口 + 托盘 + 服务保活），运行时冒烟未验证——按用户指示等 web 定稿后启用。
 - **MCP**：tools + `resources` + `prompts`（stdio + Streamable HTTP 双 transport 都有）。
   声明了资源的 server 会给模型挂 `list_resources` / `read_resource`；声明了提示词的挂
-  `list_prompts` / `get_prompt`（服务自己已有同名工具时不覆盖）；设置→插件 的 MCP 卡片会列出
+  `list_prompts` / `get_prompt`（服务自己已有同名工具时不覆盖）；设置→运行时 的 MCP 卡片会列出
   资源与提示词清单。**OAuth 授权流程未做**（远端服务需要 OAuth 时，可先用带 `Authorization`
   头的配置接）。
-- **WASM 插件**：ABI v1（alloc/describe/run，action 与 payload 分缓冲），仍是**零 host function** 的
-  纯计算沙箱——插件碰不到文件/网络/UI，只能做纯函数工具。
-- **组件总线**：v1 —— 静态 UI + 只读数据桥 + `manifest.json` 声明的 **界面插槽**（顶栏按钮）
-  与**写操作权限**（`composer.insert` / `workspace.write` / `bus.publish` / `notify`；未声明一律拒，
-  写工作区文件还会替扩展弹一次确认）+ **扩展间通信**（宿主转发 `bus.message`）+ 启用/停用管理
-  （设置→插件 里开关；停用的扩展不出页面、不加载、不服务）。宿主/扩展只能通过 postMessage 白名单往来。
+- **工具插件（WASM 引擎）**：ABI v1（alloc/describe/run，action 与 payload 分缓冲），仍是**零 host function** 的
+  纯计算沙箱——工具碰不到文件/网络/UI，只能做纯函数。draft 工具字节内存编译，同尺隔离。
+- **插件契约**：v1 已冻结（二合一 + apiVersion + storage 权限 + draft）——详见插件章节与
+  `docs/plugin-contract-v1.md`；「扩展」一词退役，端点与设置字段名保留为兼容。
+- **钩子**：v1 四挂点（before_tool 仅否决权 / after_tool / session_end / budget_exceeded），
+  超时与失败一律放行，JSONL `hook.*` 审计；承载形式 = config.toml `[hooks]` 里的本地命令。
 - **eval 任务集**：11 个任务（hello-file / fix-json / read-only-plan / edit-existing-file / delete-file /
   multi-file-scaffold / fix-code-bug / search-and-report / plan-mode-write-guard / run-tests-and-report /
   plan-approve-execute），

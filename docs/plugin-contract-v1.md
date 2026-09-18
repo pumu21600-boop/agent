@@ -1,0 +1,128 @@
+# 插件契约 v1（施工单 027 / P18）
+
+> 定案日期：2026-09-19（对话拍板，执行不得推翻的部分已写进施工单 027「设计定案」）。
+> 配套代码：`src/plugin/contract.rs`（契约校验）、`src/plugin/ui.rs`（面板插件）、
+> `src/plugin/wasm.rs`（工具引擎）、`src/plugin/draft.rs`（draft 隔离区）、`src/storage.rs`（存储一门）、
+> `src/hooks.rs`（钩子四挂点）。
+
+## 一、模型定案：二合一
+
+**扩展与 WASM 插件统一为「插件」**：一个插件 = 一个目录 + 一份 manifest.json，
+清单里只声明「有什么」（面板 / 工具 / 权限），**不贴类型标签**——一个插件可以同时有面板和工具。
+（原报告的「界面型 / 能力型」分支作废；实据：board 名义界面型，实有 workspace.write /
+composer.insert / notify 三项能力，分类名不副实。）
+
+对外只留四个词：**Skill / MCP / 插件 / 沙箱**。
+
+- Skill：知识注入，进提示词，不可执行；
+- MCP：外部工具通道，公开标准协议，**不并入插件**（兼容责任在外）；
+- 插件：宿主扩展，本地目录 + 清单，兼容责任归我们；
+- 沙箱：执行隔离，不是扩展机制。
+
+WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱轻量档**（代码即 wasm 引擎）。
+
+## 二、manifest schema v1
+
+```json
+{
+  "apiVersion": 1,
+  "source": "user",
+  "title": "项目速览",
+  "description": "…",
+  "version": "0.3.0",
+  "entry": "index.html",
+  "tool_file": "calc.wat",
+  "ui": [{ "slot": "toolbar", "id": "board", "title": "项目速览" }],
+  "permissions": ["composer.insert", "notify", "bus.publish", "workspace.write", "storage"]
+}
+```
+
+| 字段 | 必填 | 语义 |
+| --- | --- | --- |
+| apiVersion | 否 | 缺失按 v1 读入（老目录自动迁移）；写了但不等于 1 → **拒载并提示升级**，不做 shim |
+| source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；未声明按位置默认（应用根=built_in，工作区=user） |
+| title / description / version | 否 | 展示元数据；目录形态工具插件未写时用目录名 |
+| entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写 |
+| tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
+| ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer） |
+| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage`；**未声明的一律拒绝** |
+
+**契约纪律**：解析器忽略未知字段（只增不删 = 天然向后兼容）；apiVersion 不匹配即拒载 +
+UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件兼容。
+
+## 三、目录形态（磁盘自动迁移，两种都认）
+
+- 面板：`ui-ext/<name>/manifest.json` + 静态资源（应用根与工作区两处，工作区同名优先）；
+- 工具（旧形态）：`plugins/*.wasm|.wat`，插件名 = 文件名去扩展名；
+- 工具（目录形态）：`plugins/<name>/manifest.json` + 目录内**恰好一个** .wasm/.wat。
+
+## 四、生命周期
+
+- **停用 = 拒新调用 + 等完**：settings.disabled_extensions（ui-ext 与工具插件共用一份名单）
+  → 工具不再下发 + 调用被拒；在跑调用是独立实例、30s 内自终，自然结束即「等完」，
+  超时击杀兜底。选「等完」的理由：每会话单轮不变量下不存在需要杀的长驻任务，
+  为它造任务管理器不值（施工单 027 定案 5）。
+- **资源域记账**：统一清单（/api/ext）本身就是账本——每个插件的 panels / tools /
+  permissions 都在清单行里；停用时整域回收（工具从总线消失、面板 404、总线拒转发）。
+- **draft 隔离区**（source=model_generated）：只在内存（不入盘，**重启即失**）、
+  **权限一律清空**（最低权限）、工具经 WASM 引擎内存编译（零宿主函数物理隔离）；
+  一键转正（/api/ext/promote）落盘持久化、来源改 user；丢弃（DELETE /api/ext/draft）即清。
+  ⚠️ 与定案的差异：定案说「仅当前会话生效」，v1 实为「到重启」（多会话同见）——
+  会话级过滤要贯穿清单/面板/总线全链路，在还没有真实生产者（模型生成插件的工具链属 P22）
+  之前是纯成本，先做重启粒度，语义留口。
+
+## 五、存储一门（插件侧 API）
+
+插件永远没有 raw 文件句柄。数据 API（宿主总线 → /api/plugin/data）：
+
+- `storage.read(key)` / `storage.write(key, value)` / `storage.delete(key)`，须声明 `storage` 权限；
+- 物理位置 `<app_root>/plugin_data/<插件名>/<key>.json`（原子写）；
+- 键名白名单 `^[A-Za-z0-9_-]{1,64}$`（构造上无路径穿越），值 ≤ 64KB；
+- 会话 / settings / 记忆 / 检查点是**内核保留区**，不在任何插件写路径上；
+  越权尝试（含键名穿越）→ 拒绝 + `storage.plugin_denied` 审计；
+- 内核侧：会话与 settings 落盘收口 `storage::write_session / write_settings`（唯一入口 + 审计）。
+
+> 一句话纪律：**插件可以写自己名下的格子，碰不到昨天存下来的东西。**
+
+## 六、钩子 v1
+
+config.toml `[hooks]`，四个挂点，承载形式 = 本地命令（stdin 收 JSON 事件、stdout 回 JSON）：
+
+| 挂点 | 触发时机 | 决定权 |
+| --- | --- | --- |
+| before_tool | 每次工具执行前 | **仅否决权**：stdout `{"decision":"deny","reason":"…"}` = 拦下并回喂模型；放行 ≠ 免审批（审批门单点不动） |
+| after_tool | 工具执行后 | 通知（观测 / 格式化等后续动作） |
+| session_end | 任务结束（含取消/出错） | 通知（沉淀记忆等收尾） |
+| budget_exceeded | 单任务累计 token 超 budget_tokens（每次任务最多一次） | 通知（降级策略留 P21 成本台账） |
+
+语义四条：4 挂点 / 仅否决 / **超时（timeout_ms）与拉起失败一律放行**（坏钩子不卡主循环）/
+JSONL 审计（hook.* 事件只增）。
+
+```toml
+[hooks]
+before_tool = "C:\\hooks\\block-dangerous.cmd"   # deny 示例见本文件
+session_end = "C:\\hooks\\save-memory.cmd"
+budget_tokens = 500000
+timeout_ms = 5000
+```
+
+## 七、内置插件试点选型（P18 选型，P19 落地）
+
+| 试点 | 形态 | 结论 |
+| --- | --- | --- |
+| trace 时间线 | 纯面板（entry + 只读桥） | 现有字段**够用**；P19 拆 App.svelte 时把 trace 面板拆成独立组件顺势插件化 |
+| web_search | 纯工具 | 现有字段**够用**：以目录形态落 plugins/（或内置注册表直挂）即可，无需新契约字段 |
+
+试点的意义：自己吃自己的狗粮——内置功能装得进插件壳，契约就够结实；装不进就说明契约
+有缺陷，开源前赶紧改。**执法者（审批门 / 存储 / 并发控制）永不插件化**（裁判不下场）。
+
+## 八、术语对照（退役表）
+
+| 旧 | 新 |
+| --- | --- |
+| 扩展 / UI 扩展 | 插件（面板） |
+| WASM 插件 | 工具插件 / 插件工具（WASM 引擎） |
+| 界面型 / 能力型 | （废除，不再分型） |
+
+兼容保留（避免无谓破坏）：端点 `/api/ext`、`/ui-ext/` 路径、设置字段 `disabled_extensions`
+名字不变；术语退役以用户可见文案与文档为准。

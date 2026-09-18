@@ -123,6 +123,23 @@
 | `chat.steered` | 同会话运行中再发消息 → 进队列（027） | `session`、`mode`（`queue`=排队等本轮结束 / `immediate`=立即并进本轮）、`pending`（积压条数） |
 | `chat.rejected` | 同会话运行中再发消息被拒（025：仅带附件的「立即发送」不支持） | `session`、`reason`（`session_busy_attachments`） |
 
+### 4.x P18 新增 kind（施工单 027，只增）
+
+| `kind` | 说明 | 关键字段 |
+| --- | --- | --- |
+| `storage.write` | 内核保留区落盘经存储一门（session/settings） | `area` |
+| `storage.plugin_write` | 插件命名空间写入成功 | `plugin`、`key`、`bytes` |
+| `storage.plugin_denied` | 插件越权/超限被拒（保留区不可达） | `plugin`、`key`、`reason` |
+| `storage.plugin_delete` | 插件命名空间删除 | `plugin`、`key`、`found` |
+| `hook.before_tool` | 钩子前置挂点结果（deny/allow/timeout_pass/spawn_error_pass） | `tool`、`decision`、`reason?`、`timeout_ms?` |
+| `hook.blocked` | 钩子 deny 拦下工具调用并回喂模型 | `step`、`tool`、`reason` |
+| `hook.after_tool` | 工具执行后通知挂点已跑 | `ok` |
+| `hook.session_end` | 任务结束挂点已跑 | `session`、`ok` |
+| `hook.budget_exceeded` | 单任务累计 token 超预算通知 | `tokens`、`budget`（通知载荷） |
+| `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |
+| `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
+| `plugin.draft_discarded` | draft 丢弃 | `plugin` |
+
 ### 4.5 error —— 错误
 
 ```json
