@@ -834,7 +834,7 @@ fn base64url_decode(s: &str) -> Option<String> {
             other => other,
         })
         .collect();
-    while t.len() % 4 != 0 {
+    while !t.len().is_multiple_of(4) {
         t.push('=');
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(t.as_bytes()).ok()?;

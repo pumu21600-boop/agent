@@ -53,6 +53,12 @@ struct ServerState {
     cfg: Option<McpServerCfg>,
     /// tools/list 缓存：(工具名, 描述, inputSchema)
     tools: Vec<(String, String, Value)>,
+    /// resources/list 缓存：(uri, name, mimeType)
+    resources: Vec<(String, String, String)>,
+    /// prompts/list 缓存：(name, description)
+    prompts: Vec<(String, String)>,
+    /// initialize 声明的能力：(resources, prompts)
+    caps: (bool, bool),
     online: bool,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -146,11 +152,15 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
         if url.is_empty() {
             return Err("transport=http 但 url 为空".into());
         }
-        let client = reqwest::blocking::Client::builder()
+        let mut builder = reqwest::blocking::Client::builder()
             // 单请求超时由 http_round 逐次设置；这里给的是整体上限兜底
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("HTTP 客户端创建失败: {e}"))?;
+            .timeout(Duration::from_secs(300));
+        // 环回地址的 MCP server 不经代理：环境里配了 http_proxy 时（挂着代理/VPN 很常见），
+        // 代理多半连不到 127.0.0.1，本机 server 会莫名其妙连不上。
+        if is_loopback_url(&url) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|e| format!("HTTP 客户端创建失败: {e}"))?;
         st.http = Some(HttpState { client, session_id: None });
     } else {
         spawn_stdio(st, &cfg)?;
@@ -165,10 +175,13 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
             "clientInfo": { "name": "agent-local", "version": env!("CARGO_PKG_VERSION") }
         }
     });
-    rpc_round(st, &init, Some(0), 15_000).map_err(|e| {
+    let init_resp = rpc_round(st, &init, Some(0), 15_000).map_err(|e| {
         st.reset_proc();
         format!("initialize 失败: {e}")
     })?;
+    // 能力声明：决定要不要暴露 resources / prompts 相关工具（拿不到就按不支持处理）
+    let caps = init_resp.get("capabilities").cloned().unwrap_or_else(|| json!({}));
+    st.caps = (caps.get("resources").is_some(), caps.get("prompts").is_some());
     // initialized 通知（无 id，无响应体）
     let _ = rpc_round(
         st,
@@ -196,8 +209,67 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
             Some((name, desc, schema))
         })
         .collect();
+    // —— resources/list、prompts/list（声明了能力才拉；失败不影响上线，按空清单处理）——
+    if st.caps.0 {
+        let req = json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {} });
+        if let Ok(resp) = rpc_round(st, &req, Some(2), 10_000) {
+            st.resources = parse_resource_list(&resp);
+        }
+    }
+    if st.caps.1 {
+        let req = json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/list", "params": {} });
+        if let Ok(resp) = rpc_round(st, &req, Some(3), 10_000) {
+            st.prompts = parse_prompt_list(&resp);
+        }
+    }
     st.online = true;
     Ok(())
+}
+
+/// resources/list 响应 → (uri, name, mimeType)。
+fn parse_resource_list(resp: &Value) -> Vec<(String, String, String)> {
+    resp.get("resources")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let uri = r.get("uri").and_then(Value::as_str)?.to_string();
+                    let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let mime = r.get("mimeType").and_then(Value::as_str).unwrap_or("").to_string();
+                    Some((uri, name, mime))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// prompts/list 响应 → (name, description)。
+fn parse_prompt_list(resp: &Value) -> Vec<(String, String)> {
+    resp.get("prompts")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let name = p.get("name").and_then(Value::as_str)?.to_string();
+                    let desc = p.get("description").and_then(Value::as_str).unwrap_or("").to_string();
+                    Some((name, desc))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// URL 主机是不是环回（127.x / localhost / [::1]）——决定要不要绕过环境代理。
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        h.split(']').next().unwrap_or("") // IPv6 字面量
+    } else {
+        host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port)
+    };
+    let h = host.trim().to_ascii_lowercase();
+    h == "localhost" || h == "::1" || h.starts_with("127.")
 }
 
 /// stdio transport：起子进程并把 stdin/stdout 挂到运行态。
@@ -428,7 +500,40 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
     })
 }
 
-/// 已启用 + 已确认 + 在线工具的 OpenAI function 定义。
+/// 资源/提示词相关的合成工具名（server 自己若已有同名工具，以它为准，不覆盖）。
+const SYNTH_TOOLS: [&str; 4] = ["list_resources", "read_resource", "list_prompts", "get_prompt"];
+
+/// 合成工具的 function 定义（reads resources / prompts）。
+fn synth_def(srv: &str, name: &str) -> Value {
+    let (desc, params) = match name {
+        "list_resources" => (
+            "列出这个 MCP 服务暴露的资源（URI 清单）。要读正文用 read_resource。",
+            json!({"type":"object","properties":{}}),
+        ),
+        "read_resource" => (
+            "读取一个 MCP 资源的正文（uri 来自 list_resources）。",
+            json!({"type":"object","properties":{"uri":{"type":"string","description":"资源 URI"}},"required":["uri"]}),
+        ),
+        "list_prompts" => (
+            "列出这个 MCP 服务提供的提示词模板（名称 + 说明）。要取模板用 get_prompt。",
+            json!({"type":"object","properties":{}}),
+        ),
+        "get_prompt" => (
+            "取一个 MCP 提示词模板（可带参数），返回渲染后的提示词正文。",
+            json!({"type":"object","properties":{
+                "name":{"type":"string","description":"模板名（来自 list_prompts）"},
+                "arguments":{"type":"object","description":"模板参数（可选，键值均为字符串）"}
+            },"required":["name"]}),
+        ),
+        _ => unreachable!("未知合成工具"),
+    };
+    json!({
+        "type": "function",
+        "function": { "name": format!("{PREFIX}{srv}{SEP}{name}"), "description": desc, "parameters": params }
+    })
+}
+
+/// 已启用 + 已确认 + 在线工具的 OpenAI function 定义（含声明了 resources/prompts 时的合成工具）。
 pub fn tool_definitions() -> Vec<Value> {
     let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
@@ -450,8 +555,32 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }));
         }
+        let has_own = |n: &str| st.tools.iter().any(|(t, _, _)| t == n);
+        let (want_res, want_prompts) = (st.caps.0, st.caps.1);
+        for name in SYNTH_TOOLS {
+            let wanted = match name {
+                "list_resources" | "read_resource" => want_res,
+                "list_prompts" | "get_prompt" => want_prompts,
+                _ => false,
+            };
+            if wanted && !has_own(name) {
+                out.push(synth_def(srv, name));
+            }
+        }
     }
     out
+}
+
+/// 公开：各 server 的资源/提示词清单（设置面板展示用）。
+pub fn catalogs() -> std::collections::HashMap<String, (Vec<String>, Vec<String>)> {
+    let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+    m.iter()
+        .map(|(name, st)| {
+            let res: Vec<String> = st.resources.iter().map(|(uri, n, _)| if n.is_empty() { uri.clone() } else { format!("{n} ({uri})") }).collect();
+            let prompts: Vec<String> = st.prompts.iter().map(|(n, _)| n.clone()).collect();
+            (name.clone(), (res, prompts))
+        })
+        .collect()
 }
 
 /// 执行 MCP 工具调用（tools::execute 对 mcp__ 前缀分发到这里）。
@@ -462,6 +591,10 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     } else {
         serde_json::from_str(args_json).map_err(|e| format!("参数不是合法 JSON: {e}"))?
     };
+    // 资源/提示词是客户端侧合成的工具，直接走本地实现（不进 tools/call）
+    if SYNTH_TOOLS.contains(&tool.as_str()) {
+        return call_resource_or_prompt(&srv, &tool, args).await;
+    }
 
     // 阻塞 IO 丢进 blocking 线程池；外层 timeout 到点放弃（残留行由 id 过滤自愈）
     let full = full_name.to_string();
@@ -510,6 +643,102 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
 }
 
 /// 进程存活自检：把已退出的 server 标记离线。调用方须已持有管理器锁（status() 内用）。
+/// resources / prompts 合成工具的本地实现（阻塞 IO 交给 blocking 线程池，超时 60s）。
+async fn call_resource_or_prompt(srv: &str, tool: &str, args: Value) -> Result<String, String> {
+    let srv = srv.to_string();
+    let tool = tool.to_string();
+    let fut = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+        let st = m.get_mut(&srv).ok_or_else(|| format!("未知 server: {srv}"))?;
+        ensure_online(st)?;
+        let rpc = |st: &mut ServerState, method: &str, params: Value| -> Result<Value, String> {
+            let id = st.next_id;
+            st.next_id += 1;
+            let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+            rpc_round(st, &req, Some(id), 60_000)
+        };
+        match tool.as_str() {
+            "list_resources" => {
+                if st.resources.is_empty() {
+                    let resp = rpc(st, "resources/list", json!({}))?;
+                    st.resources = parse_resource_list(&resp);
+                }
+                if st.resources.is_empty() {
+                    return Ok("（这个 MCP 服务没有暴露资源）".into());
+                }
+                let list: Vec<String> = st
+                    .resources
+                    .iter()
+                    .map(|(uri, name, mime)| {
+                        if mime.is_empty() { format!("{uri}\t{name}") } else { format!("{uri}\t{name}\t{mime}") }
+                    })
+                    .collect();
+                Ok(format!("共 {} 个资源（uri\\t名称\\t类型）：\n{}", list.len(), list.join("\n")))
+            }
+            "read_resource" => {
+                let uri = args.get("uri").and_then(Value::as_str).ok_or("缺少 uri")?;
+                let resp = rpc(st, "resources/read", json!({ "uri": uri }))?;
+                let mut out = String::new();
+                for c in resp.get("contents").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    if let Some(t) = c.get("text").and_then(Value::as_str) {
+                        out.push_str(t);
+                        out.push('\n');
+                    } else if let Some(b) = c.get("blob").and_then(Value::as_str) {
+                        out.push_str(&format!(
+                            "（二进制资源 {}：{} 字节 base64，未解码展示）\n",
+                            c.get("uri").and_then(Value::as_str).unwrap_or(uri),
+                            b.len()
+                        ));
+                    }
+                }
+                if out.trim().is_empty() {
+                    return Err(format!("资源 {uri} 内容为空"));
+                }
+                Ok(out)
+            }
+            "list_prompts" => {
+                if st.prompts.is_empty() {
+                    let resp = rpc(st, "prompts/list", json!({}))?;
+                    st.prompts = parse_prompt_list(&resp);
+                }
+                if st.prompts.is_empty() {
+                    return Ok("（这个 MCP 服务没有提供提示词模板）".into());
+                }
+                let list: Vec<String> = st
+                    .prompts
+                    .iter()
+                    .map(|(name, desc)| if desc.is_empty() { name.clone() } else { format!("{name}\t{desc}") })
+                    .collect();
+                Ok(format!("共 {} 个提示词模板：\n{}", list.len(), list.join("\n")))
+            }
+            "get_prompt" => {
+                let name = args.get("name").and_then(Value::as_str).ok_or("缺少 name")?;
+                let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let resp = rpc(st, "prompts/get", json!({ "name": name, "arguments": arguments }))?;
+                let mut out = String::new();
+                for msg in resp.get("messages").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+                    let text = msg
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    out.push_str(&format!("[{role}] {text}\n"));
+                }
+                if out.trim().is_empty() {
+                    return Err(format!("提示词 {name} 渲染结果为空"));
+                }
+                Ok(out)
+            }
+            other => Err(format!("未知合成工具: {other}")),
+        }
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(65), fut).await {
+        Ok(r) => r.map_err(|e| format!("MCP 调用任务失败: {e}"))?,
+        Err(_) => Err("MCP 资源/提示词调用超时（60s）".into()),
+    }
+}
+
 fn reap_dead_locked(m: &mut HashMap<String, ServerState>) {
     for st in m.values_mut() {
         if let Some(child) = st.child.as_mut()
@@ -559,6 +788,13 @@ mod tests {
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// MCP 管理器是进程级单例、`sync_configs` 整体替换配置——碰管理器的测试必须串行，
+    /// 否则并行跑会互相把对方刚同步的配置清掉（表现为偶发「无配置」）。
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -703,6 +939,7 @@ data: \"result\":{\"n\":7}}";
     /// → tools/list（SSE 帧）→ tools/call（SSE 帧，夹心跳与串扰帧）。同时断言会话头被回带。
     #[test]
     fn http_transport_handshake_and_call() {
+        let _guard = test_lock();
         // (method, 该请求带的 Mcp-Session-Id)
         let seen: std::sync::Arc<Mutex<Vec<(String, String)>>> =
             std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -779,9 +1016,159 @@ data: \"result\":{\"n\":7}}";
         assert_eq!(init_sid.as_deref(), Some("-"), "首个请求不该自带会话头");
     }
 
+    /// resources / prompts（P17）：握手发现能力 → 合成工具可调用 → 清单进 catalogs（UI 展示）。
+    #[test]
+    fn http_resources_and_prompts_end_to_end() {
+        let _guard = test_lock();
+        let url = mock_http(|_path, _headers, req| {
+            let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            match method {
+                "initialize" => MockResp {
+                    status: 200,
+                    ctype: "application/json",
+                    body: json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": { "tools": {}, "resources": { "subscribe": false }, "prompts": {} }
+                        }
+                    })
+                    .to_string(),
+                    extra: Vec::new(),
+                },
+                "notifications/initialized" => MockResp::accepted(),
+                "tools/list" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": [{ "name": "echo", "description": "echo", "inputSchema": { "type": "object" } }] }
+                })]),
+                "resources/list" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "resources": [
+                        { "uri": "file:///notes/a.md", "name": "A 笔记", "mimeType": "text/markdown" },
+                        { "uri": "file:///notes/b.md", "name": "B 笔记" }
+                    ] }
+                })]),
+                "prompts/list" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "prompts": [{ "name": "review", "description": "代码评审" }] }
+                })]),
+                "resources/read" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "contents": [{ "uri": "file:///notes/a.md", "text": "笔记正文：状态 OK" }] }
+                })]),
+                "prompts/get" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "messages": [
+                        { "role": "user", "content": { "type": "text", "text": "请评审：{{path}}" } }
+                    ] }
+                })]),
+                other => MockResp { status: 400, ctype: "text/plain", body: format!("unknown {other}"), extra: Vec::new() },
+            }
+        });
+
+        let cfg = McpServerCfg {
+            name: "mockres".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url,
+            headers: BTreeMap::new(),
+            enabled: true,
+            confirmed: true,
+            risk: "normal".into(),
+        };
+        sync_configs(std::slice::from_ref(&cfg));
+        ensure_online_by_name("mockres").expect("握手应成功");
+
+        // 1) 声明了能力 → 暴露 4 个合成工具；2) 清单进 catalogs（UI 用）
+        let defs = tool_definitions();
+        let names: Vec<String> = defs
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        for want in [
+            "mcp__mockres__list_resources",
+            "mcp__mockres__read_resource",
+            "mcp__mockres__list_prompts",
+            "mcp__mockres__get_prompt",
+        ] {
+            assert!(names.contains(&want.to_string()), "缺少合成工具 {want}: {names:?}");
+        }
+        let cat = catalogs();
+        let (res, prompts) = cat.get("mockres").cloned().expect("应有清单");
+        assert_eq!(res.len(), 2, "{res:?}");
+        assert!(res[0].contains("file:///notes/a.md"), "{res:?}");
+        assert_eq!(prompts, vec!["review".to_string()]);
+
+        // 3) 合成工具真能取到内容（走 resources/read 与 prompts/get）
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let text = rt
+            .block_on(call_tool("mcp__mockres__read_resource", r#"{"uri":"file:///notes/a.md"}"#))
+            .expect("read_resource 应成功");
+        assert_eq!(text.trim(), "笔记正文：状态 OK");
+        let listed = rt
+            .block_on(call_tool("mcp__mockres__list_resources", "{}"))
+            .expect("list_resources 应成功");
+        assert!(listed.contains("file:///notes/b.md") && listed.contains("共 2 个资源"), "{listed}");
+        let prompt = rt
+            .block_on(call_tool("mcp__mockres__get_prompt", r#"{"name":"review"}"#))
+            .expect("get_prompt 应成功");
+        assert!(prompt.contains("[user] 请评审：{{path}}"), "{prompt}");
+    }
+
+    /// 没声明 resources/prompts 能力的 server 不该出现合成工具（避免给模型空能力）。
+    #[test]
+    fn synth_tools_hidden_without_capabilities() {
+        let _guard = test_lock();
+        let url = mock_http(|_path, _headers, req| {
+            let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = req.get("id").cloned().unwrap_or(Value::Null);
+            match method {
+                "initialize" => MockResp {
+                    status: 200,
+                    ctype: "application/json",
+                    body: json!({ "jsonrpc": "2.0", "id": id, "result": { "capabilities": { "tools": {} } } }).to_string(),
+                    extra: Vec::new(),
+                },
+                "notifications/initialized" => MockResp::accepted(),
+                "tools/list" => MockResp::sse(&[json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": [{ "name": "echo", "inputSchema": { "type": "object" } }] }
+                })]),
+                other => MockResp { status: 400, ctype: "text/plain", body: format!("unknown {other}"), extra: Vec::new() },
+            }
+        });
+        let cfg = McpServerCfg {
+            name: "mockbare".into(),
+            transport: "http".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url,
+            headers: BTreeMap::new(),
+            enabled: true,
+            confirmed: true,
+            risk: "normal".into(),
+        };
+        sync_configs(std::slice::from_ref(&cfg));
+        ensure_online_by_name("mockbare").expect("握手应成功");
+        let names: Vec<String> = tool_definitions()
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"mcp__mockbare__echo".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("list_resources") || n.contains("get_prompt")),
+            "没声明能力不该有合成工具: {names:?}"
+        );
+    }
+
     /// 出错路径：URL 打不通 → 报错且标记离线（下次调用重连，而不是假装在线）。
     #[test]
     fn http_transport_failure_marks_offline() {
+        let _guard = test_lock();
         let cfg = McpServerCfg {
             name: "deadhttp".into(),
             transport: "http".into(),

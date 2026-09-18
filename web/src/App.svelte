@@ -4305,6 +4305,18 @@
                   <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
                 {/each}
                 {#if !sv.tools.length}<span class="hint">（未发现工具——点「重连」尝试）</span>{/if}
+                {#if sv.resources && sv.resources.length}
+                  <div class="mcp-tool-item"><b>资源 {sv.resources.length}</b>（模型可用 list_resources / read_resource 读取）</div>
+                  {#each sv.resources.slice(0, 8) as r}
+                    <div class="mcp-tool-item"><code>{r}</code></div>
+                  {/each}
+                {/if}
+                {#if sv.prompts && sv.prompts.length}
+                  <div class="mcp-tool-item"><b>提示词模板 {sv.prompts.length}</b>（模型可用 list_prompts / get_prompt 取用）</div>
+                  {#each sv.prompts.slice(0, 8) as p}
+                    <div class="mcp-tool-item"><code>{p}</code></div>
+                  {/each}
+                {/if}
               </div>
             {/if}
           </div>

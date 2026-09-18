@@ -301,8 +301,11 @@ cargo run                                # 终端 2：127.0.0.1:5173
 ## 已知边界（未做 / 搁置）
 
 - **P13 桌面壳**：`desktop/` 脚手架已入库（窗口 + 托盘 + 服务保活），运行时冒烟未验证——按用户指示等 web 定稿后启用。
-- **MCP**：只做 tools 子集（stdio + Streamable HTTP 双 transport 都有）；`resources` / `prompts`、
-  OAuth 授权流程未做。
+- **MCP**：tools + `resources` + `prompts`（stdio + Streamable HTTP 双 transport 都有）。
+  声明了资源的 server 会给模型挂 `list_resources` / `read_resource`；声明了提示词的挂
+  `list_prompts` / `get_prompt`（服务自己已有同名工具时不覆盖）；设置→插件 的 MCP 卡片会列出
+  资源与提示词清单。**OAuth 授权流程未做**（远端服务需要 OAuth 时，可先用带 `Authorization`
+  头的配置接）。
 - **WASM 插件**：ABI v1（alloc/describe/run，action 与 payload 分缓冲），仍是**零 host function** 的
   纯计算沙箱——插件碰不到文件/网络/UI，只能做纯函数工具。
 - **组件总线 v0**：静态 UI + 只读数据桥。写操作、宿主 UI 注入点（菜单/消息流插槽）、扩展间通信、

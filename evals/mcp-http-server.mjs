@@ -38,12 +38,41 @@ function handle(msg) {
       return {
         result: {
           protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
+          // tools + resources + prompts（P17：资源与提示词子集）
+          capabilities: { tools: {}, resources: {}, prompts: {} },
           serverInfo: { name: 'mini-http-mcp', version: '0.1.0' },
         },
       };
     case 'tools/list':
       return { result: { tools: TOOLS } };
+    case 'resources/list':
+      return {
+        result: {
+          resources: [
+            { uri: 'notes://readme', name: 'README 摘要', mimeType: 'text/markdown' },
+            { uri: 'notes://changelog', name: '变更记录', mimeType: 'text/markdown' },
+          ],
+        },
+      };
+    case 'resources/read': {
+      const uri = msg.params?.uri;
+      const text = uri === 'notes://readme' ? '# 迷你 MCP 资源\n这是 resources/read 返回的正文。' : '';
+      if (!text) return { error: { code: -32602, message: `unknown resource: ${uri}` } };
+      return { result: { contents: [{ uri, mimeType: 'text/markdown', text }] } };
+    }
+    case 'prompts/list':
+      return { result: { prompts: [{ name: 'summarize', description: '把给定文本压成三句话' }] } };
+    case 'prompts/get': {
+      const name = msg.params?.name;
+      if (name !== 'summarize') return { error: { code: -32602, message: `unknown prompt: ${name}` } };
+      const text = msg.params?.arguments?.text || '(空)';
+      return {
+        result: {
+          description: '把给定文本压成三句话',
+          messages: [{ role: 'user', content: { type: 'text', text: `把下面内容压成三句话：\n${text}` } }],
+        },
+      };
+    }
     case 'tools/call': {
       const name = msg.params?.name;
       const args = msg.params?.arguments || {};

@@ -2305,6 +2305,8 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             .into_iter()
             .map(|(n, o, t)| (n, (o, t)))
             .collect();
+    // P17：resources / prompts 清单（声明了能力的 server 才有内容）
+    let catalogs = crate::plugin::mcp::catalogs();
     let servers: Vec<Value> = s
         .mcp_servers
         .iter()
@@ -2313,12 +2315,15 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 .get(&c.name)
                 .cloned()
                 .unwrap_or((false, Vec::new()));
+            let (res, prompts) = catalogs.get(&c.name).cloned().unwrap_or_default();
             json!({
                 "name": c.name, "transport": c.transport, "command": c.command, "args": c.args,
                 "env": c.env, "url": c.url, "headers": c.headers,
                 "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
                 "online": online,
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
+                "resources": res,
+                "prompts": prompts,
             })
         })
         .collect();
