@@ -92,6 +92,19 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 0,
         },
         ToolSpec {
+            name: "web_search",
+            description: "联网搜索：按关键词搜网页，返回前几条结果的标题/网址/摘要（不需要 key）。要找资料先用它，再对感兴趣的网址用 web_fetch 抓正文。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "搜索关键词（尽量具体）" },
+                    "count": { "type": "integer", "description": "可选：返回条数（默认 6，上限 10）" }
+                },
+                "required": ["query"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
             name: "read_page",
             description: "按页读取工作目录内的大文本文件（默认 200 行/页）。大文件优先用本工具翻页，不要一次读全。",
             parameters: json!({
@@ -227,6 +240,7 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "edit_file" => edit_file(args),
         "search" => search(args, cfg.max_chars),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
+        "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
         "git" => git(args, cfg).await,
         other => Err(format!("未知工具: {other}")),
@@ -562,18 +576,26 @@ fn html_to_text(html: &str) -> String {
     collapsed.trim().to_string()
 }
 
+/// web_fetch / web_search 共用的 HTTP 客户端（浏览器 UA：搜索页与部分站点会按 UA 拦爬虫）。
+fn web_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+        // 搜索引擎按 TLS/协议指纹分流：HTTP/2 客户端会被当成爬虫，回一张「查询对得上、结果
+        // 全是别的东西」的页面（真机踩过：查「rust 语言」返回西班牙股票、德国天气）。HTTP/1.1 正常。
+        .http1_only()
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
+}
+
 async fn web_fetch(args: &str, max_chars: usize) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let url = v.get("url").and_then(Value::as_str).ok_or("缺少 url 参数")?;
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("url 必须以 http:// 或 https:// 开头".to_string());
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) agent-p4")
-        .build()
-        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+    let client = web_client()?;
     let resp = client
         .get(url)
         .send()
@@ -590,6 +612,365 @@ async fn web_fetch(args: &str, max_chars: usize) -> Result<String, String> {
         return Err("页面内容为空（可能是纯 JS 渲染页，本工具不做 JS 渲染）".to_string());
     }
     Ok(cap(&text, max_chars))
+}
+
+/// 一条搜索结果。
+#[derive(Debug, Clone, PartialEq)]
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// 联网搜索（026）：Bing（cn 域名，国内可直连）为主，取不到结果时回落 DuckDuckGo HTML。
+/// 两个引擎都不需要 key；搜到网址后用 web_fetch 抓正文。
+async fn web_search(args: &str, max_chars: usize) -> Result<String, String> {
+    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+    let query = v.get("query").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if query.is_empty() {
+        return Err("query 为空".to_string());
+    }
+    let count = v.get("count").and_then(Value::as_u64).unwrap_or(6).clamp(1, 10) as usize;
+    let client = web_client()?;
+    let q = urlencode(query);
+    // 引擎顺序按「直连可用性」排：www.bing.com 直连会 302 到 region 站、走代理也能出结果，
+    // cn.bing.com 直连可用但走代理会被重定向成首页，DDG 只在墙外好用——三个都试一遍。
+    // 引擎顺序：Bing 的 **RSS 输出**优先——那是给阅读器用的接口，结果里是干净的真 URL
+    // （HTML 版的结果链接被包成 ck/a 跳转，且对程序化客户端可能返回「标题对、内容不是这回事」
+    // 的页面，真机踩过）。RSS 不行再退回 HTML 版，最后 DuckDuckGo（墙外可用）。
+    let engines: [(&str, String, &str); 5] = [
+        ("Bing 中国站 RSS", format!("https://cn.bing.com/search?q={q}&format=rss&count={count}"), "rss"),
+        ("Bing RSS", format!("https://www.bing.com/search?q={q}&format=rss&count={count}"), "rss"),
+        ("Bing 中国站", format!("https://cn.bing.com/search?q={q}&count={}", count * 2), "bing"),
+        ("Bing", format!("https://www.bing.com/search?q={q}&count={}", count * 2), "bing"),
+        ("DuckDuckGo", format!("https://html.duckduckgo.com/html/?q={q}"), "ddg"),
+    ];
+    let mut hits = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for (name, url, kind) in engines {
+        match client.get(url).send().await {
+            Ok(r) if r.status().is_success() => {
+                // 关键：只认落在「搜索结果页」上的响应。Bing 会把请求重定向到首页（/?q=…），
+                // 首页上的推荐链接也带同类 CSS 类名，照解析就会把推荐位当搜索结果（真机踩过）。
+                let effective = r.url().clone();
+                let html = r.text().await.unwrap_or_default();
+                let got = match kind {
+                    "rss" => parse_bing_rss(&html, count),
+                    "bing" => parse_bing(&html, count),
+                    _ => parse_ddg(&html, count),
+                };
+                // 调试开关：设了 AGENT_WEB_DEBUG_DIR 就把原始页面落盘（排查搜索/抓取解析问题用）
+                if let Ok(dir) = std::env::var("AGENT_WEB_DEBUG_DIR") {
+                    let file = format!("web_{}.html", name.replace(' ', "_"));
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(file), &html);
+                }
+                // 诊断信息常驻日志（搜索出问题时靠它定位：哪个引擎、落到哪个 URL、页面标题是什么）
+                crate::observability::try_event(
+                    crate::observability::EventType::State,
+                    json!({
+                        "kind": "web.search",
+                        "engine": name,
+                        "url": effective.as_str(),
+                        "page_title": html_title(&html),
+                        "bytes": html.len(),
+                        "hits": got.len(),
+                    }),
+                );
+                if kind != "rss" && !is_search_url(effective.path()) {
+                    notes.push(format!("{name}: 被重定向到 {}（不是结果页）", effective));
+                } else if got.is_empty() {
+                    notes.push(format!("{name}: 页面里没解析到结果（多半是反爬或代理中转页）"));
+                } else {
+                    hits = got;
+                    break;
+                }
+            }
+            Ok(r) => notes.push(format!("{name}: HTTP {}", r.status())),
+            Err(e) => notes.push(format!("{name}: 请求失败 {e}")),
+        }
+    }
+    if hits.is_empty() {
+        return Err(format!(
+            "搜索没有取到结果（{}）：换关键词再试，或直接用 web_fetch 抓已知网址",
+            notes.join("；")
+        ));
+    }
+    let mut out = format!("搜索「{query}」取到 {} 条：\n", hits.len());
+    for (i, h) in hits.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n   {}\n", i + 1, h.title, h.url));
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", h.snippet));
+        }
+    }
+    Ok(cap(&out, max_chars))
+}
+
+/// Bing RSS 输出解析（给阅读器用的接口，链接是干净的真 URL，还带摘要）。
+fn parse_bing_rss(xml: &str, limit: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while hits.len() < limit {
+        let Some(rel) = xml[from..].find("<item>") else { break };
+        let start = from + rel + "<item>".len();
+        let Some(end_rel) = xml[start..].find("</item>") else { break };
+        let item = &xml[start..start + end_rel];
+        from = start + end_rel + "</item>".len();
+        let title = xml_tag(item, "title");
+        let url = xml_tag(item, "link");
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        hits.push(SearchHit {
+            title: clean_text(&title),
+            url: clean_text(&url),
+            snippet: clean_text(&xml_tag(item, "description")),
+        });
+    }
+    hits
+}
+
+/// 取 XML 里某个标签的文本（含实体解码；找不到返回空串）。
+fn xml_tag(item: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(i) = item.find(&open) else { return String::new() };
+    let rest = &item[i + open.len()..];
+    let Some(j) = rest.find(&close) else { return String::new() };
+    decode_entities(rest[..j].trim())
+}
+
+/// 页面 `<title>`（诊断用：判断拿到的到底是结果页还是反爬/中转页）。
+fn html_title(html: &str) -> String {
+    extract_tag(html, "<title", "</title>").map(|t| clean_text(&t)).unwrap_or_default()
+}
+
+/// 是不是「搜索结果页」的路径（Bing 首页 / 各种中转页都排除掉）。
+fn is_search_url(path: &str) -> bool {
+    matches!(path, "/search" | "/html/" | "/lite/" | "/html" | "/lite")
+}
+
+/// Bing 结果页解析：`class="b_algo"` 切块，块内 `<h2>` 拿标题与链接、`b_lineclamp` 拿摘要。
+fn parse_bing(html: &str, limit: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while hits.len() < limit {
+        let Some(rel) = html[from..].find("class=\"b_algo\"") else { break };
+        let start = from + rel;
+        let block_end = html[start + 1..]
+            .find("class=\"b_algo\"")
+            .map(|p| start + 1 + p)
+            .unwrap_or(html.len());
+        let block = &html[start..block_end];
+        from = block_end;
+        let Some(h2_start) = block.find("<h2") else { continue };
+        let Some(h2_end) = block[h2_start..].find("</h2>").map(|p| h2_start + p) else { continue };
+        let h2 = &block[h2_start..h2_end];
+        let Some(href_at) = h2.find("href=\"") else { continue };
+        let raw = h2[href_at + 6..].split('"').next().unwrap_or("").trim();
+        let url = bing_real_url(raw);
+        let title = clean_text(h2);
+        if url.is_empty() || title.is_empty() {
+            continue;
+        }
+        let snippet = extract_after_class(block, "class=\"b_lineclamp")
+            .or_else(|| extract_tag(block, "<p", "</p>"))
+            .map(|s| clean_text(&s))
+            .unwrap_or_default();
+        hits.push(SearchHit { title, url, snippet });
+    }
+    hits
+}
+
+/// DuckDuckGo HTML 版解析：`result__a` 是标题与链接（链接常是 /l/?uddg= 跳转，取真身）。
+fn parse_ddg(html: &str, limit: usize) -> Vec<SearchHit> {
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while hits.len() < limit {
+        let Some(rel) = html[from..].find("class=\"result__a\"") else { break };
+        let start = from + rel;
+        let Some(gt) = html[start..].find('>').map(|p| start + p) else { break };
+        let Some(end) = html[gt..].find("</a>").map(|p| gt + p) else { break };
+        let anchor = &html[start..gt];
+        let url = anchor
+            .find("href=\"")
+            .map(|h| ddg_real_url(&anchor[h + 6..]))
+            .unwrap_or_default();
+        let title = clean_text(&html[gt + 1..end]);
+        from = end + 4;
+        if url.is_empty() || title.is_empty() {
+            continue;
+        }
+        let snippet = extract_after_class(&html[from..], "class=\"result__snippet")
+            .map(|s| clean_text(&s))
+            .unwrap_or_default();
+        hits.push(SearchHit { title, url, snippet });
+    }
+    hits
+}
+
+/// Bing 的跳转链接还原：结果链接常是 `bing.com/ck/a?…&u=a1<base64url 真 URL>&…`
+/// （`u=` 的值前缀 `a1` 是 Bing 的标记，后面才是编码过的网址）。
+fn bing_real_url(href: &str) -> String {
+    if href.contains("bing.com/ck/a")
+        && let Some(i) = href.find("u=")
+    {
+        let val = href[i + 2..].split('&').next().unwrap_or("");
+        let enc = val.strip_prefix("a1").unwrap_or(val);
+        if let Some(url) = base64url_decode(enc) {
+            return url;
+        }
+    }
+    href.to_string()
+}
+
+/// base64url 解码（无填充也接受）；失败返回 None。
+fn base64url_decode(s: &str) -> Option<String> {
+    use base64::Engine;
+    let mut t: String = s
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            other => other,
+        })
+        .collect();
+    while t.len() % 4 != 0 {
+        t.push('=');
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(t.as_bytes()).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// DuckDuckGo 的跳转链接还原：`//duckduckgo.com/l/?uddg=<百分号编码的真 URL>&rut=…`。
+fn ddg_real_url(href: &str) -> String {
+    let href = href.trim();
+    if let Some(i) = href.find("uddg=") {
+        let rest = &href[i + 5..];
+        let enc = rest.split('&').next().unwrap_or("");
+        return percent_decode(enc);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("https://{stripped}");
+    }
+    href.to_string()
+}
+
+/// 取 `class="<cls>` 所在元素的文本：跳过开标签（后面可能还有别的属性），
+/// 一直取到该元素的闭合标签（摘要里常夹 `<b>` 等内联标签，取到第一个 `<` 会截断）。
+fn extract_after_class(html: &str, cls: &str) -> Option<String> {
+    let i = html.find(cls)?;
+    let gt = html[i..].find('>')? + i;
+    let tail = &html[gt + 1..];
+    let end = ["</p>", "</div>", "</a>", "</span>", "</li>"]
+        .iter()
+        .filter_map(|c| tail.find(c))
+        .min()?;
+    Some(tail[..end].to_string())
+}
+
+/// 取某个开标签到闭合标签之间的文本。
+fn extract_tag(html: &str, open: &str, close: &str) -> Option<String> {
+    let i = html.find(open)?;
+    let gt = html[i..].find('>')? + i;
+    let end = html[gt..].find(close)? + gt;
+    Some(html[gt + 1..end].to_string())
+}
+
+/// 去标签 → 解实体 → 压空白（搜索结果的标题/摘要用）。
+fn clean_text(s: &str) -> String {
+    decode_entities(&strip_tags(s)).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// HTML 实体解码（搜索页里 `&ensp;` / `&#0183;` 这类很多）。
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let window = &tail[..tail.len().min(12)];
+        let Some(semi) = window.find(';') else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let ent = &tail[1..semi];
+        let decoded = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "nbsp" | "ensp" | "emsp" | "thinsp" => Some(' '),
+            "hellip" => Some('…'),
+            "mdash" => Some('—'),
+            "ndash" => Some('–'),
+            "middot" => Some('·'),
+            _ if ent.starts_with("#x") || ent.starts_with("#X") => {
+                u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32)
+            }
+            _ if ent.starts_with('#') => ent[1..].parse::<u32>().ok().and_then(char::from_u32),
+            _ => None,
+        };
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 查询串编码（空格用 %20：`+` 只在表单编码里有「空格」含义，百分号更无歧义）。
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// 百分号解码（UTF-8 字节流）。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 3 <= b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// shell / git 共用：沙箱（或本机直跑）内跑命令行，格式化输出。
@@ -1083,6 +1464,70 @@ mod tests {
         let r = execute(&cfg(), "search", r#"{"query":"needle_marker_p4","path":".p4-test-search"}"#).await;
         assert!(r.unwrap().contains("needle_marker_p4"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 搜索页解析（离线夹具）：Bing 的 b_algo 块、DDG 的 result__a/跳转链接还原、实体解码。
+    #[test]
+    fn web_search_parsers_extract_hits() {
+        // Bing：块内 <h2> 拿标题与链接，b_lineclamp 拿摘要（含 &ensp; 与 &#0183; 这类实体）
+        let bing = r#"
+        <li class="b_algo" data-id iid=SERP.1><h2><a href="https://rust-lang.org/">Rust Programming &amp; Language</a></h2>
+        <p class="b_lineclamp2">Rust is <b>fast</b>: no runtime.&ensp;&#0183;&ensp;Memory safe.</p></li>
+        <li class="b_algo" data-id iid=SERP.2><h2><a href="https://example.com/b">Second</a></h2>
+        <p class="b_lineclamp3">Snippet two</p></li>
+        "#;
+        let hits = parse_bing(bing, 5);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        assert_eq!(hits[0].title, "Rust Programming & Language");
+        assert_eq!(hits[0].snippet, "Rust is fast: no runtime. · Memory safe.");
+        assert_eq!(hits[1].url, "https://example.com/b");
+        // 上限生效
+        assert_eq!(parse_bing(bing, 1).len(), 1);
+
+        // Bing 结果链接是 ck/a 跳转（u=a1<base64url>），要还原成真 URL
+        let ck = "https://www.bing.com/ck/a?!&amp;&amp;p=xx&amp;u=a1aHR0cHM6Ly9ydXN0LWxhbmcub3JnL3poLUNOLw&amp;ntb=1";
+        assert_eq!(bing_real_url(ck), "https://rust-lang.org/zh-CN/");
+        assert_eq!(bing_real_url("https://example.com/plain"), "https://example.com/plain");
+
+        // DuckDuckGo：result__a 的 href 是 /l/?uddg= 跳转，要还原成真 URL
+        let ddg = r#"
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&amp;rut=xx">Example &hellip; Title</a>
+        <a class="result__snippet" href="https://example.com/a?b=1">Snippet <b>here</b>.</a>
+        "#;
+        let hits = parse_ddg(ddg, 5);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].url, "https://example.com/a?b=1");
+        assert_eq!(hits[0].title, "Example … Title");
+        assert_eq!(hits[0].snippet, "Snippet here.");
+    }
+
+    /// Bing RSS 解析：真 URL、实体解码、条数上限。
+    #[test]
+    fn web_search_parses_bing_rss() {
+        let xml = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>必应：rust</title>
+        <item><title>Rust Programming Language</title><link>https://rust-lang.org/</link><description>Rust is &lt;fast&gt; &amp; safe.</description></item>
+        <item><title>Rust 教程 | 菜鸟教程</title><link>https://www.runoob.com/rust/rust-tutorial.html?x=1&amp;y=2</link><description>中文摘要</description></item>
+        <item><title>Bad</title><description>没有 link，应被跳过</description></item>
+        </channel></rss>"#;
+        let hits = parse_bing_rss(xml, 6);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].title, "Rust Programming Language");
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        // 描述里是转义过的 HTML：先解实体再剥标签（和 HTML 版一致）
+        assert_eq!(hits[0].snippet, "Rust is & safe.");
+        assert_eq!(hits[1].url, "https://www.runoob.com/rust/rust-tutorial.html?x=1&y=2");
+        assert_eq!(parse_bing_rss(xml, 1).len(), 1);
+    }
+
+    #[test]
+    fn urlencode_and_percent_decode_roundtrip() {
+        let raw = "rust 语言 & 中文/符号";
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("中文"), "%E4%B8%AD%E6%96%87");
+        assert_eq!(percent_decode(&urlencode(raw)), raw);
+        // 不完整/非法的百分号序列原样保留，不 panic
+        assert_eq!(percent_decode("%zz%"), "%zz%");
     }
 
     #[tokio::test]

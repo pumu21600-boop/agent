@@ -50,8 +50,8 @@ impl RiskLevel {
 /// 否则未登记工具会走 Dangerous 默认策略（见 `evaluate_risk` 末尾分支）。
 /// P11 的 MCP 工具接入时同样在此登记。
 const KNOWN_TOOLS: &[&str] = &[
-    "read_file", "read_page", "read_skill", "search", "web_fetch", "write_file", "edit_file",
-    "shell", "git",
+    "read_file", "read_page", "read_skill", "search", "web_fetch", "web_search", "write_file",
+    "edit_file", "shell", "git",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -140,7 +140,7 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
     }
     match tool_name {
         // 只读工具：恒定 Safe
-        "read_file" | "read_page" | "search" | "web_fetch" => {
+        "read_file" | "read_page" | "search" | "web_fetch" | "web_search" => {
             (RiskLevel::Safe, "只读安全查询操作".into())
         }
 
@@ -812,7 +812,7 @@ mod tests {
         // 已登记但无专门规则的工具（登记表里存在）按常规处理，不再一律高危
         assert!(KNOWN_TOOLS.contains(&"write_file"));
         assert!(KNOWN_TOOLS.contains(&"edit_file"));
-        assert_eq!(KNOWN_TOOLS.len(), 9, "新增内置工具须同步登记到 KNOWN_TOOLS");
+        assert_eq!(KNOWN_TOOLS.len(), 10, "新增内置工具须同步登记到 KNOWN_TOOLS");
     }
 
     #[test]
