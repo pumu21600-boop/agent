@@ -131,13 +131,10 @@ impl SessionManager {
     }
 
     /// 原子写（临时文件 + rename），save / rename / set_meta / fork 共用。
+    /// P18 存储一门：会话落盘只走 `storage::write_session`（仓内唯一入口 + 审计）。
     fn write(&self, f: &SessionFile) -> anyhow::Result<()> {
-        let tmp = self.path(&f.id).with_extension("json.tmp");
         let text = serde_json::to_string(f).context("会话序列化失败")?;
-        std::fs::write(&tmp, text).with_context(|| format!("写临时文件失败: {}", tmp.display()))?;
-        std::fs::rename(&tmp, self.path(&f.id))
-            .with_context(|| format!("替换会话文件失败: {}", self.path(&f.id).display()))?;
-        Ok(())
+        crate::storage::write_session(&self.path(&f.id), &text)
     }
 
     /// 落盘（原子写）：已存在则保留 created_at/标题/置顶/归档/工作区，否则标题取首条

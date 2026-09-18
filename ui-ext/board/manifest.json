@@ -1,7 +1,9 @@
 {
+  "apiVersion": 1,
+  "source": "built_in",
   "title": "项目速览",
-  "description": "看当前工作区、Git 状态与最近记忆 —— 组件总线参考扩展（只读桥 + 写操作 + 顶栏插槽 + 扩展间通信演示）",
-  "version": "0.2.0",
+  "description": "看当前工作区、Git 状态与最近记忆 —— 插件契约参考实现（只读桥 + 写操作 + 顶栏插槽 + 插件间通信演示）",
+  "version": "0.3.0",
   "entry": "index.html",
   "ui": [{ "slot": "toolbar", "id": "board", "title": "项目速览" }],
   "permissions": ["composer.insert", "notify", "bus.publish", "workspace.write"]

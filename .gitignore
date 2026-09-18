@@ -19,3 +19,4 @@ desktop/target/
 
 # 发布打包产物（scripts/package_release.ps1 输出）
 /dist/
+target-smoke/

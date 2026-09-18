@@ -29,38 +29,50 @@
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
-/// 扩展目录名（应用根与工作区同名）。
+use crate::plugin::{contract, ToolBrief};
+
+/// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "ui-ext";
 
-/// 一个 UI 扩展的描述（GET /api/ext 直出）。
+/// 一个插件的描述（GET /api/ext 直出；P18 契约 v1：面板与工具插件同构）。
 #[derive(Debug, Clone, Serialize)]
 pub struct UiExt {
     pub name: String,
     pub title: String,
     pub description: String,
     pub version: String,
-    /// 入口页（相对扩展目录）
+    /// 入口页（相对插件目录；纯工具插件为空串）
     pub entry: String,
-    /// "app"（内置，应用根）| "workspace"（当前工作区）
+    /// 位置："app"（应用根）| "workspace"（当前工作区）| "draft"（内存草稿）
     pub source: String,
-    /// 是否覆盖了同名的内置扩展（工作区同名优先；界面显式提示，避免"看起来是内置那个"）
+    /// P18 契约 v1：来源 built_in / user / model_generated（manifest `source` 声明，
+    /// 未声明按位置默认）
+    pub origin: String,
+    /// P18：模型自产草稿（内存态不入盘、权限已清空、转正后持久化）
+    pub draft: bool,
+    /// P18 契约版本（读入时的实际值；拒载时 0）
+    pub api_version: u32,
+    /// 是否覆盖了同名的内置插件（工作区同名优先；界面显式提示，避免"看起来是内置那个"）
     pub shadowed: bool,
-    /// 扩展目录绝对路径（界面提示用）
+    /// 插件目录绝对路径（界面提示用）
     pub dir: String,
     /// manifest 是否可用（false 时 error 有原因）
     pub ok: bool,
     pub error: Option<String>,
-    /// P17：启用状态（设置里的停用名单；停用的扩展不加载、不参与界面插槽与数据桥）
+    /// P17：启用状态（设置里的停用名单；停用的插件不加载、不参与界面插槽与数据桥）
     pub enabled: bool,
     /// P17：宿主界面插槽声明（manifest `ui: [{slot, title}]`；v1 支持 toolbar / composer）
-    pub ui: Vec<serde_json::Value>,
-    /// P17：写操作权限声明（manifest `permissions: ["composer.insert", "workspace.write"]`）
+    pub ui: Vec<Value>,
+    /// P17/P18：权限声明（composer.insert / workspace.write / bus.publish / notify / storage）
     /// ——宿主只认这里声明过的动作，没声明的请求一律拒绝
     pub permissions: Vec<String>,
+    /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
+    pub tools: Vec<ToolBrief>,
 }
 
-/// 扫描全部扩展（内置 + 当前工作区；工作区同名覆盖内置，顺序稳定）。
+/// 扫描全部插件（内置 + 当前工作区 + 内存 draft；工作区同名覆盖内置，顺序稳定）。
 /// `disabled`：设置里的停用名单（停用的仍在清单里，只是 `enabled=false`）。
 pub fn scan(disabled: &[String]) -> Vec<UiExt> {
     let app = crate::config::app_root();
@@ -69,6 +81,49 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
     collect(&app.join(DIR), "app", &mut out, disabled);
     if ws != app {
         collect(&ws.join(DIR), "workspace", &mut out, disabled);
+    }
+    // P18：模型自产 draft 插件并入统一清单（内存态、权限已清空、重启即失）
+    for d in crate::plugin::draft::list() {
+        let entry = d
+            .manifest
+            .get("entry")
+            .and_then(Value::as_str)
+            .unwrap_or("index.html")
+            .to_string();
+        let has_entry = d.files.contains_key(&entry);
+        let ui = d.manifest.get("ui").and_then(Value::as_array).cloned().unwrap_or_default();
+        out.push(UiExt {
+            name: d.name.clone(),
+            title: d.manifest.get("title").and_then(Value::as_str).unwrap_or(&d.name).to_string(),
+            description: d
+                .manifest
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            version: d.manifest.get("version").and_then(Value::as_str).unwrap_or_default().to_string(),
+            entry: entry.clone(),
+            source: "draft".into(),
+            origin: contract::ORIGIN_MODEL.to_string(),
+            draft: true,
+            api_version: contract::API_VERSION,
+            shadowed: false,
+            dir: "（内存草稿 · 转正前不入盘，重启即失）".into(),
+            ok: has_entry || d.tool_loaded,
+            error: if has_entry || d.tool_loaded {
+                None
+            } else {
+                Some(format!("入口页 {entry} 缺失"))
+            },
+            enabled: true,
+            ui: ui
+                .iter()
+                .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer")))
+                .cloned()
+                .collect(),
+            permissions: Vec::new(),
+            tools: Vec::new(),
+        });
     }
     out
 }
@@ -94,7 +149,7 @@ fn collect(root: &Path, source: &str, out: &mut Vec<UiExt>, disabled: &[String])
     }
 }
 
-/// 读一个扩展目录的 manifest，缺文件/字段不合法都记成 ok=false + error。
+/// 读一个插件目录的 manifest，缺文件/字段不合法都记成 ok=false + error。
 fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt {
     let mut e = UiExt {
         name: name.to_string(),
@@ -103,6 +158,9 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         version: String::new(),
         entry: "index.html".into(),
         source: source.to_string(),
+        origin: contract::ORIGIN_BUILT_IN.into(),
+        draft: false,
+        api_version: contract::API_VERSION,
         shadowed: false,
         dir: dir.display().to_string(),
         ok: false,
@@ -110,6 +168,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         enabled: !disabled.iter().any(|d| d == name),
         ui: Vec::new(),
         permissions: Vec::new(),
+        tools: Vec::new(),
     };
     if !safe_segment(name) {
         e.error = Some("目录名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into());
@@ -123,38 +182,49 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             return e;
         }
     };
-    let v: serde_json::Value = match serde_json::from_str(&text) {
+    let v: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(err) => {
             e.error = Some(format!("manifest.json 不是合法 JSON: {err}"));
             return e;
         }
     };
-    if let Some(t) = v.get("title").and_then(|x| x.as_str()) {
+    // P18 契约 v1：apiVersion 不匹配 → 拒载 + 提示升级（不做 shim）；缺失按 v1 读入（老目录迁移）
+    if let Err(err) = contract::check_api_version(&v) {
+        e.error = Some(err);
+        return e;
+    }
+    e.origin = contract::origin_of(&v, source);
+    if let Some(t) = v.get("title").and_then(Value::as_str) {
         e.title = t.to_string();
     }
-    if let Some(d) = v.get("description").and_then(|x| x.as_str()) {
+    if let Some(d) = v.get("description").and_then(Value::as_str) {
         e.description = d.to_string();
     }
-    if let Some(ver) = v.get("version").and_then(|x| x.as_str()) {
+    if let Some(ver) = v.get("version").and_then(Value::as_str) {
         e.version = ver.to_string();
     }
-    if let Some(en) = v.get("entry").and_then(|x| x.as_str()) {
+    if let Some(en) = v.get("entry").and_then(Value::as_str) {
         e.entry = en.to_string();
     }
     // P17：界面插槽与写操作权限（只认白名单里的插槽名与动作名）
-    if let Some(ui) = v.get("ui").and_then(|x| x.as_array()) {
+    if let Some(ui) = v.get("ui").and_then(Value::as_array) {
         e.ui = ui
             .iter()
             .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer")))
             .cloned()
             .collect();
     }
-    if let Some(perms) = v.get("permissions").and_then(|x| x.as_array()) {
+    if let Some(perms) = v.get("permissions").and_then(Value::as_array) {
         e.permissions = perms
             .iter()
             .filter_map(|p| p.as_str())
-            .filter(|p| matches!(*p, "composer.insert" | "workspace.write" | "bus.publish" | "notify"))
+            .filter(|p| {
+                matches!(
+                    *p,
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage"
+                )
+            })
             .map(str::to_string)
             .collect();
     }

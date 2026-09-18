@@ -7,6 +7,7 @@ mod context;
 mod core;
 mod fsx;
 mod gateway;
+mod hooks;
 mod memory;
 mod observability;
 mod plugin;
@@ -16,6 +17,7 @@ mod server;
 mod service;
 mod session;
 mod skills;
+mod storage;
 mod tools;
 
 use std::{
@@ -64,6 +66,8 @@ async fn main() -> anyhow::Result<()> {
     crate::plugin::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
     crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
+    crate::plugin::wasm::set_disabled(&user_settings.disabled_extensions); // P18 027：停用名单贯通工具插件
+    crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
     observability::event(
         observability::EventType::State,
         serde_json::json!({

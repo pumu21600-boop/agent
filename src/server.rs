@@ -313,6 +313,11 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/version", get(get_version))
         .route("/api/ext", get(list_extensions))
         .route("/api/ext/toggle", post(toggle_extension))
+        // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
+        .route("/api/ext/draft", post(submit_draft).delete(discard_draft))
+        .route("/api/ext/promote", post(promote_draft))
+        // P18 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
+        .route("/api/plugin/data", get(read_plugin_data).put(write_plugin_data).delete(delete_plugin_data))
         .route("/api/workspace/file", post(write_workspace_file))
         // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
         // 尾斜杠那条约等于目录首页：不带它请求会掉进 SPA 兜底，把整个应用套进 iframe
@@ -872,6 +877,8 @@ async fn put_settings(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -949,6 +956,8 @@ async fn manage_configs(
     let pid = s.provider_id();
     let model = s.effective_model();
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -1012,6 +1021,8 @@ fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Result<(), Stri
     s.recent_workspaces.truncate(8);
     s.save().map_err(|e| e.to_string())?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
@@ -1684,6 +1695,9 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
             .iter()
             .filter_map(|n| find_channel(&s, n))
             .collect();
+        // P18 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
+        let task_tokens = std::sync::atomic::AtomicU64::new(0);
+        let budget_fired = std::sync::atomic::AtomicBool::new(false);
         loop {
             let outcome = agent::run_task(
                 &gateway,
@@ -1744,6 +1758,17 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
                         }
                     })),
                     AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
+                        // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
+                        // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
+                        let total = task_tokens
+                            .fetch_add(prompt_tokens, std::sync::atomic::Ordering::Relaxed)
+                            + prompt_tokens;
+                        let budget = crate::hooks::budget_tokens();
+                        if crate::hooks::budget_exceeded(total, budget)
+                            && !budget_fired.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            crate::hooks::notify_budget_exceeded(&session_id, total, budget);
+                        }
                         send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                     }
                     // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
@@ -1852,6 +1877,8 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
         // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
         prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
+        // P18 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
+        crate::hooks::session_end(&session_id).await;
     });
 
     Sse::new(UnboundedReceiverStream::new(rx)).into_response()
@@ -2268,6 +2295,8 @@ async fn post_mcp(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
@@ -2352,8 +2381,11 @@ async fn list_extensions(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or_else(|e| e.into_inner())
         .disabled_extensions
         .clone();
+    // P18 二合一（027）：面板插件 + 工具插件（wasm 桥）+ 内存 draft，一份清单
+    let mut extensions = crate::plugin::ui::scan(&disabled);
+    extensions.extend(crate::plugin::wasm::scan_plugins(&disabled));
     Json(json!({
-        "extensions": crate::plugin::ui::scan(&disabled),
+        "extensions": extensions,
         "dir": crate::plugin::ui::DIR,
         "app_dir": crate::config::app_root().join(crate::plugin::ui::DIR).display().to_string(),
         "workspace_dir": crate::tools::workspace_root().join(crate::plugin::ui::DIR).display().to_string(),
@@ -2402,12 +2434,131 @@ async fn toggle_extension(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     observability::event(
         EventType::State,
         json!({ "kind": "ext.toggle", "name": name, "enabled": enabled }),
     );
-    let list = crate::plugin::ui::scan(&s.disabled_extensions);
+    // P18 二合一：回包清单含工具插件
+    let mut list = crate::plugin::ui::scan(&s.disabled_extensions);
+    list.extend(crate::plugin::wasm::scan_plugins(&s.disabled_extensions));
     (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+}
+
+/// POST /api/ext/draft —— 模型自产插件提交进 draft 隔离区（P18 027）。
+/// 规范化（source=model_generated、权限清空）在 draft::submit 里强制执行。
+async fn submit_draft(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let manifest = req.get("manifest").cloned().unwrap_or(json!({}));
+    let mut files = std::collections::BTreeMap::new();
+    if let Some(obj) = req.get("files").and_then(Value::as_object) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                files.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    match crate::plugin::draft::submit(&name, &manifest, &files) {
+        Ok(()) => {
+            let disabled = state
+                .settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .disabled_extensions
+                .clone();
+            let mut list = crate::plugin::ui::scan(&disabled);
+            list.extend(crate::plugin::wasm::scan_plugins(&disabled));
+            (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    }
+}
+
+/// POST /api/ext/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
+async fn promote_draft(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    match crate::plugin::draft::promote(&name) {
+        Ok(paths) => {
+            let disabled = state
+                .settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .disabled_extensions
+                .clone();
+            let mut list = crate::plugin::ui::scan(&disabled);
+            list.extend(crate::plugin::wasm::scan_plugins(&disabled));
+            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "extensions": list })))
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    }
+}
+
+/// DELETE /api/ext/draft?name= —— 丢弃 draft（内存即清，WASM 注册表同步回收）。
+async fn discard_draft(
+    State(state): State<AppState>,
+    Query(q): Query<PluginDataQueryName>,
+) -> (StatusCode, Json<Value>) {
+    if crate::plugin::draft::discard(&q.name) {
+        let disabled = state
+            .settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .disabled_extensions
+            .clone();
+        let mut list = crate::plugin::ui::scan(&disabled);
+        list.extend(crate::plugin::wasm::scan_plugins(&disabled));
+        (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "error": format!("没有名为 {} 的 draft", q.name) })))
+    }
+}
+
+#[derive(Deserialize)]
+struct PluginDataQueryName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PluginDataQuery {
+    name: String,
+    key: String,
+}
+
+/// GET /api/plugin/data?name=&key= —— 插件命名空间读（存储一门的插件侧 API）。
+async fn read_plugin_data(Query(q): Query<PluginDataQuery>) -> Response {
+    match crate::storage::plugin_read(&q.name, &q.key) {
+        Ok(Some(v)) => (StatusCode::OK, Json(json!({ "ok": true, "value": v }))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "键不存在").into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, e).into_response(),
+    }
+}
+
+/// PUT /api/plugin/data {name, key, value} —— 插件命名空间写（JSON ≤64KB；越权/超限审计拒绝）。
+async fn write_plugin_data(Json(req): Json<Value>) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("");
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("");
+    let Some(value) = req.get("value") else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 value" })));
+    };
+    match crate::storage::plugin_write(name, key, value) {
+        Ok(bytes) => (StatusCode::OK, Json(json!({ "ok": true, "bytes": bytes }))),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    }
+}
+
+/// DELETE /api/plugin/data?name=&key= —— 插件命名空间删。
+async fn delete_plugin_data(Query(q): Query<PluginDataQuery>) -> (StatusCode, Json<Value>) {
+    match crate::storage::plugin_delete(&q.name, &q.key) {
+        Ok(found) => (StatusCode::OK, Json(json!({ "ok": true, "found": found }))),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))),
+    }
 }
 
 /// GET /ui-ext/{name} —— 扩展入口页（entry 由 manifest 指定）。
@@ -2432,7 +2583,20 @@ fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
         .disabled_extensions
         .clone();
     if disabled.iter().any(|d| d == name) {
-        return (StatusCode::NOT_FOUND, "扩展已停用").into_response();
+        return (StatusCode::NOT_FOUND, "插件已停用").into_response();
+    }
+    // P18（027）：draft 面板资产走内存 overlay——键必须与提交时的文件名完全一致，
+    // 不做路径拼接（构造上无穿越）；命中即返回，未命中落回磁盘路径。
+    let eff_rel = if rel.trim().is_empty() {
+        crate::plugin::draft::entry_file(name)
+    } else {
+        Some(rel.to_string())
+    };
+    if let Some(eff) = eff_rel
+        && let Some(bytes) = crate::plugin::draft::read_file(name, &eff)
+    {
+        let ct = crate::plugin::ui::content_type(std::path::Path::new(&eff));
+        return ([(CONTENT_TYPE, ct)], bytes).into_response();
     }
     let entry = crate::plugin::ui::scan(&disabled)
         .into_iter()
@@ -2832,6 +2996,8 @@ async fn remove_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
@@ -2857,6 +3023,8 @@ async fn alias_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,

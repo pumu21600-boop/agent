@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
@@ -436,8 +436,9 @@ impl Settings {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        // 原子写：settings.json 里有全部配置与密文 key，写坏一次等于配置全丢
-        crate::fsx::write_atomic_str(&Self::path(), &json).context("写 settings.json 失败")
+        // P18 存储一门：settings.json 落盘只走 `storage::write_settings`（原子写 + 审计
+        // 都在那里面）；这里是仓内唯一调用点。
+        crate::storage::write_settings(&Self::path(), &json)
     }
 
     fn path() -> std::path::PathBuf {

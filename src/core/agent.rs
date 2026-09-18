@@ -724,6 +724,7 @@ pub async fn run_task(
         struct Decision {
             approved: bool,
             plan_reason: Option<String>,
+            hook_reason: Option<String>,
             risk: u8,
             skip_conflict: bool,
         }
@@ -744,12 +745,21 @@ pub async fn run_task(
 
             // P9 B2：Plan 档拦截优先于审批流；P9 细粒度审批单点不变
             let plan_reason = gate.plan_block_reason(&call.name, &call.arguments);
-            let approved = match &plan_reason {
-                Some(_) => false,
-                None if gate.needs_approval_for(&call.name, &call.arguments) => {
+            // P18 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
+            // 钩子放行 ≠ 免审批，审批门照走（定案 7）。
+            let hook_reason = if plan_reason.is_none() {
+                crate::hooks::before_tool(gate.session_id(), &call.name, &call.arguments)
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            let approved = match (&plan_reason, &hook_reason) {
+                (Some(_), _) | (_, Some(_)) => false,
+                (None, None) if gate.needs_approval_for(&call.name, &call.arguments) => {
                     gate.ask(&call.name, &call.arguments).await
                 }
-                None => true,
+                (None, None) => true,
             };
             let (risk, _) = crate::core::rules::evaluate_risk(
                 &call.name,
@@ -759,6 +769,7 @@ pub async fn run_task(
             decisions.push(Decision {
                 approved,
                 plan_reason,
+                hook_reason,
                 risk: risk.as_u8(),
                 skip_conflict: false,
             });
@@ -818,6 +829,7 @@ pub async fn run_task(
                 json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
             );
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            crate::hooks::notify_after_tool(gate.session_id(), &call.name, ok);
             results[i] = (content, ok);
         }
 
@@ -845,6 +857,17 @@ pub async fn run_task(
                     format!(
                         "Plan 模式拦截（未执行）：{reason}。请勿执行写/改类操作——继续只读调研，并在最终回答中用 ```plan 围栏输出执行计划，等待用户批准。"
                     ),
+                    true,
+                )
+            } else if let Some(reason) = &d.hook_reason {
+                // P18 钩子 deny（027）：未执行，把理由回喂给模型调整做法
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "hook.blocked", "step": step, "tool": call.name, "reason": reason }),
+                );
+                on_event(AgentEvent::Notice(format!("钩子已拦截 {}：{}", call.name, reason)));
+                (
+                    format!("自定义钩子拦截（未执行）：{reason}。请换别的做法或直接回答用户。"),
                     true,
                 )
             } else if d.skip_conflict {
@@ -895,6 +918,7 @@ pub async fn run_task(
                 json!({ "step": step, "id": call.id, "name": call.name, "ok": ok, "chars": content.chars().count(), "truncated": content.contains(context::OMITTED_MARK), "preview": preview }),
             );
             on_event(AgentEvent::ToolResult { name: call.name.clone(), ok, preview });
+            crate::hooks::notify_after_tool(gate.session_id(), &call.name, ok);
             results[i] = (content, ok);
         }
 

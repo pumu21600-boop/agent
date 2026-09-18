@@ -62,6 +62,8 @@ pub struct Config {
     pub recovery: RecoveryConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 /// P8 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的
@@ -168,6 +170,35 @@ pub struct SandboxConfig {
 }
 fn default_sandbox_mode() -> String {
     "restricted".into()
+}
+
+/// 钩子配置（施工单 027，P18）—— 用户不改源码即可在固定挂点插入自定义动作。
+/// 承载形式：本地命令（stdin 收 JSON 事件、stdout 回 JSON 决定）；空串 = 未配置。
+/// 语义四条（定案 7）：4 挂点 / before_tool 仅否决权 / 超时放行 / JSONL 审计。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    /// 工具执行前：stdout `{"decision":"deny","reason":"…"}` = 拦下并回喂模型；其余 = 放行
+    #[serde(default)]
+    pub before_tool: String,
+    /// 工具执行后（观测性通知，stdout 不参与决策）
+    #[serde(default)]
+    pub after_tool: String,
+    /// 任务结束（沉淀记忆等收尾动作）
+    #[serde(default)]
+    pub session_end: String,
+    /// 超预算通知（budget_tokens>0 且单任务累计 token 超限时触发一次）
+    #[serde(default)]
+    pub budget_exceeded: String,
+    /// 挂点限时（ms）：到点视为放行，绝不卡主循环
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 单任务累计 token 预算（0 = 不启用）
+    #[serde(default)]
+    pub budget_tokens: u64,
+}
+
+fn default_hook_timeout_ms() -> u64 {
+    5000
 }
 
 /// 上下文工程参数（施工单 006）。
