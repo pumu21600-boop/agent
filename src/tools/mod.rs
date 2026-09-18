@@ -1551,6 +1551,11 @@ mod tests {
     #[tokio::test]
     async fn shell_runs_in_sandbox() {
         init_logger();
+        // 宿主起不了受限 token 子进程（托管 runner）时自检跳过，本机照常全量断言
+        if let Some(reason) = crate::sandbox::probes::restricted_host_limitation() {
+            eprintln!("[skip] shell_runs_in_sandbox：{reason}");
+            return;
+        }
         let r = execute(&cfg(), "shell", r#"{"command":"echo p4-sandbox-ok"}"#).await;
         let out = r.unwrap();
         assert!(out.contains("p4-sandbox-ok") && out.contains("exit=0"), "{out}");
@@ -1559,6 +1564,10 @@ mod tests {
     #[tokio::test]
     async fn git_version_runs() {
         init_logger();
+        if let Some(reason) = crate::sandbox::probes::restricted_host_limitation() {
+            eprintln!("[skip] git_version_runs：{reason}");
+            return;
+        }
         let r = execute(&cfg(), "git", r#"{"args":"--version"}"#).await;
         assert!(r.unwrap().contains("git version"));
         // push 的拦截归属：工具层不再硬禁（否则 shell 里跑 git push 能绕过，形成两套标准），

@@ -32,7 +32,14 @@ jobs:
       - name: clippy（告警即失败）
         run: cargo clippy --all-targets -- -D warnings
 
-      # 沙箱探针要真拉起受限进程（内存上限探针 60s），单独给时间预算
+      # 沙箱探针的 find_hog() 依赖 target/debug/sandbox_hog.exe，
+      # 而 cargo test / clippy 都不产普通 bin，必须显式构建（否则 CI 干净环境必挂）
+      - name: 构建二进制（沙箱探针依赖 target/debug 产物）
+        run: cargo build --bins
+
+      # 沙箱探针要真拉起受限进程（内存上限探针 60s），单独给时间预算。
+      # 托管 runner 起不了受限 token 子进程（cmd/git 未执行即 exit 0xC0000142），
+      # 探针测试会宿主自检后跳过并留原因（probes::restricted_host_limitation），本机仍全量执行
       - name: 测试（全量，不 fail-fast）
         run: cargo test --no-fail-fast
         timeout-minutes: 25
