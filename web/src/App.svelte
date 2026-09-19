@@ -41,6 +41,9 @@
   let wsPath = '';
   let wsMsg = '';
   let apiTotals = { prompt: 0, cached: 0 }; // 渠道真实用量累计（平均缓存命中率）
+  // 027：用量按会话记账 —— key → { ctx, api }。后台会话的流写各自账本，
+  // 切回会话时从账本恢复（跑完的会话不再发事件，不记账就会显示 0）。
+  let usageBySession = {};
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -123,6 +126,14 @@
       delete nextOut[from];
       nextOut[to] = q;
       outbox = nextOut;
+    }
+    // 027：用量账本跟着 key 走（'@new' → 真 id 时不丢记账）
+    if (usageBySession[from]) {
+      const u = usageBySession[from];
+      const nextU = { ...usageBySession };
+      delete nextU[from];
+      nextU[to] = u;
+      usageBySession = nextU;
     }
     if (curKey() === from) {
       currentSessionId = to;
@@ -324,8 +335,9 @@
       currentSessionId = null;
       sessionMsgs = {};
       outbox = {};
+      usageBySession = {}; // 旧项目的会话账本一并清
       syncCur();
-      resetCtxUsage();
+      restoreUsage('@new');
       await loadSettings();
       await loadSessions(true);
     } catch (e) {
@@ -1831,16 +1843,25 @@
                 if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
               }
               else if (d.context_usage) {
-                // 用量事件按会话归属：只更新正在看的会话（后台会话的流不污染当前圆环）
+                // 用量按会话记账（后台会话写各自账本）；正在看的才刷到显示
+                usageBySession = {
+                  ...usageBySession,
+                  [skey]: {
+                    ctx: { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null },
+                    api: (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 },
+                  },
+                };
                 if (skey === curKey())
                   ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
               }
               else if (d.api_usage) {
-                if (skey === curKey())
-                  apiTotals = {
-                    prompt: apiTotals.prompt + (d.api_usage.prompt_tokens || 0),
-                    cached: apiTotals.cached + (d.api_usage.cached_tokens || 0),
-                  };
+                const prev = (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 };
+                const api = { prompt: prev.prompt + (d.api_usage.prompt_tokens || 0), cached: prev.cached + (d.api_usage.cached_tokens || 0) };
+                usageBySession = {
+                  ...usageBySession,
+                  [skey]: { ctx: (usageBySession[skey] || {}).ctx || ctxUsage, api },
+                };
+                if (skey === curKey()) apiTotals = api;
               } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
@@ -1957,9 +1978,11 @@
     }
   }
 
-  // 重置占用但保留预算（圆环常驻：预算来自设置，切会话不该归零）
-  function resetCtxUsage() {
-    ctxUsage = { tokens: 0, budget: ctxUsage.budget, breakdown: null };
+  // 切到某会话：从按会话账本恢复用量；没账本的新会话清零（预算保留——圆环常驻）
+  function restoreUsage(key) {
+    const u = usageBySession[key];
+    ctxUsage = u ? u.ctx : { tokens: 0, budget: ctxUsage.budget, breakdown: null };
+    apiTotals = u ? u.api : { prompt: 0, cached: 0 };
   }
 
   // 打开会话：后端会在其所属项目与当前项目不同时先切过去（切会话 = 回到那个项目），
@@ -1971,8 +1994,7 @@
       currentSessionId = id;
       currentTitle = sessions.find((x) => x.id === id)?.title ?? currentTitle;
       syncCur();
-      resetCtxUsage();
-      apiTotals = { prompt: 0, cached: 0 }; // 命中率按会话累计，切会话即重置
+      restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
       dockCp = null;
       refreshDock();
       return;
@@ -1994,8 +2016,7 @@
         sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };
       }
       syncCur();
-      resetCtxUsage();
-      apiTotals = { prompt: 0, cached: 0 }; // 命中率按会话累计，切会话即重置
+      restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
       dockCp = null;
       if (r.warning) settingsMsg = r.warning;
       if (r.switched) {
@@ -2018,8 +2039,7 @@
     dockCp = null;
     sessionMsgs = { ...sessionMsgs, '@new': [] };
     syncCur();
-    resetCtxUsage();
-    apiTotals = { prompt: 0, cached: 0 };
+    restoreUsage('@new'); // 新会话：账本里没有它 → 清零
     try {
       const r = await fetch('/api/sessions/new', { method: 'POST' }).then((r) => r.json());
       if (r.ok && r.id) {
