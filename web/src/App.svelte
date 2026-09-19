@@ -2,6 +2,11 @@
   import { onMount, afterUpdate, tick } from 'svelte';
   import Select from './Select.svelte';
   import Galaxy from './Galaxy.svelte';
+  import ImagePreview from './lib/ImagePreview.svelte';
+  import RenameModal from './lib/RenameModal.svelte';
+  import WorkspaceModal from './lib/WorkspaceModal.svelte';
+  import ModelPicker from './lib/ModelPicker.svelte';
+  import { fmtBytes, relTime, fmtTok, norm, configLabel, inferCapabilities, gitStatusLabel } from './lib/format.js';
 
   // —— 配置（改动即自动保存即时生效）——
   let providers = [];
@@ -41,7 +46,6 @@
   let workspace = '';
   let recentWorkspaces = [];
   let wsModalOpen = false;
-  let wsPath = '';
   let wsMsg = '';
   let apiTotals = { prompt: 0, cached: 0 }; // 渠道真实用量累计（平均缓存命中率）
   // 027：用量按会话记账 —— key → { ctx, api }。后台会话的流写各自账本，
@@ -157,13 +161,6 @@
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
   let fileInput; // 隐藏文件选择器引用
   let previewImageModal = null; // 放大预览的图片 dataUrl
-
-  function fmtBytes(b) {
-    if (!b) return '0B';
-    if (b < 1024) return `${b}B`;
-    if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)}KB`;
-    return `${(b / (1024 * 1024)).toFixed(1)}MB`;
-  }
 
   function onFileSelect(e) {
     const files = e.target.files;
@@ -340,7 +337,6 @@
       const d = await r.json();
       if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
       wsMsg = '';
-      wsPath = '';
       wsModalOpen = false;
       // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
       currentSessionId = null;
@@ -354,19 +350,6 @@
     } catch (e) {
       wsMsg = `切换失败: ${e.message}`;
     }
-  }
-
-  function relTime(iso) {
-    if (!iso) return '';
-    const ms = Date.now() - new Date(iso).getTime();
-    const m = Math.floor(ms / 60000);
-    if (m < 1) return '刚刚';
-    if (m < 60) return `${m}分钟前`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}小时前`;
-    const d = Math.floor(h / 24);
-    if (d < 30) return `${d}天前`;
-    return new Date(iso).toLocaleDateString();
   }
 
   afterUpdate(() => {
@@ -400,11 +383,6 @@
       row('其他', b.other, 'var(--g5)'),
     ];
   })();
-  function fmtTok(n) {
-    if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
-    return String(n);
-  }
-
   // —— ZCode 式输入框：思考模式选择器（常驻）——
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
@@ -481,10 +459,6 @@
     if (!chatBody) return;
     chatPinned = true;
     chatBody.scrollTo({ top: chatBody.scrollHeight, behavior: 'smooth' });
-  }
-
-  function norm(url) {
-    return (url || '').trim().replace(/\/+$/, '').toLowerCase();
   }
 
   async function loadProviders() {
@@ -610,10 +584,6 @@
     manageConfig('delete', activeConfigId);
   }
 
-  function configLabel(c) {
-    return c.name || '未命名';
-  }
-
   function onProviderChange() {
     const p = providers.find((x) => x.id === providerId);
     const newBase = p ? p.default_base_url : '';
@@ -643,16 +613,6 @@
     } catch (e) {
       settingsMsg = `获取模型失败: ${e.message}`;
     }
-  }
-
-  function inferCapabilities(mId) {
-    const id = (mId || '').toLowerCase();
-    return {
-      tools: true,
-      vision: id.includes('vl') || id.includes('vision') || id.includes('gemini') || id.includes('gpt-4o') || id.includes('claude-3') || id.includes('omni') || id.includes('mimo'),
-      video: id.includes('video') || id.includes('gemini-2') || id.includes('omni') || id.includes('mimo'),
-      audio: id.includes('audio') || id.includes('realtime') || id.includes('whisper') || id.includes('omni') || id.includes('gemini') || id.includes('mimo'),
-    };
   }
 
   function isChecked(m) {
@@ -853,16 +813,6 @@
     }
   }
   // porcelain 状态码 → 人看的短标签
-  function gitStatusLabel(s) {
-    const c = String(s || '');
-    if (c.includes('?')) return '未跟踪';
-    if (c.includes('U')) return '冲突';
-    if (c.includes('R')) return '重命名';
-    if (c.includes('A')) return '新增';
-    if (c.includes('D')) return '删除';
-    if (c.includes('M')) return '修改';
-    return c || '改动';
-  }
   // 点文件 → 右侧面板直接预览内容（改动条里的路径同样可读）
   function openGitFile(path) {
     gitPopOpen = false;
@@ -4733,105 +4683,27 @@
   </div>
 {/if}
 
-{#if wsModalOpen}
-  <div class="modal-backdrop" on:click={() => (wsModalOpen = false)}>
-    <div class="modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <b>切换工作区</b>
-        <span class="hint">{wsMsg}</span>
-        <button class="btn ghost" on:click={() => (wsModalOpen = false)}>关闭</button>
-      </div>
-      <div class="field">
-        <label>当前工作区</label>
-        <div class="ws-current" title={workspace}>{workspace || '（工程根）'}</div>
-      </div>
-      <div class="field">
-        <label>本地文件夹路径（agent 的文件读写/命令执行/影子仓库都在这里，与 agent 自身目录隔离）</label>
-        <div class="sub-row">
-          <input bind:value={wsPath} placeholder="如 D:\projects\demo 或 C:\Users\你\test" />
-          <button class="btn primary" on:click={() => applyWorkspace(wsPath)} disabled={!wsPath.trim()}>应用</button>
-        </div>
-      </div>
-      {#if recentWorkspaces.length}
-        <div class="field">
-          <label>最近使用</label>
-          <div class="ws-recent">
-            {#each recentWorkspaces as w}
-              <button class="ws-chip" class:active={w === workspace} title={w} on:click={() => applyWorkspace(w)}>
-                {w.split(/[\\/]/).filter(Boolean).pop()}
-              </button>
-            {/each}
-          </div>
-        </div>
-      {/if}
-        <div class="param-hint">切换后会话列表与约定按新工作区重开；进行中的任务不受影响</div>
-    </div>
-  </div>
-{/if}
+<WorkspaceModal
+    open={wsModalOpen}
+    msg={wsMsg}
+    workspace={workspace}
+    recent={recentWorkspaces}
+    on:apply={(e) => applyWorkspace(e.detail)}
+    on:close={() => (wsModalOpen = false)}
+  />
+<RenameModal modal={renameModal} on:close={() => (renameModal = null)} on:submit={submitRename} />
 
-{#if renameModal}
-  <div class="modal-backdrop" on:click={() => (renameModal = null)}>
-    <div class="modal rename-modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <b>{renameModal.kind === 'session' ? '重命名会话' : '重命名项目'}</b>
-        <button class="btn ghost" on:click={() => (renameModal = null)}>关闭</button>
-      </div>
-      <div class="field">
-        <input
-          class="rename-input"
-          bind:value={renameModal.value}
-          placeholder={renameModal.kind === 'project' ? '留空恢复为文件夹名' : '会话标题'}
-          on:keydown={(e) => e.key === 'Enter' && submitRename()}
-        />
-      </div>
-      <div class="rename-actions">
-        <button class="btn" on:click={() => (renameModal = null)}>取消</button>
-        <button class="btn primary" on:click={submitRename}>确定</button>
-      </div>
-    </div>
-  </div>
-{/if}
+<ModelPicker
+    open={modelModalOpen}
+    models={fetchedModels}
+    saved={savedModels}
+    on:close={() => (modelModalOpen = false)}
+    on:toggle={(e) => toggleModel(e.detail)}
+    on:selectall={selectAllModels}
+    on:selectnone={selectNoModels}
+  />
 
-{#if modelModalOpen}
-  <div class="modal-backdrop" on:click={() => (modelModalOpen = false)}>
-    <div class="modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <b>获取到的模型（{fetchedModels.length} 个，勾选即加入）</b>
-        <div class="modal-actions">
-          <button class="btn" on:click={selectAllModels}>全选</button>
-          <button class="btn" on:click={selectNoModels}>全不选</button>
-          <button class="btn ghost" on:click={() => (modelModalOpen = false)}>完成</button>
-        </div>
-      </div>
-      <div class="model-list">
-        {#if fetchedModels.length === 0}
-          <div class="empty">渠道未返回任何模型</div>
-        {/if}
-        {#each fetchedModels as m}
-          {@const caps = inferCapabilities(m)}
-          <label class="model-item">
-            <input type="checkbox" checked={isChecked(m)} on:change={() => toggleModel(m)} />
-            <span class="m-name">{m}</span>
-            <span class="m-caps">
-              {#if caps.vision}<span class="m-tag" title="支持图片理解">图片</span>{/if}
-              {#if caps.video}<span class="m-tag" title="支持视频理解">视频</span>{/if}
-              {#if caps.audio}<span class="m-tag" title="支持音频理解">音频</span>{/if}
-            </span>
-          </label>
-        {/each}
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if previewImageModal}
-  <div class="modal-backdrop" on:click={() => (previewImageModal = null)}>
-    <div class="image-modal" on:click|stopPropagation>
-      <img src={previewImageModal} alt="大图预览" />
-      <button class="image-modal-close" on:click={() => (previewImageModal = null)} aria-label="关闭"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-    </div>
-  </div>
-{/if}
+<ImagePreview src={previewImageModal} on:close={() => (previewImageModal = null)} />
 
 {#if galaxyOpen}
   <!-- 记忆库星云：光点 = 会话；搜索 = 向量检索过滤 -->
@@ -4882,86 +4754,7 @@
 {/if}
 
 <style>
-:global(:root),
-  :global([data-theme="dark"]) {
-  color-scheme: dark;
-  scrollbar-color: var(--g4) transparent;
-/* P10.5 主题系统：变量由聚类脚本生成；dark=原视觉，light=翻转 */
-/* P13 主题系统：中性色阶（无彩色倾向），侧栏/对话区/设置面板层级靠明度微差区分 */
-  --g0: #0e0e10;
-  --g1: #17171a;
-  --g2: #202024;
-  --g3: #2c2c31;
-  --g4: #3d3d44;
-  --g5: #777b85;
-  --g6: #a7abb5;
-  --g7: #f4f5f7;
-  --overlay: rgba(0, 0, 0, 0.55);
-  --veil: rgba(255, 255, 255, 0.07);
-  --tint-blue-bg: #1f2c44;
-  --tint-blue-fg: #cdd2dd;
-  --tint-cyan-fg: #22d3ee;
-  --tint-green-bg: #1d3a28;
-  --tint-green-fg: #8fe3ae;
-  --tint-red-bg: #541d1d;
-  --tint-red-fg: #ff9b9b;
-  --tint-yellow-bg: #241f14;
-  --tint-yellow-fg: #facc15;
-  /* 成熟化品牌强调色：单色系唯一行动色（发送/主按钮/用户气泡/激活态） */
-  --brand: #4f7cff;
-  --brand-hover: #3d6bf5;
-  --brand-ink: #ffffff;
-}
-:global([data-theme="light"]) {
-  color-scheme: light;
-  scrollbar-color: var(--g4) transparent;
-  --g0: #f6f6f7;
-  --g1: #ffffff;
-  /* g2 在深色里是「凸起面/次级描边」，浅色必须给淡灰而不是纯白，否则气泡描边、
-     header 底边、模型 chip、按钮底色会全部隐形 */
-  --g2: #f0f0f2;
-  --g3: #e4e4e7;
-  --g4: #d4d4d8;
-  --g5: #7d7f88;
-  --g6: #4b4d55;
-  --g7: #17171a;
-  --overlay: rgba(15, 23, 42, 0.32);
-  --veil: rgba(13, 18, 28, 0.05);
-  --tint-red-bg: #fdeaea;
-  --tint-red-fg: #b3261e;
-  --tint-yellow-bg: #f7f1dd;
-  --tint-yellow-fg: #8a6d1a;
-  --tint-green-bg: #e2f4e8;
-  --tint-green-fg: #1e7a3f;
-  --tint-cyan-bg: #e0f4f7;
-  --tint-cyan-fg: #0e7490;
-  --tint-blue-bg: #e7edfb;
-  --tint-blue-fg: #2f5fd0;
-  --tint-purple-bg: #efe8fb;
-  --tint-purple-fg: #6d3fc0;
-  --tint-orange-bg: #fbf0e1;
-  --tint-orange-fg: #a05a1a;
-  --tint-pink-bg: #fbe9f1;
-  --tint-pink-fg: #b0326c;
-  --tint-gray-bg: #eceef2;
-  --tint-gray-fg: #4a4f5e;
-  /* 成熟化品牌强调色：与深色主题同值，保证双主题行动色一致 */
-  --brand: #4f7cff;
-  --brand-hover: #3d6bf5;
-  --brand-ink: #ffffff;
-}
 
-  :global(body) {
-    margin: 0;
-    background: var(--g1);
-    color: var(--g7);
-    font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
-    font-size: 14px;
-    -webkit-font-smoothing: antialiased;
-  }
-  :global(#app) {
-    height: 100vh;
-  }
   .app {
     display: flex;
     height: 100vh;
@@ -5501,28 +5294,6 @@
     margin-left: auto;
     color: var(--g7);
   }
-  .rename-modal {
-    min-width: 380px;
-  }
-  .rename-input {
-    width: 100%;
-    box-sizing: border-box;
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 10px;
-    color: var(--g7);
-    font-size: 14px;
-    padding: 9px 12px;
-    outline: none;
-  }
-  .rename-input:focus {
-    border-color: var(--g3);
-  }
-  .rename-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
   .sidebar-restore {
     position: absolute;
     left: 12px;
@@ -5722,12 +5493,6 @@
     border-radius: 6px;
     padding: 6px 8px;
     font-size: 12px;
-  }
-  .param-hint {
-    margin-top: 2px;
-    color: var(--g5);
-    font-size: 11.5px;
-    line-height: 1.65;
   }
   .chat-head {
     display: flex;
@@ -6252,8 +6017,8 @@
     height: 17px;
     display: block;
   }
-  .att-del svg,
-  .image-modal-close svg {
+
+  .att-del svg {
     width: 13px;
     height: 13px;
     display: block;
@@ -6582,37 +6347,6 @@
   }
 
   /* 图片预览模态框 */
-  .image-modal {
-    position: relative;
-    max-width: 90vw;
-    max-height: 90vh;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-  }
-  .image-modal img {
-    max-width: 90vw;
-    max-height: 90vh;
-    object-fit: contain;
-    border-radius: 8px;
-    box-shadow: 0 10px 30px var(--overlay);
-  }
-  .image-modal-close {
-    position: absolute;
-    top: -12px;
-    right: -12px;
-    width: 28px;
-    height: 28px;
-    background: var(--g2);
-    border: 1px solid var(--g4);
-    color: var(--g7);
-    border-radius: 50%;
-    cursor: pointer;
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
   .cp-dock {
     display: flex;
     justify-content: center;
@@ -7225,42 +6959,6 @@
     filter: brightness(1.12);
   }
   /* —— P8.2 工作区切换 —— */
-  .ws-current {
-    font-family: Consolas, monospace;
-    font-size: 12px;
-    color: var(--g6);
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 6px;
-    padding: 6px 8px;
-    word-break: break-all;
-  }
-  .ws-recent {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .ws-chip {
-    padding: 4px 10px;
-    border-radius: 12px;
-    border: 1px solid var(--g3);
-    background: var(--g1);
-    color: var(--g6);
-    font-size: 12px;
-    cursor: pointer;
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .ws-chip:hover {
-    border-color: var(--g4);
-    color: var(--g7);
-  }
-  .ws-chip.active {
-    border-color: var(--g5);
-    color: var(--g7);
-  }
   .menu-sep {
     height: 1px;
     background: var(--g2);
@@ -7270,68 +6968,6 @@
     color: var(--g5);
     font-size: 12px;
     padding: 8px 10px;
-  }
-  .btn {
-    padding: 9px 17px;
-    border-radius: 8px;
-    border: 1px solid var(--g3);
-    background: var(--g2);
-    color: var(--g7);
-    font-size: 13px;
-    font-weight: 550;
-    cursor: pointer;
-  }
-  .btn:hover {
-    background: var(--g3);
-  }
-  .btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  /* 主按钮不搞亮底高亮：用略强的底色+描边+字重表达「主要动作」，两个主题下都不刺眼 */
-  .btn.primary {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
-    font-weight: 650;
-  }
-  .btn.primary:hover {
-    background: var(--g4);
-    border-color: var(--g6);
-  }
-  .btn.danger {
-    background: var(--g2);
-    border-color: var(--g4);
-    color: var(--g7);
-  }
-  .btn.danger:hover {
-    background: var(--g3);
-    border-color: var(--g5);
-  }
-  .btn.ghost {
-    background: transparent;
-  }
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: var(--overlay);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 20;
-  }
-  /* P10-A：trace 时间线面板 */
-  .modal {
-    background: var(--g2);
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    width: 560px;
-    max-height: 85vh;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    padding: 16px;
-    gap: 12px;
   }
   /* P10.5 设置分区（左导航 + 内容区） */
   .settings-modal {
@@ -7492,9 +7128,6 @@
     border-radius: 4px;
     padding: 1px 6px;
   }
-  .flex-sp {
-    flex: 1;
-  }
   .mcp-cmd {
     font-family: Consolas, monospace;
     font-size: 11px;
@@ -7537,59 +7170,6 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-  }
-  .modal-head .hint {
-    flex: 1;
-    text-align: right;
-    font-size: 12px;
-    color: var(--g5);
-  }
-  .modal-actions {
-    display: flex;
-    gap: 6px;
-  }
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 9px;
-  }
-  .field label {
-    font-size: 12px;
-    color: var(--g6);
-  }
-  .field input,
-  .field select {
-    padding: 8px 10px;
-    border-radius: 8px;
-    border: 1px solid var(--g3);
-    background: var(--g1);
-    color: var(--g7);
-    font-size: 13px;
-  }
-  /* 原生下拉的弹出层由浏览器绘制：根元素的 color-scheme 不一定传导到弹出层，
-     必须在 select 元素自身声明，并给 option 显式配色，否则深色主题下是白底浅字 */
-  :global([data-theme="dark"]) select {
-    color-scheme: dark;
-  }
-  :global([data-theme="light"]) select {
-    color-scheme: light;
-  }
-  select {
-    accent-color: var(--g5);
-  }
-  select option {
-    background: var(--g1);
-    color: var(--g7);
-  }
-  select option:checked {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .sub-row {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    flex-wrap: wrap;
   }
   .chips {
     display: flex;
@@ -7638,27 +7218,6 @@
   .chip.del:hover {
     color: var(--g7);
     border-color: var(--g5);
-  }
-  .model-list {
-    overflow-y: auto;
-    border: 1px solid var(--g2);
-    border-radius: 8px;
-    padding: 6px;
-    max-height: 50vh;
-  }
-  .model-item {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    padding: 4px 6px;
-    font-family: Consolas, monospace;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .empty {
-    color: var(--g5);
-    padding: 12px;
-    text-align: center;
   }
   .del-key {
     padding: 7px 10px;
@@ -7722,23 +7281,5 @@
   .role-item :global(.csel) {
     font-size: 12px;
     padding: 6px 8px;
-  }
-  .m-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .m-caps {
-    display: flex;
-    gap: 4px;
-    font-size: 11px;
-  }
-  .m-tag {
-    background: var(--g2);
-    color: var(--g6);
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-family: sans-serif;
   }
 </style>

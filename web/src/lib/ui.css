@@ -1,0 +1,227 @@
+/* 设计系统基元（P19 App.svelte 拆分）：主题变量 + 全局共享的最小控件集。
+   只放「跨组件共用且无场景特化」的规则；场景覆盖留在各组件作用域样式里。 */
+
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+  scrollbar-color: var(--g4) transparent;
+  /* P10.5 主题系统：变量由聚类脚本生成；dark=原视觉，light=翻转 */
+  /* P13 主题系统：中性色阶（无彩色倾向），侧栏/对话区/设置面板层级靠明度微差区分 */
+  --g0: #0e0e10;
+  --g1: #17171a;
+  --g2: #202024;
+  --g3: #2c2c31;
+  --g4: #3d3d44;
+  --g5: #777b85;
+  --g6: #a7abb5;
+  --g7: #f4f5f7;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --veil: rgba(255, 255, 255, 0.07);
+  --tint-blue-bg: #1f2c44;
+  --tint-blue-fg: #cdd2dd;
+  --tint-cyan-fg: #22d3ee;
+  --tint-green-bg: #1d3a28;
+  --tint-green-fg: #8fe3ae;
+  --tint-red-bg: #541d1d;
+  --tint-red-fg: #ff9b9b;
+  --tint-yellow-bg: #241f14;
+  --tint-yellow-fg: #facc15;
+  /* 成熟化品牌强调色：单色系唯一行动色（发送/主按钮/用户气泡/激活态） */
+  --brand: #4f7cff;
+  --brand-hover: #3d6bf5;
+  --brand-ink: #ffffff;
+}
+
+[data-theme='light'] {
+  color-scheme: light;
+  scrollbar-color: var(--g4) transparent;
+  --g0: #f6f6f7;
+  --g1: #ffffff;
+  /* g2 在深色里是「凸起面/次级描边」，浅色必须给淡灰而不是纯白，否则气泡描边、
+     header 底边、模型 chip、按钮底色会全部隐形 */
+  --g2: #f0f0f2;
+  --g3: #e4e4e7;
+  --g4: #d4d4d8;
+  --g5: #7d7f88;
+  --g6: #4b4d55;
+  --g7: #17171a;
+  --overlay: rgba(15, 23, 42, 0.32);
+  --veil: rgba(13, 18, 28, 0.05);
+  --tint-red-bg: #fdeaea;
+  --tint-red-fg: #b3261e;
+  --tint-yellow-bg: #f7f1dd;
+  --tint-yellow-fg: #8a6d1a;
+  --tint-green-bg: #e2f4e8;
+  --tint-green-fg: #1e7a3f;
+  --tint-cyan-bg: #e0f4f7;
+  --tint-cyan-fg: #0e7490;
+  --tint-blue-bg: #e7edfb;
+  --tint-blue-fg: #2f5fd0;
+  --tint-purple-bg: #efe8fb;
+  --tint-purple-fg: #6d3fc0;
+  --tint-orange-bg: #fbf0e1;
+  --tint-orange-fg: #a05a1a;
+  --tint-pink-bg: #fbe9f1;
+  --tint-pink-fg: #b0326c;
+  --tint-gray-bg: #eceef2;
+  --tint-gray-fg: #4a4f5e;
+  /* 成熟化品牌强调色：与深色主题同值，保证双主题行动色一致 */
+  --brand: #4f7cff;
+  --brand-hover: #3d6bf5;
+  --brand-ink: #ffffff;
+}
+
+body {
+  margin: 0;
+  background: var(--g1);
+  color: var(--g7);
+  font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100vh;
+}
+
+/* —— 基元：按钮 —— */
+.btn {
+  padding: 9px 17px;
+  border-radius: 8px;
+  border: 1px solid var(--g3);
+  background: var(--g2);
+  color: var(--g7);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+}
+.btn:hover {
+  background: var(--g3);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* 主按钮不搞亮底高亮：用略强的底色+描边+字重表达「主要动作」，两个主题下都不刺眼 */
+.btn.primary {
+  background: var(--g3);
+  border-color: var(--g5);
+  color: var(--g7);
+  font-weight: 650;
+}
+.btn.primary:hover {
+  background: var(--g4);
+  border-color: var(--g6);
+}
+.btn.danger {
+  background: var(--g2);
+  border-color: var(--g4);
+  color: var(--g7);
+}
+.btn.danger:hover {
+  background: var(--g3);
+  border-color: var(--g5);
+}
+.btn.ghost {
+  background: transparent;
+}
+
+/* —— 基元：弹窗骨架 —— */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.modal {
+  background: var(--g2);
+  border: 1px solid var(--g3);
+  border-radius: 10px;
+  width: 560px;
+  max-height: 85vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.modal-head .hint {
+  flex: 1;
+  text-align: right;
+  font-size: 12px;
+  color: var(--g5);
+}
+.modal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* —— 基元：表单字段 —— */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.field label {
+  font-size: 12px;
+  color: var(--g6);
+}
+.field input,
+.field select {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--g3);
+  background: var(--g1);
+  color: var(--g7);
+  font-size: 13px;
+}
+/* 原生下拉的弹出层由浏览器绘制：根元素的 color-scheme 不一定传导到弹出层，
+   必须在 select 元素自身声明，并给 option 显式配色，否则深色主题下是白底浅字 */
+[data-theme='dark'] select {
+  color-scheme: dark;
+}
+[data-theme='light'] select {
+  color-scheme: light;
+}
+select {
+  accent-color: var(--g5);
+}
+select option {
+  background: var(--g1);
+  color: var(--g7);
+}
+select option:checked {
+  background: var(--g2);
+  color: var(--g7);
+}
+.sub-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* —— 基元：文案与占位 —— */
+.param-hint {
+  margin-top: 2px;
+  color: var(--g5);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+.empty {
+  color: var(--g5);
+  padding: 12px;
+  text-align: center;
+}
+.flex-sp {
+  flex: 1;
+}
