@@ -740,12 +740,36 @@
   let webBusy = false;
   let webError = ''; // 建页/导航失败的面板内提示（不再静默）
   let webShotT = 0; // 截图缓存穿透参数（动作后递增触发 <img> 重载）
-  const WEB_W = 1280;
-  const WEB_H = 900;
+  let webBodyW = 0;
+  let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
+  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 调试工具）
+  // 右侧面板宽度（左缘拖拽可调，320–820；对齐 ZCode 的自由尺寸）
+  let rpWidth = Number(localStorage.getItem('rpWidth')) || 420;
+  let rpResizing = false;
+  function startRpResize(e) {
+    e.preventDefault();
+    rpResizing = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    const move = (ev) => {
+      rpWidth = Math.min(820, Math.max(320, Math.round(window.innerWidth - ev.clientX)));
+    };
+    const up = () => {
+      rpResizing = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem('rpWidth', String(rpWidth));
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  }
 
   $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
   // 空白页（about:blank）显示空态引导；有地址就渲染截图
   $: webShowShot = !!(webActive && webActive.url && webActive.url !== 'about:blank');
+  $: if (rpTab === 'web' && webBodyW && webActive) webQueueViewport();
 
   async function loadWebState(keepActive = true) {
     try {
@@ -794,6 +818,38 @@
     return 'https://' + s;
   }
 
+  // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）
+  let webViewportTimer = null;
+  function webQueueViewport() {
+    clearTimeout(webViewportTimer);
+    webViewportTimer = setTimeout(webSyncViewport, 350);
+  }
+  function webSyncViewport() {
+    if (!webActive || rpTab !== 'web') return;
+    const w = Math.max(320, Math.min(1600, Math.round(webBodyW)));
+    const h = Math.max(400, Math.min(2400, Math.round(webBodyH)));
+    if (!webBodyW || !webBodyH) return;
+    webApi('/api/browser/viewport', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: webActive.id, w, h }),
+    })
+      .then(() => {
+        webShotT += 1;
+      })
+      .catch(() => {});
+  }
+  function webMenuAction(kind) {
+    webMenuOpen = false;
+    if (!webActive) return;
+    webApi(`/api/browser/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: webActive.id }),
+    }).catch((e) => {
+      webError = String(e.message || e);
+    });
+  }
   async function webNewTab() {
     if (webBusy) return;
     webBusy = true;
@@ -877,8 +933,10 @@
   async function webShotClick(ev) {
     if (!webActive || webBusy) return;
     const rect = ev.currentTarget.getBoundingClientRect();
-    const x = Math.round(((ev.clientX - rect.left) * WEB_W) / rect.width);
-    const y = Math.round(((ev.clientY - rect.top) * WEB_H) / rect.height);
+    const nw = ev.currentTarget.naturalWidth || 1280;
+    const nh = ev.currentTarget.naturalHeight || 900;
+    const x = Math.round(((ev.clientX - rect.left) * nw) / rect.width);
+    const y = Math.round(((ev.clientY - rect.top) * nh) / rect.height);
     webBusy = true;
     try {
       await webApi('/api/browser/click', {
@@ -3997,7 +4055,8 @@
   </main>
 
   {#if rightPanelOpen}
-    <aside class="right-panel" class:wide={rpTab === 'web'}>
+    <aside class="right-panel" class:resizing={rpResizing} style="width:{rpWidth}px">
+      <div class="rp-resize" title="拖拽调整宽度" on:mousedown={startRpResize}></div>
       <div class="rp-tabs">
         <button class:active={rpTab === 'artifacts'} on:click={() => { rpTab = 'artifacts'; loadArtifacts(); }}>产物</button>
         <button class:active={rpTab === 'preview'} on:click={() => { rpTab = 'preview'; if (!rpPreviewContent && rpFiles.length) previewFile(rpFiles[0]); }}>预览</button>
@@ -4073,11 +4132,28 @@
                 }}
               />
               <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
+              <button class="web-nav" title="更多" on:click={() => (webMenuOpen = !webMenuOpen)}>
+                <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
+              </button>
+              {#if webMenuOpen}
+                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                <div class="web-menu-backdrop" on:click={() => (webMenuOpen = false)}></div>
+                <div class="web-menu">
+                  <button on:click={() => webMenuAction('open-external')}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></svg>
+                    在默认浏览器中打开
+                  </button>
+                  <button on:click={() => webMenuAction('devtools')}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
+                    打开调试工具
+                  </button>
+                </div>
+              {/if}
             </div>
             {#if webError}
               <div class="web-error">{webError}</div>
             {/if}
-            <div class="web-body">
+            <div class="web-body" bind:clientWidth={webBodyW} bind:clientHeight={webBodyH}>
               {#if !webShowShot}
                 <div class="web-empty">
                   <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
@@ -5943,13 +6019,26 @@
   }
   /* —— 右侧栏：产物 / 预览 —— */
   .right-panel {
-    width: 360px;
     flex: none;
+    position: relative;
     display: flex;
     flex-direction: column;
     background: var(--g0);
     border-left: 1px solid var(--g3);
     min-height: 0;
+  }
+  /* 左缘拖拽调宽手柄（对齐 ZCode 的自由尺寸） */
+  .rp-resize {
+    position: absolute;
+    left: -3px;
+    top: 0;
+    bottom: 0;
+    width: 7px;
+    cursor: col-resize;
+    z-index: 6;
+  }
+  .right-panel.resizing {
+    border-left-color: var(--g5);
   }
   .rp-tabs {
     display: flex;
@@ -5991,9 +6080,6 @@
     background: var(--g1);
   }
   /* P20.1 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
-  .right-panel.wide {
-    width: 460px;
-  }
   .web-wrap {
     flex: 1;
     min-height: 0;
@@ -6074,12 +6160,53 @@
   .web-add:hover {
     color: var(--g7);
   }
+  .web-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+  }
+  .web-menu {
+    position: absolute;
+    top: calc(100% + 2px);
+    right: 8px;
+    z-index: 31;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 9px;
+    padding: 4px;
+    min-width: 180px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  }
+  .web-menu button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 10px;
+    border: none;
+    background: transparent;
+    color: var(--g7);
+    font-size: 12.5px;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .web-menu button:hover {
+    background: var(--g3);
+  }
+  .web-menu svg {
+    width: 14px;
+    height: 14px;
+    flex: none;
+    color: var(--g6);
+  }
   .web-toolbar {
     display: flex;
     align-items: center;
     gap: 4px;
     padding: 6px 8px;
     border-bottom: 1px solid var(--g3);
+    position: relative;
   }
   .web-nav {
     flex: none;

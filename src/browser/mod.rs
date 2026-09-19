@@ -1022,6 +1022,83 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("截图 base64 解码失败: {e}"))
 }
 
+/// 面板设置标签页视口（截图尺寸跟随面板大小——固定 1280×900 会在窄面板里
+/// 显示得又小又留大黑边，ZCode 的面板浏览器就是视口=面板尺寸）。
+pub async fn panel_viewport(id: &str, w: i64, h: i64) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    let w = w.clamp(320, 1600);
+    let h = h.clamp(400, 2400);
+    tab.cdp
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": false }),
+        )
+        .await?;
+    Ok(json!({ "ok": true, "w": w, "h": h }))
+}
+
+/// 用系统默认浏览器打开一个地址（explorer.exe 转发，URL 里的 & 不会被 cmd 吃掉）。
+fn open_url_in_system(url: &str) -> Result<Value, String> {
+    Command::new("explorer")
+        .arg(url)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map_err(|e| format!("打开系统浏览器失败: {e}"))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// 「在默认浏览器中打开」当前标签页。
+pub async fn panel_open_external(id: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    let url = tab
+        .cdp
+        .call(
+            "Runtime.evaluate",
+            json!({ "expression": "location.href", "returnByValue": true }),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    if url.is_empty() || url == "about:blank" {
+        return Err("当前是空白页，没有可打开的地址".into());
+    }
+    open_url_in_system(&url)
+}
+
+/// 「打开调试工具」：取该标签页的 DevTools 前端地址（Edge 托管的 inspector，
+/// 经 ws 连回本实例的 headless 页面），用系统默认浏览器打开。
+pub async fn panel_devtools(id: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    let client = dev_client()?;
+    let text = client
+        .get(format!("http://127.0.0.1:{}/json/list", session.port))
+        .send()
+        .await
+        .map_err(|e| format!("查询 CDP 端点失败: {e}"))?
+        .text()
+        .await
+        .map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let front = v
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|t| t.get("id").and_then(Value::as_str) == Some(tab.id.as_str()))
+                .and_then(|t| t.get("devtoolsFrontendUrl").and_then(Value::as_str).map(str::to_string))
+        });
+    let Some(front) = front else {
+        return Err("该标签页没有调试前端（可能刚被关闭）".into());
+    };
+    open_url_in_system(&front)
+}
+
 /// 面板点击（视口坐标）→ 等可能的导航沉降。
 pub async fn panel_click(id: &str, x: i64, y: i64) -> Result<Value, String> {
     let session = current_session().await?;

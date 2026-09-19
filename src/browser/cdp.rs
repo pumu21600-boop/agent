@@ -136,18 +136,6 @@ impl Cdp {
         }
     }
 
-    /// 同步注册一个事件等待器，稍后再 await 回传端（先注册后触发动作的时序由调用方保证）。
-    pub fn register_wait(
-        &self,
-        event: &str,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<Value, String>>, String> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(ToActor::WaitEvent { method: event.into(), reply: tx })
-            .map_err(|_| "CDP actor 已退出".to_string())?;
-        Ok(rx)
-    }
-
     /// 发命令并等指定事件到达（等待器先同步注册、命令后入队——同一条 FIFO 通道，
     /// actor 处理顺序即注册顺序，无竞态）。事件超时视为失败（导航没完成）。
     pub async fn call_and_wait_event(

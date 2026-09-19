@@ -115,6 +115,26 @@ pub(super) async fn browser_reload(Json(req): Json<Value>) -> Result<Json<Value>
     crate::browser::panel_reload(id).await.map(Json).map_err(bad)
 }
 
+/// POST /api/browser/viewport —— 设置标签页视口（截图尺寸跟随面板大小）。
+pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    let w = req.get("w").and_then(Value::as_i64).unwrap_or(1280);
+    let h = req.get("h").and_then(Value::as_i64).unwrap_or(900);
+    crate::browser::panel_viewport(id, w, h).await.map(Json).map_err(bad)
+}
+
+/// POST /api/browser/open-external —— 在系统默认浏览器打开当前页。
+pub(super) async fn browser_open_external(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    crate::browser::panel_open_external(id).await.map(Json).map_err(bad)
+}
+
+/// POST /api/browser/devtools —— 打开该标签页的调试工具（系统浏览器里的 DevTools 前端）。
+pub(super) async fn browser_devtools(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    crate::browser::panel_devtools(id).await.map(Json).map_err(bad)
+}
+
 /// DELETE /api/browser/tab?id= —— 关标签页。
 pub(super) async fn browser_close_tab(Query(q): Query<ScreenshotQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match crate::browser::panel_close_tab(&q.id).await {
