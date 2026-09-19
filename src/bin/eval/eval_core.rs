@@ -3,8 +3,8 @@
 //! **HTTP 黑盒驱动**：对运行中的服务发真实对话（/api/chat SSE），断言文件系统与
 //! SSE 事件流。主服务代码零改动——本模块只被 `src/bin/eval.rs`（CLI 壳）引用。
 //!
-//! 断言 7 种：file_exists / file_not_exists / file_contains / file_not_contains /
-//! no_new_files / files_unchanged / sse_event。
+//! 断言 8 种：file_exists / file_not_exists / file_contains / file_not_contains /
+//! no_new_files / files_unchanged / sse_event / no_sse_event（P20：负向事件断言）。
 //!
 //! 任务定义（evals/tasks/*.json）：
 //! `name / prompt / plan_mode / approval_mode / timeout_secs / setup_files / assertions`
@@ -55,7 +55,7 @@ fn default_timeout() -> u64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Assertion {
     /// file_exists | file_not_exists | file_contains | file_not_contains |
-    /// no_new_files | files_unchanged | sse_event
+    /// no_new_files | files_unchanged | sse_event | no_sse_event
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
@@ -77,6 +77,7 @@ impl Assertion {
             "no_new_files" => "无新增文件".into(),
             "files_unchanged" => "已有文件内容未被改动".into(),
             "sse_event" => format!("SSE 出现事件: {}", self.event),
+            "no_sse_event" => format!("SSE 不出现事件: {}", self.event),
             other => format!("未知断言类型: {other}"),
         }
     }
@@ -154,6 +155,8 @@ pub fn run_assertion(
             }
         }),
         "sse_event" => sse_events.contains(&a.event),
+        // P20：负向事件断言——如 auto 档「零确认」要求审批卡事件（approval_request）绝不出现
+        "no_sse_event" => !sse_events.contains(&a.event),
         _ => false, // 未知类型一律失败（防任务集手滑静默通过）
     };
     (ok, desc)
@@ -393,6 +396,9 @@ mod tests {
         assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &sse).0);
         assert!(run_assertion(&a("sse_event", "", "", "done"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("sse_event", "", "", "plan_proposal"), &ws, &before, &sse).0);
+        // P20：负向事件断言（事件缺席=通过，出现=失败）
+        assert!(run_assertion(&a("no_sse_event", "", "", "approval_request"), &ws, &before, &sse).0);
+        assert!(!run_assertion(&a("no_sse_event", "", "", "done"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("unknown_kind", "", "", ""), &ws, &before, &sse).0, "未知断言类型必须失败");
     }
 
@@ -473,7 +479,7 @@ mod tests {
     /// 新增任务时手滑写错断言类型 / 重名，CI 就会红（而不是跑评测时才发现）。
     #[test]
     fn repo_task_set_is_valid() {
-        const KNOWN: [&str; 7] = [
+        const KNOWN: [&str; 8] = [
             "file_exists",
             "file_not_exists",
             "file_contains",
@@ -481,6 +487,7 @@ mod tests {
             "no_new_files",
             "files_unchanged",
             "sse_event",
+            "no_sse_event",
         ];
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals").join("tasks");
         let tasks = load_tasks(&dir).expect("仓库任务集应能全部解析");

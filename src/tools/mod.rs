@@ -186,6 +186,60 @@ fn builtin_tools() -> Vec<ToolSpec> {
             }),
             danger_level: 2,
         },
+        ToolSpec {
+            name: "browser_open",
+            description: "打开内置浏览器（无头 Edge/Chrome，本进程直连控制）并加载网页，返回页面结构快照。需要看 JS 渲染后的页面、或要在页面上点击/输入时用本工具组，纯读静态内容用 web_fetch 更快。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "完整 URL（http:// 或 https://）" }
+                },
+                "required": ["url"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
+            name: "browser_snapshot",
+            description: "获取当前浏览器页面的结构快照（可交互元素带 ref 编号），并与上次快照做增量对比（新增/移除/变化）。点击或输入前先拿最新 ref。",
+            parameters: json!({ "type": "object", "properties": {} }),
+            danger_level: 0,
+        },
+        ToolSpec {
+            name: "browser_click",
+            description: "在当前浏览器页面点击一个元素。优先语义定位：ref（快照编号）或 text（元素可见文本）；都不给时可用视口坐标 x/y 兜底。点击后返回最新快照。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "快照里的元素编号，如 e12" },
+                    "text": { "type": "string", "description": "元素可见文本（如「登录」），语义匹配" },
+                    "x": { "type": "integer", "description": "视口横坐标（语义定位失败时的兜底）" },
+                    "y": { "type": "integer", "description": "视口纵坐标" }
+                }
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
+            name: "browser_type",
+            description: "向当前浏览器页面的输入框输入文字。定位：ref 或 label（占位符/名称）。clear=true 先清空，submit=true 输入后回车（如搜索）。返回最新快照。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "ref": { "type": "string", "description": "快照里的元素编号" },
+                    "label": { "type": "string", "description": "输入框的占位符或名称（语义匹配）" },
+                    "text": { "type": "string", "description": "要输入的文字" },
+                    "clear": { "type": "boolean", "description": "输入前先清空（默认 false）" },
+                    "submit": { "type": "boolean", "description": "输入后按回车（默认 false）" }
+                },
+                "required": ["text"]
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
+            name: "browser_close",
+            description: "关闭内置浏览器（清理进程；下次 browser_open 会重新拉起）。页面操作结束后调用以免残留。",
+            parameters: json!({ "type": "object", "properties": {} }),
+            danger_level: 0,
+        },
     ]
 }
 
@@ -246,6 +300,12 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
         "git" => git(args, cfg).await,
+        // P20 浏览器内核：Chromium 自带站点隔离即边界，不进 Windows 沙箱
+        "browser_open" => crate::browser::open(args, cfg.max_chars).await,
+        "browser_snapshot" => crate::browser::snapshot(args, cfg.max_chars).await,
+        "browser_click" => crate::browser::click(args, cfg.max_chars).await,
+        "browser_type" => crate::browser::type_text(args, cfg.max_chars).await,
+        "browser_close" => crate::browser::close(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -1001,12 +1061,15 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// shell / git 共用：沙箱（或本机直跑）内跑命令行，格式化输出。
+/// P20 沙箱统一：选档交给 SandboxTier 对象（探测链解析出的生效档，含 AC→受限回退），
+/// 调用方不再手工拼 restricted/appcontainer 标志位。
 async fn run_in_sandbox(
     cfg: &ExecConfig,
     application: PathBuf,
     command_line: String,
     timeout_ms: u32,
 ) -> Result<String, String> {
+    let tier = sandbox::probes::effective_tier(&cfg.sandbox, cfg.unsandboxed);
     let spec = SandboxSpec {
         application,
         command_line,
@@ -1016,11 +1079,11 @@ async fn run_in_sandbox(
             memory_mb: cfg.sandbox.memory_mb,
             active_processes: cfg.sandbox.active_processes,
         },
-        restricted: !cfg.unsandboxed,
-        appcontainer: !cfg.unsandboxed && cfg.sandbox.mode == "appcontainer",
-        allow_network: cfg.sandbox.allow_network,
+        restricted: false,
+        appcontainer: false,
+        allow_network: false,
     };
-    let out = spawn_blocking(move || sandbox::run(&spec))
+    let out = spawn_blocking(move || tier.run(&spec))
         .await
         .map_err(|e| format!("沙箱任务失败: {e}"))?
         .map_err(|e| format!("沙箱拉起失败: {e}"))?;

@@ -1,0 +1,18 @@
+{
+  "name": "csv-clean",
+  "prompt": "工作区里有 data.csv。把它清洗后写出 clean.csv：去掉空行、去掉完全重复的行，其余内容（含列名行）保持原样。全程用工具完成，不要向用户提问。",
+  "plan_mode": false,
+  "approval_mode": "auto",
+  "timeout_secs": 180,
+  "setup_files": {
+    "data.csv": "name,age,city\n张三,25,北京\n李四,,上海\n\n张三,25,北京\n王五,30,\n"
+  },
+  "assertions": [
+    { "type": "file_exists", "path": "clean.csv" },
+    { "type": "file_contains", "path": "clean.csv", "needle": "张三,25,北京" },
+    { "type": "file_contains", "path": "clean.csv", "needle": "王五,30," },
+    { "type": "file_not_contains", "path": "clean.csv", "needle": "\n\n" },
+    { "type": "no_sse_event", "event": "approval_request" },
+    { "type": "sse_event", "event": "done" }
+  ]
+}

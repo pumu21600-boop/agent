@@ -2,6 +2,7 @@
 //!
 //! 模块骨架对齐总架构 §17。核心循环 P2、沙箱 P3、工具 P4 依次后置。
 
+mod browser;
 mod config;
 mod context;
 mod core;

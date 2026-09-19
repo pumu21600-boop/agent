@@ -52,6 +52,8 @@ impl RiskLevel {
 const KNOWN_TOOLS: &[&str] = &[
     "read_file", "read_page", "read_skill", "search", "web_fetch", "web_search", "write_file",
     "edit_file", "shell", "git",
+    // P20 浏览器内核（打开/快照/关闭只读；点击/输入是页面操作）
+    "browser_open", "browser_snapshot", "browser_close", "browser_click", "browser_type",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -142,6 +144,15 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         // 只读工具：恒定 Safe
         "read_file" | "read_page" | "search" | "web_fetch" | "web_search" => {
             (RiskLevel::Safe, "只读安全查询操作".into())
+        }
+
+        // P20 浏览器内核：打开/快照/关闭只动内置无头浏览器，视为只读；
+        // 点击/输入会改变远端页面状态（可能提交表单），按常规改动审批
+        "browser_open" | "browser_snapshot" | "browser_close" => {
+            (RiskLevel::Safe, "浏览器只读操作（打开/快照/关闭）".into())
+        }
+        "browser_click" | "browser_type" => {
+            (RiskLevel::Normal, "浏览器页面操作（点击/输入，可能触发页面状态变更）".into())
         }
 
         // 读技能：只读 SKILL.md，恒定 Safe
@@ -822,7 +833,7 @@ mod tests {
         // 已登记但无专门规则的工具（登记表里存在）按常规处理，不再一律高危
         assert!(KNOWN_TOOLS.contains(&"write_file"));
         assert!(KNOWN_TOOLS.contains(&"edit_file"));
-        assert_eq!(KNOWN_TOOLS.len(), 10, "新增内置工具须同步登记到 KNOWN_TOOLS");
+        assert_eq!(KNOWN_TOOLS.len(), 15, "新增内置工具须同步登记到 KNOWN_TOOLS");
     }
 
     #[test]

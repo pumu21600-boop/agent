@@ -86,15 +86,55 @@ http
         const loopForever = /死循环/.test(lastText);
         // 慢循环：同死循环，但每步先等 1.5s——留出「运行中插话」的窗口（验证 steering）
         const slowLoop = /慢循环/.test(lastText);
-        // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环剧本除外
+        // 多步剧本（P20）：「清洗」= read_file → write_file → 最终回答；
+        // 「浏览 <url>」= browser_open → browser_click → 最终回答（按 example.com 语义点链接）
+        const browseUrl = (lastText.match(/浏览\s*(\S+)/) || [])[1];
+        const cleaning = /清洗/.test(lastText);
+        const toolMsgCount = msgs.filter((m) => m.role === 'tool').length;
+        // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环/多步剧本除外
         const wantsTool =
-          hasToolsParam && (loopForever || slowLoop || (!hasToolMsg && /读|编辑|插件搜索/.test(lastText)));
+          hasToolsParam &&
+          (loopForever ||
+            slowLoop ||
+            browseUrl ||
+            cleaning ||
+            (!hasToolMsg && /读|编辑|插件搜索/.test(lastText)));
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
         });
+        /** 多步剧本的最终回答（与单步剧本同形：reasoning 分片 + content 分片）。 */
+        const emitFinal = (text) => {
+          sendSSE(res, { choices: [{ index: 0, delta: { reasoning_content: '剧本步骤已走完，' } }] });
+          sendSSE(res, { choices: [{ index: 0, delta: { reasoning_content: '总结回答即可。' } }] });
+          for (let i = 0; i < text.length; i += 6) {
+            sendSSE(res, { choices: [{ index: 0, delta: { content: text.slice(i, i + 6) } }] });
+          }
+          sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+          res.write('data: [DONE]\n\n');
+          res.end();
+        };
         if (wantsTool) {
-          if (!loopForever && /插件搜索/.test(lastText)) {
+          if (browseUrl) {
+            if (toolMsgCount === 0) {
+              emitToolCall(res, 'browser_open', { url: browseUrl });
+            } else if (toolMsgCount === 1) {
+              // example.com 语义：点击可见文本匹配的链接，验证真实站点语义定位（链接文本以快照为准）
+              emitToolCall(res, 'browser_click', { text: 'Learn more' });
+            } else {
+              emitFinal('已按剧本完成浏览：打开页面、语义点击链接并拿到最新快照。（mock 浏览循环闭环）');
+            }
+          } else if (cleaning) {
+            // 清洗规则（与 eval 任务 csv-clean 一致）：去空行 + 去重复行
+            const CLEANED = 'name,age,city\n张三,25,北京\n李四,,上海\n王五,30,';
+            if (toolMsgCount === 0) {
+              emitToolCall(res, 'read_file', { path: 'data.csv' });
+            } else if (toolMsgCount === 1) {
+              emitToolCall(res, 'write_file', { path: 'clean.csv', content: CLEANED });
+            } else {
+              emitFinal('已清洗 data.csv 并写出 clean.csv（去空行、去重复行）。（mock 清洗循环闭环）');
+            }
+          } else if (!loopForever && /插件搜索/.test(lastText)) {
             // 插件工具剧本（P19）：调用目录形态工具插件 wasm__web_search__search，
             // 验证 模型 → 审批门（wasm 工具风险研判）→ WASM 引擎 → 结果回填 全链路
             emitToolCall(res, 'wasm__web_search__search', { query: '插件契约 v1' });
