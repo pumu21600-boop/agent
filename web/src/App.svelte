@@ -733,12 +733,12 @@
   let rpPreviewPath = '';
   let rpPreviewContent = '';
 
-  // —— P20.1 网页面板（内置无头浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例）——
-  let webPanelOpen = false;
+  // —— P20.1 网页（右侧面板「网页」页签：内置无头浏览器截图渲染 + 坐标回传，与 agent 工具共享实例）——
   let webTabs = []; // { id, agent, title, url }
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
+  let webError = ''; // 建页/导航失败的面板内提示（不再静默）
   let webShotT = 0; // 截图缓存穿透参数（动作后递增触发 <img> 重载）
   const WEB_W = 1280;
   const WEB_H = 900;
@@ -766,16 +766,6 @@
     }
   }
 
-  function openWebPanel() {
-    webPanelOpen = !webPanelOpen;
-    if (webPanelOpen) {
-      terminalOpen = false;
-      rightPanelOpen = false;
-      extOpen = false;
-      loadWebState();
-    }
-  }
-
   function webNormalizeUrl(u) {
     const s = (u || '').trim();
     if (!s) return '';
@@ -786,21 +776,29 @@
   async function webNewTab() {
     if (webBusy) return;
     webBusy = true;
+    webError = '';
     try {
       const r = await fetch('/api/browser/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
       }).then((r) => r.json());
-      if (r.id) webActiveId = r.id;
+      if (r.id) {
+        webActiveId = r.id;
+      } else {
+        webError = r.error || '新建标签页失败';
+      }
       await loadWebState(true);
       webShotT += 1;
-    } catch {}
+    } catch (e) {
+      webError = String(e.message || e);
+    }
     webBusy = false;
   }
 
   async function webCloseTab(id) {
     webBusy = true;
+    webError = '';
     try {
       await fetch(`/api/browser/tab?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
       await loadWebState();
@@ -811,17 +809,32 @@
 
   async function webGo() {
     const url = webNormalizeUrl(webAddress);
-    if (!url || !webActive || webBusy) return;
+    if (!url || webBusy) return;
     webBusy = true;
+    webError = '';
     try {
-      await fetch('/api/browser/navigate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: webActive.id, url }),
-      });
+      if (!webActive) {
+        // 没有标签页：地址栏回车 = 自动开新页并导航
+        const r = await fetch('/api/browser/new', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        }).then((r) => r.json());
+        if (r.id) webActiveId = r.id;
+        else webError = r.error || '打开网页失败';
+      } else {
+        const r = await fetch('/api/browser/navigate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: webActive.id, url }),
+        }).then((r) => r.json());
+        if (r.error) webError = r.error;
+      }
       webShotT += 1;
       await loadWebState();
-    } catch {}
+    } catch (e) {
+      webError = String(e.message || e);
+    }
     webBusy = false;
   }
 
@@ -3426,14 +3439,7 @@
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="M14.5 4.5v15"/><path d="M17.5 9.5h1M17.5 12.5h1" stroke-linecap="round"/></svg>
         </button>
-        <button
-          class="head-btn"
-          class:active={webPanelOpen}
-          title="网页（内置浏览器）"
-          on:click={openWebPanel}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
-        </button>
+
       </div>
     </header>
 
@@ -3960,12 +3966,15 @@
   </main>
 
   {#if rightPanelOpen}
-    <aside class="right-panel">
+    <aside class="right-panel" class:wide={rpTab === 'web'}>
       <div class="rp-tabs">
         <button class:active={rpTab === 'artifacts'} on:click={() => { rpTab = 'artifacts'; loadArtifacts(); }}>产物</button>
         <button class:active={rpTab === 'preview'} on:click={() => { rpTab = 'preview'; if (!rpPreviewContent && rpFiles.length) previewFile(rpFiles[0]); }}>预览</button>
+        <button class:active={rpTab === 'web'} on:click={() => { rpTab = 'web'; loadWebState(); }}>网页</button>
         <span class="flex-sp"></span>
-        <button class="rp-refresh" title="刷新产物清单" on:click={loadArtifacts}>↻</button>
+        {#if rpTab === 'artifacts'}
+          <button class="rp-refresh" title="刷新产物清单" on:click={loadArtifacts}>↻</button>
+        {/if}
       </div>
       <div class="rp-body">
         {#if rpTab === 'artifacts'}
@@ -3980,93 +3989,85 @@
               </button>
             {/each}
           {/if}
-        {:else}
+        {:else if rpTab === 'preview'}
           {#if rpPreviewPath}
             <div class="rp-preview-path">{rpPreviewPath}</div>
             <pre class="rp-preview">{rpPreviewContent || '（空文件）'}</pre>
           {:else}
             <div class="rp-empty">从「产物」里点一个文件查看内容</div>
           {/if}
-        {/if}
-      </div>
-    </aside>
-  {/if}
-
-  {#if webPanelOpen}
-    <aside class="web-panel">
-      <div class="web-tabbar">
-        <div class="web-tabs">
-          {#each webTabs as t (t.id)}
-            <button
-              class="web-tab"
-              class:active={t.id === webActiveId}
-              title={t.url || 'about:blank'}
-              on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; }}
-            >
-              <span class="web-tab-title">{t.title || (t.url === 'about:blank' ? '空白页' : t.url) || '空白页'}</span>
-              {#if t.agent}<span class="web-tab-agent" title="agent 浏览器工具的工作页">agent</span>{/if}
-              <span
-                class="web-tab-x"
-                title="关闭标签页"
-                role="button"
-                tabindex="-1"
-                on:click|stopPropagation={() => webCloseTab(t.id)}
-              >×</span>
-            </button>
-          {/each}
-        </div>
-        <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
-        <span class="flex-sp"></span>
-        <button class="rp-refresh" title="刷新面板状态" on:click={() => loadWebState()}>↻</button>
-        <button class="btn ghost" on:click={() => (webPanelOpen = false)}>关闭</button>
-      </div>
-      <div class="web-toolbar">
-        <button class="web-nav" title="后退" disabled={!webActive || webBusy} on:click={() => webAction('back')}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 6-6 6 6 6"/></svg>
-        </button>
-        <button class="web-nav" title="前进" disabled={!webActive || webBusy} on:click={() => webAction('forward')}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6 6 6-6 6"/></svg>
-        </button>
-        <button class="web-nav" title="刷新" disabled={!webActive || webBusy} on:click={() => webAction('reload')}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95"/><path d="M19 3.5V7h-3.5"/></svg>
-        </button>
-        <input
-          class="web-address"
-          placeholder="输入网址后回车"
-          bind:value={webAddress}
-          disabled={!webActive || webBusy}
-          spellcheck="false"
-          on:keydown={(e) => {
-            if (e.isComposing || e.keyCode === 229) return;
-            if (e.key === 'Enter') { e.preventDefault(); webGo(); }
-          }}
-        />
-      </div>
-      <div class="web-body">
-        {#if !webActive}
-          <div class="web-empty">
-            <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
-            <div class="web-empty-title">网页</div>
-            <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
-          </div>
-        {:else if !webShowShot}
-          <div class="web-empty">
-            <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
-            <div class="web-empty-title">网页</div>
-            <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
-          </div>
         {:else}
-          {#if webBusy}<div class="web-loading">加载中…</div>{/if}
-          <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-          <img
-            class="web-shot"
-            class:busy={webBusy}
-            src={`/api/browser/screenshot?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
-            alt="页面截图"
-            draggable="false"
-            on:click={webShotClick}
-            on:wheel={webShotWheel}
-          />
+          <div class="web-wrap">
+            {#if webTabs.length}
+              <div class="web-tabbar">
+                {#each webTabs as t (t.id)}
+                  <button
+                    class="web-tab"
+                    class:active={t.id === webActiveId}
+                    title={t.url || 'about:blank'}
+                    on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; }}
+                  >
+                    <span class="web-tab-title">{t.title || (t.url === 'about:blank' ? '空白页' : t.url) || '空白页'}</span>
+                    {#if t.agent}<span class="web-tab-agent" title="agent 浏览器工具的工作页">agent</span>{/if}
+                    <span
+                      class="web-tab-x"
+                      title="关闭标签页"
+                      role="button"
+                      tabindex="-1"
+                      on:click|stopPropagation={() => webCloseTab(t.id)}
+                    >×</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+            <div class="web-toolbar">
+              <button class="web-nav" title="后退" disabled={!webActive || webBusy} on:click={() => webAction('back')}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 6-6 6 6 6"/></svg>
+              </button>
+              <button class="web-nav" title="前进" disabled={!webActive || webBusy} on:click={() => webAction('forward')}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6 6 6-6 6"/></svg>
+              </button>
+              <button class="web-nav" title="刷新" disabled={!webActive || webBusy} on:click={() => webAction('reload')}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95"/><path d="M19 3.5V7h-3.5"/></svg>
+              </button>
+              <input
+                class="web-address"
+                placeholder="输入网址后回车"
+                bind:value={webAddress}
+                disabled={webBusy}
+                spellcheck="false"
+                on:keydown={(e) => {
+                  if (e.isComposing || e.keyCode === 229) return;
+                  if (e.key === 'Enter') { e.preventDefault(); webGo(); }
+                }}
+              />
+              <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
+            </div>
+            {#if webError}
+              <div class="web-error">{webError}</div>
+            {/if}
+            <div class="web-body">
+              {#if !webShowShot}
+                <div class="web-empty">
+                  <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
+                  <div class="web-empty-title">网页</div>
+                  <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
+                </div>
+              {:else}
+                {#if webBusy}<div class="web-loading">加载中…</div>{/if}
+                <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+                <img
+                  class="web-shot"
+                  class:busy={webBusy}
+                  src={`/api/browser/screenshot?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
+                  alt="页面截图"
+                  draggable="false"
+                  on:click={webShotClick}
+                  on:wheel={webShotWheel}
+                />
+              {/if}
+            </div>
+          </div>
         {/if}
       </div>
     </aside>
@@ -5959,14 +5960,19 @@
     background: var(--g1);
   }
   /* P20.1 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
-  .web-panel {
+  .right-panel.wide {
     width: 460px;
-    flex: none;
+  }
+  .web-wrap {
+    flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    background: var(--g0);
-    border-left: 1px solid var(--g3);
-    min-height: 0;
+  }
+  .web-error {
+    color: var(--tint-red-fg, #ff6b6b);
+    font-size: 12px;
+    padding: 4px 2px 0;
   }
   .web-tabbar {
     display: flex;
@@ -6136,10 +6142,6 @@
     border-radius: 6px;
     padding: 2px 8px;
     z-index: 2;
-  }
-  :global(body.has-wallpaper) .web-panel {
-    background: color-mix(in srgb, var(--g0) 60%, transparent);
-    border-left-color: color-mix(in srgb, var(--g4) 30%, transparent);
   }
   .ext-panel .rp-tabs {
     flex-wrap: nowrap;
