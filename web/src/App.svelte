@@ -1830,13 +1830,17 @@
                 loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
                 if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
               }
-              else if (d.context_usage)
-                ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
+              else if (d.context_usage) {
+                // 用量事件按会话归属：只更新正在看的会话（后台会话的流不污染当前圆环）
+                if (skey === curKey())
+                  ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
+              }
               else if (d.api_usage) {
-                apiTotals = {
-                  prompt: apiTotals.prompt + (d.api_usage.prompt_tokens || 0),
-                  cached: apiTotals.cached + (d.api_usage.cached_tokens || 0),
-                };
+                if (skey === curKey())
+                  apiTotals = {
+                    prompt: apiTotals.prompt + (d.api_usage.prompt_tokens || 0),
+                    cached: apiTotals.cached + (d.api_usage.cached_tokens || 0),
+                  };
               } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
@@ -1968,6 +1972,7 @@
       currentTitle = sessions.find((x) => x.id === id)?.title ?? currentTitle;
       syncCur();
       resetCtxUsage();
+      apiTotals = { prompt: 0, cached: 0 }; // 命中率按会话累计，切会话即重置
       dockCp = null;
       refreshDock();
       return;
@@ -1984,9 +1989,13 @@
       }
       currentSessionId = id;
       currentTitle = r.title || (sessions.find((x) => x.id === id)?.title ?? '');
-      sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };
+      // 本地已有缓冲就用本地（含流式思考等尚未落盘的新内容），没有才从服务端重建
+      if (!sessionMsgs[id]) {
+        sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };
+      }
       syncCur();
       resetCtxUsage();
+      apiTotals = { prompt: 0, cached: 0 }; // 命中率按会话累计，切会话即重置
       dockCp = null;
       if (r.warning) settingsMsg = r.warning;
       if (r.switched) {
@@ -2352,7 +2361,8 @@
           id: nextId(),
           role: 'assistant',
           content: contentText(m.content),
-          thinking: '',
+          // 027：思考内容已随消息落盘（reasoning_content），切回会话时恢复
+          thinking: m.reasoning_content || '',
           tools: (m.tool_calls || []).map((tc) => ({
             id: tc.id,
             name: tc.function?.name || '?',

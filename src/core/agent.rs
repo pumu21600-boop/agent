@@ -660,8 +660,13 @@ pub async fn run_task(
                     )),
                 }
             }
-            // P6：最终回答写入会话并落盘（与前端看到的一致）
-            msgs.push(json!({ "role": "assistant", "content": final_text }));
+            // P6：最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
+            // 随消息持久化，前端切回会话时恢复；回放侧由 replay.rs 按渠道契约决定去留）
+            let mut final_msg = json!({ "role": "assistant", "content": final_text });
+            if !turn.reasoning.is_empty() {
+                final_msg["reasoning_content"] = json!(turn.reasoning);
+            }
+            msgs.push(final_msg);
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
             emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             observability::event(
@@ -694,7 +699,7 @@ pub async fn run_task(
         }
         prev_tool_sigs = sigs;
 
-        // 回填 assistant 消息（含 tool_calls）
+        // 回填 assistant 消息（含 tool_calls）；思考内容随消息落盘（前端切回会话可恢复）
         let calls_json: Vec<Value> = turn
             .tool_calls
             .iter()
@@ -706,11 +711,15 @@ pub async fn run_task(
                 })
             })
             .collect();
-        msgs.push(json!({
+        let mut asst_msg = json!({
             "role": "assistant",
             "content": if turn.content.is_empty() { Value::Null } else { json!(turn.content) },
             "tool_calls": calls_json,
-        }));
+        });
+        if !turn.reasoning.is_empty() {
+            asst_msg["reasoning_content"] = json!(turn.reasoning);
+        }
+        msgs.push(asst_msg);
 
         // —— P12 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
         let exec_cfg = ExecConfig {
