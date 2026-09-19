@@ -8,10 +8,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{run, SandboxLimits, SandboxSpec};
+use super::{
+    backend::{AppContainerTier, SandboxTier, UnsandboxedTier},
+    run, SandboxLimits, SandboxSpec,
+};
 // 仅测试路径（probe_memory_cap）用到，放这里避免非测试构建的 unused import 告警
 #[cfg(test)]
 use super::SandboxOutput;
+use crate::observability::{self, EventType};
 use crate::{config::SandboxConfig, tools::workspace_root};
 
 /// 探针结果（SSE/HTTP 直出 JSON）。
@@ -35,6 +39,141 @@ pub fn run_fast_suite(cfg: &SandboxConfig) -> Vec<ProbeResult> {
         probe_workspace_read(limits),
         probe_timeout_kill(limits),
     ]
+}
+
+/// P20 档位探测链：把同一套快速探针跑到**指定档位**的 spawn 通道上。
+/// privilege_strip 是受限 token 内省，只对受限语义的档位有意义（AppContainer 由
+/// LowBox 派生 token，特权面不同，直跑档无 token 剥离）——其余档位自动跳过该项。
+pub fn run_fast_suite_for_tier(tier: &dyn SandboxTier, limits: SandboxLimits) -> Vec<ProbeResult> {
+    let mut out = vec![
+        probe_echo_via(tier, limits),
+        probe_env_trim_via(tier, limits),
+        probe_workspace_read_via(tier, limits),
+        probe_timeout_kill_via(tier, limits),
+    ];
+    if tier.id() == "restricted" {
+        out.insert(2, probe_privilege_strip(limits));
+    }
+    out
+}
+
+/// 直跑档 canary：完整 token echo 一发（证明本档可用，不验证隔离——它没有隔离面）。
+pub fn canary_unsandboxed(limits: SandboxLimits) -> ProbeResult {
+    probe_echo_via(&UnsandboxedTier, limits)
+}
+
+// —— 通用「经指定档位 spawn」的探针实现 ——
+// 与上面面向 restricted 的四个探针同一套断言，只是拉起通道换成 tier.spawn。
+
+fn tier_spec(command: &str, working_dir: &Path, limits: SandboxLimits) -> SandboxSpec {
+    let cmd = super::system_cmd();
+    SandboxSpec {
+        application: cmd.clone(),
+        command_line: format!("\"{}\" {command}", cmd.display()),
+        working_dir: working_dir.to_path_buf(),
+        limits,
+        restricted: false,
+        appcontainer: false,
+        allow_network: false,
+    }
+    // 标志位由 tier.spawn 归一（调用方不再拼）
+}
+
+fn probe_echo_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeResult {
+    let name = "echo";
+    match tier.spawn(&tier_spec("/C echo hello-sandbox-42", &probe_workdir(), limits)) {
+        Ok(child) => match child.wait(limits.timeout_ms) {
+            Ok(o) if o.stdout.contains("hello-sandbox-42") => {
+                ProbeResult { name, ok: true, detail: format!("输出捕获正常（档位 {}）", tier.id()) }
+            }
+            Ok(o) => ProbeResult {
+                name,
+                ok: false,
+                detail: format!("stdout 未包含标记: {:?}", o.stdout),
+            },
+            Err(e) => ProbeResult { name, ok: false, detail: e.to_string() },
+        },
+        Err(e) => ProbeResult { name, ok: false, detail: e.to_string() },
+    }
+}
+
+fn probe_env_trim_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeResult {
+    let name = "env_trim";
+    let out = tier
+        .spawn(&tier_spec("/C set", &probe_workdir(), limits))
+        .and_then(|c| c.wait(limits.timeout_ms));
+    match out {
+        Ok(o) => {
+            let strangers: Vec<&str> = o
+                .stdout
+                .lines()
+                .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+                .filter(|k| !super::proc::SANDBOX_ENV_VARS.iter().any(|v| v.eq_ignore_ascii_case(k)))
+                .collect();
+            // 直跑档继承完整环境，本探针不适用——只验证进程能跑
+            if tier.id() == "unsandboxed" {
+                ProbeResult { name, ok: true, detail: "直跑档继承父环境（无白名单语义），进程可跑".into() }
+            } else if strangers.is_empty() {
+                ProbeResult { name, ok: true, detail: "子进程环境为纯白名单".into() }
+            } else {
+                ProbeResult { name, ok: false, detail: format!("环境出现白名单外变量: {strangers:?}") }
+            }
+        }
+        Err(e) => ProbeResult { name, ok: false, detail: e.to_string() },
+    }
+}
+
+fn probe_workspace_read_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeResult {
+    const TOKEN: &str = "agent-sandbox-read-probe";
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let marker_name = format!(".agent_probe_read_{}_{seq}.txt", std::process::id());
+    let root = workspace_root();
+    let marker = root.join(&marker_name);
+    if let Err(e) = std::fs::write(&marker, TOKEN) {
+        return ProbeResult {
+            name: "workspace_read",
+            ok: false,
+            detail: format!("写标记文件失败（工作区不可写）: {e}"),
+        };
+    }
+    let out = tier
+        .spawn(&tier_spec(&format!("/C type {marker_name}"), &root, limits))
+        .and_then(|c| c.wait(limits.timeout_ms));
+    let _ = std::fs::remove_file(&marker);
+    match out {
+        Ok(o) if o.stdout.contains(TOKEN) => {
+            ProbeResult { name: "workspace_read", ok: true, detail: "工作目录内文件可读".into() }
+        }
+        Ok(o) => ProbeResult {
+            name: "workspace_read",
+            ok: false,
+            detail: format!("type {marker_name} 异常: exit={:?} out={:?}", o.exit_code, o.stderr),
+        },
+        Err(e) => ProbeResult { name: "workspace_read", ok: false, detail: e.to_string() },
+    }
+}
+
+fn probe_timeout_kill_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeResult {
+    let tight = SandboxLimits { timeout_ms: 1_000, ..limits };
+    let start = Instant::now();
+    let out = tier
+        .spawn(&tier_spec("/C ping -n 30 127.0.0.1", &probe_workdir(), tight))
+        .and_then(|c| c.wait(1_000));
+    let elapsed = start.elapsed();
+    match out {
+        Ok(o) if o.timed_out && elapsed < Duration::from_millis(10_000) => ProbeResult {
+            name: "timeout_kill",
+            ok: true,
+            detail: format!("超时击杀生效，耗时 {}ms", elapsed.as_millis()),
+        },
+        Ok(o) => ProbeResult {
+            name: "timeout_kill",
+            ok: false,
+            detail: format!("timed_out={} 耗时={}ms", o.timed_out, elapsed.as_millis()),
+        },
+        Err(e) => ProbeResult { name: "timeout_kill", ok: false, detail: e.to_string() },
+    }
 }
 
 pub(crate) fn limits_of(cfg: &SandboxConfig) -> SandboxLimits {
@@ -355,10 +494,146 @@ pub(crate) fn restricted_host_limitation() -> Option<String> {
         .clone()
 }
 
+// —— P20 档位探测链编排 ——
+
+/// 档位解析结果（/api/sandbox/info 直出 + 工具层选档依据）。
+pub struct TierReport {
+    /// 配置请求的档位（含 allow_unsandboxed 生效后的 unsandboxed）
+    pub requested: String,
+    /// 实际生效的档位 id
+    pub effective: String,
+    /// 生效档位中文标签
+    pub label: String,
+    /// 生效档位隔离面说明
+    pub describe: String,
+    /// 请求档不可用而回退时的原因（无回退则 None）
+    pub fallback_reason: Option<String>,
+    /// 生效档位的探测链结果
+    pub probes: Vec<ProbeResult>,
+    pub probed_at_ms: u64,
+}
+
+impl TierReport {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested": self.requested,
+            "effective": self.effective,
+            "label": self.label,
+            "describe": self.describe,
+            "fallback_reason": self.fallback_reason,
+            "ok": self.probes.iter().all(|p| p.ok),
+            "probes": self.probes.iter().map(|p| serde_json::json!({
+                "name": p.name, "ok": p.ok, "detail": p.detail,
+            })).collect::<Vec<_>>(),
+            "probed_at_ms": self.probed_at_ms,
+        })
+    }
+}
+
+/// 按配置解析出生效档位并跑一遍探测链。
+///
+/// 回退策略（窄而刚，只此一条自动回退）：
+/// - 请求 appcontainer 但 canary 拉不起（实验特性在部分宿主上不可用）→ 回退 restricted，
+///   fallback_reason 写明原因（UI 明示 + JSONL 审计）；
+/// - 请求 restricted 失败**不回退**——往下的唯一档位是直跑（解除隔离），绝不通向那里；
+///   失败如实暴露在探测链结果里，工具调用会拿到明确报错；
+/// - 请求 unsandboxed（需 allow_unsandboxed=true）无隔离面，只跑 canary 证明可拉起。
+pub fn resolve_tier(cfg: &SandboxConfig, unsandboxed_allowed: bool) -> TierReport {
+    let limits = limits_of(cfg);
+    let requested = if unsandboxed_allowed { "unsandboxed".to_string() } else { cfg.mode.clone() };
+    let now = || std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let (effective_tier, fallback_reason): (Box<dyn SandboxTier>, Option<String>) = match requested.as_str() {
+        "appcontainer" => {
+            let ac = AppContainerTier { allow_network: cfg.allow_network };
+            // canary：AC 通道真实拉起一发 echo
+            let canary = probe_echo_via(&ac, SandboxLimits { timeout_ms: 15_000, ..limits });
+            if canary.ok {
+                (Box::new(ac), None)
+            } else {
+                (
+                    Box::new(super::backend::RestrictedTier),
+                    Some(format!("AppContainer canary 未通过：{}（已回退受限 token 沙箱）", canary.detail)),
+                )
+            }
+        }
+        "unsandboxed" => (Box::new(UnsandboxedTier), None),
+        _ => (Box::new(super::backend::RestrictedTier), None),
+    };
+
+    let probes = effective_tier.probe_chain(limits);
+    let report = TierReport {
+        requested,
+        effective: effective_tier.id().to_string(),
+        label: effective_tier.label().to_string(),
+        describe: effective_tier.describe(),
+        fallback_reason,
+        probes,
+        probed_at_ms: now(),
+    };
+    if let Some(reason) = &report.fallback_reason {
+        observability::try_event(
+            EventType::State,
+            serde_json::json!({ "kind": "sandbox.tier.fallback", "requested": report.requested, "effective": report.effective, "reason": reason }),
+        );
+    }
+    observability::try_event(
+        EventType::State,
+        serde_json::json!({ "kind": "sandbox.tier.resolved", "effective": report.effective, "ok": report.probes.iter().all(|p| p.ok) }),
+    );
+    report
+}
+
+/// 解析缓存：同配置（档位 + 网络开关）只探一次；refresh=true 强制重探（UI「重新检测」）。
+pub fn cached_tier_report(cfg: &SandboxConfig, unsandboxed_allowed: bool, refresh: bool) -> TierReport {
+    static CACHE: std::sync::RwLock<Option<((String, bool), TierReport)>> =
+        std::sync::RwLock::new(None);
+    let key = (if unsandboxed_allowed { "unsandboxed".to_string() } else { cfg.mode.clone() }, cfg.allow_network);
+    let mut guard = CACHE.write().unwrap_or_else(|e| e.into_inner());
+    if !refresh
+        && let Some(((k_mode, k_net), report)) = guard.as_ref()
+        && *k_mode == key.0
+        && *k_net == key.1
+    {
+        return TierReport {
+            requested: report.requested.clone(),
+            effective: report.effective.clone(),
+            label: report.label.clone(),
+            describe: report.describe.clone(),
+            fallback_reason: report.fallback_reason.clone(),
+            probes: report.probes.iter().map(|p| ProbeResult { name: p.name, ok: p.ok, detail: p.detail.clone() }).collect(),
+            probed_at_ms: report.probed_at_ms,
+        };
+    }
+    let report = resolve_tier(cfg, unsandboxed_allowed);
+    *guard = Some((key, TierReport {
+        requested: report.requested.clone(),
+        effective: report.effective.clone(),
+        label: report.label.clone(),
+        describe: report.describe.clone(),
+        fallback_reason: report.fallback_reason.clone(),
+        probes: report.probes.iter().map(|p| ProbeResult { name: p.name, ok: p.ok, detail: p.detail.clone() }).collect(),
+        probed_at_ms: report.probed_at_ms,
+    }));
+    report
+}
+
+/// 工具层选档入口：取缓存解析（首次会真探一次，之后零开销），按生效档构造 tier 对象。
+pub fn effective_tier(cfg: &SandboxConfig, unsandboxed_allowed: bool) -> Box<dyn SandboxTier> {
+    let report = cached_tier_report(cfg, unsandboxed_allowed, false);
+    match report.effective.as_str() {
+        "unsandboxed" => Box::new(super::backend::UnsandboxedTier),
+        "appcontainer" => Box::new(AppContainerTier { allow_network: cfg.allow_network }),
+        _ => Box::new(super::backend::RestrictedTier),
+    }
+}
+
 /// 测试内 logger 初始化（sandbox 事件落 JSONL，探针依赖它）。
 #[cfg(test)]
-fn init_logger() {
-    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+fn init_logger() {    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         let dir = std::env::temp_dir().join("agent-p3-test-logs");
         let _ = crate::observability::init(&dir, "test.jsonl", format!("test-{}", uuid::Uuid::new_v4()));
@@ -491,5 +766,45 @@ mod tests {
             ));
         }
         assert!(results.iter().all(|r| r.ok), "fast suite 未全绿: {:?}", results.iter().filter(|r| !r.ok).map(|r| (r.name, r.detail.clone())).collect::<Vec<_>>());
+    }
+
+    // —— P20 档位探测链：解析出的生效档位与探测链自洽 ——
+    #[test]
+    fn tier_resolution_reports_effective() {
+        init_logger();
+        let c = cfg();
+        // 受限档请求：无论宿主能不能拉起受限进程，生效档都不得回退到无隔离档
+        let r = resolve_tier(&c, false);
+        assert_eq!(r.requested, "restricted");
+        assert_eq!(r.effective, "restricted");
+        assert!(r.fallback_reason.is_none(), "受限档失败不回退，应如实暴露: {:?}", r.fallback_reason);
+        if restricted_host_limitation().is_none() {
+            let bad: Vec<_> = r.probes.iter().filter(|p| !p.ok).map(|p| (p.name, p.detail.clone())).collect();
+            assert!(bad.is_empty(), "受限档探测链应全绿: {bad:?}");
+        }
+        // 直跑请求（allow_unsandboxed 已开时 full-access 档的选档结果）
+        let r2 = resolve_tier(&c, true);
+        assert_eq!(r2.requested, "unsandboxed");
+        assert_eq!(r2.effective, "unsandboxed");
+        let bad2: Vec<_> = r2.probes.iter().filter(|p| !p.ok).map(|p| (p.name, p.detail.clone())).collect();
+        assert!(bad2.is_empty(), "直跑 canary 应通过: {bad2:?}");
+        // JSON 形状（/api/sandbox/info 契约）
+        let v = r.to_json();
+        assert!(v["effective"] == "restricted" || v["effective"] == "unsandboxed");
+        assert!(v.get("probes").and_then(|p| p.as_array()).is_some());
+    }
+
+    // —— P20 生效档缓存：同配置第二次解析走缓存（结论幂等）——
+    #[test]
+    fn tier_cache_is_stable_per_config() {
+        init_logger();
+        let c = cfg();
+        let a = cached_tier_report(&c, false, false);
+        let b = cached_tier_report(&c, false, false);
+        assert_eq!(a.effective, b.effective);
+        assert_eq!(a.probes.len(), b.probes.len(), "缓存命中应返回同长度探测链");
+        // 强制重探不改变结论（幂等）
+        let f = cached_tier_report(&c, false, true);
+        assert_eq!(f.effective, a.effective);
     }
 }

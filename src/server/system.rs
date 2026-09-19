@@ -120,3 +120,38 @@ pub(super) async fn sandbox_selftest(State(state): State<AppState>) -> Json<Valu
             .collect::<Vec<Value>>(),
     }))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct SandboxInfoQuery {
+    /// 1=强制重探（UI「重新检测」）；默认取缓存（进程内只探一次）
+    #[serde(default)]
+    pub refresh: u8,
+}
+
+/// GET /api/sandbox/info —— 当前沙箱档位（P20 沙箱统一：档位探测链 + 生效档缓存）。
+/// 返回配置档位、生效档位（含 AppContainer→受限 自动回退与原因）、隔离面说明、探测链明细。
+pub(super) async fn sandbox_info(
+    State(state): State<AppState>,
+    Query(q): Query<SandboxInfoQuery>,
+) -> Json<Value> {
+    let cfg = (*state.sandbox_cfg).clone();
+    let allow_unsandboxed = state.agent_cfg.allow_unsandboxed;
+    let refresh = q.refresh == 1;
+    let report = tokio::task::spawn_blocking(move || {
+        crate::sandbox::probes::cached_tier_report(&cfg, false, refresh)
+    })
+    .await
+    .unwrap_or_else(|e| crate::sandbox::probes::TierReport {
+        requested: "unknown".into(),
+        effective: "restricted".into(),
+        label: "探测失败".into(),
+        describe: format!("档位探测任务失败: {e}"),
+        fallback_reason: None,
+        probes: vec![],
+        probed_at_ms: 0,
+    });
+    let mut v = report.to_json();
+    v["allow_unsandboxed"] = json!(allow_unsandboxed);
+    v["mode_configured"] = json!(report.requested);
+    Json(v)
+}

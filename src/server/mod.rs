@@ -158,6 +158,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
+        .route("/api/sandbox/info", get(sandbox_info))
         .route("/api/workspace/files", get(list_workspace_files))
         .route("/api/workspace/file", get(read_workspace_file))
         .route("/api/changes", get(list_changes))

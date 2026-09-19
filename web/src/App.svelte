@@ -2495,9 +2495,8 @@
     settingsTab = t;
     localStorage.setItem('settingsTab', t);
     if (t === 'mcp' || t === 'plugins') loadMcp();
-    if (t === 'ext') loadGitRuntime();
     if (t === 'skills') loadSkills();
-    if (t === 'ext') loadExt();
+    if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
   }
 
   // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
@@ -2675,6 +2674,18 @@
     } catch (e) {
       gitRuntime = null;
     }
+  }
+  // P20 沙箱档位（运行状态卡首卡）：配置档 / 生效档（含 AC→受限回退与原因）/ 探测链
+  let sandboxInfo = null;
+  let sbInfoLoading = false;
+  async function loadSandboxInfo(refresh) {
+    sbInfoLoading = true;
+    try {
+      sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }).then((r) => r.json());
+    } catch (e) {
+      sandboxInfo = null;
+    }
+    sbInfoLoading = false;
   }
   async function loadMcp() {
     try {
@@ -4597,6 +4608,26 @@
         <div class="field"><label>运行状态（本机环境）</label></div>
         <div class="field mcp-card">
           <div class="mcp-head">
+            <span class="dot" class:haskey={sandboxInfo?.ok === true}></span>
+            <b>沙箱档位</b>
+            <span class="mcp-status">
+              {sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? `（请求的 ${sandboxInfo.requested} 已回退）` : '') : '读取中…'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>
+              {sbInfoLoading ? '探测中…' : '重新检测'}
+            </button>
+          </div>
+          {#if sandboxInfo}
+            <div class="mcp-cmd">生效档 {sandboxInfo.effective} · 配置档 {sandboxInfo.mode_configured} · 直跑开关{sandboxInfo.allow_unsandboxed ? '已开启' : '未开启'}</div>
+            {#if sandboxInfo.fallback_reason}
+              <div class="mcp-cmd" style="color: var(--tint-orange-fg)">⚠ {sandboxInfo.fallback_reason}</div>
+            {/if}
+            <div class="param-hint">{sandboxInfo.describe}</div>
+          {/if}
+        </div>
+        <div class="field mcp-card">
+          <div class="mcp-head">
             <span class="dot" class:haskey={gitRuntime?.ok}></span>
             <b>Git 运行时</b>
             <span class="mcp-status">
@@ -4632,6 +4663,9 @@
               {sbRunning ? '运行中…' : sandboxProbe ? (sandboxProbe.ok ? '全部通过' : '有失败项') : '未运行'}
             </span>
             <span class="flex-sp"></span>
+            {#if sandboxInfo}
+              <span class="tool-badge ok">{sandboxInfo.label}</span>
+            {/if}
             <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>运行自检</button>
           </div>
           {#if sandboxProbe?.results?.length}

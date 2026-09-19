@@ -7,6 +7,7 @@
 //! 留口（不实现）：AppContainer / 网络出向限制 / 完整性降级（P12）；交互式输入（P4 视需要）。
 
 mod appcontainer;
+pub mod backend;
 mod job;
 mod proc;
 pub mod probes;
@@ -26,6 +27,8 @@ pub struct SandboxLimits {
 }
 
 /// 一次受限拉起的完整描述（持有所有权，构造方便）。
+/// P20 起派生 Clone：tier.spawn 内部按档位归一标志位时要基于调用方的 spec 出副本。
+#[derive(Clone)]
 pub struct SandboxSpec {
     /// exe 绝对路径（如 C:\Windows\System32\cmd.exe）
     pub application: std::path::PathBuf,
