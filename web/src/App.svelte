@@ -733,6 +733,148 @@
   let rpPreviewPath = '';
   let rpPreviewContent = '';
 
+  // —— P20.1 网页面板（内置无头浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例）——
+  let webPanelOpen = false;
+  let webTabs = []; // { id, agent, title, url }
+  let webActiveId = '';
+  let webAddress = '';
+  let webBusy = false;
+  let webShotT = 0; // 截图缓存穿透参数（动作后递增触发 <img> 重载）
+  const WEB_W = 1280;
+  const WEB_H = 900;
+
+  $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
+  // 空白页（about:blank）显示空态引导；有地址就渲染截图
+  $: webShowShot = !!(webActive && webActive.url && webActive.url !== 'about:blank');
+
+  async function loadWebState(keepActive = true) {
+    try {
+      const s = await fetch('/api/browser/state', { cache: 'no-store' }).then((r) => r.json());
+      webTabs = s.tabs || [];
+      if (!keepActive || !webTabs.some((t) => t.id === webActiveId)) {
+        webActiveId = webTabs.length ? webTabs[webTabs.length - 1].id : '';
+      }
+      // 地址栏跟随当前标签页。注意不能读 $: webActive（函数内拿到的是本帧旧值），
+      // 就地重查；用户正在地址栏打字时（聚焦中）不覆盖。
+      const act = webTabs.find((t) => t.id === webActiveId) || null;
+      const addrEl = document.querySelector('.web-address');
+      if (act && document.activeElement !== addrEl) {
+        webAddress = act.url === 'about:blank' ? '' : act.url || '';
+      }
+    } catch {
+      webTabs = [];
+    }
+  }
+
+  function openWebPanel() {
+    webPanelOpen = !webPanelOpen;
+    if (webPanelOpen) {
+      terminalOpen = false;
+      rightPanelOpen = false;
+      extOpen = false;
+      loadWebState();
+    }
+  }
+
+  function webNormalizeUrl(u) {
+    const s = (u || '').trim();
+    if (!s) return '';
+    if (s === 'about:blank' || /^(https?|file):\/\//.test(s)) return s;
+    return 'https://' + s;
+  }
+
+  async function webNewTab() {
+    if (webBusy) return;
+    webBusy = true;
+    try {
+      const r = await fetch('/api/browser/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }).then((r) => r.json());
+      if (r.id) webActiveId = r.id;
+      await loadWebState(true);
+      webShotT += 1;
+    } catch {}
+    webBusy = false;
+  }
+
+  async function webCloseTab(id) {
+    webBusy = true;
+    try {
+      await fetch(`/api/browser/tab?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await loadWebState();
+      webShotT += 1;
+    } catch {}
+    webBusy = false;
+  }
+
+  async function webGo() {
+    const url = webNormalizeUrl(webAddress);
+    if (!url || !webActive || webBusy) return;
+    webBusy = true;
+    try {
+      await fetch('/api/browser/navigate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id, url }),
+      });
+      webShotT += 1;
+      await loadWebState();
+    } catch {}
+    webBusy = false;
+  }
+
+  async function webAction(action) {
+    if (!webActive || webBusy) return;
+    webBusy = true;
+    try {
+      await fetch(`/api/browser/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id }),
+      });
+      webShotT += 1;
+      await loadWebState();
+    } catch {}
+    webBusy = false;
+  }
+
+  async function webShotClick(ev) {
+    if (!webActive || webBusy) return;
+    const rect = ev.currentTarget.getBoundingClientRect();
+    const x = Math.round(((ev.clientX - rect.left) * WEB_W) / rect.width);
+    const y = Math.round(((ev.clientY - rect.top) * WEB_H) / rect.height);
+    webBusy = true;
+    try {
+      await fetch('/api/browser/click', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id, x, y }),
+      });
+      webShotT += 1;
+      await loadWebState();
+    } catch {}
+    webBusy = false;
+  }
+
+  async function webShotWheel(ev) {
+    if (!webActive || webBusy) return;
+    ev.preventDefault();
+    const dy = Math.max(-600, Math.min(600, ev.deltaY || 0));
+    if (!dy) return;
+    webBusy = true;
+    try {
+      await fetch('/api/browser/scroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id, deltaY: dy }),
+      });
+      webShotT += 1;
+    } catch {}
+    webBusy = false;
+  }
+
   async function runTerm(cmd) {
     termRunning = true;
     termLines = [...termLines, { cmd, out: '', ok: true }];
@@ -3284,6 +3426,14 @@
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="M14.5 4.5v15"/><path d="M17.5 9.5h1M17.5 12.5h1" stroke-linecap="round"/></svg>
         </button>
+        <button
+          class="head-btn"
+          class:active={webPanelOpen}
+          title="网页（内置浏览器）"
+          on:click={openWebPanel}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
+        </button>
       </div>
     </header>
 
@@ -3837,6 +3987,86 @@
           {:else}
             <div class="rp-empty">从「产物」里点一个文件查看内容</div>
           {/if}
+        {/if}
+      </div>
+    </aside>
+  {/if}
+
+  {#if webPanelOpen}
+    <aside class="web-panel">
+      <div class="web-tabbar">
+        <div class="web-tabs">
+          {#each webTabs as t (t.id)}
+            <button
+              class="web-tab"
+              class:active={t.id === webActiveId}
+              title={t.url || 'about:blank'}
+              on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; }}
+            >
+              <span class="web-tab-title">{t.title || (t.url === 'about:blank' ? '空白页' : t.url) || '空白页'}</span>
+              {#if t.agent}<span class="web-tab-agent" title="agent 浏览器工具的工作页">agent</span>{/if}
+              <span
+                class="web-tab-x"
+                title="关闭标签页"
+                role="button"
+                tabindex="-1"
+                on:click|stopPropagation={() => webCloseTab(t.id)}
+              >×</span>
+            </button>
+          {/each}
+        </div>
+        <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
+        <span class="flex-sp"></span>
+        <button class="rp-refresh" title="刷新面板状态" on:click={() => loadWebState()}>↻</button>
+        <button class="btn ghost" on:click={() => (webPanelOpen = false)}>关闭</button>
+      </div>
+      <div class="web-toolbar">
+        <button class="web-nav" title="后退" disabled={!webActive || webBusy} on:click={() => webAction('back')}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m14.5 6-6 6 6 6"/></svg>
+        </button>
+        <button class="web-nav" title="前进" disabled={!webActive || webBusy} on:click={() => webAction('forward')}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9.5 6 6 6-6 6"/></svg>
+        </button>
+        <button class="web-nav" title="刷新" disabled={!webActive || webBusy} on:click={() => webAction('reload')}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95"/><path d="M19 3.5V7h-3.5"/></svg>
+        </button>
+        <input
+          class="web-address"
+          placeholder="输入网址后回车"
+          bind:value={webAddress}
+          disabled={!webActive || webBusy}
+          spellcheck="false"
+          on:keydown={(e) => {
+            if (e.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') { e.preventDefault(); webGo(); }
+          }}
+        />
+      </div>
+      <div class="web-body">
+        {#if !webActive}
+          <div class="web-empty">
+            <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
+            <div class="web-empty-title">网页</div>
+            <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
+          </div>
+        {:else if !webShowShot}
+          <div class="web-empty">
+            <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
+            <div class="web-empty-title">网页</div>
+            <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
+          </div>
+        {:else}
+          {#if webBusy}<div class="web-loading">加载中…</div>{/if}
+          <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+          <img
+            class="web-shot"
+            class:busy={webBusy}
+            src={`/api/browser/screenshot?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
+            alt="页面截图"
+            draggable="false"
+            on:click={webShotClick}
+            on:wheel={webShotWheel}
+          />
         {/if}
       </div>
     </aside>
@@ -5727,6 +5957,189 @@
     width: 100%;
     border: none;
     background: var(--g1);
+  }
+  /* P20.1 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
+  .web-panel {
+    width: 460px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    background: var(--g0);
+    border-left: 1px solid var(--g3);
+    min-height: 0;
+  }
+  .web-tabbar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--g3);
+  }
+  .web-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    overflow-x: auto;
+    flex: 1;
+    min-width: 0;
+  }
+  .web-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 150px;
+    padding: 3px 6px;
+    border: 1px solid var(--g3);
+    border-radius: 7px;
+    background: var(--g1);
+    color: var(--g6);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex: none;
+  }
+  .web-tab.active {
+    background: var(--g3);
+    color: var(--g7);
+  }
+  .web-tab-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 96px;
+  }
+  .web-tab-agent {
+    font-size: 10px;
+    color: var(--tint-blue-fg, #6aa9ff);
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 0 3px;
+    flex: none;
+  }
+  .web-tab-x {
+    opacity: 0.55;
+    padding: 0 2px;
+  }
+  .web-tab-x:hover {
+    opacity: 1;
+  }
+  .web-add {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    border: 1px solid var(--g3);
+    border-radius: 7px;
+    background: var(--g1);
+    color: var(--g6);
+    font-size: 15px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .web-add:hover {
+    color: var(--g7);
+  }
+  .web-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--g3);
+  }
+  .web-nav {
+    flex: none;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--g6);
+    border-radius: 7px;
+    cursor: pointer;
+  }
+  .web-nav:hover:not(:disabled) {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .web-nav:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .web-nav svg {
+    width: 15px;
+    height: 15px;
+  }
+  .web-address {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 10px;
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    background: var(--g1);
+    color: var(--g7);
+    font-size: 12.5px;
+    outline: none;
+  }
+  .web-address:focus {
+    border-color: var(--g5);
+  }
+  .web-body {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+    overflow: auto;
+    background: var(--g1);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+  }
+  .web-empty {
+    margin: auto;
+    text-align: center;
+    color: var(--g5);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 40px 10px;
+  }
+  .web-globe {
+    width: 52px;
+    height: 52px;
+    opacity: 0.5;
+  }
+  .web-empty-title {
+    font-size: 14px;
+    color: var(--g6);
+  }
+  .web-empty-sub {
+    font-size: 12px;
+  }
+  .web-shot {
+    width: 100%;
+    height: auto;
+    display: block;
+    cursor: pointer;
+    user-select: none;
+  }
+  .web-shot.busy {
+    opacity: 0.6;
+  }
+  .web-loading {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    font-size: 11px;
+    color: var(--g6);
+    background: var(--g2);
+    border: 1px solid var(--g3);
+    border-radius: 6px;
+    padding: 2px 8px;
+    z-index: 2;
+  }
+  :global(body.has-wallpaper) .web-panel {
+    background: color-mix(in srgb, var(--g0) 60%, transparent);
+    border-left-color: color-mix(in srgb, var(--g4) 30%, transparent);
   }
   .ext-panel .rp-tabs {
     flex-wrap: nowrap;

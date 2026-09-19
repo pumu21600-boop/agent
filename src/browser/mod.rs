@@ -22,7 +22,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Value, json};
@@ -48,11 +48,23 @@ struct OutlineNode {
     depth: usize,
 }
 
+/// 一个标签页 = 一条页面级 CDP 连接（P20.1 网页面板起多标签化；面板与 agent 工具
+/// 共享同一个浏览器进程，各标签页连接互不干扰）。
+pub struct WebTab {
+    /// CDP target id
+    pub id: String,
+    /// agent 工具（browser_* 五件套）专用标签页
+    pub agent: bool,
+    pub cdp: cdp::Cdp,
+    /// agent 快照的增量 diff 基线（仅 agent 标签页使用）
+    last_outline: Mutex<Vec<OutlineNode>>,
+}
+
 struct BrowserSession {
     child: std::sync::Mutex<Child>,
-    cdp: cdp::Cdp,
-    /// 上次快照（增量 diff 基线）。
-    last_outline: Mutex<Vec<OutlineNode>>,
+    /// CDP HTTP 端点端口（/json/new、/json/close、探活用）
+    port: u16,
+    tabs: std::sync::Mutex<Vec<Arc<WebTab>>>,
     last_used_ms: AtomicU64,
 }
 
@@ -62,6 +74,35 @@ impl BrowserSession {
     }
     fn idle_secs(&self) -> u64 {
         now_ms().saturating_sub(self.last_used_ms.load(Ordering::Relaxed)) / 1000
+    }
+    /// 快照列表（面板展示用：id/标题/地址/是否 agent 页）。
+    async fn tab_briefs(&self) -> Vec<(String, bool, String, String)> {
+        let tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut out = Vec::new();
+        for t in tabs {
+            let title = t
+                .cdp
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": "document.title", "returnByValue": true }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            let url = t
+                .cdp
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": "location.href", "returnByValue": true }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            out.push((t.id.clone(), t.agent, title, url));
+        }
+        out
     }
 }
 
@@ -95,6 +136,23 @@ fn kill_child(s: &BrowserSession) {
     }
 }
 
+/// 清理别的进程留下的旧浏览器 profile（名字前缀相同、不属于本进程）。
+/// 被占用的目录（残留浏览器还活着）删不动就跳过，错误一律忽略。
+fn clean_stale_profiles(keep: &PathBuf) {
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("agent-browser-profile") {
+                let p = e.path();
+                if p != *keep {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    }
+}
+
 // —— 浏览器发现与拉起 ——
 
 fn find_browser_exe() -> Result<PathBuf, String> {
@@ -124,13 +182,18 @@ fn find_browser_exe() -> Result<PathBuf, String> {
 }
 
 /// 探测 CDP HTTP 端点，拿到页面级 ws 地址（headless 拉起后第一个 target 就是 about:blank 页）。
-async fn wait_page_target(port: u16, budget: Duration) -> Result<String, String> {
-    // 坑 17 同源问题：本机代理环境变量会把 127.0.0.1 的请求拦进代理——CDP 端点必须直连
-    let client = reqwest::Client::builder()
+/// CDP HTTP 端点客户端（环回、no_proxy——坑 17：本机代理环境变量会拦环回请求）。
+fn dev_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3))
         .build()
-        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
+}
+
+/// 探测 CDP HTTP 端点，拿到页面 target 的 (id, ws 地址)。
+async fn wait_page_target(port: u16, budget: Duration) -> Result<(String, String), String> {
+    let client = dev_client()?;
     let deadline = tokio::time::Instant::now() + budget;
     let url = format!("http://127.0.0.1:{port}/json/list");
     while tokio::time::Instant::now() < deadline {
@@ -141,13 +204,118 @@ async fn wait_page_target(port: u16, budget: Duration) -> Result<String, String>
             && let Some(page) = targets
                 .iter()
                 .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+            && let Some(id) = page.get("id").and_then(Value::as_str)
             && let Some(ws) = page.get("webSocketDebuggerUrl").and_then(Value::as_str)
         {
-            return Ok(ws.to_string());
+            return Ok((id.to_string(), ws.to_string()));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     Err("等待浏览器 CDP 端点超时（10s 内 /json/list 无 page target）".into())
+}
+
+/// 浏览器进程是否还活着（/json/version 可达）。
+async fn browser_alive(port: u16) -> bool {
+    if let Ok(c) = dev_client() {
+        return c
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .send()
+            .await
+            .is_ok();
+    }
+    false
+}
+
+/// 经 CDP HTTP 端点开一个新标签页（PUT /json/new；老版本只认 GET，失败回退）。
+/// 固定 about:blank 起步，导航统一走 CDP（能等加载完成）。
+async fn dev_new_target(port: u16) -> Result<(String, String), String> {
+    let client = dev_client()?;
+    for method in ["PUT", "GET"] {
+        let u = format!("http://127.0.0.1:{port}/json/new?about:blank");
+        let req = if method == "PUT" { client.put(&u) } else { client.get(&u) };
+        if let Ok(resp) = req.send().await
+            && let Ok(text) = resp.text().await
+            && let Ok(v) = serde_json::from_str::<Value>(&text)
+            && let Some(id) = v.get("id").and_then(Value::as_str)
+            && let Some(ws) = v.get("webSocketDebuggerUrl").and_then(Value::as_str)
+        {
+            return Ok((id.to_string(), ws.to_string()));
+        }
+    }
+    Err("无法创建标签页（/json/new 不可用）".into())
+}
+
+/// 关闭标签页（GET /json/close）。
+async fn dev_close_target(port: u16, id: &str) {
+    if let Ok(c) = dev_client() {
+        let _ = c.get(format!("http://127.0.0.1:{port}/json/close/{id}")).send().await;
+    }
+}
+
+/// 建一条标签页连接（Page.enable + 可选导航等待加载完成）并挂进会话。
+async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<Arc<WebTab>, String> {
+    let (id, ws) = dev_new_target(session.port).await?;
+    let cdp = cdp::Cdp::connect(&ws).await?;
+    cdp.call("Page.enable", json!({})).await?;
+    let tab = Arc::new(WebTab {
+        id,
+        agent,
+        cdp,
+        last_outline: Mutex::new(Vec::new()),
+    });
+    session
+        .tabs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(tab.clone());
+    if url != "about:blank" && !url.is_empty() {
+        navigate_tab(&tab, url).await?;
+    }
+    log(
+        "browser.tab.new",
+        json!({ "id": tab.id, "agent": agent, "url": url }),
+    );
+    Ok(tab)
+}
+
+/// 关闭并移除一个标签页（连接即弃，进程侧异步关）。
+async fn close_tab(session: &BrowserSession, id: &str) -> bool {
+    let removed = {
+        let mut tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = tabs.iter().position(|t| t.id == id);
+        if let Some(pos) = pos {
+            tabs.remove(pos);
+        }
+        pos.is_some()
+    };
+    if removed {
+        dev_close_target(session.port, id).await;
+        log("browser.tab.close", json!({ "id": id }));
+    }
+    removed
+}
+
+/// agent 工具的专用标签页：找活的 agent 页，没有就现开一个。
+async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, String> {
+    {
+        let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(t) = tabs.iter().find(|t| t.agent) {
+            return Ok(t.clone());
+        }
+    }
+    create_tab(session, "about:blank", true).await
+}
+
+/// 按 id 取标签页。
+fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>, String> {
+    session
+        .tabs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|t| t.id == id)
+        .cloned()
+        .ok_or_else(|| format!("标签页不存在: {id}"))
 }
 
 async fn launch() -> Result<Arc<BrowserSession>, String> {
@@ -159,7 +327,10 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
             l.local_addr().map_err(|e| e.to_string())?.port()
         };
-        let profile = std::env::temp_dir().join("agent-browser-profile");
+        // profile 按进程 PID 隔离：宿主被强杀时无头浏览器会残留并握住 profile 单例锁
+        // （真机踩过：残留 Edge 让下一次 launch「拉起后立即退出」）。顺手清掉别的旧 profile。
+        let profile = std::env::temp_dir().join(format!("agent-browser-profile-{}", std::process::id()));
+        clean_stale_profiles(&profile);
         let _ = std::fs::create_dir_all(&profile);
         let child = Command::new(&exe)
             .args([
@@ -176,7 +347,8 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                 "about:blank",
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // stderr 留管道：秒退时的退出码与报错原文是定位「为什么拉不起」的唯一线索
+            .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn();
@@ -186,20 +358,53 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
         };
         // 拉起后立刻探活：老版本 Edge 不认 --headless=new 会秒退
         tokio::time::sleep(Duration::from_millis(300)).await;
-        if let Ok(Some(_)) = child.try_wait() {
-            last_err = format!("浏览器拉起后立即退出（{} 可能不支持 --headless=new）", exe.display());
+        if let Ok(Some(code)) = child.try_wait() {
+            // 收 stderr（管道里已有内容；进程退出后读到 EOF 为止，限时收）
+            let mut tail = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                use std::io::Read;
+                let deadline = Instant::now() + Duration::from_millis(500);
+                let mut buf = [0u8; 1024];
+                loop {
+                    if Instant::now() > deadline {
+                        break;
+                    }
+                    match err.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            tail.push_str(&String::from_utf8_lossy(&buf[..n]));
+                            if tail.len() > 2000 {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            last_err = format!(
+                "浏览器拉起后立即退出（exit={code:?}，{}）：{tail}",
+                exe.display()
+            );
             continue;
         }
         match wait_page_target(port, Duration::from_secs(10)).await {
-            Ok(ws) => {
+            Ok((target_id, ws)) => {
                 let cdp = cdp::Cdp::connect(&ws).await?;
                 // loadEventFired 需要 Page 域使能
                 cdp.call("Page.enable", json!({})).await?;
                 log("browser.launch", json!({ "exe": exe.display().to_string(), "port": port }));
-                let session = Arc::new(BrowserSession {
-                    child: std::sync::Mutex::new(child),
+                // 启动自带的 about:blank 页即 agent 工具的专用标签页
+                let first = Arc::new(WebTab {
+                    id: target_id,
+                    agent: true,
                     cdp,
                     last_outline: Mutex::new(Vec::new()),
+                });
+                let session = Arc::new(BrowserSession {
+                    child: std::sync::Mutex::new(child),
+                    port,
+                    tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
                 });
                 ensure_reaper();
@@ -219,7 +424,7 @@ async fn ensure_session() -> Result<Arc<BrowserSession>, String> {
     let mut guard = SESSION.lock().await;
     if let Some(s) = guard.as_ref() {
         s.touch();
-        if s.cdp.call("Runtime.evaluate", json!({ "expression": "1+1", "returnByValue": true })).await.is_ok() {
+        if browser_alive(s.port).await {
             return Ok(s.clone());
         }
         log("browser.stale", json!({}));
@@ -389,8 +594,8 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-async fn take_snapshot(session: &BrowserSession, max_chars: usize) -> Result<String, String> {
-    let res = session
+async fn take_snapshot(tab: &WebTab, max_chars: usize) -> Result<String, String> {
+    let res = tab
         .cdp
         .call(
             "Runtime.evaluate",
@@ -424,7 +629,7 @@ async fn take_snapshot(session: &BrowserSession, max_chars: usize) -> Result<Str
         }
     }
 
-    let mut guard = session.last_outline.lock().await;
+    let mut guard = tab.last_outline.lock().await;
     let (summary, detail) = diff_outline(&guard, &nodes);
     *guard = nodes.clone();
     drop(guard);
@@ -481,7 +686,7 @@ const LOCATE_JS: &str = r#"((ref, text, label) => {
 /// 解析定位参数 → 视口坐标。ref/文本语义优先，x/y 兜底。
 /// click 形态 (ref, text)；type 形态 (ref, label)——由 text_key 区分。
 async fn locate(
-    session: &BrowserSession,
+    tab: &WebTab,
     v: &Value,
     ref_key: &str,
     text_key: &str,
@@ -502,7 +707,7 @@ async fn locate(
                 serde_json::to_string(&text).unwrap_or_else(|_| "null".into())
             )
         };
-        let res = session
+        let res = tab
             .cdp
             .call("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }))
             .await?;
@@ -525,20 +730,20 @@ async fn locate(
     }
 }
 
-async fn dispatch_click(session: &BrowserSession, x: i64, y: i64) -> Result<(), String> {
+async fn dispatch_click(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
     let (x, y) = (x as f64, y as f64);
-    session
+    tab
         .cdp
         .call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))
         .await?;
-    session
+    tab
         .cdp
         .call(
             "Input.dispatchMouseEvent",
             json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
         )
         .await?;
-    session
+    tab
         .cdp
         .call(
             "Input.dispatchMouseEvent",
@@ -550,9 +755,9 @@ async fn dispatch_click(session: &BrowserSession, x: i64, y: i64) -> Result<(), 
 
 /// 点击可能触发导航：先注册 load 事件等待器（同步入队），再点击；事件到了就多给
 /// 渲染一点时间，没到（无导航的普通点击）照常返回。
-async fn click_and_settle(session: &BrowserSession, x: i64, y: i64) -> Result<(), String> {
-    let rx = session.cdp.register_wait("Page.loadEventFired")?;
-    dispatch_click(session, x, y).await?;
+async fn click_and_settle(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
+    let rx = tab.cdp.register_wait("Page.loadEventFired")?;
+    dispatch_click(tab, x, y).await?;
     if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(6), rx).await {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -573,27 +778,36 @@ fn require_url(v: &Value) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// 在标签页里导航并等加载完成；返回超时提示（None=正常）。会话死了返回 Err。
+async fn navigate_tab(tab: &WebTab, url: &str) -> Result<Option<&'static str>, String> {
+    let nav = tab
+        .cdp
+        .call_and_wait_event("Page.navigate", json!({ "url": url }), "Page.loadEventFired", LOAD_TIMEOUT)
+        .await;
+    match nav {
+        Ok(_) => Ok(None),
+        Err(e) if e.contains("等待事件超时") => Ok(Some("（页面加载未在预算内完成，以下为当前状态）\n")),
+        Err(e) => Err(e),
+    }
+}
+
 /// browser_open：加载页面（无会话则拉起浏览器），返回快照。
 pub async fn open(args: &str, max_chars: usize) -> Result<String, String> {
     let v = parse_args(args)?;
     let url = require_url(&v)?;
     let session = ensure_session().await?;
     session.touch();
+    let tab = agent_tab(&session).await?;
     log("browser.navigate", json!({ "url": url }));
-    let nav = session
-        .cdp
-        .call_and_wait_event("Page.navigate", json!({ "url": url }), "Page.loadEventFired", LOAD_TIMEOUT)
-        .await;
-    let note = match nav {
-        Ok(_) => String::new(),
-        Err(e) if e.contains("等待事件超时") => "（页面加载未在预算内完成，以下为当前快照）\n".to_string(),
+    let note = match navigate_tab(&tab, &url).await {
+        Ok(note) => note.unwrap_or(""),
         Err(e) => {
             // 会话死了：清掉，下次自动重拉
             close_internal("dead").await;
             return Err(format!("浏览器会话异常已重置（重试 browser_open 即可）: {e}"));
         }
     };
-    let snap = take_snapshot(&session, max_chars).await?;
+    let snap = take_snapshot(&tab, max_chars).await?;
     Ok(format!("{note}{snap}"))
 }
 
@@ -602,7 +816,8 @@ pub async fn snapshot(args: &str, max_chars: usize) -> Result<String, String> {
     let _ = parse_args(args)?;
     let session = current_session().await?;
     session.touch();
-    take_snapshot(&session, max_chars).await
+    let tab = agent_tab(&session).await?;
+    take_snapshot(&tab, max_chars).await
 }
 
 async fn current_session() -> Result<Arc<BrowserSession>, String> {
@@ -618,15 +833,16 @@ pub async fn click(args: &str, max_chars: usize) -> Result<String, String> {
     let v = parse_args(args)?;
     let session = current_session().await?;
     session.touch();
-    let (x, y, desc) = locate(&session, &v, "ref", "text").await?;
-    if let Err(e) = click_and_settle(&session, x, y).await {
+    let tab = agent_tab(&session).await?;
+    let (x, y, desc) = locate(&tab, &v, "ref", "text").await?;
+    if let Err(e) = click_and_settle(&tab, x, y).await {
         if e.contains("连接已断开") {
             close_internal("dead").await;
         }
         return Err(format!("点击失败: {e}"));
     }
     log("browser.click", json!({ "target": desc, "x": x, "y": y }));
-    let snap = take_snapshot(&session, max_chars).await?;
+    let snap = take_snapshot(&tab, max_chars).await?;
     Ok(format!("已点击 {desc}（{x},{y}）\n{snap}"))
 }
 
@@ -638,17 +854,17 @@ pub async fn type_text(args: &str, max_chars: usize) -> Result<String, String> {
     let clear = v.get("clear").and_then(Value::as_bool).unwrap_or(false);
     let session = current_session().await?;
     session.touch();
+    let tab = agent_tab(&session).await?;
     // 输入框定位允许用 label（占位符/名称）匹配，text 参数留给输入内容
     let locator: Value = json!({
         "ref": v.get("ref"),
         "label": v.get("label"),
     });
-    let (x, y, desc) = locate(&session, &locator, "ref", "label").await?;
+    let (x, y, desc) = locate(&tab, &locator, "ref", "label").await?;
     // 聚焦：点击一次输入框中央（真实事件，能触发站点自己的聚焦逻辑）
-    dispatch_click(&session, x, y).await?;
+    dispatch_click(&tab, x, y).await?;
     if clear {
-        session
-            .cdp
+        tab.cdp
             .call(
                 "Runtime.evaluate",
                 json!({ "expression": "(() => { const el = document.activeElement; if (el && 'value' in el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); } })()" , "returnByValue": true }),
@@ -656,15 +872,15 @@ pub async fn type_text(args: &str, max_chars: usize) -> Result<String, String> {
             .await?;
     }
     if !text.is_empty() {
-        session.cdp.call("Input.insertText", json!({ "text": text })).await?;
+        tab.cdp.call("Input.insertText", json!({ "text": text })).await?;
     }
     if submit {
-        session.cdp.call("Input.dispatchKeyEvent", json!({ "type": "rawKeyDown", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
-        session.cdp.call("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
+        tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "rawKeyDown", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
+        tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     log("browser.type", json!({ "target": desc, "chars": text.chars().count(), "submit": submit }));
-    let snap = take_snapshot(&session, max_chars).await?;
+    let snap = take_snapshot(&tab, max_chars).await?;
     Ok(format!("已向 {desc} 输入 {} 字符{}\n{snap}", text.chars().count(), if submit { " 并回车" } else { "" }))
 }
 
@@ -672,6 +888,179 @@ pub async fn type_text(args: &str, max_chars: usize) -> Result<String, String> {
 pub async fn close(_args: &str) -> Result<String, String> {
     close_internal("tool").await;
     Ok("浏览器已关闭".into())
+}
+
+// —— 网页面板（P20.1）：与 agent 工具共享同一浏览器，截图渲染 + 坐标回传 ——
+
+/// 视口尺寸（与 launch 的 --window-size 一致；前端按比例换算点击坐标）。
+pub const VIEWPORT_W: i64 = 1280;
+pub const VIEWPORT_H: i64 = 900;
+
+/// 面板状态：浏览器是否在跑 + 全部标签页。
+pub async fn panel_state() -> Value {
+    let guard = SESSION.lock().await;
+    match guard.as_ref() {
+        None => json!({ "running": false, "tabs": [] }),
+        Some(s) => {
+            if !browser_alive(s.port).await {
+                return json!({ "running": false, "tabs": [] });
+            }
+            let briefs = s.tab_briefs().await;
+            json!({
+                "running": true,
+                "tabs": briefs.iter().map(|(id, agent, title, url)| json!({
+                    "id": id, "agent": agent, "title": title, "url": url,
+                })).collect::<Vec<_>>(),
+            })
+        }
+    }
+}
+
+fn check_panel_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank") {
+        return Err("地址必须以 http:// / https:// / file:// 开头".into());
+    }
+    Ok(())
+}
+
+/// 面板开新标签页（可选直接导航）。
+pub async fn panel_new(url: Option<String>) -> Result<Value, String> {
+    let url = url.unwrap_or_else(|| "about:blank".into());
+    if url != "about:blank" {
+        check_panel_url(&url)?;
+    }
+    let session = ensure_session().await?;
+    session.touch();
+    let tab = create_tab(&session, &url, false).await?;
+    Ok(json!({ "id": tab.id }))
+}
+
+/// 面板导航（地址栏回车）。
+pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
+    check_panel_url(url)?;
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    match navigate_tab(&tab, url).await {
+        Ok(_) => Ok(json!({ "ok": true })),
+        Err(e) => {
+            if e.contains("连接已断开") {
+                close_internal("dead").await;
+            }
+            Err(format!("导航失败: {e}"))
+        }
+    }
+}
+
+/// 面板截图：PNG 字节（前端 <img> 直链 + 缓存穿透参数）。
+pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    let res = tab
+        .cdp
+        .call("Page.captureScreenshot", json!({ "format": "png" }))
+        .await?;
+    let data = res
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "截图结果缺 data".to_string())?;
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| format!("截图 base64 解码失败: {e}"))
+}
+
+/// 面板点击（视口坐标）→ 等可能的导航沉降。
+pub async fn panel_click(id: &str, x: i64, y: i64) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    click_and_settle(&tab, x, y).await.map_err(|e| format!("点击失败: {e}"))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// 面板输入：向当前聚焦元素插文本（点过输入框后用）。
+pub async fn panel_type(id: &str, text: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    if !text.is_empty() {
+        tab.cdp.call("Input.insertText", json!({ "text": text })).await?;
+    }
+    Ok(json!({ "ok": true }))
+}
+
+/// 面板按键（如 Enter 提交搜索）。
+pub async fn panel_key(id: &str, key: &str, code: i64) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "rawKeyDown", "key": key, "windowsVirtualKeyCode": code })).await?;
+    tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": key, "windowsVirtualKeyCode": code })).await?;
+    Ok(json!({ "ok": true }))
+}
+
+/// 面板滚轮。
+pub async fn panel_scroll(id: &str, delta_y: i64) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    tab.cdp
+        .call(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseWheel", "x": VIEWPORT_W / 2, "y": VIEWPORT_H / 2, "deltaX": 0, "deltaY": delta_y }),
+        )
+        .await?;
+    Ok(json!({ "ok": true }))
+}
+
+/// 历史导航（后退/前进）：Page.getNavigationHistory + navigateToHistoryEntry。
+async fn history_go(id: &str, offset: i64) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    let hist = tab.cdp.call("Page.getNavigationHistory", json!({})).await?;
+    let index = hist.get("currentIndex").and_then(Value::as_i64).unwrap_or(0);
+    let entries = hist.get("entries").and_then(Value::as_array);
+    let target = index + offset;
+    if let Some(entries) = entries
+        && target >= 0
+        && let Some(entry) = entries.get(target as usize)
+        && let Some(entry_id) = entry.get("id").and_then(Value::as_i64)
+    {
+        tab.cdp
+            .call("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }))
+            .await?;
+        // 给导航一点沉降时间（不硬等 load：历史条目可能早已缓存）
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        return Ok(json!({ "ok": true }));
+    }
+    Err("没有更早/更晚的历史页".into())
+}
+
+pub async fn panel_back(id: &str) -> Result<Value, String> {
+    history_go(id, -1).await
+}
+
+pub async fn panel_forward(id: &str) -> Result<Value, String> {
+    history_go(id, 1).await
+}
+
+pub async fn panel_reload(id: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    tab.cdp.call("Page.reload", json!({})).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    Ok(json!({ "ok": true }))
+}
+
+/// 面板关标签页；全部关完浏览器进程自然退出。
+pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    close_tab(&session, id).await;
+    Ok(json!({ "ok": true }))
 }
 
 #[cfg(test)]

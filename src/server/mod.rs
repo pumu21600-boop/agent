@@ -26,7 +26,7 @@ pub(crate) use axum::{
         Html, IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{Value, json};
@@ -52,6 +52,7 @@ mod memory;
 mod sessions;
 mod settings;
 mod system;
+mod webpanel;
 mod workspace;
 
 use chat::*;
@@ -62,6 +63,7 @@ use memory::*;
 use sessions::*;
 use settings::*;
 use system::*;
+use webpanel::*;
 use workspace::*;
 
 
@@ -159,6 +161,19 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
         .route("/api/sandbox/info", get(sandbox_info))
+        // P20.1 网页面板：多标签管理 + 截图渲染 + 坐标回传（与 agent 浏览器工具共享实例）
+        .route("/api/browser/state", get(browser_state))
+        .route("/api/browser/new", post(browser_new))
+        .route("/api/browser/navigate", post(browser_navigate))
+        .route("/api/browser/screenshot", get(browser_screenshot))
+        .route("/api/browser/click", post(browser_click))
+        .route("/api/browser/type", post(browser_type))
+        .route("/api/browser/key", post(browser_key))
+        .route("/api/browser/scroll", post(browser_scroll))
+        .route("/api/browser/back", post(browser_back))
+        .route("/api/browser/forward", post(browser_forward))
+        .route("/api/browser/reload", post(browser_reload))
+        .route("/api/browser/tab", delete(browser_close_tab))
         .route("/api/workspace/files", get(list_workspace_files))
         .route("/api/workspace/file", get(read_workspace_file))
         .route("/api/changes", get(list_changes))
