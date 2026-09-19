@@ -71,12 +71,12 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search",
-            description: "在工作目录内按正则/关键字搜索文件内容，返回匹配行（默认 ripgrep，缺失时 findstr 兜底）。",
+            description: "在工作目录内按正则/关键字搜索文件内容，返回匹配行（默认 ripgrep，缺失时 findstr 兜底）。自动/完全访问档下 path 也接受绝对路径（可搜整台电脑）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "搜索关键字或正则" },
-                    "path": { "type": "string", "description": "可选：限定搜索的子目录或文件（相对工作目录）" }
+                    "path": { "type": "string", "description": "可选：限定搜索的子目录或文件（相对工作目录；自动/完全访问档可为绝对路径）" }
                 },
                 "required": ["query"]
             }),
