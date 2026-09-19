@@ -21,7 +21,7 @@ P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用�
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，11 个任务）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 运行时 / 插件）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——Git 运行时卡片与沙箱自检）。
 - **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测 174 项（含沙箱 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构

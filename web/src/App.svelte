@@ -2480,14 +2480,14 @@
 
   // —— P10.5 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'plugins', 'ext'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
     settingsTab = t;
     localStorage.setItem('settingsTab', t);
     if (t === 'mcp' || t === 'plugins') loadMcp();
-    if (t === 'plugins') loadGitRuntime();
+    if (t === 'ext') loadGitRuntime();
     if (t === 'skills') loadSkills();
     if (t === 'ext') loadExt();
   }
@@ -4012,7 +4012,6 @@
           <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆</button>
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
-          <button class:active={settingsTab === 'plugins'} on:click={() => pickSettingsTab('plugins')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="8" y="8" width="8" height="8" rx="1.5"/><path d="M10 8V4.5M14 8V4.5M10 19.5V16M14 19.5V16M4.5 10H8M4.5 14H8M16 10h3.5M16 14h3.5"/></svg> 运行时</button>
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
         </div>
         <div class="settings-content">
@@ -4572,90 +4571,6 @@
           {/if}
         </div>
       {/if}
-      {#if settingsTab === 'plugins'}
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={gitRuntime?.ok}></span>
-            <b>Git 运行时</b>
-            <span class="mcp-status">
-              {gitRuntime?.ok
-                ? gitRuntime.source === 'system'
-                  ? '系统 Git'
-                  : gitRuntime.source === 'portable'
-                    ? '便携版（exe 同级）'
-                    : '内置 Git'
-                : gitRuntime
-                  ? '不可用'
-                  : '读取中…'}
-            </span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" on:click={loadGitRuntime}>重新检测</button>
-          </div>
-          {#if gitRuntime?.ok}
-            <div class="mcp-cmd">版本 {gitRuntime.version} · {gitRuntime.path}</div>
-          {:else if gitRuntime}
-            <div class="mcp-cmd">{gitRuntime.error}</div>
-          {/if}
-          <div class="param-hint">
-            优先使用你机器上已装的 Git（PATH / 注册表 / 常见安装位置）；没装时才解压随包内置的
-            MinGit 到 {gitRuntime?.runtime_dir || '%LOCALAPPDATA%\\agent\\runtime\\git'}（无需联网、不要管理员）。
-            内置包{gitRuntime?.zip_available ? '已随发行包携带' : '未携带'}；新装 Git 后需重启服务才会重新检测。
-          </div>
-        </div>
-        <div class="param-hint">工具插件（WASM 引擎，契约 v1 后是插件的一种工具实现）：本地纯计算沙箱（无文件/网络），trap 不连坐；工具名以 wasm__插件__函数 下发，默认常规审批档。</div>
-        {#if wasmPlugins.length}
-          <div class="field">
-            <label>已加载插件（plugins/ 目录）</label>
-            {#each wasmPlugins as w}
-              <div class="mcp-card" style="margin-bottom:8px">
-                <div class="mcp-head">
-                  <b>{w.stem}</b>
-                  <span class="mcp-status">{w.ok ? '已加载' : '加载失败'}</span>
-                </div>
-                {#if w.load_error}
-                  <div class="mcp-cmd">{w.load_error}</div>
-                {/if}
-                <div class="mcp-tools-list">
-                  {#each w.tools as t}
-                    <div class="mcp-tool-item"><code>wasm__{w.stem}__{t.name}</code> {t.desc}</div>
-                  {/each}
-                </div>
-              </div>
-            {/each}
-            <div class="param-hint">放置 .wasm/.wat 到项目 plugins/ 目录后点任意「重连」重新扫描</div>
-          </div>
-        {:else}
-          <div class="menu-empty">plugins/ 目录下还没有 .wasm/.wat 插件。放入后刷新本页即可扫描加载。</div>
-        {/if}
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={sandboxProbe?.ok === true}></span>
-            <b>沙箱自检</b>
-            <span class="mcp-status">
-              {sbRunning ? '运行中…' : sandboxProbe ? (sandboxProbe.ok ? '全部通过' : '有失败项') : '未运行'}
-            </span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>运行自检</button>
-          </div>
-          {#if sandboxProbe?.results?.length}
-            <div class="probe-list">
-              {#each sandboxProbe.results as p}
-                <div class="probe-row">
-                  <span class="dot" class:haskey={p.ok}></span>
-                  <code>{p.name}</code>
-                  <span class="probe-detail">{p.detail}</span>
-                </div>
-              {/each}
-            </div>
-          {:else if sandboxProbe?.error}
-            <div class="mcp-cmd">{sandboxProbe.error}</div>
-          {/if}
-          <div class="param-hint">
-            真实拉起受限进程跑一遍隔离面（输出捕获 / 环境白名单 / 特权剥离 / 工作目录可达 / 超时团灭）。
-            只读操作，不会改动任何文件；kill-tree 与内存上限两项较慢，只在 cargo test 里跑。
-          </div>
-        </div>
-      {/if}
       {#if settingsTab === 'ext'}
         <div class="param-hint">
           插件（契约 v1）：一个目录 + 一份 manifest.json = 一个插件，面板与工具都在清单里声明，
@@ -4722,6 +4637,64 @@
             入口页里用 <code>postMessage({'{'}type:'agent:hello'{'}'})</code> 握手，之后可调
             app.info / workspace.info / workspace.files / git.status / memory.search / session.info /
             storage.read / storage.write / storage.delete。
+          </div>
+        </div>
+        <div class="field"><label>运行状态（本机环境）</label></div>
+        <div class="field mcp-card">
+          <div class="mcp-head">
+            <span class="dot" class:haskey={gitRuntime?.ok}></span>
+            <b>Git 运行时</b>
+            <span class="mcp-status">
+              {gitRuntime?.ok
+                ? gitRuntime.source === 'system'
+                  ? '系统 Git'
+                  : gitRuntime.source === 'portable'
+                    ? '便携版（exe 同级）'
+                    : '内置 Git'
+                : gitRuntime
+                  ? '不可用'
+                  : '读取中…'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={loadGitRuntime}>重新检测</button>
+          </div>
+          {#if gitRuntime?.ok}
+            <div class="mcp-cmd">版本 {gitRuntime.version} · {gitRuntime.path}</div>
+          {:else if gitRuntime}
+            <div class="mcp-cmd">{gitRuntime.error}</div>
+          {/if}
+          <div class="param-hint">
+            优先使用你机器上已装的 Git（PATH / 注册表 / 常见安装位置）；没装时才解压随包内置的
+            MinGit 到 {gitRuntime?.runtime_dir || '%LOCALAPPDATA%\\agent\\runtime\\git'}（无需联网、不要管理员）。
+            内置包{gitRuntime?.zip_available ? '已随发行包携带' : '未携带'}；新装 Git 后需重启服务才会重新检测。
+          </div>
+        </div>
+        <div class="field mcp-card">
+          <div class="mcp-head">
+            <span class="dot" class:haskey={sandboxProbe?.ok === true}></span>
+            <b>沙箱自检</b>
+            <span class="mcp-status">
+              {sbRunning ? '运行中…' : sandboxProbe ? (sandboxProbe.ok ? '全部通过' : '有失败项') : '未运行'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>运行自检</button>
+          </div>
+          {#if sandboxProbe?.results?.length}
+            <div class="probe-list">
+              {#each sandboxProbe.results as p}
+                <div class="probe-row">
+                  <span class="dot" class:haskey={p.ok}></span>
+                  <code>{p.name}</code>
+                  <span class="probe-detail">{p.detail}</span>
+                </div>
+              {/each}
+            </div>
+          {:else if sandboxProbe?.error}
+            <div class="mcp-cmd">{sandboxProbe.error}</div>
+          {/if}
+          <div class="param-hint">
+            真实拉起受限进程跑一遍隔离面（输出捕获 / 环境白名单 / 特权剥离 / 工作目录可达 / 超时团灭）。
+            只读操作，不会改动任何文件；kill-tree 与内存上限两项较慢，只在 cargo test 里跑。
           </div>
         </div>
       {/if}
