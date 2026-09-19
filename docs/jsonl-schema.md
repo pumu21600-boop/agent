@@ -144,6 +144,8 @@
 | `browser.click` | 页面点击完成（P20） | `target`（语义定位描述）、`x`、`y` |
 | `browser.type` | 页面输入完成（P20） | `target`、`chars`、`submit` |
 | `browser.close` | 浏览器关闭（工具/空转/idle 收割，P20） | `reason`（tool/idle/dead） |
+| `browser.tab.new` | 新开标签页（agent 工作页或面板「+」，P20.1） | `id`、`agent`、`url` |
+| `browser.tab.close` | 关闭标签页（P20.1） | `id` |
 | `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
