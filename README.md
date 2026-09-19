@@ -1,17 +1,16 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P18 完成**（契约收敛：插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；P15 缺口补齐（MCP http transport / WASM ABI v1 / 发布打包 / CI）；
-扩展覆盖标记）；P15 缺口补齐（组件总线 v0 / MCP http transport / WASM ABI v1 / 发布打包 / CI）；
+当前进度：**P20 完成**（浏览器内核：内置无头浏览器 CDP 直连 + 语义定位点击 + DOM 增量 diff；沙箱统一：SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / App.svelte 拆分 / 内置插件试点）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
 P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用）。
 逐阶段排产与踩坑记录见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
 ## 功能总览
 
 - **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、**取消会话化**（停止只停当前会话的这一轮，别的会话不受影响）；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
-- **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与插件工具（`wasm__<plugin>__<tool>`；契约 v1 起 WASM 是插件工具的一种实现，见 `docs/plugin-contract-v1.md`）。
+- **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / **`browser_*`（内置无头浏览器五件套：open / snapshot / click / type / close，语义定位为主、坐标兜底，快照带稳定 ref 与增量 diff）** / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git`，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与插件工具（`wasm__<plugin>__<tool>`；契约 v1 起 WASM 是插件工具的一种实现，见 `docs/plugin-contract-v1.md`）。
 - **审批与 Plan**：四档 `read-only`（只读）`sandbox`（沙箱）`auto`（自动）`full-access`（完全访问）——只读=写/执行逐次询问；沙箱=只在沙箱内执行，工作区与电脑都不改（写文件直接驳回）；自动=可动工作区与整台电脑（越界写按高危先问，shell 仍在沙箱）；完全访问=全免审 + 本机直跑（需 `allow_unsandboxed`）。档位按会话记忆、运行中切换下一步即生效，风险分级引擎逐条判定，「本会话同类允许」记忆授权范围。Plan 档是**接口层能力**（请求级 `plan_mode`：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划，最终回答可产出结构化计划块）——P14 起**界面不再提供 Plan/Act 手动切换**（改由模型按系统约定在任务里自己列步骤），该档保留给 API 与 eval 使用。
-- **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网）；设置 → 运行时 有「沙箱自检」卡片可一键跑探针套件。
+- **执行沙箱**：`SandboxTier` 统一接口包住三档——Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）为默认档；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网，探测链 canary 不过自动回退受限档并在 UI/审计注明）；**档位探测链**（快速探针跑在生效档上，解析结果进程内缓存）+ 设置 → 插件 → 运行状态「沙箱档位」卡明示当前档位（`GET /api/sandbox/info`）。浏览器工具走 Chromium 自带站点隔离，不进 Windows 沙箱。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
 - **恢复与撤销**：danger≥1 工具执行前拍影子仓库检查点；撤销只回退本任务改过的文件（绝不整树 reset）；对话流内显示「N 个文件已更改 +x −y ↩ 撤销」。
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）；HANDOFF 交接文档（手动或上下文 ≥80% 自动）。
@@ -20,9 +19,9 @@ P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用�
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
-- **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，11 个任务）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——Git 运行时卡片与沙箱自检）。
-- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测 174 项（含沙箱 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
+- **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
+- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 180 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
 
@@ -37,7 +36,8 @@ agent/
 │   ├── gateway/          # 模型网关：providers 数据加载、端点/思考形态探测、降级链
 │   ├── config/           # config.toml + settings.json（DPAPI 存 key）+ app_root 运行形态
 │   ├── observability/    # JSONL 日志（6 类事件 + 轮转）+ trace 读取
-│   ├── sandbox/          # 执行沙箱：Job Objects + 受限 token + AppContainer + 探针
+│   ├── browser/          # P20 浏览器内核：cdp.rs（CDP WebSocket 客户端 + 浏览器发现拉起）+ 会话管理与 DOM 快照/diff
+│   ├── sandbox/          # 执行沙箱：backend.rs（SandboxTier trait 三档）+ probes.rs（探针与档位探测链）
 │   ├── context/          # 上下文工程：token 估算/压缩/裁剪
 │   ├── recovery/         # 影子仓库检查点 + HANDOFF 交接
 │   ├── session/          # 会话落盘与恢复
@@ -49,7 +49,7 @@ agent/
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
 ├── ui-ext/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
-├── evals/                # eval 评测：tasks/ 11 个任务 + mcp-mini-server.mjs（stdio）/ mcp-http-server.mjs（http）冒烟工具
+├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-mini-server.mjs（stdio）/ mcp-http-server.mjs（http）冒烟工具
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
 ├── plugins/              # 插件工具（*.wat / 目录+manifest，WASM 引擎执行）
 ├── prompts/system.md     # 系统约定（每轮任务实时读盘）
@@ -244,6 +244,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/ui-ext/{name}[/{path}]` | 插件面板静态资源（入口页由 manifest 指定；路径穿越一律 404） |
 | GET | `/api/version` | 版本与运行形态（`root` = 当前生效的应用根） |
 | GET | `/api/sandbox/selftest` | 沙箱探针套件（真实拉起受限进程） |
+| GET | `/api/sandbox/info` | 当前沙箱档位（配置档/生效档/回退原因/探测链明细；`?refresh=1` 强制重探） |
 
 ## MCP 双 transport
 

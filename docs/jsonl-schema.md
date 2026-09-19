@@ -78,6 +78,8 @@
 | `sandbox.spawn` | 沙箱/本机直跑拉起进程（P3/P4） | `pid`、`app`、`working_dir`、`restricted`（false=本机直跑）、`timeout_ms`、`memory_mb`、`active_processes` |
 | `sandbox.exit` | 沙箱进程树收割（P3） | `pid`、`exit_code`、`timed_out`、`stdout_chars`、`stderr_chars` |
 | `sandbox.selftest` | 沙箱探针套件结果（P3） | `ok` |
+| `sandbox.tier.resolved` | 档位探测链解析完成（P20） | `effective`、`ok`（探测链是否全绿） |
+| `sandbox.tier.fallback` | 请求档不可用自动回退（P20；仅 AppContainer→受限 一种） | `requested`、`effective`、`reason` |
 | `gateway.client_rebuild` | 网关 HTTP 客户端热重建（网络自愈） | `note` |
 | `settings.channel_changed` | 配置渠道地址变更，模型清单作废 | `base_url` |
 | `approval.requested` | 工具调用待审批（P4） | `id`、`tool` |
@@ -136,6 +138,12 @@
 | `hook.after_tool` | 工具执行后通知挂点已跑 | `ok` |
 | `hook.session_end` | 任务结束挂点已跑 | `session`、`ok` |
 | `hook.budget_exceeded` | 单任务累计 token 超预算通知 | `tokens`、`budget`（通知载荷） |
+| `browser.launch` | 内置浏览器已拉起（P20） | `exe`、`port`（CDP 调试端口） |
+| `browser.stale` | 浏览器会话失活（进程退出/连接断开），已清理待重拉（P20） | — |
+| `browser.navigate` | 页面导航（browser_open，P20） | `url` |
+| `browser.click` | 页面点击完成（P20） | `target`（语义定位描述）、`x`、`y` |
+| `browser.type` | 页面输入完成（P20） | `target`、`chars`、`submit` |
+| `browser.close` | 浏览器关闭（工具/空转/idle 收割，P20） | `reason`（tool/idle/dead） |
 | `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
