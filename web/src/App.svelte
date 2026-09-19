@@ -749,7 +749,7 @@
 
   async function loadWebState(keepActive = true) {
     try {
-      const s = await fetch('/api/browser/state', { cache: 'no-store' }).then((r) => r.json());
+      const s = await webApi('/api/browser/state', { cache: 'no-store' });
       webTabs = s.tabs || [];
       if (!keepActive || !webTabs.some((t) => t.id === webActiveId)) {
         webActiveId = webTabs.length ? webTabs[webTabs.length - 1].id : '';
@@ -761,11 +761,32 @@
       if (act && document.activeElement !== addrEl) {
         webAddress = act.url === 'about:blank' ? '' : act.url || '';
       }
-    } catch {
+    } catch (e) {
       webTabs = [];
+      webError = String((e && e.message) || e);
     }
   }
 
+  // 面板 → 后端的响应统一解析：旧版服务（无 /api/browser/*）会返回 404 空体或 HTML，
+  // 直接 r.json() 只会报天书——这里翻成「请重启服务」的明确提示。
+  async function webApi(path, opts) {
+    let resp;
+    try {
+      resp = await fetch(path, opts);
+    } catch (e) {
+      throw new Error('服务连不上：' + String(e.message || e));
+    }
+    const text = await resp.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      if (resp.status === 404) throw new Error('服务端没有浏览器接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
+      throw new Error('服务返回异常（HTTP ' + resp.status + '），请重启服务后重试');
+    }
+    if (!resp.ok) throw new Error((data && data.error) || '请求失败（HTTP ' + resp.status + '）');
+    return data || {};
+  }
   function webNormalizeUrl(u) {
     const s = (u || '').trim();
     if (!s) return '';
@@ -778,11 +799,11 @@
     webBusy = true;
     webError = '';
     try {
-      const r = await fetch('/api/browser/new', {
+      const r = await webApi('/api/browser/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
-      }).then((r) => r.json());
+      });
       if (r.id) {
         webActiveId = r.id;
       } else {
@@ -800,7 +821,7 @@
     webBusy = true;
     webError = '';
     try {
-      await fetch(`/api/browser/tab?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await webApi(`/api/browser/tab?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
       await loadWebState();
       webShotT += 1;
     } catch {}
@@ -815,19 +836,19 @@
     try {
       if (!webActive) {
         // 没有标签页：地址栏回车 = 自动开新页并导航
-        const r = await fetch('/api/browser/new', {
+        const r = await webApi('/api/browser/new', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url }),
-        }).then((r) => r.json());
+        });
         if (r.id) webActiveId = r.id;
         else webError = r.error || '打开网页失败';
       } else {
-        const r = await fetch('/api/browser/navigate', {
+        const r = await webApi('/api/browser/navigate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: webActive.id, url }),
-        }).then((r) => r.json());
+        });
         if (r.error) webError = r.error;
       }
       webShotT += 1;
@@ -842,7 +863,7 @@
     if (!webActive || webBusy) return;
     webBusy = true;
     try {
-      await fetch(`/api/browser/${action}`, {
+      await webApi(`/api/browser/${action}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: webActive.id }),
@@ -860,7 +881,7 @@
     const y = Math.round(((ev.clientY - rect.top) * WEB_H) / rect.height);
     webBusy = true;
     try {
-      await fetch('/api/browser/click', {
+      await webApi('/api/browser/click', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: webActive.id, x, y }),
@@ -878,7 +899,7 @@
     if (!dy) return;
     webBusy = true;
     try {
-      await fetch('/api/browser/scroll', {
+      await webApi('/api/browser/scroll', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: webActive.id, deltaY: dy }),
@@ -899,7 +920,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: cmd }),
-      }).then((r) => r.json());
+      });
       termLines = termLines.map((l, i) =>
         i === termLines.length - 1 ? { ...l, out: (r.output || '').trim(), ok: r.ok !== false } : l
       );
@@ -2137,7 +2158,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
-      }).then((r) => r.json());
+      });
       if (r.error) {
         settingsMsg = r.error;
         return;
@@ -2174,7 +2195,7 @@
     syncCur();
     restoreUsage('@new'); // 新会话：账本里没有它 → 清零
     try {
-      const r = await fetch('/api/sessions/new', { method: 'POST' }).then((r) => r.json());
+      const r = await fetch('/api/sessions/new', { method: 'POST' });
       if (r.ok && r.id) {
         rekey('@new', r.id);
         currentTitle = r.title || '';
@@ -2401,7 +2422,7 @@
   // 添加项目：server 弹 Win 原生选文件夹窗口 → 选中的目录注册为项目（=切换工作区）
   async function addProject() {
     try {
-      const r = await fetch('/api/workspace/picker', { method: 'POST' }).then((r) => r.json());
+      const r = await fetch('/api/workspace/picker', { method: 'POST' });
       if (r.canceled || !r.path) return;
       await applyWorkspace(r.path);
     } catch (e) {
@@ -2452,7 +2473,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
-      }).then((r) => r.json());
+      });
       await loadSessions();
       if (r.id) await loadSession(r.id);
     } catch (e) {
@@ -2701,7 +2722,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope: memTab, content: memText }),
-      }).then((r) => r.json());
+      });
       if (r.ok) {
         memDirty = false; // 先清脏标记再回读，框里保留的就是文件真实内容
         await loadMemory();
@@ -2768,7 +2789,7 @@
           description: skillEditor.description,
           content: skillEditor.content,
         }),
-      }).then((r) => r.json());
+      });
       if (r.error) {
         skillMsg = `保存失败: ${r.error}`;
         return;
@@ -2786,7 +2807,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'delete', name }),
-      }).then((r) => r.json());
+      });
       skillMsg = r.error ? `删除失败: ${r.error}` : `已删除 ${name}`;
       await loadSkills();
     } catch (e) {
@@ -2809,7 +2830,7 @@
   let appVersion = null;
   async function loadVersion() {
     try {
-      appVersion = await fetch('/api/version', { cache: 'no-store' }).then((r) => r.json());
+      appVersion = await fetch('/api/version', { cache: 'no-store' });
     } catch (e) {
       appVersion = null;
     }
@@ -2817,7 +2838,7 @@
   async function runSandboxProbe() {
     sbRunning = true;
     try {
-      sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' }).then((r) => r.json());
+      sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' });
     } catch (e) {
       sandboxProbe = { error: String(e.message || e) };
     }
@@ -2825,7 +2846,7 @@
   }
   async function loadGitRuntime() {
     try {
-      gitRuntime = await fetch('/api/git/info', { cache: 'no-store' }).then((r) => r.json());
+      gitRuntime = await fetch('/api/git/info', { cache: 'no-store' });
     } catch (e) {
       gitRuntime = null;
     }
@@ -2836,7 +2857,7 @@
   async function loadSandboxInfo(refresh) {
     sbInfoLoading = true;
     try {
-      sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }).then((r) => r.json());
+      sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' });
     } catch (e) {
       sandboxInfo = null;
     }
@@ -2858,7 +2879,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, name, risk, server }),
-      }).then((r) => r.json());
+      });
       if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
       if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
     } catch (e) {
@@ -2915,7 +2936,7 @@
 
   async function loadExt() {
     try {
-      const r = await fetch('/api/ext', { cache: 'no-store' }).then((r) => r.json());
+      const r = await fetch('/api/ext', { cache: 'no-store' });
       extList = r.extensions || [];
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
     } catch (e) {
@@ -2976,7 +2997,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name, enabled: e.enabled === false }),
-      }).then((r) => r.json());
+      });
       if (r.extensions) extList = r.extensions;
       if (e.enabled !== false && extCurrent && extCurrent.name === e.name) extOpen = false; // 停用后关面板
     } catch (err) {
@@ -2991,7 +3012,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name }),
-      }).then((r) => r.json());
+      });
       if (r.error) extMsg = `转正失败: ${r.error}`;
       else extMsg = `已转正「${e.title || e.name}」（来源已改为 user，重启后仍在）`;
       if (r.extensions) extList = r.extensions;
@@ -3003,7 +3024,7 @@
   async function discardExt(e) {
     if (!confirm(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`)) return;
     try {
-      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
+      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' });
       if (r.error) extMsg = `丢弃失败: ${r.error}`;
       else extMsg = `已丢弃「${e.title || e.name}」`;
       if (r.extensions) extList = r.extensions;
@@ -3054,7 +3075,7 @@
     const id = d.id;
     const params = d.params || {};
     const reply = (ok, result) => postToName(from, { type: 'agent:response', id, ok, result });
-    const get = (url) => fetch(url, { cache: 'no-store' }).then((r) => r.json());
+    const get = (url) => fetch(url, { cache: 'no-store' });
     try {
       switch (d.method) {
         case 'app.info':
@@ -3134,7 +3155,7 @@
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ path, content }),
-          }).then((r) => r.json());
+          });
           reply(!!r.ok, r.ok ? { ok: true, path: r.path, bytes: r.bytes } : r.error || '写入失败');
           break;
         }
@@ -3158,7 +3179,7 @@
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name: from, key, value: params.value ?? null }),
-          }).then((r) => r.json());
+          });
           reply(!!r.ok, r.ok ? { ok: true, bytes: r.bytes } : r.error || '写入失败');
           break;
         }
@@ -3166,7 +3187,7 @@
           if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
           const key = String(params.key || '');
           if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
-          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' }).then((r) => r.json());
+          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' });
           reply(!!r.ok, r.ok ? { ok: true, found: r.found } : r.error || '删除失败');
           break;
         }
