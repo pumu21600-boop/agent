@@ -203,7 +203,7 @@ pub struct ChatRequest {
     /// 可选的请求级 key 覆盖（仅内存）；为空则用已保存设置
     #[serde(default)]
     pub api_key: String,
-    /// 审批档位覆盖：suggest / auto-edit / full-auto（缺省用配置默认）
+    /// 审批档位覆盖（P19 四档）：read-only / sandbox / auto / full-access（旧档名自动映射；缺省用配置默认）
     #[serde(default)]
     pub approval_mode: String,
     /// P6.1 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
@@ -565,6 +565,7 @@ async fn read_workspace_file(
         max_chars: 200_000,
         sandbox: sandbox_cfg,
         unsandboxed: false,
+        fs_unconfined: false,
     };
     match crate::tools::execute(
         &exec,
@@ -618,6 +619,7 @@ async fn run_shell(
         max_chars: 100_000,
         sandbox: sandbox_cfg,
         unsandboxed: false,
+        fs_unconfined: false,
     };
     match crate::tools::execute(&exec, "shell", &json!({ "command": command }).to_string()).await {
         Ok(output) => Ok(Json(json!({ "ok": true, "output": output }))),
@@ -1266,26 +1268,27 @@ async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Re
     let run_flag = run_flag.expect("占位或接管必得其一");
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
-    // 审批档位归一化（Codex 式三档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
-    // full-access 需 config 总开关，没开就回退 auto 并告知前端。
+    // 审批档位归一化（P19 四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
+    // full-access 需 config 总开关，没开就降级为 auto 并告知前端（档位与实际权限保持一致）。
     let norm = |m: &str| -> String {
         match m.trim() {
             "suggest" => "read-only".into(),
             "auto-edit" | "full-auto" => "auto".into(),
             "local" | "full-access" => "full-access".into(),
-            other @ ("read-only" | "auto") => other.to_string(),
+            other @ ("read-only" | "sandbox" | "auto") => other.to_string(),
             _ => "auto".into(),
         }
     };
     let allow_unsandboxed = cfg.allow_unsandboxed;
-    let mode = if req.approval_mode.trim().is_empty() {
+    let mut mode = if req.approval_mode.trim().is_empty() {
         norm(&cfg.default_approval)
     } else {
         norm(&req.approval_mode)
     };
     if mode == "full-access" && !allow_unsandboxed {
+        mode = "auto".into();
         let _ = tx.send(Ok(json_event(json!({
-            "notice": "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为沙箱内自动"
+            "notice": "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为自动档"
         }))));
     }
     // M1：档位写进**本会话**（不再写全局默认，否则并发多会话会互相覆盖——
@@ -2742,6 +2745,33 @@ impl agent::ApprovalGate for ChatGate {
         !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
     }
 
+    /// P19：文件工具是否允许越出工作区——auto / full-access 档=true（auto 档越界写会按
+    /// Dangerous 先弹审批；full-access 全免审），read-only / sandbox 档锁死工作区。
+    /// 每步现读：运行中切档，下一个决策步即按新档位执行。
+    fn file_tools_unconfined(&self) -> bool {
+        matches!(
+            self.effective_mode().as_str(),
+            "auto" | "full-auto" | "auto-edit" | "full-access" | "local"
+        )
+    }
+
+    /// P19 sandbox 档：工作区文件写入直接驳回（不进审批弹窗）——「只能在沙箱执行，
+    /// 工作区和电脑都动不了」。shell/git 照常走审批流（执行恒在沙箱内）。
+    fn tier_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {
+        if self.effective_mode() != "sandbox" {
+            return None;
+        }
+        if matches!(tool, "write_file" | "edit_file") {
+            let _ = args_json;
+            Some(
+                "沙箱档只允许在沙箱内执行，不修改工作区和电脑上的任何文件（要写文件请切「自动」或「完全访问」档）"
+                    .into(),
+            )
+        } else {
+            None
+        }
+    }
+
     fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -2805,15 +2835,24 @@ async fn set_approval_mode(
     let Some(mode) = req.get("mode").and_then(Value::as_str) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 mode" })));
     };
-    if !matches!(mode, "read-only" | "auto" | "full-access" | "suggest" | "auto-edit" | "full-auto" | "local") {
+    if !matches!(
+        mode,
+        "read-only" | "sandbox" | "auto" | "full-access" | "suggest" | "auto-edit" | "full-auto" | "local"
+    ) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未知档位" })));
     }
-    let mode = match mode {
+    let mut mode = match mode {
         "suggest" => "read-only",
         "auto-edit" | "full-auto" => "auto",
         "local" => "full-access",
         other => other,
     };
+    // 完全访问需要 config 总开关支撑（脱沙箱直跑）；没开就真的降为 auto，
+    // 否则前端显示「完全访问」而权限面还是沙箱档——档位与实际权限不一致。
+    if mode == "full-access" && !state.agent_cfg.allow_unsandboxed {
+        mode = "auto";
+    }
+    let mode = mode.to_string();
     // M1：带 session 就只改这条会话的档（并发多会话各切各的）；不带 session 改全局默认档
     let session = req.get("session").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if session.is_empty() {
@@ -3523,6 +3562,7 @@ loadProviders().then(loadSettings);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::agent::ApprovalGate;
 
     /// 测试用配置（custom 中转端点：探测不出规范 → openai 兜底，适合测显式覆盖）。
     fn test_config() -> crate::config::settings::Config {
@@ -3635,6 +3675,55 @@ mod tests {
         *def.write().unwrap_or_else(|e| e.into_inner()) = "read-only".into();
         assert_eq!(a.effective_mode(), "full-access");
         assert_eq!(b.effective_mode(), "read-only");
+    }
+
+    /// P19 四档：sandbox 档硬拦写文件工具；文件放行面与沙箱开关按档位区分。
+    #[test]
+    fn tier_semantics_sandbox_and_fs_scope() {
+        let def = Arc::new(std::sync::RwLock::new("auto".to_string()));
+        let modes = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gate = |sid: &str, tier: &str| {
+            modes
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sid.to_string(), tier.to_string());
+            ChatGate {
+                mode: def.clone(),
+                session_modes: modes.clone(),
+                allow_unsandboxed: true,
+                unsandboxed_approval: false,
+                pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                session_id: sid.to_string(),
+                meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                approved: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                plan_mode: false,
+                tx: tx.clone(),
+                cancel: Arc::new(CancelFlag::new()),
+                steer: Arc::new(crate::core::steer::SteerQueue::new()),
+            }
+        };
+        // sandbox 档：写文件直接驳回（不进审批），读与执行不拦；文件工具锁工作区，执行恒沙箱
+        let s = gate("sess-s", "sandbox");
+        assert!(s.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_some());
+        assert!(s.tier_block_reason("edit_file", r#"{"path":"a.txt"}"#).is_some());
+        assert!(s.tier_block_reason("read_file", r#"{"path":"a.txt"}"#).is_none());
+        assert!(s.tier_block_reason("shell", r#"{"command":"cargo build"}"#).is_none());
+        assert!(!s.file_tools_unconfined(), "sandbox 档文件工具锁死工作区");
+        assert!(s.sandbox_enabled(), "sandbox 档执行恒在沙箱内");
+        // auto 档：不硬拦（越界写走 Dangerous 审批），文件工具放行出工作区，shell 仍沙箱
+        let a = gate("sess-a", "auto");
+        assert!(a.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_none());
+        assert!(a.file_tools_unconfined(), "auto 档文件工具可越出工作区");
+        assert!(a.sandbox_enabled(), "auto 档 shell 仍在沙箱内");
+        // full-access 档：文件全放行 + 本机直跑
+        let f = gate("sess-f", "full-access");
+        assert!(f.file_tools_unconfined());
+        assert!(!f.sandbox_enabled());
+        // read-only 档：写文件走审批（不硬拦），文件工具锁工作区
+        let r = gate("sess-r", "read-only");
+        assert!(r.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_none());
+        assert!(!r.file_tools_unconfined());
     }
 
     #[test]

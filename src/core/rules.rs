@@ -195,6 +195,11 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
 
     // 3) 绝对路径越界（Windows 大小写不敏感比较，避免盘符/目录名大小写差异误判）
     let target_path = workspace_root.join(path_str);
+    // 词面先判：目标文件/父目录还不存在时 canonicalize 必失败，越界判定会被整段跳过——
+    // `C:/外部/尚不存在.txt` 这类绝对路径就不能按常规改动静默放行
+    if target_path.is_absolute() && !is_within_root(workspace_root, &target_path) {
+        return (RiskLevel::Dangerous, format!("试图修改工作区外部文件: {path_str}"));
+    }
     if let Ok(canon_target) = target_path.canonicalize()
         && let Ok(canon_root) = workspace_root.canonicalize()
             && !is_within_root(&canon_root, &canon_target) {
@@ -605,15 +610,20 @@ pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String 
 
 /// 判定当前审批模式下该风险等级是否需要向用户请求审批。
 ///
-/// 模式映射：
+/// 四档映射（P19，Codex 式三档扩为四档）：
 /// - "read-only" (原 suggest)：Safe(0) 放行，Normal(1) 及以上需审批；
+/// - "sandbox"：执行仅限沙箱内（shell/git 恒沙箱），工作区文件写入在进审批前已被
+///   `ApprovalGate::tier_block_reason` 直接驳回——能走到这里的 Normal/Dangerous
+///   只有沙箱内执行类（git 提交、重定向写等），照 read-only 语义逐次询问；
 /// - "auto" (原 auto-edit / full-auto)：Safe(0) 与 Normal(1) 静默放行，仅 Dangerous(2) 需审批；
+///   工作区外写入判 Dangerous（见 `risk_write_file`），因此在 auto 档「能动电脑但高危先问」；
 /// - "full-access" (原 local)：全免审（除非配置显式强制了 unsandboxed_approval）。
 pub fn should_ask_approval(mode: &str, risk: RiskLevel) -> bool {
     match mode {
         "full-access" | "local" => false,
         "auto" | "full-auto" | "auto-edit" => risk >= RiskLevel::Dangerous,
-        _ => risk >= RiskLevel::Normal, // read-only / suggest / 未知
+        // read-only / sandbox / suggest / 未知：Normal 及以上逐次询问
+        _ => risk >= RiskLevel::Normal,
     }
 }
 
@@ -822,6 +832,12 @@ mod tests {
         assert!(should_ask_approval("read-only", RiskLevel::Normal));
         assert!(should_ask_approval("read-only", RiskLevel::Dangerous));
 
+        // sandbox 档：Safe 放行，Normal / Dangerous 需审批
+        // （write_file/edit_file 在进审批前已被档位硬拦截，能走到这里的只有沙箱内执行类）
+        assert!(!should_ask_approval("sandbox", RiskLevel::Safe));
+        assert!(should_ask_approval("sandbox", RiskLevel::Normal));
+        assert!(should_ask_approval("sandbox", RiskLevel::Dangerous));
+
         // auto 模式：Safe / Normal 自动放行，Dangerous 需审批
         assert!(!should_ask_approval("auto", RiskLevel::Safe));
         assert!(!should_ask_approval("auto", RiskLevel::Normal));
@@ -831,6 +847,20 @@ mod tests {
         assert!(!should_ask_approval("full-access", RiskLevel::Safe));
         assert!(!should_ask_approval("full-access", RiskLevel::Normal));
         assert!(!should_ask_approval("full-access", RiskLevel::Dangerous));
+    }
+
+    // —— P19：绝对路径越界且目标尚不存在——canonicalize 必失败，词面判定必须兜住 ——
+    #[test]
+    fn test_write_file_absolute_outside_is_dangerous_even_if_missing() {
+        let r = evaluate_risk(
+            "write_file",
+            &json!({"path": "C:/test/absent-dir/absent.txt", "content": "x"}),
+            &ws(),
+        );
+        assert_eq!(r.0, RiskLevel::Dangerous, "{}", r.1);
+        // 工作区内的绝对路径（哪怕文件还没建）不判越界
+        let r = evaluate_risk("write_file", &json!({"path": "C:/test/ws/src/new.rs", "content": "x"}), &ws());
+        assert_eq!(r.0, RiskLevel::Normal, "{}", r.1);
     }
 
     #[test]

@@ -50,17 +50,20 @@ pub struct ExecConfig {
     /// 本机直跑（脱沙箱）：shell/git 用完整用户 token + 继承父环境
     /// （AppContainer / 网络出向不在此重复存——run_in_sandbox 按 sandbox.mode 现算）
     pub unsandboxed: bool,
+    /// 文件工具是否允许越出工作区（auto / full-access 档=true；read-only / sandbox 档锁死工作区）。
+    /// 相对路径永远以工作区为基准；放行的只是绝对路径与 `..` 出界。
+    pub fs_unconfined: bool,
 }
 
 fn builtin_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file",
-            description: "读取工作目录内一个 UTF-8 文本文件的完整内容。路径相对于工作目录根。",
+            description: "读取工作目录内一个 UTF-8 文本文件的完整内容。路径相对于工作目录根；自动/完全访问档下也接受绝对路径（可读整台电脑）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "要读取的文件路径（相对工作目录，如 README.md 或 src/main.rs）" }
+                    "path": { "type": "string", "description": "要读取的文件路径（相对工作目录，如 README.md 或 src/main.rs；自动/完全访问档可为绝对路径）" }
                 },
                 "required": ["path"]
             }),
@@ -106,11 +109,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_page",
-            description: "按页读取工作目录内的大文本文件（默认 200 行/页）。大文件优先用本工具翻页，不要一次读全。",
+            description: "按页读取工作目录内的大文本文件（默认 200 行/页）。大文件优先用本工具翻页，不要一次读全。自动/完全访问档下也接受绝对路径。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "文件路径（相对工作目录）" },
+                    "path": { "type": "string", "description": "文件路径（相对工作目录；自动/完全访问档可为绝对路径）" },
                     "page": { "type": "integer", "description": "页码，从 1 开始" },
                     "page_size": { "type": "integer", "description": "可选：每页行数（默认 200，上限 1000）" }
                 },
@@ -132,11 +135,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。",
+            description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。自动/完全访问档下也接受绝对路径写工作区外（完全访问静默，自动档按高危先询问）；只读/沙箱档拒绝。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "目标文件路径（相对工作目录）" },
+                    "path": { "type": "string", "description": "目标文件路径（相对工作目录；自动/完全访问档可为绝对路径）" },
                     "content": { "type": "string", "description": "要写入的完整内容（覆盖式）" }
                 },
                 "required": ["path", "content"]
@@ -145,11 +148,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "在工作目录内一个文本文件里做局部替换：把 old_string 精确替换为 new_string（改大文件、改几行时优先用它，不要用 write_file 重写全文）。old_string 必须与文件内容逐字一致（含缩进与换行）且在文件中唯一出现；出现 0 次或多次都会失败并说明原因，可读文件后再试。",
+            description: "在工作目录内一个文本文件里做局部替换：把 old_string 精确替换为 new_string（改大文件、改几行时优先用它，不要用 write_file 重写全文）。old_string 必须与文件内容逐字一致（含缩进与换行）且在文件中唯一出现；出现 0 次或多次都会失败并说明原因，可读文件后再试。自动/完全访问档下也接受绝对路径改工作区外文件。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "目标文件路径（相对工作目录）" },
+                    "path": { "type": "string", "description": "目标文件路径（相对工作目录；自动/完全访问档可为绝对路径）" },
                     "old_string": { "type": "string", "description": "要被替换的原文本（与文件逐字一致；多带几行上下文保证唯一）" },
                     "new_string": { "type": "string", "description": "替换后的新文本（删除内容时给空串）" },
                     "replace_all": { "type": "boolean", "description": "可选：old_string 出现多次时全部替换（默认 false，要求唯一匹配）" }
@@ -226,8 +229,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         return crate::plugin::wasm::call_tool(name, args).await;
     }
     match name {
-        "read_file" => read_file(args, cfg.max_chars),
-        "read_page" => read_page(args, cfg.max_chars),
+        "read_file" => read_file(args, cfg.max_chars, cfg.fs_unconfined),
+        "read_page" => read_page(args, cfg.max_chars, cfg.fs_unconfined),
         "read_skill" => {
             let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
             let name = v
@@ -236,9 +239,9 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
                 .ok_or("缺少 name 参数")?;
             crate::skills::read(name)
         }
-        "write_file" => write_file(args),
-        "edit_file" => edit_file(args),
-        "search" => search(args, cfg.max_chars),
+        "write_file" => write_file(args, cfg.fs_unconfined),
+        "edit_file" => edit_file(args, cfg.fs_unconfined),
+        "search" => search(args, cfg.max_chars, cfg.fs_unconfined),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
         "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
@@ -253,7 +256,7 @@ pub fn write_workspace_relative(rel: &str, content: &str) -> Result<usize, Strin
     if content.len() > MAX_FILE_BYTES {
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
-    let full = resolve_in_workspace(rel, false)?;
+    let full = resolve_in_workspace(rel, false, false)?;
     crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
     Ok(content.len())
 }
@@ -263,17 +266,30 @@ fn cap(s: &str, max: usize) -> String {
     crate::context::compress(s, max)
 }
 
-/// 解析相对路径并做工作目录穿越校验，返回 canonicalize 后的绝对路径。
+/// 解析路径并做工作目录穿越校验，返回 canonicalize 后的绝对路径。
 /// `must_exist=false` 时对不存在的路径校验其父目录（写文件用）。
-fn resolve_in_workspace(rel: &str, must_exist: bool) -> Result<PathBuf, String> {
+/// `unconfined=true`（auto/full-access 档）允许绝对路径越出工作区——整台电脑可读写；
+/// read-only / sandbox 档传 false，工作区边界照旧硬拦。
+fn resolve_in_workspace(rel: &str, must_exist: bool, unconfined: bool) -> Result<PathBuf, String> {
     if rel.trim().is_empty() {
         return Err("path 为空".to_string());
     }
     let root = workspace_root().canonicalize().map_err(|e| format!("工作目录解析失败: {e}"))?;
+    // 放行档的绝对路径：原样使用，不做工作区归属检查（相对路径仍以工作区为基准）
+    if unconfined && Path::new(rel).is_absolute() {
+        if must_exist {
+            return Path::new(rel)
+                .canonicalize()
+                .map_err(|e| format!("路径不存在或不可访问: {e}"));
+        }
+        let parent = Path::new(rel).parent().ok_or("路径无父目录")?.to_path_buf();
+        std::fs::create_dir_all(&parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+        return Ok(Path::new(rel).to_path_buf());
+    }
     let full = root.join(rel);
     if must_exist {
         let canon = full.canonicalize().map_err(|e| format!("路径不存在或不可访问: {e}"))?;
-        if !canon.starts_with(&root) {
+        if !unconfined && !canon.starts_with(&root) {
             return Err(format!("拒绝访问工作目录外的路径: {rel}"));
         }
         Ok(canon)
@@ -282,16 +298,16 @@ fn resolve_in_workspace(rel: &str, must_exist: bool) -> Result<PathBuf, String> 
         let parent = full.parent().ok_or("路径无父目录")?.to_path_buf();
         std::fs::create_dir_all(&parent).map_err(|e| format!("创建父目录失败: {e}"))?;
         let canon_parent = parent.canonicalize().map_err(|e| format!("父目录解析失败: {e}"))?;
-        if !canon_parent.starts_with(&root) {
+        if !unconfined && !canon_parent.starts_with(&root) {
             return Err(format!("拒绝访问工作目录外的路径: {rel}"));
         }
         Ok(canon_parent.join(full.file_name().ok_or("路径无文件名")?))
     }
 }
 
-fn read_file(args: &str, max_chars: usize) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+fn read_file(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
-    let full = resolve_in_workspace(rel, true)?;
+    let full = resolve_in_workspace(rel, true, unconfined)?;
     let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
@@ -301,7 +317,7 @@ fn read_file(args: &str, max_chars: usize) -> Result<String, String> {    let v:
 }
 
 /// 分页读取大文件（P5）：按行分页，页码越界自动钳到最后/第一页。
-fn read_page(args: &str, max_chars: usize) -> Result<String, String> {
+fn read_page(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let page = v.get("page").and_then(Value::as_u64).ok_or("缺少 page 参数")?;
@@ -309,7 +325,7 @@ fn read_page(args: &str, max_chars: usize) -> Result<String, String> {
         return Err("page 从 1 开始".to_string());
     }
     let page_size = v.get("page_size").and_then(Value::as_u64).unwrap_or(200).clamp(10, 1000) as usize;
-    let full = resolve_in_workspace(rel, true)?;
+    let full = resolve_in_workspace(rel, true, unconfined)?;
     if full.metadata().map_err(|e| format!("读取失败: {e}"))?.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
@@ -338,14 +354,14 @@ fn read_page(args: &str, max_chars: usize) -> Result<String, String> {
 /// 共用（审查 N2——edit_file 原先无上限，模型误编辑大文件时整文件读入内存）。
 const MAX_FILE_BYTES: usize = 512 * 1024;
 
-fn write_file(args: &str) -> Result<String, String> {
+fn write_file(args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let content = v.get("content").and_then(Value::as_str).ok_or("缺少 content 参数")?;
     if content.len() > MAX_FILE_BYTES {
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
-    let full = resolve_in_workspace(rel, false)?;
+    let full = resolve_in_workspace(rel, false, unconfined)?;
     // 原子写：写到一半失败不能留下半截文件（模型写代码文件时这是最常见的损坏来源）
     crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
     Ok(format!("已写入 {} 字节 → {}", content.len(), rel))
@@ -353,7 +369,7 @@ fn write_file(args: &str) -> Result<String, String> {
 
 /// 局部修改（P16）：文件里唯一出现的 old_string → new_string。
 /// 大文件改几行用它，省 token 也避免重写全文时误伤其他内容。
-fn edit_file(args: &str) -> Result<String, String> {
+fn edit_file(args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let old = v.get("old_string").and_then(Value::as_str).ok_or("缺少 old_string 参数")?;
@@ -368,7 +384,7 @@ fn edit_file(args: &str) -> Result<String, String> {
     if new.len() > MAX_FILE_BYTES {
         return Err(format!("new_string 过大（{} 字节，上限 512KB）", new.len()));
     }
-    let full = resolve_in_workspace(rel, true)?;
+    let full = resolve_in_workspace(rel, true, unconfined)?;
     let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
@@ -475,14 +491,14 @@ fn rg_available() -> bool {
     })
 }
 
-fn search(args: &str, max_chars: usize) -> Result<String, String> {
+fn search(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let query = v.get("query").and_then(Value::as_str).ok_or("缺少 query 参数")?;
     if query.trim().is_empty() {
         return Err("query 为空".to_string());
     }
     let sub = v.get("path").and_then(Value::as_str).unwrap_or(".");
-    let target = resolve_in_workspace(sub, true)?;
+    let target = resolve_in_workspace(sub, true, unconfined)?;
     if target.is_file() {
         return Err("path 请给目录（搜索整个文件请用 read_file）".to_string());
     }
@@ -1366,7 +1382,7 @@ mod tests {
     }
 
     fn cfg() -> ExecConfig {
-        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false }
+        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, fs_unconfined: false }
     }
 
     #[tokio::test]
@@ -1383,6 +1399,31 @@ mod tests {
         let r = execute(&cfg(), "read_file", r#"{"path":"C:\\Windows\\win.ini"}"#).await;
         assert!(r.is_err(), "绝对路径越界应被拒绝");
         std::fs::remove_dir_all(workspace_root().join(".p4-test")).ok();
+    }
+
+    // —— P19：fs_unconfined（auto / full-access 档）放行绝对路径读写整台电脑 ——
+    #[tokio::test]
+    async fn fs_unconfined_reaches_outside_workspace() {
+        init_logger();
+        let outside = std::env::temp_dir().join("p19-unconfined-probe.txt");
+        std::fs::write(&outside, "outside-ok").ok();
+        let path = outside.to_string_lossy().replace('\\', "/");
+        let args = format!(r#"{{"path":"{path}"}}"#);
+        let wargs = format!(r#"{{"path":"{path}","content":"p19-write"}}"#);
+
+        // 放行档：工作区外绝对路径可读可写
+        let mut c = cfg();
+        c.fs_unconfined = true;
+        let r = execute(&c, "read_file", &args).await;
+        assert_eq!(r.unwrap(), "outside-ok", "放行档应可读工作区外文件");
+        let r = execute(&c, "write_file", &wargs).await;
+        assert!(r.is_ok(), "放行档应可写工作区外文件: {r:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "p19-write");
+
+        // 收紧回 read-only / sandbox 档：同一绝对路径被硬拦
+        let r = execute(&cfg(), "read_file", &args).await;
+        assert!(r.is_err() && r.unwrap_err().contains("拒绝"), "收紧行后越界应被拒绝");
+        std::fs::remove_file(&outside).ok();
     }
 
     #[tokio::test]

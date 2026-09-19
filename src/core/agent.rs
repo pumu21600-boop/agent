@@ -225,6 +225,16 @@ pub trait ApprovalGate: Send + Sync {
     }
     /// 本档位是否还在沙箱里跑（local 档 = false，前提是 config 总开关已开）
     fn sandbox_enabled(&self) -> bool;
+    /// 本档位文件工具是否允许越出工作区（auto / full-access = true；read-only / sandbox = false）。
+    /// 与 sandbox_enabled 一样按决策步现读——运行中切档，下一步即生效。
+    fn file_tools_unconfined(&self) -> bool {
+        false
+    }
+    /// 档位硬拦截（P19 sandbox 档）：Some(理由) = 该工具被当前档位直接驳回，
+    /// 不进审批弹窗（连「问用户」都不问）。默认不拦截。
+    fn tier_block_reason(&self, _tool: &str, _args: &str) -> Option<String> {
+        None
+    }
     /// 当前对话会话 id：检查点归属用（切回该会话时改动条/撤销只认自己的基线）。
     /// 默认空串 = 不归属，行为与旧版一致。
     fn session_id(&self) -> &str {
@@ -722,17 +732,20 @@ pub async fn run_task(
         msgs.push(asst_msg);
 
         // —— P12 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
+        // fs_unconfined / unsandboxed 每步现读 gate：运行中切档，从下一步起按新档位执行
         let exec_cfg = ExecConfig {
             sandbox: sandbox_cfg.clone(),
             max_chars: cfg.tool_result_max_chars,
             unsandboxed: !gate.sandbox_enabled(),
+            fs_unconfined: gate.file_tools_unconfined(),
         };
         use futures_util::StreamExt;
 
-        // 阶段一「判定」（串行）：Plan 拦截 / 审批弹窗 / 取消——全部现有语义不变
+        // 阶段一「判定」（串行）：Plan 拦截 / 档位拦截 / 审批弹窗 / 取消——全部现有语义不变
         struct Decision {
             approved: bool,
             plan_reason: Option<String>,
+            tier_reason: Option<String>,
             hook_reason: Option<String>,
             risk: u8,
             skip_conflict: bool,
@@ -754,21 +767,27 @@ pub async fn run_task(
 
             // P9 B2：Plan 档拦截优先于审批流；P9 细粒度审批单点不变
             let plan_reason = gate.plan_block_reason(&call.name, &call.arguments);
+            // P19：sandbox 档硬拦截（如工作区文件写入）——不进审批流，直接驳回
+            let tier_reason = if plan_reason.is_none() {
+                gate.tier_block_reason(&call.name, &call.arguments)
+            } else {
+                None
+            };
             // P18 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
             // 钩子放行 ≠ 免审批，审批门照走（定案 7）。
-            let hook_reason = if plan_reason.is_none() {
+            let hook_reason = if plan_reason.is_none() && tier_reason.is_none() {
                 crate::hooks::before_tool(gate.session_id(), &call.name, &call.arguments)
                     .await
                     .err()
             } else {
                 None
             };
-            let approved = match (&plan_reason, &hook_reason) {
-                (Some(_), _) | (_, Some(_)) => false,
-                (None, None) if gate.needs_approval_for(&call.name, &call.arguments) => {
+            let approved = match (&plan_reason, &tier_reason, &hook_reason) {
+                (Some(_), _, _) | (_, Some(_), _) | (_, _, Some(_)) => false,
+                (None, None, None) if gate.needs_approval_for(&call.name, &call.arguments) => {
                     gate.ask(&call.name, &call.arguments).await
                 }
-                (None, None) => true,
+                (None, None, None) => true,
             };
             let (risk, _) = crate::core::rules::evaluate_risk(
                 &call.name,
@@ -778,6 +797,7 @@ pub async fn run_task(
             decisions.push(Decision {
                 approved,
                 plan_reason,
+                tier_reason,
                 hook_reason,
                 risk: risk.as_u8(),
                 skip_conflict: false,
@@ -866,6 +886,17 @@ pub async fn run_task(
                     format!(
                         "Plan 模式拦截（未执行）：{reason}。请勿执行写/改类操作——继续只读调研，并在最终回答中用 ```plan 围栏输出执行计划，等待用户批准。"
                     ),
+                    true,
+                )
+            } else if let Some(reason) = &d.tier_reason {
+                // P19 档位拦截（sandbox 档禁写等）：未执行，把理由回喂给模型调整做法
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "tier.blocked", "step": step, "tool": call.name, "reason": reason }),
+                );
+                on_event(AgentEvent::Notice(format!("审批档位已拦截 {}：{}", call.name, reason)));
+                (
+                    format!("审批档位拦截（未执行）：{reason}。当前档位下这类操作不可用，请改用只读方式继续，或建议用户切换审批档位。"),
                     true,
                 )
             } else if let Some(reason) = &d.hook_reason {

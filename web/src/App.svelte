@@ -19,11 +19,14 @@
   let autoSaveTimer = null;
   let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
   let approvalMode = (() => {
-    // Codex 式三档；旧档名自动迁移
+    // 四档（P19）；旧档名自动迁移
     const map = { suggest: 'read-only', 'auto-edit': 'auto', 'full-auto': 'auto', local: 'full-access' };
     const saved = localStorage.getItem('approvalMode');
     return map[saved] || saved || 'auto';
-  })(); // 审批三档：read-only / auto / full-access
+  })(); // 审批四档：read-only / sandbox / auto / full-access
+  // M1：每会话各自的档位（切会话时圆点显示该会话真实在跑的档，而不是全局最后一次选的）
+  let approvalBySession = {};
+  $: approvalEffective = approvalBySession[currentSessionId || '@new'] || approvalMode;
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
   let ctxUsage = { tokens: 0, budget: 0, breakdown: null }; // 上下文占用（P5 圆环+明细卡）
   let ctxLen = 0; // 当前模型上下文长度（0=默认）
@@ -134,6 +137,14 @@
       delete nextU[from];
       nextU[to] = u;
       usageBySession = nextU;
+    }
+    // M1：会话档位跟着 key 走（新会话切过档后拿到 id，档位不能丢）
+    if (approvalBySession[from]) {
+      const m = approvalBySession[from];
+      const nextM = { ...approvalBySession };
+      delete nextM[from];
+      nextM[to] = m;
+      approvalBySession = nextM;
     }
     if (curKey() === from) {
       currentSessionId = to;
@@ -422,9 +433,16 @@
 
   // —— 审批档位菜单（输入栏内）——
   let approvalMenuOpen = false;
-  const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
+  // 四档语义（P19）：
+  // 只读 = 只读操作自动放行，写/执行逐次询问（shell 恒沙箱）
+  // 沙箱 = 只读 + 沙箱内执行；工作区和电脑都不改（写文件直接驳回）
+  // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
+  // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
+  const APPROVAL_LABELS = { 'read-only': '只读', sandbox: '沙箱', auto: '自动', 'full-access': '完全访问' };
   function pickApproval(m) {
+    const key = currentSessionId || '@new';
     approvalMode = m;
+    approvalBySession = { ...approvalBySession, [key]: m };
     approvalMenuOpen = false;
     localStorage.setItem('approvalMode', m);
     // M1：带当前会话 id——多会话并发时只切本会话的档（不带 session 才改全局默认）
@@ -432,7 +450,17 @@
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode: m, session: currentSessionId || '' }),
-    });
+    })
+      .then((r) => r.json())
+      .then((r) => {
+        // 服务端可能把「完全访问」降级为「自动」（config 未开脱沙箱）：以服务端裁决为准
+        if (r && r.mode && r.mode !== m) {
+          approvalMode = r.mode;
+          approvalBySession = { ...approvalBySession, [key]: r.mode };
+          localStorage.setItem('approvalMode', r.mode);
+        }
+      })
+      .catch(() => {});
   }
 
   function handleKey(e) {
@@ -1726,7 +1754,7 @@
           attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, mime: a.mime, data: a.data })) : undefined,
           model,
           base_url: baseUrl,
-          approval_mode: approvalMode,
+          approval_mode: approvalBySession[key] || approvalMode,
           session_id: skey === '@new' ? '' : skey,
           steer: opts.steer === true,
         }),
@@ -3649,17 +3677,17 @@
             <div class="bar-menu">
               <button
                 class="pill"
-                class:danger={approvalMode === 'full-access'}
+                class:danger={approvalEffective === 'full-access'}
                 on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
-                title="审批档位：控制工具执行要不要先问你"
+                title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 沙箱=只在沙箱执行不动工作区和电脑 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
               >
-                <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalMode] || approvalMode}
+                <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalEffective] || approvalEffective}
                 <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
               </button>
               {#if approvalMenuOpen}
                 <div class="bar-dropdown">
                   {#each Object.entries(APPROVAL_LABELS) as [val, label]}
-                    <button class="bar-item" class:active={val === approvalMode} on:click={() => pickApproval(val)}>
+                    <button class="bar-item" class:active={val === approvalEffective} on:click={() => pickApproval(val)}>
                       {label}
                     </button>
                   {/each}
@@ -7113,9 +7141,7 @@
     color: var(--tint-red-fg);
     border: 1px solid var(--tint-red-bg);
   }
-  .pill.danger:hover {
-    background: var(--tint-red-bg);
-  }
+  /* 完全访问档悬停不再垫红底：沿用 .pill:hover 的灰色高亮，红字红边只作静态警示 */
   .model-pill {
     font-family: Consolas, monospace;
   }
