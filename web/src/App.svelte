@@ -892,21 +892,31 @@
     webBusy = false;
   }
 
-  async function webShotWheel(ev) {
-    if (!webActive || webBusy) return;
+  // 滚轮合并：连续滚动只按 120ms 批量发一次（deltaY 累加），滚动不独占 busy，
+  // 截图在批次结束后刷新——一次一来回会把快速滚动卡成幻灯片。
+  let webScrollPending = 0;
+  let webScrollTimer = null;
+  function webShotWheel(ev) {
     ev.preventDefault();
-    const dy = Math.max(-600, Math.min(600, ev.deltaY || 0));
-    if (!dy) return;
-    webBusy = true;
-    try {
-      await webApi('/api/browser/scroll', {
+    const dy = Math.max(-800, Math.min(800, ev.deltaY || 0));
+    if (!dy || !webActive) return;
+    webScrollPending += dy;
+    if (webScrollTimer) return;
+    webScrollTimer = setTimeout(() => {
+      webScrollTimer = null;
+      const batch = webScrollPending;
+      webScrollPending = 0;
+      if (!batch || !webActive || webBusy) return;
+      webApi('/api/browser/scroll', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: webActive.id, deltaY: dy }),
-      });
-      webShotT += 1;
-    } catch {}
-    webBusy = false;
+        body: JSON.stringify({ id: webActive.id, deltaY: batch }),
+      })
+        .then(() => {
+          webShotT += 1;
+        })
+        .catch (() => {});
+    }, 120);
   }
 
   async function runTerm(cmd) {

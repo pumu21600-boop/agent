@@ -753,12 +753,46 @@ async fn dispatch_click(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// 点击可能触发导航：先注册 load 事件等待器（同步入队），再点击；事件到了就多给
-/// 渲染一点时间，没到（无导航的普通点击）照常返回。
+/// 点击后的「沉降」：多数点击不触发导航，不能死等——轮询 readyState，
+/// 没出现 loading（约 400ms 内）就返回；真导航了则等到加载完成（上限 6s）。
 async fn click_and_settle(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
-    let rx = tab.cdp.register_wait("Page.loadEventFired")?;
     dispatch_click(tab, x, y).await?;
-    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(6), rx).await {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut navigated = false;
+    let mut polls = 0u32;
+    loop {
+        if Instant::now() > deadline {
+            break; // 兜底：导航卡住也返回（截图会拿到当前状态）
+        }
+        let state = tab
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState", "returnByValue": true }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string));
+        match state.as_deref() {
+            // 求值失败 = 上下文正在换页（旧 context 已销毁），视为导航中
+            None => navigated = true,
+            Some("loading") => navigated = true,
+            Some("complete") => {
+                if navigated {
+                    break; // 导航完成
+                }
+                // 连续两次 complete 且从未见 loading = 本次点击没有导航，快速返回
+                if polls >= 1 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        polls += 1;
+        tokio::time::sleep(Duration::from_millis(180)).await;
+    }
+    if navigated {
+        // 给新页面渲染留一点时间再截图
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     Ok(())
@@ -953,10 +987,27 @@ pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
 }
 
 /// 面板截图：PNG 字节（前端 <img> 直链 + 缓存穿透参数）。
+/// 截图前若页面正在加载（readyState=loading）先等它完成——无论调用时序如何，
+/// 都不会拿到半张旧页/白图。
 pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
     let session = current_session().await?;
     session.touch();
     let tab = get_tab(&session, id)?;
+    for _ in 0..25 {
+        let st = tab
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({ "expression": "document.readyState", "returnByValue": true }),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string));
+        match st.as_deref() {
+            Some("loading") => tokio::time::sleep(Duration::from_millis(200)).await,
+            _ => break,
+        }
+    }
     let res = tab
         .cdp
         .call("Page.captureScreenshot", json!({ "format": "png" }))
