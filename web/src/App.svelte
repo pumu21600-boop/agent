@@ -3054,6 +3054,13 @@
           reply(!!r.ok, r.ok ? { ok: true, found: r.found } : r.error || '删除失败');
           break;
         }
+        // —— P19 只读桥：trace 时间线面板（ui-ext/trace 试点）拉最近任务事件流 ——
+        // 只读信息类方法与 workspace.info 同级，不占权限白名单。
+        case 'trace.recent': {
+          const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
+          reply(true, await get(`/api/trace?limit=${limit}`));
+          break;
+        }
         default:
           reply(false, `未知方法: ${d.method}`);
       }
@@ -3069,65 +3076,8 @@
     loadSession(e.detail);
   }
 
-  // —— P10-A：trace 时间线（最近任务的事件流）——
-  let traceOpen = false;
-  let traceTasks = [];
-  let traceLoading = false;
-  let traceNote = '';
-  let traceExpanded = null; // 当前展开的任务索引（一次一个）
-
-  async function openTrace() {
-    traceOpen = true;
-    traceLoading = true;
-    traceNote = '';
-    traceExpanded = null;
-    try {
-      const r = await fetch('/api/trace?limit=10').then((r) => r.json());
-      traceTasks = r.tasks || [];
-      traceNote = r.note || '';
-    } catch (e) {
-      traceNote = `读取失败: ${e.message || e}`;
-      traceTasks = [];
-    } finally {
-      traceLoading = false;
-    }
-  }
-  // 事件摘要（一行）：按类型提取可读文本
-  function traceSummary(ev) {
-    const p = ev.payload || {};
-    switch (ev.etype) {
-      case 'state': return p.kind || JSON.stringify(p).slice(0, 90);
-      case 'tool_call': return `${p.name}  ${String(p.arguments || '').slice(0, 90)}`;
-      case 'tool_result': return `${p.ok ? '[成功] ' : '[失败] '}${String(p.preview || '').slice(0, 90)}`;
-      case 'model_chunk': return p.aggregated ? `${p.count} 个模型流式分片（聚合展示）` : '模型分片';
-      case 'thought': return String(p.text || '').slice(0, 90);
-      case 'error': return String(p.message || p.error || JSON.stringify(p)).slice(0, 90);
-      default: return JSON.stringify(p).slice(0, 90);
-    }
-  }
-  // tool_call → 后续同名 tool_result 配对耗时（毫秒；配不上返回 null）
-  function tracePairMs(events, i) {
-    const c = events[i];
-    if (!c || c.etype !== 'tool_call') return null;
-    for (let j = i + 1; j < events.length; j++) {
-      const r = events[j];
-      if (r.etype === 'tool_result' && r.payload?.name === c.payload?.name) {
-        return r.offset_ms - c.offset_ms;
-      }
-      if (r.etype === 'tool_call') return null;
-    }
-    return null;
-  }
-  function traceBadge(ev) {
-    return { state: 'st', tool_call: 'call', tool_result: (ev.payload?.ok === false ? 'fail' : 'res'), model_chunk: 'chunk', thought: 'th', error: 'err' }[ev.etype] || 'st';
-  }
-  function fmtClock(ts) {
-    const d = new Date(ts);
-    return isNaN(d) ? ts : d.toLocaleTimeString('zh-CN', { hour12: false });
-  }
-  function fmtDur(ms) {
-    return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
-  }
+  // P10-A trace 时间线已插件化（P19）：ui-ext/trace 面板 + 宿主只读桥 trace.recent，
+  // 原内置弹窗（状态/函数/标记/样式）整体撤下——顶栏的插件按钮即入口。
 
   function nextId() {
     return ++seq;
@@ -3177,9 +3127,6 @@
           </button>
           <button class="icon-btn" title="添加项目" on:click={addProject}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.2v5.8a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h3.2l1.8 2H18a2 2 0 0 1 2 2v.2"/><line x1="17" y1="2.5" x2="17" y2="8"/><line x1="14.2" y1="5.2" x2="19.8" y2="5.2"/></svg>
-          </button>
-          <button class="icon-btn" title="时间线（最近任务的事件流）" on:click={openTrace}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2.2"/></svg>
           </button>
         </span>
         {#if viewMenuOpen}
@@ -4889,55 +4836,6 @@
 {#if galaxyOpen}
   <!-- 记忆库星云：光点 = 会话；搜索 = 向量检索过滤 -->
   <Galaxy currentSessionId={currentSessionId || ''} on:close={() => (galaxyOpen = false)} on:open={openSessionFromGalaxy} />
-{/if}
-
-{#if traceOpen}
-  <!-- P10-A：trace 时间线面板（最近任务的事件流） -->
-  <div class="modal-backdrop" on:click={() => (traceOpen = false)}>
-    <div class="modal trace-modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <div class="mh-left">
-          <h2>时间线 · 最近任务</h2>
-          <button class="icon-btn" title="刷新" on:click={openTrace}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 3.5V8h-4.5"/></svg></button>
-        </div>
-        <button class="icon-btn" title="关闭" on:click={() => (traceOpen = false)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-      </div>
-      {#if traceLoading}
-        <div class="trace-empty">加载中…</div>
-      {:else if traceNote && traceTasks.length === 0}
-        <div class="trace-empty">{traceNote}</div>
-      {:else if traceTasks.length === 0}
-        <div class="trace-empty">还没有任务记录（跑一次对话后这里会出现事件流）</div>
-      {:else}
-        {#if traceNote}<div class="trace-note">{traceNote}</div>{/if}
-        {#each traceTasks as task, ti}
-          <div class="trace-task">
-            <button class="trace-task-head" on:click={() => (traceExpanded = traceExpanded === ti ? null : ti)}>
-              <span class="trace-idx">#{traceTasks.length - ti}</span>
-              <span class="trace-time">{fmtClock(task.start_ts)}</span>
-              <span class="trace-meta">{fmtDur(task.duration_ms)} · {task.events.length} 事件</span>
-              <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
-            </button>
-            {#if traceExpanded === ti}
-              <div class="trace-events">
-                {#each task.events as ev, ei}
-                  {@const pairMs = tracePairMs(task.events, ei)}
-                  <div class="trace-ev">
-                    <span class="trace-offset">{(ev.offset_ms / 1000).toFixed(1)}s</span>
-                    <span class="trace-badge trace-badge-{traceBadge(ev)}">{ev.etype}</span>
-                    <span class="trace-sum" title={JSON.stringify(ev.payload)}>{traceSummary(ev)}</span>
-                    {#if pairMs !== null}
-                      <span class="trace-pair">{fmtDur(pairMs)}</span>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/each}
-      {/if}
-    </div>
-  </div>
 {/if}
 
 {#if commitModal}
@@ -7423,123 +7321,6 @@
     z-index: 20;
   }
   /* P10-A：trace 时间线面板 */
-  .trace-modal {
-    width: 720px;
-  }
-  .trace-empty {
-    color: var(--g5);
-    font-size: 13px;
-    text-align: center;
-    padding: 24px 0;
-  }
-  .trace-note {
-    font-size: 12px;
-    color: var(--tint-yellow-fg);
-    background: var(--tint-yellow-bg);
-    border-radius: 6px;
-    padding: 6px 10px;
-  }
-  .trace-task {
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .trace-task-head {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    background: var(--g2);
-    border: none;
-    color: var(--g7);
-    padding: 8px 12px;
-    cursor: pointer;
-    font-size: 13px;
-    text-align: left;
-  }
-  .trace-task-head:hover {
-    background: var(--g2);
-  }
-  .trace-idx {
-    color: var(--tint-blue-fg);
-    font-weight: 600;
-  }
-  .trace-time {
-    font-variant-numeric: tabular-nums;
-  }
-  .trace-meta {
-    color: var(--g5);
-    font-size: 12px;
-    flex: 1;
-  }
-  .trace-events {
-    display: flex;
-    flex-direction: column;
-    padding: 6px 10px 10px;
-    max-height: 46vh;
-    overflow-y: auto;
-  }
-  .trace-ev {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 3px 0;
-    border-bottom: 1px dashed var(--g2);
-    font-size: 12px;
-    color: var(--g6);
-  }
-  .trace-ev:last-child {
-    border-bottom: none;
-  }
-  .trace-offset {
-    color: var(--g5);
-    font-variant-numeric: tabular-nums;
-    min-width: 52px;
-    text-align: right;
-  }
-  .trace-badge {
-    min-width: 78px;
-    text-align: center;
-    border-radius: 4px;
-    padding: 0 4px;
-    font-size: 11px;
-  }
-  .trace-badge-st {
-    background: var(--tint-blue-bg);
-    color: var(--tint-blue-fg);
-  }
-  .trace-badge-call {
-    background: var(--tint-green-bg);
-    color: var(--tint-green-fg);
-  }
-  .trace-badge-res {
-    background: var(--g2);
-    color: var(--tint-green-fg);
-  }
-  .trace-badge-fail {
-    background: var(--tint-red-bg);
-    color: var(--tint-red-fg);
-  }
-  .trace-badge-chunk {
-    background: var(--g3);
-    color: var(--g6);
-  }
-  .trace-badge-th {
-    background: var(--tint-blue-bg);
-    color: var(--tint-blue-fg);
-  }
-  .trace-badge-err {
-    background: var(--tint-red-bg);
-    color: var(--tint-red-fg);
-  }
-  .trace-sum {
-    flex: 1;
-    word-break: break-all;
-  }
-  .trace-pair {
-    color: var(--tint-yellow-fg);
-    font-variant-numeric: tabular-nums;
-  }
   .modal {
     background: var(--g2);
     border: 1px solid var(--g3);

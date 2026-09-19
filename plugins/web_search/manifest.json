@@ -1,0 +1,8 @@
+{
+  "apiVersion": 1,
+  "source": "built_in",
+  "title": "web_search 契约试点",
+  "description": "P19 契约试点：内置 web_search 以目录形态工具插件装进插件壳，验证 manifest 清单 / describe ABI / 审批门 / 停用回收全链路。WASM 引擎 v0 零宿主函数（纯计算沙箱）没有网络能力，真联网搜索仍由内置 web_search 工具承担。",
+  "version": "0.1.0",
+  "tool_file": "web_search.wat"
+}

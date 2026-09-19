@@ -88,13 +88,17 @@ http
         const slowLoop = /慢循环/.test(lastText);
         // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环剧本除外
         const wantsTool =
-          hasToolsParam && (loopForever || slowLoop || (!hasToolMsg && /读|编辑/.test(lastText)));
+          hasToolsParam && (loopForever || slowLoop || (!hasToolMsg && /读|编辑|插件搜索/.test(lastText)));
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
         });
         if (wantsTool) {
-          if (!loopForever && /编辑/.test(lastText)) {
+          if (!loopForever && /插件搜索/.test(lastText)) {
+            // 插件工具剧本（P19）：调用目录形态工具插件 wasm__web_search__search，
+            // 验证 模型 → 审批门（wasm 工具风险研判）→ WASM 引擎 → 结果回填 全链路
+            emitToolCall(res, 'wasm__web_search__search', { query: '插件契约 v1' });
+          } else if (!loopForever && /编辑/.test(lastText)) {
             // edit_file 剧本：路径取「编辑」后的 token，替换固定的一行
             const m = lastText.match(/编辑\s*([^\s，。]+)/);
             emitToolCall(res, 'edit_file', {
