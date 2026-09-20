@@ -51,7 +51,7 @@
 
 - 分支：`dev` 为主线；每阶段开 `p<N>-<短名>` 分支，验收后合回 `dev` 并打 tag（`v0.<N>-p<N>`）。`master` 保持干净（或后续由用户定发布策略）。
 - 提交：小步提交，一条功能点一条；中文 message，前缀标阶段（如 `P1: ...`）。
-- 推送（2026-09-19 用户定）：**每次大改动（阶段/整块功能收尾）提交后随即自行推送** origin dev + 里程碑标签，不再等用户逐次说「推」；小改动可攒到大节点一起推；破坏性操作（force push 等）仍逐次确认。远端 origin → GitHub 私有仓库 pumu21600-boop/agent。
+- 推送（2026-09-19 用户定后修正）：**只有 P 级施工单收尾（整阶段验收通过）才提交并推送**（origin dev + 里程碑标签）；调试/小修只本地提交，不单独推。破坏性操作（force push 等）仍逐次确认。远端 origin → GitHub 私有仓库 pumu21600-boop/agent。
 - 永不入库：`settings.json`（含 DPAPI 加密 key）、`logs/`、`target/`、`frontend/dist/`、`frontend/node_modules/`（已 gitignore）。
 
 ## 四、已知坑（新对话必读）

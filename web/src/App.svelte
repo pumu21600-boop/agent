@@ -845,21 +845,39 @@
         webViewportKey = ''; // 失败重试
       });
   }
-  // DevTools 内嵌弹窗：拿后端拼的 devtools:// 地址，iframe 直接跑真 DevTools（零新进程）
-  let webDevtools = null; // 非 null = 打开中的 DevTools 地址
-  async function webOpenDevtools() {
-    webMenuOpen = false;
-    if (!webActive) return;
-    try {
-      const r = await webApi('/api/browser/devtools', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: webActive.id }),
-      });
-      webDevtools = r.url;
-    } catch (e) {
-      webError = String(e.message || e);
-    }
+  // —— agent 调试面板（用户要的「打开整个 agent 的 DevTools」）——
+  // 录两样：前端错误（window.onerror / unhandledrejection）与接口请求（fetch 包装：
+  // 方法/路径/状态/耗时）。无头网页的元素读不到（面板是截图渲染），要调网页请在默认
+  // 浏览器里打开后按 F12。
+  let dbgOpen = false;
+  let dbgErrors = [];
+  let dbgRequests = [];
+  const DBG_MAX = 100;
+  if (typeof window !== 'undefined' && !window.__agentDbgHooked) {
+    window.__agentDbgHooked = true;
+    window.addEventListener('error', (ev) => {
+      dbgErrors = [{ ts: Date.now(), text: String(ev.message || '未知错误') + (ev.filename ? ' @' + ev.filename.split('/').pop() + ':' + ev.lineno : '') },
+        ...dbgErrors].slice(0, DBG_MAX);
+    });
+    window.addEventListener('unhandledrejection', (ev) => {
+      dbgErrors = [{ ts: Date.now(), text: 'Promise 拒绝: ' + String(ev.reason && ev.reason.message ? ev.reason.message : ev.reason) },
+        ...dbgErrors].slice(0, DBG_MAX);
+    });
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
+      const method = (args[1] && args[1].method) || 'GET';
+      if (url.startsWith('/api/browser/screenshot')) return origFetch.apply(this, args); // 截图轮询太吵，不录
+      const t0 = Date.now();
+      try {
+        const resp = await origFetch.apply(this, args);
+        dbgRequests = [{ ts: t0, method, url, status: resp.status, ms: Date.now() - t0 }, ...dbgRequests].slice(0, DBG_MAX);
+        return resp;
+      } catch (err) {
+        dbgRequests = [{ ts: t0, method, url, status: 0, ms: Date.now() - t0 }, ...dbgRequests].slice(0, DBG_MAX);
+        throw err;
+      }
+    };
   }
   function webMenuAction(kind) {
     webMenuOpen = false;
@@ -4188,9 +4206,9 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
                   </button>
-                  <button on:click={webOpenDevtools}>
+                  <button on:click={() => { webMenuOpen = false; dbgOpen = true; }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
-                    打开调试工具
+                    agent 调试
                   </button>
                 </div>
               {/if}
@@ -4225,16 +4243,39 @@
     </aside>
   {/if}
 
-  {#if webDevtools}
-    <div class="web-dt-backdrop" on:click={() => (webDevtools = null)}></div>
+  {#if dbgOpen}
+    <div class="web-dt-backdrop" on:click={() => (dbgOpen = false)}></div>
     <div class="web-dt-modal">
       <div class="web-dt-head">
-        <b>DevTools</b>
-        <span class="mcp-status">内嵌 · 调试当前标签页</span>
+        <b>agent 调试</b>
+        <span class="mcp-status">前端错误 + 接口请求记录（无头网页的元素在真实 DevTools 里看：菜单 → 在默认浏览器中打开 → F12）</span>
         <span class="flex-sp"></span>
-        <button class="btn ghost" on:click={() => (webDevtools = null)}>关闭</button>
+        <button class="btn ghost" on:click={() => { dbgErrors = []; dbgRequests = []; }}>清空</button>
+        <button class="btn ghost" on:click={() => (dbgOpen = false)}>关闭</button>
       </div>
-      <iframe class="web-dt-frame" src={webDevtools} title="DevTools"></iframe>
+      <div class="dbg-body">
+        <div class="dbg-col">
+          <div class="dbg-col-title">接口请求（最近 {dbgRequests.length} 条）</div>
+          {#each dbgRequests as r}
+            <div class="dbg-row">
+              <span class="dbg-m">{r.method}</span>
+              <span class="dbg-url" title={r.url}>{r.url.replace(/^https?:\/\/[^/]+/, "")}</span>
+              <span class="dbg-status" class:bad={r.status >= 400 || r.status === 0}>{r.status || "失败"}</span>
+              <span class="dbg-ms">{r.ms}ms</span>
+            </div>
+          {:else}
+            <div class="dbg-empty">还没有请求记录</div>
+          {/each}
+        </div>
+        <div class="dbg-col">
+          <div class="dbg-col-title">前端错误（最近 {dbgErrors.length} 条）</div>
+          {#each dbgErrors as e}
+            <div class="dbg-row err"><span class="dbg-url">{e.text}</span></div>
+          {:else}
+            <div class="dbg-empty">没有错误</div>
+          {/each}
+        </div>
+      </div>
     </div>
   {/if}
   {#if extOpen && extCurrent}
@@ -6258,12 +6299,67 @@
     padding: 8px 12px;
     border-bottom: 1px solid var(--g3);
   }
-  .web-dt-frame {
+  .dbg-body {
     flex: 1;
     min-height: 0;
-    width: 100%;
-    border: none;
-    background: var(--g1);
+    display: flex;
+    overflow: auto;
+  }
+  .dbg-col {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    padding: 8px 10px;
+  }
+  .dbg-col + .dbg-col {
+    border-left: 1px solid var(--g3);
+  }
+  .dbg-col-title {
+    font-size: 12px;
+    color: var(--g6);
+    margin-bottom: 6px;
+  }
+  .dbg-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12px;
+    padding: 3px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--g3) 40%, transparent);
+  }
+  .dbg-row.err .dbg-url {
+    color: var(--tint-red-fg, #ff6b6b);
+  }
+  .dbg-m {
+    flex: none;
+    font-family: Consolas, monospace;
+    color: var(--g6);
+  }
+  .dbg-url {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--g7);
+  }
+  .dbg-status {
+    flex: none;
+    font-family: Consolas, monospace;
+    color: var(--g6);
+  }
+  .dbg-status.bad {
+    color: var(--tint-red-fg, #ff6b6b);
+  }
+  .dbg-ms {
+    flex: none;
+    font-family: Consolas, monospace;
+    color: var(--g5);
+  }
+  .dbg-empty {
+    font-size: 12px;
+    color: var(--g5);
+    padding: 8px 0;
   }
   .web-menu {
     position: absolute;
