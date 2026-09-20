@@ -343,6 +343,9 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                 "--hide-scrollbars",
                 "--window-size=1280,900",
                 &format!("--remote-debugging-port={port}"),
+                // iframe 内嵌 DevTools 时前端会带 Origin 头连 ws，Chromium 默认拒——
+                // 本实例只听环回，放行任意 Origin
+                "--remote-allow-origins=*",
                 &format!("--user-data-dir={}", profile.display()),
                 "about:blank",
             ])
@@ -942,6 +945,7 @@ pub async fn panel_state() -> Value {
             let briefs = s.tab_briefs().await;
             json!({
                 "running": true,
+                "port": s.port,
                 "tabs": briefs.iter().map(|(id, agent, title, url)| json!({
                     "id": id, "agent": agent, "title": title, "url": url,
                 })).collect::<Vec<_>>(),
@@ -1075,12 +1079,17 @@ pub async fn panel_open_external(id: &str) -> Result<Value, String> {
 /// 不直接用 /json/list 返回的 devtoolsFrontendUrl：Edge 新版把它指向 aka.ms 短链，
 /// 该短链已失效（302 跳必应，真机踩过）；devtools:// scheme 不是系统注册 scheme，
 /// 外链起不来。
-pub async fn panel_devtools(id: &str) -> Result<Value, String> {
+pub async fn panel_devtools_url(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
-    // 确认标签页还在（id 不存在时报错）
-    get_tab(&session, id)?;
-    open_url_in_system(&format!("http://127.0.0.1:{}/json", session.port))
+    let tab = get_tab(&session, id)?;
+    Ok(json!({
+        "ok": true,
+        "url": format!(
+            "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{}/devtools/page/{}",
+            session.port, tab.id
+        ),
+    }))
 }
 
 /// 面板点击（视口坐标）→ 等可能的导航沉降。

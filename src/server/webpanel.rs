@@ -129,10 +129,10 @@ pub(super) async fn browser_open_external(Json(req): Json<Value>) -> Result<Json
     crate::browser::panel_open_external(id).await.map(Json).map_err(bad)
 }
 
-/// POST /api/browser/devtools —— 打开该标签页的调试工具（系统浏览器里的 DevTools 前端）。
+/// POST /api/browser/devtools —— 该标签页的 DevTools 内嵌地址（前端弹 iframe 用，零新进程）。
 pub(super) async fn browser_devtools(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
-    crate::browser::panel_devtools(id).await.map(Json).map_err(bad)
+    crate::browser::panel_devtools_url(id).await.map(Json).map_err(bad)
 }
 
 /// DELETE /api/browser/tab?id= —— 关标签页。

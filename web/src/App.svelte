@@ -845,6 +845,22 @@
         webViewportKey = ''; // 失败重试
       });
   }
+  // DevTools 内嵌弹窗：拿后端拼的 devtools:// 地址，iframe 直接跑真 DevTools（零新进程）
+  let webDevtools = null; // 非 null = 打开中的 DevTools 地址
+  async function webOpenDevtools() {
+    webMenuOpen = false;
+    if (!webActive) return;
+    try {
+      const r = await webApi('/api/browser/devtools', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id }),
+      });
+      webDevtools = r.url;
+    } catch (e) {
+      webError = String(e.message || e);
+    }
+  }
   function webMenuAction(kind) {
     webMenuOpen = false;
     if (!webActive) return;
@@ -4172,7 +4188,7 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
                   </button>
-                  <button on:click={() => webMenuAction('devtools')}>
+                  <button on:click={webOpenDevtools}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
                     打开调试工具
                   </button>
@@ -4209,6 +4225,18 @@
     </aside>
   {/if}
 
+  {#if webDevtools}
+    <div class="web-dt-backdrop" on:click={() => (webDevtools = null)}></div>
+    <div class="web-dt-modal">
+      <div class="web-dt-head">
+        <b>DevTools</b>
+        <span class="mcp-status">内嵌 · 调试当前标签页</span>
+        <span class="flex-sp"></span>
+        <button class="btn ghost" on:click={() => (webDevtools = null)}>关闭</button>
+      </div>
+      <iframe class="web-dt-frame" src={webDevtools} title="DevTools"></iframe>
+    </div>
+  {/if}
   {#if extOpen && extCurrent}
     <aside class="ext-panel">
       <div class="rp-tabs">
@@ -6204,6 +6232,38 @@
     position: fixed;
     inset: 0;
     z-index: 30;
+  }
+  .web-dt-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .web-dt-modal {
+    position: fixed;
+    inset: 5vh 4vw;
+    z-index: 61;
+    display: flex;
+    flex-direction: column;
+    background: var(--g0);
+    border: 1px solid var(--g4);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+  }
+  .web-dt-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--g3);
+  }
+  .web-dt-frame {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    border: none;
+    background: var(--g1);
   }
   .web-menu {
     position: absolute;
