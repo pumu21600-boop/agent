@@ -820,15 +820,19 @@
 
   // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）
   let webViewportTimer = null;
+  let webViewportKey = ''; // 已应用的「标签|宽x高」，防止重复请求打爆 CDP actor
   function webQueueViewport() {
     clearTimeout(webViewportTimer);
     webViewportTimer = setTimeout(webSyncViewport, 350);
   }
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
+    if (!webBodyW || !webBodyH) return;
     const w = Math.max(320, Math.min(1600, Math.round(webBodyW)));
     const h = Math.max(400, Math.min(2400, Math.round(webBodyH)));
-    if (!webBodyW || !webBodyH) return;
+    const key = webActive.id + '|' + w + 'x' + h;
+    if (key === webViewportKey) return;
+    webViewportKey = key;
     webApi('/api/browser/viewport', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -837,7 +841,9 @@
       .then(() => {
         webShotT += 1;
       })
-      .catch(() => {});
+      .catch(() => {
+        webViewportKey = ''; // 失败重试
+      });
   }
   function webMenuAction(kind) {
     webMenuOpen = false;
@@ -2318,6 +2324,28 @@
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       localStorage.setItem('sidebarW', String(sidebarW));
+      window.removeEventListener('mousemove', move);
+      window.removeEventListener('mouseup', up);
+    };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  }
+  // 终端面板高度（上缘拖拽可调，120–560，持久化）——对齐 ZCode 的可调尺寸
+  let termH = Number(localStorage.getItem('termH')) || 260;
+  let termResizing = false;
+  function startTermResize(e) {
+    e.preventDefault();
+    termResizing = true;
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    const move = (ev) => {
+      termH = Math.min(560, Math.max(120, Math.round(window.innerHeight - ev.clientY)));
+    };
+    const up = () => {
+      termResizing = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem('termH', String(termH));
       window.removeEventListener('mousemove', move);
       window.removeEventListener('mouseup', up);
     };
@@ -4011,7 +4039,8 @@
     </footer>
     </div>
     {#if terminalOpen}
-      <div class="term-panel">
+      <div class="term-panel" class:resizing={termResizing} style="height:{termH}px">
+        <div class="term-resize" title="拖拽调整高度" on:mousedown={startTermResize}></div>
         <div class="term-head">
           <span class="term-title">终端</span>
           <span class="term-hint">工作区内 · 沙箱执行</span>
@@ -5927,8 +5956,7 @@
   /* —— 终端面板：占据对话区底部，把聊天内容顶起 —— */
   .term-panel {
     flex: none;
-    height: 38vh;
-    min-height: 220px;
+    position: relative;
     display: flex;
     flex-direction: column;
     background: #101216;
@@ -5936,6 +5964,18 @@
     border-top: 1px solid var(--g3);
     font-family: Consolas, 'Cascadia Mono', monospace;
     font-size: 12.5px;
+  }
+  .term-resize {
+    position: absolute;
+    top: -3px;
+    left: 0;
+    right: 0;
+    height: 7px;
+    cursor: row-resize;
+    z-index: 6;
+  }
+  .term-panel.resizing {
+    border-top-color: var(--g5);
   }
   .term-head {
     display: flex;

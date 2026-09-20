@@ -993,7 +993,7 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
     let session = current_session().await?;
     session.touch();
     let tab = get_tab(&session, id)?;
-    for _ in 0..25 {
+    for _ in 0..4 {
         let st = tab
             .cdp
             .call(
@@ -1070,33 +1070,17 @@ pub async fn panel_open_external(id: &str) -> Result<Value, String> {
     open_url_in_system(&url)
 }
 
-/// 「打开调试工具」：取该标签页的 DevTools 前端地址（Edge 托管的 inspector，
-/// 经 ws 连回本实例的 headless 页面），用系统默认浏览器打开。
+/// 「打开调试工具」：打开 CDP 自带的调试端点页（`http://127.0.0.1:端口/json`）——
+/// 页面里每个标签的 inspect 链接就是真正的 DevTools（Chromium 官方远程调试流程）。
+/// 不直接用 /json/list 返回的 devtoolsFrontendUrl：Edge 新版把它指向 aka.ms 短链，
+/// 该短链已失效（302 跳必应，真机踩过）；devtools:// scheme 不是系统注册 scheme，
+/// 外链起不来。
 pub async fn panel_devtools(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
-    let tab = get_tab(&session, id)?;
-    let client = dev_client()?;
-    let text = client
-        .get(format!("http://127.0.0.1:{}/json/list", session.port))
-        .send()
-        .await
-        .map_err(|e| format!("查询 CDP 端点失败: {e}"))?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let front = v
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|t| t.get("id").and_then(Value::as_str) == Some(tab.id.as_str()))
-                .and_then(|t| t.get("devtoolsFrontendUrl").and_then(Value::as_str).map(str::to_string))
-        });
-    let Some(front) = front else {
-        return Err("该标签页没有调试前端（可能刚被关闭）".into());
-    };
-    open_url_in_system(&front)
+    // 确认标签页还在（id 不存在时报错）
+    get_tab(&session, id)?;
+    open_url_in_system(&format!("http://127.0.0.1:{}/json", session.port))
 }
 
 /// 面板点击（视口坐标）→ 等可能的导航沉降。
