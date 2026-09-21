@@ -6,7 +6,7 @@
 use super::*;
 use axum::response::IntoResponse;
 
-/// GET /api/browser/state —— 浏览器是否在跑 + 全部标签页（id/标题/地址/是否 agent 页）。
+/// GET /api/browser/state —— 浏览器是否在跑 + 全部标签页（id/标题/地址/可见/加载/挂起）。
 pub(super) async fn browser_state() -> Json<Value> {
     Json(crate::browser::panel_state().await)
 }
@@ -49,6 +49,33 @@ pub(super) async fn browser_screenshot(Query(q): Query<ScreenshotQuery>) -> Resu
 #[derive(Debug, Deserialize)]
 pub struct ScreenshotQuery {
     pub id: String,
+}
+
+/// GET /api/browser/frame?id= —— 面板帧（P21）：screencast 最新 JPEG，内存直出零 CDP
+/// 往返；无帧时后端回落 captureScreenshot（PNG）。前端 <img> 轮询源。
+pub(super) async fn browser_frame(Query(q): Query<ScreenshotQuery>) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    match crate::browser::panel_frame(&q.id).await {
+        Ok((bytes, mime)) => Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, mime)],
+            bytes,
+        )),
+        Err(e) => Err(bad(e)),
+    }
+}
+
+/// POST /api/browser/activate —— 面板上报可见标签页（驱动 screencast 与后台挂起）。
+pub(super) async fn browser_activate(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    crate::browser::panel_activate(id).await.map(Json).map_err(bad)
+}
+
+/// POST /api/browser/dialog —— 面板处理页面 JS 弹窗（accept + 可选 promptText）。
+pub(super) async fn browser_dialog(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    let accept = req.get("accept").and_then(Value::as_bool).unwrap_or(true);
+    let prompt_text = req.get("promptText").and_then(Value::as_str).map(str::to_string);
+    crate::browser::panel_dialog(id, accept, prompt_text).await.map(Json).map_err(bad)
 }
 
 async fn click_impl(id: &str, req: &Value) -> Result<Value, String> {

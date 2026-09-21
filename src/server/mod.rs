@@ -162,10 +162,14 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/sandbox/selftest", get(sandbox_selftest))
         .route("/api/sandbox/info", get(sandbox_info))
         // P20.1 网页面板：多标签管理 + 截图渲染 + 坐标回传（与 agent 浏览器工具共享实例）
+        // P21：帧流（screencast）替代逐次截图轮询；activate 上报可见页驱动驻留
         .route("/api/browser/state", get(browser_state))
         .route("/api/browser/new", post(browser_new))
         .route("/api/browser/navigate", post(browser_navigate))
         .route("/api/browser/screenshot", get(browser_screenshot))
+        .route("/api/browser/frame", get(browser_frame))
+        .route("/api/browser/activate", post(browser_activate))
+        .route("/api/browser/dialog", post(browser_dialog))
         .route("/api/browser/click", post(browser_click))
         .route("/api/browser/type", post(browser_type))
         .route("/api/browser/key", post(browser_key))

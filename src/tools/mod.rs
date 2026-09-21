@@ -187,58 +187,51 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 2,
         },
         ToolSpec {
-            name: "browser_open",
-            description: "打开内置浏览器（无头 Edge/Chrome，本进程直连控制）并加载网页，返回页面结构快照。需要看 JS 渲染后的页面、或要在页面上点击/输入时用本工具组，纯读静态内容用 web_fetch 更快。",
+            name: "browser",
+            description: "内置浏览器（无头 Edge/Chrome，本进程直连控制）——一个工具按 method 覆盖全部动作：navigate/back/forward/reload/snapshot/click/fill/type/press/scroll/hover/select/check/drag/screenshot/get_state/element_info/evaluate/wait_for/get_dialog/handle_dialog/new_tab/close/close_browser/list/activate_tab/capabilities。定位优先级：ref（快照编号）→ text/label（语义）→ x/y（坐标）。工作流：navigate 后直接读返回的快照；点击/输入前先 snapshot 拿最新 ref；每个观察周期只做一个状态变更动作，做完再 snapshot 验证效果；ref 失效时用 text/label 或坐标兜底，别重试同一个 ref。用户可在右侧「网页」面板看到同一个浏览器（agent 页带徽章），list 查全部标签页，tab_id 可操作面板页。完整纪律：read_skill(\"browser-use\")。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "完整 URL（http:// 或 https://）" }
-                },
-                "required": ["url"]
-            }),
-            danger_level: 0,
-        },
-        ToolSpec {
-            name: "browser_snapshot",
-            description: "获取当前浏览器页面的结构快照（可交互元素带 ref 编号），并与上次快照做增量对比（新增/移除/变化）。点击或输入前先拿最新 ref。",
-            parameters: json!({ "type": "object", "properties": {} }),
-            danger_level: 0,
-        },
-        ToolSpec {
-            name: "browser_click",
-            description: "在当前浏览器页面点击一个元素。优先语义定位：ref（快照编号）或 text（元素可见文本）；都不给时可用视口坐标 x/y 兜底。点击后返回最新快照。",
-            parameters: json!({
-                "type": "object",
-                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": crate::browser::ALL_METHODS.to_vec(),
+                        "description": "命令方法（见工具说明）"
+                    },
+                    "url": { "type": "string", "description": "navigate：完整 URL（http:// 或 https://）" },
                     "ref": { "type": "string", "description": "快照里的元素编号，如 e12" },
-                    "text": { "type": "string", "description": "元素可见文本（如「登录」），语义匹配" },
-                    "x": { "type": "integer", "description": "视口横坐标（语义定位失败时的兜底）" },
-                    "y": { "type": "integer", "description": "视口纵坐标" }
-                }
-            }),
-            danger_level: 1,
-        },
-        ToolSpec {
-            name: "browser_type",
-            description: "向当前浏览器页面的输入框输入文字。定位：ref 或 label（占位符/名称）。clear=true 先清空，submit=true 输入后回车（如搜索）。返回最新快照。",
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "ref": { "type": "string", "description": "快照里的元素编号" },
-                    "label": { "type": "string", "description": "输入框的占位符或名称（语义匹配）" },
-                    "text": { "type": "string", "description": "要输入的文字" },
-                    "clear": { "type": "boolean", "description": "输入前先清空（默认 false）" },
-                    "submit": { "type": "boolean", "description": "输入后按回车（默认 false）" }
+                    "text": { "type": "string", "description": "click：元素可见文本；wait_for：要出现的文本" },
+                    "label": { "type": "string", "description": "type：输入框的占位符或名称（语义匹配）" },
+                    "value": { "type": "string", "description": "fill：要填入的文本" },
+                    "key": { "type": "string", "description": "press：按键名，如 Enter / Tab / Escape / ArrowDown" },
+                    "x": { "type": "number", "description": "视口横坐标（坐标定位 / element_info / scroll 锚点）" },
+                    "y": { "type": "number", "description": "视口纵坐标" },
+                    "delta_x": { "type": "number", "description": "scroll：水平滚轮增量" },
+                    "delta_y": { "type": "number", "description": "scroll：垂直滚轮增量（正数向下）" },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "click：鼠标按键（默认 left）" },
+                    "double_click": { "type": "boolean", "description": "click：是否双击" },
+                    "modifiers": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
+                        "description": "click/press：修饰键"
+                    },
+                    "selector": { "type": "string", "description": "wait_for：要出现/消失的 CSS selector" },
+                    "text_gone": { "type": "string", "description": "wait_for：要消失的文本" },
+                    "timeout_ms": { "type": "integer", "description": "wait_for：超时毫秒（默认 5000，上限 30000）" },
+                    "full_page": { "type": "boolean", "description": "screenshot：整页截图（刷新到网页面板）" },
+                    "expression": { "type": "string", "description": "evaluate：在页面隔离世界执行的 JS 表达式" },
+                    "values": { "type": "array", "items": { "type": "string" }, "description": "select：按 value 或可见文本选择一个或多个 option" },
+                    "checked": { "type": "boolean", "description": "check：勾选态（默认 true）" },
+                    "from_ref": { "type": "string", "description": "drag：起点元素 ref" },
+                    "to_ref": { "type": "string", "description": "drag：终点元素 ref" },
+                    "from": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：起点坐标" },
+                    "to": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：终点坐标" },
+                    "accept": { "type": "boolean", "description": "handle_dialog：接受（true）/取消（false）" },
+                    "prompt_text": { "type": "string", "description": "handle_dialog：prompt 弹窗的输入内容" },
+                    "tab_id": { "type": "string", "description": "可选：操作指定标签页（缺省 = agent 专用页）" }
                 },
-                "required": ["text"]
+                "required": ["method"]
             }),
             danger_level: 1,
-        },
-        ToolSpec {
-            name: "browser_close",
-            description: "关闭内置浏览器（清理进程；下次 browser_open 会重新拉起）。页面操作结束后调用以免残留。",
-            parameters: json!({ "type": "object", "properties": {} }),
-            danger_level: 0,
         },
     ]
 }
@@ -300,12 +293,10 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
         "git" => git(args, cfg).await,
-        // P20 浏览器内核：Chromium 自带站点隔离即边界，不进 Windows 沙箱
-        "browser_open" => crate::browser::open(args, cfg.max_chars).await,
-        "browser_snapshot" => crate::browser::snapshot(args, cfg.max_chars).await,
-        "browser_click" => crate::browser::click(args, cfg.max_chars).await,
-        "browser_type" => crate::browser::type_text(args, cfg.max_chars).await,
-        "browser_close" => crate::browser::close(args).await,
+        // P21 浏览器内核：统一 browser 工具（method 判别，协议对齐 ZCode）。
+        // Chromium 自带站点隔离即边界，不进 Windows 沙箱；审批门按 method 分级
+        // （只读 Safe / 页面操作 Normal，见 core/rules.rs）。
+        "browser" => crate::browser::command(args, cfg.max_chars).await,
         other => Err(format!("未知工具: {other}")),
     }
 }

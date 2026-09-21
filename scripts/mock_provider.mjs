@@ -87,7 +87,7 @@ http
         // 慢循环：同死循环，但每步先等 1.5s——留出「运行中插话」的窗口（验证 steering）
         const slowLoop = /慢循环/.test(lastText);
         // 多步剧本（P20）：「清洗」= read_file → write_file → 最终回答；
-        // 「浏览 <url>」= browser_open → browser_click → 最终回答（按 example.com 语义点链接）
+        // 「浏览 <url>」= browser navigate → click → snapshot → 最终回答（按 example.com 语义点链接）
         const browseUrl = (lastText.match(/浏览\s*(\S+)/) || [])[1];
         const cleaning = /清洗/.test(lastText);
         const toolMsgCount = msgs.filter((m) => m.role === 'tool').length;
@@ -117,12 +117,18 @@ http
         if (wantsTool) {
           if (browseUrl) {
             if (toolMsgCount === 0) {
-              emitToolCall(res, 'browser_open', { url: browseUrl });
+              emitToolCall(res, 'browser', { method: 'navigate', url: browseUrl });
             } else if (toolMsgCount === 1) {
               // example.com 语义：点击可见文本匹配的链接，验证真实站点语义定位（链接文本以快照为准）
-              emitToolCall(res, 'browser_click', { text: 'Learn more' });
+              emitToolCall(res, 'browser', { method: 'click', text: 'Learn more' });
+            } else if (toolMsgCount === 2) {
+              // 动作后观察周期：再拿一次快照验证点击效果（对齐 browser-use 技能纪律）
+              emitToolCall(res, 'browser', { method: 'snapshot' });
+            } else if (toolMsgCount === 3) {
+              // 收尾：显式关掉浏览器进程（close_browser，P21 承 P20 的 browser_close）
+              emitToolCall(res, 'browser', { method: 'close_browser' });
             } else {
-              emitFinal('已按剧本完成浏览：打开页面、语义点击链接并拿到最新快照。（mock 浏览循环闭环）');
+              emitFinal('已按剧本完成浏览：打开页面、语义点击链接、复核快照并关闭浏览器。（mock 浏览循环闭环）');
             }
           } else if (cleaning) {
             // 清洗规则（与 eval 任务 csv-clean 一致）：去空行 + 去重复行

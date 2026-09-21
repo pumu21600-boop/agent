@@ -1,8 +1,8 @@
-//! CDP（Chrome DevTools Protocol）客户端 —— P20 浏览器内核。
-//!
-//! 进程内直持 CDP 会话：本进程拉起 Edge/Chrome（headless）、直连**页面级** WebSocket
-//! 端点，JSON-RPC 收发全部自持（不经过任何外部 driver）。协议面刻意收窄到 v1 需要的
-//! 几个域：Page（导航/加载事件）、Runtime（求值）、Input（鼠标/键盘）。
+//! CDP（Chrome DevTools Protocol）客户端 —— P20 浏览器内核；P21 增补两件事：
+//! ① **事件广播通道**——actor 把每条 CDP 事件复制一份进 broadcast（screencast 帧、
+//!    JS dialog 事件由标签页级订阅者消费；等待器机制不变）；② **隔离世界求值**
+//!    （`Page.createIsolatedWorld` + 带 contextId 的 `Runtime.evaluate`，快照/定位/求值
+//!    都在隔离世界跑，页面覆写全局对象或 getter 也改不了结果——移植自 ZCode）。
 //!
 //! 架构：单 actor 任务独占 WS 流（select 命令通道 + WS 消息），请求按 id 配对经
 //! oneshot 回传；事件等待器与命令走同一条 FIFO 通道，「先注册等待器再发命令」
@@ -11,11 +11,15 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 /// 单次 CDP 调用的默认预算。
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 事件广播容量：screencast 帧消费慢时丢弃中间帧（最新帧胜出），不阻塞 actor。
+const EVENT_CHANNEL_CAP: usize = 256;
 
 enum ToActor {
     Call { method: String, params: Value, reply: oneshot::Sender<Result<Value, String>> },
@@ -25,6 +29,10 @@ enum ToActor {
 /// 页面级 CDP 会话句柄。
 pub struct Cdp {
     tx: mpsc::UnboundedSender<ToActor>,
+    /// CDP 事件广播（每条事件复制一份；无订阅者时发送失败被忽略）。
+    events: broadcast::Sender<(String, Value)>,
+    /// 隔离世界 executionContextId 缓存（world 名 → contextId；导航销毁后重建）。
+    worlds: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl Cdp {
@@ -35,6 +43,8 @@ impl Cdp {
             .map_err(|e| format!("CDP WebSocket 连接失败: {e}"))?;
         let (mut sink, mut stream) = ws.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<ToActor>();
+        let (ev_tx, _rx) = broadcast::channel::<(String, Value)>(EVENT_CHANNEL_CAP);
+        let ev_in_actor = ev_tx.clone();
 
         tokio::spawn(async move {
             let mut next_id: u64 = 1;
@@ -99,18 +109,30 @@ impl Cdp {
                                 };
                                 let _ = slot.send(res);
                             }
-                        } else if let Some(method) = v.get("method").and_then(Value::as_str)
-                            && let Some(pos) = waiters.iter().position(|(m, _)| method == m || method.starts_with(m.as_str()))
-                        {
-                            let (_, slot) = waiters.remove(pos);
-                            let _ = slot.send(Ok(v.get("params").cloned().unwrap_or(Value::Null)));
+                        } else if let Some(method) = v.get("method").and_then(Value::as_str) {
+                            // 广播给订阅者（screencast 帧 / dialog 事件）；无订阅者时丢弃
+                            let _ = ev_in_actor.send((
+                                method.to_string(),
+                                v.get("params").cloned().unwrap_or(Value::Null),
+                            ));
+                            if let Some(pos) = waiters.iter().position(|(m, _)| method == m || method.starts_with(m.as_str()))
+                            {
+                                let (_, slot) = waiters.remove(pos);
+                                let _ = slot.send(Ok(v.get("params").cloned().unwrap_or(Value::Null)));
+                            }
                         }
                     }
                 }
             }
         });
 
-        Ok(Self { tx })
+        Ok(Self { tx, events: ev_tx, worlds: Arc::new(Mutex::new(HashMap::new())) })
+    }
+
+    /// 订阅全部 CDP 事件（(方法名, params) 流）。慢消费者会拿到 Lagged 并丢中间帧——
+    /// screencast 场景下最新帧胜出，可接受；dialog 等低频事件不受影响。
+    pub fn subscribe_events(&self) -> broadcast::Receiver<(String, Value)> {
+        self.events.subscribe()
     }
 
     /// 调用一个 CDP 方法，返回 result（默认 10s 预算）。
@@ -158,10 +180,89 @@ impl Cdp {
         result?;
         event_res
     }
+
+    /// 在页面的**隔离世界**里执行表达式（移植自 ZCode：worldName 隔离 + contextId 求值）。
+    /// contextId 按 world 名缓存；页面导航会销毁执行上下文，此时清缓存重建一次再试。
+    pub async fn evaluate_in_isolated_world(&self, world: &str, expression: &str) -> Result<Value, String> {
+        for attempt in 0..2 {
+            let context_id = match self.ensure_world_context(world).await {
+                Ok(id) => id,
+                Err(e) => {
+                    if attempt == 0 {
+                        continue; // 缓存 context 失效时已清缓存，重试走重建
+                    }
+                    return Err(e);
+                }
+            };
+            let res = self
+                .call(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expression,
+                        "contextId": context_id,
+                        "awaitPromise": true,
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
+            if res.get("exceptionDetails").is_some() {
+                let exc = res.get("exceptionDetails").cloned().unwrap_or(Value::Null);
+                let desc = exc
+                    .get("exception")
+                    .and_then(|e| e.get("description"))
+                    .and_then(Value::as_str)
+                    .or_else(|| exc.get("text").and_then(Value::as_str))
+                    .unwrap_or("未知异常");
+                return Err(format!("页面脚本执行异常: {}", desc.chars().take(300).collect::<String>()));
+            }
+            return res
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .cloned()
+                .ok_or_else(|| "隔离世界求值结果缺 value".to_string());
+        }
+        Err("隔离世界求值失败".to_string())
+    }
+
+    /// 拿（或重建）隔离世界的 executionContextId。
+    async fn ensure_world_context(&self, world: &str) -> Result<i64, String> {
+        if let Some(id) = self.worlds.lock().ok().and_then(|m| m.get(world).copied()) {
+            return Ok(id);
+        }
+        let tree = self.call("Page.getFrameTree", json!({})).await?;
+        let frame_id = tree
+            .get("frameTree")
+            .and_then(|t| t.get("frame"))
+            .and_then(|f| f.get("id"))
+            .and_then(Value::as_str)
+            .ok_or("拿不到主 frame id（隔离世界需要 frameId）")?
+            .to_string();
+        let world_res = self
+            .call(
+                "Page.createIsolatedWorld",
+                json!({ "frameId": frame_id, "worldName": world, "grantUniveralAccess": false }),
+            )
+            .await?;
+        let context_id = world_res
+            .get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or("Page.createIsolatedWorld 未返回 executionContextId")?;
+        if let Ok(mut m) = self.worlds.lock() {
+            m.insert(world.to_string(), context_id);
+        }
+        Ok(context_id)
+    }
+
+    /// 页面已导航/上下文销毁时调用：清掉全部隔离世界 context 缓存（下次求值自动重建）。
+    pub fn invalidate_worlds(&self) {
+        if let Ok(mut m) = self.worlds.lock() {
+            m.clear();
+        }
+    }
 }
 
 impl Clone for Cdp {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone() }
+        Self { tx: self.tx.clone(), events: self.events.clone(), worlds: self.worlds.clone() }
     }
 }

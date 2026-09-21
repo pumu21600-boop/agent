@@ -1,30 +1,50 @@
-//! 内置浏览器内核（P20）—— 进程内直持 CDP 会话的页面操作能力。
+//! 内置浏览器内核（P20 起，P21 对齐 ZCode 协议）—— 进程内直持 CDP 会话的页面操作能力。
 //!
-//! 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs），工具层暴露五个
-//! 操作：browser_open / browser_snapshot / browser_click / browser_type / browser_close。
+//! 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs）。P21 起：
+//! - **统一命令面**（commands.rs，协议形状移植自 ZCode `browserCommandSchema`，Apache-2.0）：
+//!   一个 `browser` 工具按 `method` 判别覆盖全部动作；结构化错误码不静默兜底。
+//! - **快照双结构**：`elements`（可动作元素，带 ref/selector/rect/inViewport/parentRef/
+//!   disabled/checked）与 `dom`（语义正文节点，不占 action ref）——正文节点不再消耗
+//!   交互预算；ref 失效后可用 selector 兜底定位。
+//! - **隔离世界**：快照/定位/求值在 `Page.createIsolatedWorld` 的隔离世界执行，
+//!   页面覆写全局对象或 getter 也改不了结果。
+//! - **screencast 帧流**：面板可见标签页跑 `Page.startScreencast`（jpeg），帧进内存
+//!   缓冲，面板读帧零 CDP 往返（不再每次轮询全量 PNG 编码）。
+//! - **标签页驻留**：后台（非面板可见、非 agent 页）超时空闲且活跃页超限时
+//!   `Page.setWebLifecycleState(frozen)` 挂起，访问即恢复；agent 页永保护。
+//! - **JS 弹窗**：`Page.javascriptDialogOpening` 捕获进 tab 状态，面板出「确定/取消」条，
+//!   agent 侧 get_dialog / handle_dialog——弹窗不再把页面卡死。
 //!
-//! 设计约定（窄而刚 v1）：
-//! - **单浏览器单标签页**：所有会话共用一个无头实例；并发工具调用在 CDP actor 上天然串行。
+//! 设计约定（窄而刚 v1，承 P20）：
+//! - **单浏览器多标签页**：所有会话共用一个无头实例；面板与 agent 工具共享进程，
+//!   各标签页独立 CDP 连接互不干扰；agent 工具缺省作用于 agent 专用标签页。
 //! - **DOM 增量 diff**：快照时给元素钉 `data-agent-ref`（已存在的不重打——ref 稳定），
-//!   服务端与上次快照按 ref 对比出「新增/移除/变化」，工具结果只附摘要与明细。
-//! - **语义定位为主，坐标兜底**：点击/输入优先 ref 与文本/占位符定位，定位不到才允许
-//!   直接给视口坐标（Input 域真实鼠标事件，兼容一切站点）。
+//!   服务端与上次快照按 ref 对比出「新增/移除/变化」。
+//! - **语义定位为主，坐标兜底**：ref → selector → 文本/占位符 → 视口坐标。
 //! - 浏览器进程自带 Chromium 站点隔离，不在 Windows 沙箱内再包一层；profile 用临时
 //!   目录，空转 10 分钟自动关闭。
 
 mod cdp;
+mod commands;
+
+pub use commands::{
+    ALL_METHODS, BrowserCommand, BrowserError, ErrorCode, KeyModifier, MouseButton, PageState, Point,
+    TabBrief, method_is_read_only,
+};
 
 use std::{
+    collections::HashMap,
     os::windows::process::CommandExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 
+use base64::Engine;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -34,8 +54,19 @@ use crate::observability::{self, EventType};
 const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 /// 空转自动关闭阈值。
 const IDLE_CLOSE: Duration = Duration::from_secs(600);
+/// 隔离世界名（页面脚本无法触及，移植自 ZCode 的 zcode-playwright-helper 思路）。
+const ISOLATED_WORLD: &str = "agent-browser-helper";
+/// 活跃（未挂起）标签页上限：超过则挂起最久空闲的后台页。
+const LIVE_TAB_LIMIT: usize = 4;
+/// 后台页挂起前的空闲阈值。
+const SUSPEND_IDLE: Duration = Duration::from_secs(60);
+/// wait_for 默认/上限预算。
+const WAIT_FOR_DEFAULT_MS: u64 = 5_000;
+const WAIT_FOR_MAX_MS: u64 = 30_000;
+/// 驻留/screencast 巡检周期。
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 单个 DOM 快照节点（服务端 diff 与渲染用）。
+/// 单个 DOM 快照元素（服务端 diff、渲染与兜底定位用）。
 #[derive(Clone, PartialEq)]
 struct OutlineNode {
     reference: String,
@@ -46,18 +77,83 @@ struct OutlineNode {
     value: Option<String>,
     href: Option<String>,
     depth: usize,
+    selector: String,
+    in_viewport: bool,
+    disabled: bool,
+    checked: Option<bool>,
+    parent_reference: Option<String>,
+}
+
+/// 语义正文节点（只负责"读懂页面"，不占 action ref）。
+#[derive(Clone, PartialEq)]
+struct DomNode {
+    tag: String,
+    depth: usize,
+    in_viewport: bool,
+    reference: Option<String>,
+    role: Option<String>,
+    name: String,
+    text: String,
+}
+
+/// screencast 最新帧（jpeg 字节；Chromium 只在页面变化时产帧，有帧即为当前画面）。
+#[derive(Clone)]
+struct Frame {
+    data: Vec<u8>,
+}
+
+/// 页面当前 JS 弹窗（alert/confirm/prompt/beforeunload）。
+#[derive(Clone, Default)]
+struct DialogInfo {
+    kind: String,
+    message: String,
+    default_prompt: String,
 }
 
 /// 一个标签页 = 一条页面级 CDP 连接（P20.1 网页面板起多标签化；面板与 agent 工具
-/// 共享同一个浏览器进程，各标签页连接互不干扰）。
+/// 共享同一个浏览器进程，各标签页连接互不干扰）。P21 增补驻留/帧/弹窗状态。
 pub struct WebTab {
     /// CDP target id
     pub id: String,
-    /// agent 工具（browser_* 五件套）专用标签页
+    /// agent 工具（browser 统一工具）专用标签页
     pub agent: bool,
     pub cdp: cdp::Cdp,
     /// agent 快照的增量 diff 基线（仅 agent 标签页使用）
     last_outline: Mutex<Vec<OutlineNode>>,
+    /// ref → selector 映射（ref 失效后 selector 兜底定位）
+    ref_selectors: Mutex<HashMap<String, String>>,
+    /// 最近一次交互时间（驻留 victim 选择用）
+    last_active_ms: AtomicU64,
+    /// 是否被挂起（frozen）
+    suspended: AtomicBool,
+    /// 已淘汰（从会话移除）：事件任务见之即退
+    retired: AtomicBool,
+    /// screencast 是否在跑
+    screencast_on: AtomicBool,
+    /// 最新 screencast 帧
+    frame: Mutex<Option<Frame>>,
+    /// 当前 JS 弹窗
+    dialog: Mutex<Option<DialogInfo>>,
+    /// 视口覆盖（挂起恢复时重放；None = 未设置过）
+    viewport: Mutex<Option<(i64, i64)>>,
+}
+
+impl WebTab {
+    fn touch(&self) {
+        self.last_active_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    fn idle_secs(&self) -> u64 {
+        now_ms().saturating_sub(self.last_active_ms.load(Ordering::Relaxed)) / 1000
+    }
+    /// ref 失效后按 selector 兜底定位（快照时存下的映射）。
+    async fn selector_for(&self, reference: &str) -> Option<String> {
+        self.ref_selectors.lock().await.get(reference).cloned()
+    }
+    async fn remember_selector(&self, reference: &str, selector: &str) {
+        if !reference.is_empty() && !selector.is_empty() {
+            self.ref_selectors.lock().await.insert(reference.to_string(), selector.to_string());
+        }
+    }
 }
 
 struct BrowserSession {
@@ -66,6 +162,8 @@ struct BrowserSession {
     port: u16,
     tabs: std::sync::Mutex<Vec<Arc<WebTab>>>,
     last_used_ms: AtomicU64,
+    /// 面板当前可见的标签页（驱动 screencast 与驻留；None = 面板没在看）
+    visible_tab: std::sync::Mutex<Option<String>>,
 }
 
 impl BrowserSession {
@@ -75,32 +173,31 @@ impl BrowserSession {
     fn idle_secs(&self) -> u64 {
         now_ms().saturating_sub(self.last_used_ms.load(Ordering::Relaxed)) / 1000
     }
-    /// 快照列表（面板展示用：id/标题/地址/是否 agent 页）。
-    async fn tab_briefs(&self) -> Vec<(String, bool, String, String)> {
+    fn visible(&self) -> Option<String> {
+        self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn set_visible(&self, id: &str) {
+        *self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+    }
+    fn clear_visible(&self) {
+        *self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// 快照列表（面板展示与 agent list 用）。
+    async fn tab_briefs(&self) -> Vec<TabBrief> {
         let tabs = self.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let visible = self.visible();
         let mut out = Vec::new();
         for t in tabs {
-            let title = t
-                .cdp
-                .call(
-                    "Runtime.evaluate",
-                    json!({ "expression": "document.title", "returnByValue": true }),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_default();
-            let url = t
-                .cdp
-                .call(
-                    "Runtime.evaluate",
-                    json!({ "expression": "location.href", "returnByValue": true }),
-                )
-                .await
-                .ok()
-                .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_default();
-            out.push((t.id.clone(), t.agent, title, url));
+            let (title, url) = tab_title_url(&t).await;
+            out.push(TabBrief {
+                id: t.id.clone(),
+                agent: t.agent,
+                title,
+                url,
+                visible: visible.as_deref() == Some(t.id.as_str()),
+                loading: false,
+                suspended: t.suspended.load(Ordering::Relaxed),
+            });
         }
         out
     }
@@ -155,6 +252,34 @@ fn clean_stale_profiles(keep: &PathBuf) {
 
 // —— 浏览器发现与拉起 ——
 
+/// 收集 WebView2 运行时目录下的 msedge.exe（真机踩过：用户机器**没装完整版
+/// Edge/Chrome**，界面本身跑在 WebView2 里——运行时在
+/// `Program Files (x86)\Microsoft\EdgeCore\<版本>\msedge.exe`，同样能
+/// `--headless=new --remote-debugging-port` 起无头 CDP（实测 HeadlessChrome/153 OK）。
+/// EdgeWebKit\Application\<版本> 是老布局，一并扫。只收数字开头的版本目录
+/// （EdgeCore\Optimized 是占位副本，不是完整浏览器）。
+fn webview2_runtime_exes(pf: &str, pf86: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for base in [pf86, pf] {
+        for prefix in ["Microsoft\\EdgeCore", "Microsoft\\EdgeWebKit\\Application"] {
+            let dir = PathBuf::from(base).join(prefix);
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            let mut found: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| {
+                    e.path().is_dir()
+                        && e.file_name().to_string_lossy().starts_with(|c: char| c.is_ascii_digit())
+                })
+                .map(|e| e.path().join("msedge.exe"))
+                .filter(|p| p.is_file())
+                .collect();
+            found.sort();
+            out.extend(found);
+        }
+    }
+    out
+}
+
 fn find_browser_exe() -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("AGENT_BROWSER_PATH")
         && !p.trim().is_empty()
@@ -164,24 +289,27 @@ fn find_browser_exe() -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
+    // 环境变量可能整体缺失（如从某些最小环境里拉起服务）——回落硬编码常见路径
     let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
     let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".into());
     let lf = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    let candidates = [
-        format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe"),
-        format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
-        format!("{pf}\\Google\\Chrome\\Application\\chrome.exe"),
-        format!("{pf86}\\Google\\Chrome\\Application\\chrome.exe"),
-        format!("{lf}\\Google\\Chrome\\Application\\chrome.exe"),
+    let mut candidates: Vec<PathBuf> = vec![
+        format!("{pf86}\\Microsoft\\Edge\\Application\\msedge.exe").into(),
+        format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe").into(),
+        format!("{pf}\\Google\\Chrome\\Application\\chrome.exe").into(),
+        format!("{pf86}\\Google\\Chrome\\Application\\chrome.exe").into(),
+        format!("{lf}\\Google\\Chrome\\Application\\chrome.exe").into(),
     ];
+    // WebView2 运行时殿后（没装完整版浏览器时的唯一 Chromium 来源）
+    candidates.extend(webview2_runtime_exes(&pf, &pf86));
     candidates
         .into_iter()
-        .map(PathBuf::from)
         .find(|p| p.is_file())
-        .ok_or_else(|| "找不到 Edge/Chrome（设 AGENT_BROWSER_PATH 指到浏览器 exe 可用）".to_string())
+        .ok_or_else(|| {
+            "找不到 Edge/Chrome/WebView2 运行时（设 AGENT_BROWSER_PATH 指到浏览器 exe 可用）".to_string()
+        })
 }
 
-/// 探测 CDP HTTP 端点，拿到页面级 ws 地址（headless 拉起后第一个 target 就是 about:blank 页）。
 /// CDP HTTP 端点客户端（环回、no_proxy——坑 17：本机代理环境变量会拦环回请求）。
 fn dev_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
@@ -262,7 +390,16 @@ async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<
         agent,
         cdp,
         last_outline: Mutex::new(Vec::new()),
+        ref_selectors: Mutex::new(HashMap::new()),
+        last_active_ms: AtomicU64::new(now_ms()),
+        suspended: AtomicBool::new(false),
+        retired: AtomicBool::new(false),
+        screencast_on: AtomicBool::new(false),
+        frame: Mutex::new(None),
+        dialog: Mutex::new(None),
+        viewport: Mutex::new(None),
     });
+    spawn_tab_events(tab.clone());
     session
         .tabs
         .lock()
@@ -271,10 +408,7 @@ async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<
     if url != "about:blank" && !url.is_empty() {
         navigate_tab(&tab, url).await?;
     }
-    log(
-        "browser.tab.new",
-        json!({ "id": tab.id, "agent": agent, "url": url }),
-    );
+    log("browser.tab.new", json!({ "id": tab.id, "agent": agent, "url": url }));
     Ok(tab)
 }
 
@@ -284,11 +418,15 @@ async fn close_tab(session: &BrowserSession, id: &str) -> bool {
         let mut tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner());
         let pos = tabs.iter().position(|t| t.id == id);
         if let Some(pos) = pos {
-            tabs.remove(pos);
+            let tab = tabs.remove(pos);
+            tab.retired.store(true, Ordering::Relaxed);
         }
         pos.is_some()
     };
     if removed {
+        if session.visible().as_deref() == Some(id) {
+            session.clear_visible();
+        }
         dev_close_target(session.port, id).await;
         log("browser.tab.close", json!({ "id": id }));
     }
@@ -385,10 +523,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                 }
             }
             let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-            last_err = format!(
-                "浏览器拉起后立即退出（exit={code:?}，{}）：{tail}",
-                exe.display()
-            );
+            last_err = format!("浏览器拉起后立即退出（exit={code:?}，{}）：{tail}", exe.display());
             continue;
         }
         match wait_page_target(port, Duration::from_secs(10)).await {
@@ -403,12 +538,22 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     agent: true,
                     cdp,
                     last_outline: Mutex::new(Vec::new()),
+                    ref_selectors: Mutex::new(HashMap::new()),
+                    last_active_ms: AtomicU64::new(now_ms()),
+                    suspended: AtomicBool::new(false),
+                    retired: AtomicBool::new(false),
+                    screencast_on: AtomicBool::new(false),
+                    frame: Mutex::new(None),
+                    dialog: Mutex::new(None),
+                    viewport: Mutex::new(None),
                 });
+                spawn_tab_events(first.clone());
                 let session = Arc::new(BrowserSession {
                     child: std::sync::Mutex::new(child),
                     port,
                     tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
+                    visible_tab: std::sync::Mutex::new(None),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -440,25 +585,100 @@ async fn ensure_session() -> Result<Arc<BrowserSession>, String> {
     Ok(s)
 }
 
-/// 空转收割：10 分钟没人用就关浏览器（不占内存、不留进程）。
+/// 空转收割 + 驻留巡检 + screencast 同步（5s 一拍）。
 fn ensure_reaper() {
     REAPER.get_or_init(|| {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let idle = {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let session = {
                     let guard = SESSION.lock().await;
                     match guard.as_ref() {
-                        Some(s) => s.idle_secs(),
+                        Some(s) => {
+                            s.touch();
+                            s.clone()
+                        }
                         None => continue,
                     }
                 };
-                if idle > IDLE_CLOSE.as_secs() {
+                sweep_session(&session).await;
+                if session.idle_secs() > IDLE_CLOSE.as_secs() {
                     close_internal("idle").await;
                 }
             }
         });
     });
+}
+
+/// 驻留巡检：screencast 只服务面板可见页；后台超时空闲且活跃页超限 → 挂起最久空闲者。
+async fn sweep_session(session: &Arc<BrowserSession>) {
+    let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let visible = session.visible();
+    // screencast 同步：可见页开、其余关
+    for t in &tabs {
+        let on = visible.as_deref() == Some(t.id.as_str()) && !t.suspended.load(Ordering::Relaxed);
+        ensure_screencast(t, on).await;
+    }
+    // 驻留淘汰：非 agent、非可见、空闲超限、未挂起；活跃数超 LIVE_TAB_LIMIT 才动手
+    let live: Vec<&Arc<WebTab>> = tabs.iter().filter(|t| !t.suspended.load(Ordering::Relaxed)).collect();
+    if live.len() <= LIVE_TAB_LIMIT {
+        return;
+    }
+    let mut victims: Vec<&Arc<WebTab>> = live
+        .into_iter()
+        .filter(|t| !t.agent && visible.as_deref() != Some(t.id.as_str()) && t.idle_secs() >= SUSPEND_IDLE.as_secs())
+        .collect();
+    // 最久空闲者先淘汰
+    victims.sort_by_key(|t| t.last_active_ms.load(Ordering::Relaxed));
+    for t in victims {
+        let still_live = session
+            .tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|x| !x.suspended.load(Ordering::Relaxed))
+            .count();
+        if still_live <= LIVE_TAB_LIMIT {
+            break;
+        }
+        suspend_tab(t).await;
+    }
+}
+
+/// 挂起一个后台标签页：停 screencast → frozen（停 JS 定时器与渲染产出）。
+async fn suspend_tab(tab: &Arc<WebTab>) {
+    ensure_screencast(tab, false).await;
+    if let Err(e) = tab.cdp.call("Page.setWebLifecycleState", json!({ "state": "frozen" })).await {
+        log("browser.suspend.fail", json!({ "id": tab.id, "err": e }));
+        return;
+    }
+    tab.suspended.store(true, Ordering::Relaxed);
+    log("browser.tab.suspend", json!({ "id": tab.id }));
+}
+
+/// 恢复一个被挂起的标签页：解冻 + 重放视口覆盖 + 补一刀 Page.enable。
+async fn ensure_live(tab: &Arc<WebTab>) -> Result<(), String> {
+    if !tab.suspended.swap(false, Ordering::Relaxed) {
+        return Ok(());
+    }
+    tab.cdp.call("Page.setWebLifecycleState", json!({ "state": "active" })).await?;
+    let _ = tab.cdp.call("Page.enable", json!({})).await;
+    if let Some((w, h)) = *tab.viewport.lock().await {
+        let _ = apply_viewport_override(tab, w, h).await;
+    }
+    tab.touch();
+    log("browser.tab.restore", json!({ "id": tab.id }));
+    Ok(())
+}
+
+async fn apply_viewport_override(tab: &WebTab, w: i64, h: i64) -> Result<(), String> {
+    tab.cdp
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": false }),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn close_internal(reason: &str) {
@@ -469,19 +689,118 @@ async fn close_internal(reason: &str) {
     }
 }
 
-// —— DOM 快照（JS 注入）——
+// —— 标签页事件任务（screencast 帧 / JS 弹窗；P21）——
 
-/// 页面结构抽取：交互元素带语义角色，纯文本块保留正文；ref 钉在 DOM 上（稳定）。
-const SNAPSHOT_JS: &str = r#"(() => {
-  const MAXN = 400, MAXTEXT = 120, MAXDEPTH = 24;
+/// 每标签页一个事件任务：消费 CDP 事件广播。retired 后退出；actor 退出（WS 断）即退。
+fn spawn_tab_events(tab: Arc<WebTab>) {
+    tokio::spawn(async move {
+        let mut rx = tab.cdp.subscribe_events();
+        loop {
+            if tab.retired.load(Ordering::Relaxed) {
+                break;
+            }
+            match rx.recv().await {
+                Ok((method, params)) => match method.as_str() {
+                    "Page.screencastFrame" => {
+                        if tab.screencast_on.load(Ordering::Relaxed)
+                            && let Some(data) = params.get("data").and_then(Value::as_str)
+                            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+                        {
+                            *tab.frame.lock().await = Some(Frame { data: bytes });
+                        }
+                        // ack 必须回：不回 Chromium 会停止产帧
+                        let _ = tab
+                            .cdp
+                            .call(
+                                "Page.screencastFrameAck",
+                                json!({ "sessionId": params.get("sessionId").cloned().unwrap_or(Value::Null) }),
+                            )
+                            .await;
+                    }
+                    "Page.javascriptDialogOpening" => {
+                        let info = DialogInfo {
+                            kind: params.get("type").and_then(Value::as_str).unwrap_or("alert").to_string(),
+                            message: params.get("message").and_then(Value::as_str).unwrap_or("").to_string(),
+                            default_prompt: params
+                                .get("defaultPrompt")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        *tab.dialog.lock().await = Some(info);
+                        log("browser.dialog", json!({ "id": tab.id, "type": params.get("type") }));
+                    }
+                    "Page.javascriptDialogClosed" => {
+                        *tab.dialog.lock().await = None;
+                    }
+                    _ => {}
+                },
+                // 帧消费慢导致丢中间帧：最新帧胜出，可接受；dialog 低频不受影响
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// screencast 开关（幂等）：开=Page.startScreencast(jpeg q75)，关=Page.stopScreencast。
+async fn ensure_screencast(tab: &Arc<WebTab>, on: bool) {
+    if on {
+        if tab.screencast_on.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let r = tab
+            .cdp
+            .call("Page.startScreencast", json!({ "format": "jpeg", "quality": 75, "everyNthFrame": 1 }))
+            .await;
+        if r.is_err() {
+            tab.screencast_on.store(false, Ordering::Relaxed);
+        }
+    } else if tab.screencast_on.swap(false, Ordering::Relaxed) {
+        let _ = tab.cdp.call("Page.stopScreencast", json!({})).await;
+    }
+}
+
+/// 页面标题与地址（两次轻量求值；隔离世界，页面篡改不了）。
+async fn tab_title_url(tab: &WebTab) -> (String, String) {
+    let title = tab
+        .cdp
+        .evaluate_in_isolated_world(ISOLATED_WORLD, "document.title")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let url = tab
+        .cdp
+        .evaluate_in_isolated_world(ISOLATED_WORLD, "location.href")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    (title, url)
+}
+
+// —— DOM 快照（JS 注入，隔离世界）——
+
+/// 页面结构抽取：可交互元素（elements，带 ref/selector/rect/inViewport/parentRef/disabled/
+/// checked）+ 语义正文节点（dom，不占 ref）。双结构移植自 ZCode browserSnapshotSchema——
+/// 正文节点不消耗 action ref 预算；截断时先保证模型看到页面语义。
+const SNAPSHOT_JS: &str = r#"((MAXN_IN, INCLUDE_HIDDEN) => {
+  const MAXN = MAXN_IN || 400, MAXTEXT = 120, MAXDEPTH = 24;
   const out = [];
-  // ref 序号取现有最大值起算，避免给新元素打出与存活元素撞车的编号
   let seq = 0;
   document.querySelectorAll('[data-agent-ref]').forEach((el) => {
     const n = parseInt(el.getAttribute('data-agent-ref').slice(1), 10);
     if (!isNaN(n) && n > seq) seq = n;
   });
-  const skip = new Set(['script','style','noscript','template','svg','path','head','meta','link']);
+  const INTERACTIVE = 'a[href],button,input,textarea,select,[role],[onclick],[tabindex],summary,details,label,[contenteditable]';
+  const skip = new Set(['script','style','noscript','template','svg','path','head','meta','link','iframe','canvas']);
+  const SEMANTIC = ['p','li','td','th','label','blockquote','figcaption','dd','dt','summary','span','h1','h2','h3','h4','h5','h6','pre','code','strong','em','b','i','a'];
+  const inView = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+  };
   const roleOf = (el) => {
     const r = el.getAttribute('role'); if (r) return r;
     const t = el.tagName.toLowerCase();
@@ -501,44 +820,137 @@ const SNAPSHOT_JS: &str = r#"(() => {
   const directText = (el) => {
     let s = '';
     for (const n of el.childNodes) if (n.nodeType === 3) s += n.textContent;
-    return s.replace(/\s+/g, ' ').trim().slice(0, MAXTEXT);
+    return s.replace(/\s+/g, ' ').trim();
   };
-  const walk = (el, depth) => {
-    if (!el || out.length >= MAXN || depth > MAXDEPTH) return;
+  const depthOf = (el) => { let d = 0, p = el.parentElement; while (p && d < MAXDEPTH) { d++; p = p.parentElement; } return d; };
+  const parentRefOf = (el) => {
+    let p = el.parentElement;
+    while (p) { const r = p.getAttribute && p.getAttribute('data-agent-ref'); if (r) return r; p = p.parentElement; }
+    return null;
+  };
+  // 有界稳定 selector：id / data-testid / aria-label / name / 标签+nth-of-type
+  const selOf = (el) => {
+    try {
+      if (el.id) return '#' + CSS.escape(el.id);
+      const t = el.getAttribute('data-testid'); if (t) return '[data-testid="' + t + '"]';
+      const a = el.getAttribute('aria-label'); if (a) return '[aria-label="' + a + '"]';
+      const n = el.getAttribute('name');
+      if (n && ['INPUT','TEXTAREA','SELECT'].includes(el.tagName)) return el.tagName.toLowerCase() + '[name="' + n + '"]';
+      let node = el, path = el.tagName.toLowerCase(), hop = 0;
+      while (node.parentElement && hop < 4) {
+        const p = node.parentElement;
+        const sibs = Array.prototype.filter.call(p.children, (c) => c.tagName === node.tagName);
+        if (sibs.length > 1) { path += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')'; break; }
+        node = p; hop++;
+      }
+      return path;
+    } catch (e) { return el.tagName.toLowerCase(); }
+  };
+  const pushEl = (el) => {
+    if (out.length >= MAXN) return;
+    const tag = el.tagName.toLowerCase();
+    const rect = el.getBoundingClientRect();
+    let ref = el.getAttribute('data-agent-ref');
+    if (!ref) { seq += 1; ref = 'e' + seq; el.setAttribute('data-agent-ref', ref); }
+    out.push({
+      ref, tag, role: roleOf(el),
+      name: nameOf(el),
+      text: directText(el).slice(0, MAXTEXT),
+      value: (tag === 'input' || tag === 'textarea' || tag === 'select') ? String(el.value ?? '').slice(0, MAXTEXT) : null,
+      href: tag === 'a' && el.href ? el.href.slice(0, 200) : null,
+      disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      checked: (tag === 'input' && (el.type === 'checkbox' || el.type === 'radio')) ? !!el.checked : null,
+      selector: selOf(el),
+      rect: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)],
+      inViewport: inView(el),
+      parentRef: parentRefOf(el),
+      depth: depthOf(el),
+    });
+  };
+  document.querySelectorAll(INTERACTIVE).forEach((el) => {
     const tag = el.tagName.toLowerCase();
     if (skip.has(tag)) return;
-    const role = roleOf(el);
+    if (!INCLUDE_HIDDEN && !el.getClientRects().length) return; // 不可见（display:none / 零尺寸）
+    pushEl(el);
+  });
+  const dom = [];
+  const domPush = (el, depth) => {
+    if (!el || dom.length >= MAXN || depth > MAXDEPTH) return;
+    const tag = el.tagName.toLowerCase();
+    if (skip.has(tag)) return;
     const text = directText(el);
-    const keep = role !== null || (text && ['p','li','td','th','label','blockquote','figcaption','dd','dt','summary','span'].includes(tag));
-    let ref = null;
-    if (keep) {
-      ref = el.getAttribute('data-agent-ref');
-      if (!ref) { seq += 1; ref = 'e' + seq; el.setAttribute('data-agent-ref', ref); }
-      out.push({
-        ref, tag, role,
+    if (SEMANTIC.includes(tag) && text) {
+      dom.push({
+        tag, depth, text: text.slice(0, MAXTEXT),
+        ref: el.getAttribute('data-agent-ref') || null,
+        role: el.getAttribute('role') || null,
         name: nameOf(el),
-        text,
-        value: (tag === 'input' || tag === 'textarea') ? String(el.value ?? '').slice(0, MAXTEXT) : null,
-        href: tag === 'a' && el.href ? el.href.slice(0, 200) : null,
-        depth,
+        inViewport: inView(el),
       });
     }
-    for (const c of el.children) walk(c, depth + (keep ? 1 : 0));
+    for (const c of el.children) domPush(c, depth + 1);
   };
-  walk(document.body, 0);
+  domPush(document.body, 0);
   return {
-    url: location.href,
-    title: document.title,
-    nodes: out,
-    truncated: out.length >= MAXN,
+    url: location.href, title: document.title,
+    elements: out, dom,
+    truncated: out.length >= MAXN, domTruncated: dom.length >= MAXN,
   };
-})()"#;
+})"#;
 
-/// 渲染一行大纲。
+/// 解析快照 JS 返回值 → (elements, dom)。
+fn parse_snapshot(value: &Value) -> Result<(Vec<OutlineNode>, Vec<DomNode>), String> {
+    let mut elements = Vec::new();
+    if let Some(arr) = value.get("elements").and_then(Value::as_array) {
+        for n in arr {
+            elements.push(OutlineNode {
+                reference: n.get("ref").and_then(Value::as_str).unwrap_or_default().to_string(),
+                tag: n.get("tag").and_then(Value::as_str).unwrap_or_default().to_string(),
+                role: n.get("role").and_then(Value::as_str).map(str::to_string),
+                name: n.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                text: n.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+                value: n.get("value").and_then(Value::as_str).map(str::to_string),
+                href: n.get("href").and_then(Value::as_str).map(str::to_string),
+                depth: n.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+                selector: n.get("selector").and_then(Value::as_str).unwrap_or_default().to_string(),
+                in_viewport: n.get("inViewport").and_then(Value::as_bool).unwrap_or(false),
+                disabled: n.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+                checked: n.get("checked").and_then(Value::as_bool),
+                parent_reference: n.get("parentRef").and_then(Value::as_str).map(str::to_string),
+            });
+        }
+    }
+    let mut dom = Vec::new();
+    if let Some(arr) = value.get("dom").and_then(Value::as_array) {
+        for n in arr {
+            dom.push(DomNode {
+                tag: n.get("tag").and_then(Value::as_str).unwrap_or_default().to_string(),
+                depth: n.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
+                in_viewport: n.get("inViewport").and_then(Value::as_bool).unwrap_or(false),
+                reference: n.get("ref").and_then(Value::as_str).map(str::to_string),
+                role: n.get("role").and_then(Value::as_str).map(str::to_string),
+                name: n.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                text: n.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            });
+        }
+    }
+    Ok((elements, dom))
+}
+
+/// 渲染一行可交互元素。
 fn render_node(n: &OutlineNode) -> String {
     let indent = "  ".repeat(n.depth.min(12));
     let role = n.role.clone().unwrap_or_else(|| n.tag.clone());
     let mut line = format!("{indent}[{role} {}]", n.reference);
+    if n.disabled {
+        line.push_str(" 禁用");
+    }
+    if n.checked == Some(true) {
+        line.push_str(" 已选");
+    }
+    if !n.in_viewport {
+        line.push_str(" 屏外");
+    }
     if !n.name.is_empty() {
         line.push_str(&format!(" \"{}\"", n.name));
     }
@@ -550,6 +962,27 @@ fn render_node(n: &OutlineNode) -> String {
     }
     if let Some(h) = &n.href {
         line.push_str(&format!(" → {h}"));
+    }
+    line
+}
+
+/// 渲染一行语义正文节点。
+fn render_dom_node(n: &DomNode) -> String {
+    let indent = "  ".repeat(n.depth.min(12));
+    let role = n.role.clone().unwrap_or_else(|| n.tag.clone());
+    let mut line = format!("{indent}⟨{role}");
+    if let Some(r) = &n.reference {
+        line.push_str(&format!(" {r}"));
+    }
+    line.push('⟩');
+    if !n.name.is_empty() {
+        line.push_str(&format!(" \"{}\"", n.name));
+    }
+    if !n.text.is_empty() {
+        line.push_str(&format!(" {}", n.text));
+    }
+    if !n.in_viewport {
+        line.push_str("（屏外）");
     }
     line
 }
@@ -597,39 +1030,33 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
-async fn take_snapshot(tab: &WebTab, max_chars: usize) -> Result<String, String> {
-    let res = tab
+/// 快照：隔离世界抽结构 → diff → 渲染（elements + dom 双结构）。
+/// max_elements/include_hidden 来自 snapshot 命令（对齐 ZCode 的同名参数）。
+async fn take_snapshot(
+    tab: &WebTab,
+    max_chars: usize,
+    max_elements: Option<usize>,
+    include_hidden: bool,
+) -> Result<String, String> {
+    let expr = format!(
+        "{SNAPSHOT_JS}({}, {})",
+        max_elements.unwrap_or(0),
+        include_hidden
+    );
+    let value = tab
         .cdp
-        .call(
-            "Runtime.evaluate",
-            json!({ "expression": SNAPSHOT_JS, "returnByValue": true, "awaitPromise": false }),
-        )
-        .await?;
-    if let Some(exc) = res.get("exceptionDetails") {
-        return Err(format!("页面脚本执行异常: {}", exc.to_string().chars().take(200).collect::<String>()));
-    }
-    let value = res
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .cloned()
-        .ok_or_else(|| "快照结果缺 value".to_string())?;
+        .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+        .await
+        .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e).to_string())?;
     let url = value.get("url").and_then(Value::as_str).unwrap_or("").to_string();
     let title = value.get("title").and_then(Value::as_str).unwrap_or("").to_string();
     let truncated = value.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-    let mut nodes: Vec<OutlineNode> = Vec::new();
-    if let Some(arr) = value.get("nodes").and_then(Value::as_array) {
-        for n in arr {
-            nodes.push(OutlineNode {
-                reference: n.get("ref").and_then(Value::as_str).unwrap_or_default().to_string(),
-                tag: n.get("tag").and_then(Value::as_str).unwrap_or_default().to_string(),
-                role: n.get("role").and_then(Value::as_str).map(str::to_string),
-                name: n.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
-                text: n.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
-                value: n.get("value").and_then(Value::as_str).map(str::to_string),
-                href: n.get("href").and_then(Value::as_str).map(str::to_string),
-                depth: n.get("depth").and_then(Value::as_u64).unwrap_or(0) as usize,
-            });
-        }
+    let dom_truncated = value.get("domTruncated").and_then(Value::as_bool).unwrap_or(false);
+    let (nodes, dom) = parse_snapshot(&value)?;
+
+    // ref → selector 映射落盘（ref 失效后兜底定位）
+    for n in &nodes {
+        tab.remember_selector(&n.reference, &n.selector).await;
     }
 
     let mut guard = tab.last_outline.lock().await;
@@ -642,20 +1069,29 @@ async fn take_snapshot(tab: &WebTab, max_chars: usize) -> Result<String, String>
         out.push_str(&detail.join("\n"));
         out.push('\n');
     }
-    out.push_str("--- 页面结构 ---\n");
+    out.push_str("--- 可交互元素（ref 供 click/type/fill/hover/select/check 定位；「屏外」需先 scroll）---\n");
     out.push_str(&nodes.iter().map(render_node).collect::<Vec<_>>().join("\n"));
     if truncated {
-        out.push_str("\n（节点过多，快照已截断——可用更精确的 ref 操作已知元素）");
+        out.push_str("\n（元素过多，快照已截断——可用更精确的 ref 操作已知元素）");
+    }
+    if !dom.is_empty() {
+        out.push_str("\n--- 页面正文 ---\n");
+        out.push_str(&dom.iter().map(render_dom_node).collect::<Vec<_>>().join("\n"));
+        if dom_truncated {
+            out.push_str("\n（正文节点过多，已截断）");
+        }
     }
     Ok(crate::context::compress(&out, max_chars))
 }
 
-// —— 元素定位（语义为主） ——
+// —— 元素定位（语义为主，selector 兜底） ——
 
-/// 定位 JS 返回：{ok, x, y, tag, name} 或 {ok:false}。
-const LOCATE_JS: &str = r#"((ref, text, label) => {
-  let el = null;
-  if (ref) el = document.querySelector('[data-agent-ref="' + ref + '"]');
+/// 定位 JS 返回：{ok, x, y, tag, name, how} 或 {ok:false}。
+/// 顺序：ref → selector → 文本/占位符语义匹配。
+const LOCATE_JS: &str = r#"((ref, selector, text, label) => {
+  let el = null, how = '';
+  if (ref) { try { el = document.querySelector('[data-agent-ref="' + ref + '"]'); how = 'ref'; } catch (e) {} }
+  if (!el && selector) { try { el = document.querySelector(selector); how = 'selector'; } catch (e) {} }
   const want = (text || label || '').trim().toLowerCase();
   if (!el && want) {
     const cands = [];
@@ -672,6 +1108,7 @@ const LOCATE_JS: &str = r#"((ref, text, label) => {
     const rank = (r) => (r === 'button' || r === 'link' || r === 'textbox' || r === 'combobox') ? 0 : 1;
     cands.sort((a, b) => (rank(a.role) - rank(b.role)) || (a.w - b.w));
     el = cands[0] ? cands[0].el : null;
+    if (el) how = text ? 'text' : 'label';
   }
   if (!el) return { ok: false };
   el.scrollIntoView({ block: 'center' });
@@ -683,83 +1120,113 @@ const LOCATE_JS: &str = r#"((ref, text, label) => {
     y: Math.round(r.top + r.height / 2),
     tag: el.tagName.toLowerCase(),
     name: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || '').trim().slice(0, 60),
+    how,
   };
 })"#;
 
-/// 解析定位参数 → 视口坐标。ref/文本语义优先，x/y 兜底。
-/// click 形态 (ref, text)；type 形态 (ref, label)——由 text_key 区分。
+/// 修饰键 → CDP 位掩码（Alt=1, Ctrl=2, Meta=4, Shift=8）。
+fn modifier_mask(modifiers: &Option<Vec<KeyModifier>>) -> i64 {
+    let Some(list) = modifiers else { return 0 };
+    let mut mask = 0;
+    for m in list {
+        mask |= match m {
+            KeyModifier::Alt => 1,
+            KeyModifier::Control => 2,
+            KeyModifier::Meta => 4,
+            KeyModifier::Shift => 8,
+        };
+    }
+    mask
+}
+
+/// 解析定位参数 → 视口坐标与目标描述。ref → selector（兜底）→ 文本语义 → 坐标。
 async fn locate(
     tab: &WebTab,
-    v: &Value,
-    ref_key: &str,
-    text_key: &str,
-) -> Result<(i64, i64, String), String> {
-    let reference = v.get(ref_key).and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let text = v.get(text_key).and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if !reference.is_empty() || !text.is_empty() {
-        let expr = if text_key == "label" {
-            format!(
-                "{LOCATE_JS}({}, null, {})",
-                serde_json::to_string(&reference).unwrap_or_else(|_| "null".into()),
-                serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
-            )
-        } else {
-            format!(
-                "{LOCATE_JS}({}, {}, null)",
-                serde_json::to_string(&reference).unwrap_or_else(|_| "null".into()),
-                serde_json::to_string(&text).unwrap_or_else(|_| "null".into())
-            )
-        };
-        let res = tab
+    reference: &str,
+    text: &str,
+    label: &str,
+) -> Result<(i64, i64, String), BrowserError> {
+    let reference = reference.trim();
+    let text = text.trim();
+    let label = label.trim();
+    let mut selector = String::new();
+    if !reference.is_empty() {
+        // ref 在页面上已失效时，用快照时存下的 selector 再试一次
+        selector = tab.selector_for(reference).await.unwrap_or_default();
+    }
+    if !reference.is_empty() || !selector.is_empty() || !text.is_empty() || !label.is_empty() {
+        let expr = format!(
+            "{LOCATE_JS}({}, {}, {}, {})",
+            serde_json::to_string(reference).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(&selector).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()),
+            serde_json::to_string(label).unwrap_or_else(|_| "\"\"".into())
+        );
+        let val = tab
             .cdp
-            .call("Runtime.evaluate", json!({ "expression": expr, "returnByValue": true }))
-            .await?;
-        let val = res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null);
+            .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+            .await
+            .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
         if val.get("ok").and_then(Value::as_bool) == Some(true) {
             let x = val.get("x").and_then(Value::as_i64).unwrap_or(0);
             let y = val.get("y").and_then(Value::as_i64).unwrap_or(0);
             let tag = val.get("tag").and_then(Value::as_str).unwrap_or("?").to_string();
             let name = val.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-            return Ok((x, y, format!("{tag} \"{name}\"")));
+            let how = val.get("how").and_then(Value::as_str).unwrap_or("?");
+            return Ok((x, y, format!("{tag} \"{name}\"（{how} 定位）")));
         }
-        return Err("语义定位失败：ref 不存在或文本/占位符没有可见匹配。可先 browser_snapshot 拿最新 ref，或用坐标 x/y 兜底".into());
+        if !reference.is_empty() {
+            return Err(BrowserError::new(
+                ErrorCode::RefNotFound,
+                format!("ref {reference} 在页面上已不存在（DOM 变了）。先 browser snapshot 拿最新 ref；或给 text/label 语义定位、x/y 坐标兜底"),
+            ));
+        }
+        return Err(BrowserError::new(
+            ErrorCode::RefNotFound,
+            "语义定位失败：文本/占位符没有可见匹配。可先 browser snapshot 拿最新 ref，或用坐标 x/y 兜底",
+        ));
     }
-    // 坐标兜底
-    let x = v.get("x").and_then(Value::as_i64);
-    let y = v.get("y").and_then(Value::as_i64);
-    match (x, y) {
-        (Some(x), Some(y)) => Ok((x, y, format!("坐标 ({x},{y})"))),
-        _ => Err("缺少定位参数：给 ref（快照编号）、text/label（语义匹配）或 x/y（视口坐标）之一".into()),
-    }
+    Err(BrowserError::new(
+        ErrorCode::CapabilityUnsupported,
+        "缺少定位参数：给 ref（快照编号）、text/label（语义匹配）或 x/y（视口坐标）之一",
+    ))
 }
 
-async fn dispatch_click(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
+async fn dispatch_click(
+    tab: &WebTab,
+    x: i64,
+    y: i64,
+    button: MouseButton,
+    modifiers: i64,
+) -> Result<(), String> {
     let (x, y) = (x as f64, y as f64);
-    tab
-        .cdp
-        .call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))
-        .await?;
-    tab
-        .cdp
+    tab.cdp
         .call(
             "Input.dispatchMouseEvent",
-            json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
+            json!({ "type": "mouseMoved", "x": x, "y": y, "modifiers": modifiers }),
         )
         .await?;
-    tab
-        .cdp
-        .call(
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
-        )
-        .await?;
+    for t in ["mousePressed", "mouseReleased"] {
+        tab.cdp
+            .call(
+                "Input.dispatchMouseEvent",
+                json!({ "type": t, "x": x, "y": y, "button": button.as_str(), "clickCount": 1, "modifiers": modifiers }),
+            )
+            .await?;
+    }
     Ok(())
 }
 
 /// 点击后的「沉降」：多数点击不触发导航，不能死等——轮询 readyState，
 /// 没出现 loading（约 400ms 内）就返回；真导航了则等到加载完成（上限 6s）。
-async fn click_and_settle(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
-    dispatch_click(tab, x, y).await?;
+async fn click_and_settle(
+    tab: &WebTab,
+    x: i64,
+    y: i64,
+    button: MouseButton,
+    modifiers: i64,
+) -> Result<(), String> {
+    dispatch_click(tab, x, y, button, modifiers).await?;
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut navigated = false;
     let mut polls = 0u32;
@@ -798,21 +1265,54 @@ async fn click_and_settle(tab: &WebTab, x: i64, y: i64) -> Result<(), String> {
         // 给新页面渲染留一点时间再截图
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    tab.cdp.invalidate_worlds();
     Ok(())
 }
 
-// —— 对工具层暴露的操作 ——
+// —— 对工具层暴露的操作（统一命令分发；P21）——
 
-fn parse_args(args: &str) -> Result<Value, String> {
-    serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))
+async fn current_session() -> Result<Arc<BrowserSession>, String> {
+    let guard = SESSION.lock().await;
+    match guard.as_ref() {
+        Some(s) => Ok(s.clone()),
+        None => Err("浏览器未打开：先打开一个网页".into()),
+    }
 }
 
-fn require_url(v: &Value) -> Result<String, String> {
-    let url = v.get("url").and_then(Value::as_str).map(str::trim).unwrap_or("");
-    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank") {
-        return Err("url 必须以 http:// / https:// / file:// 开头（或 about:blank）".into());
+/// 页面状态（隔离世界求值 + 导航历史）。
+async fn page_state(tab: &WebTab) -> Result<PageState, BrowserError> {
+    let (title, url) = tab_title_url(tab).await;
+    let mut st = PageState { url, title, ..Default::default() };
+    if let Ok(hist) = tab.cdp.call("Page.getNavigationHistory", json!({})).await {
+        let index = hist.get("currentIndex").and_then(Value::as_i64).unwrap_or(0);
+        let count = hist.get("entries").and_then(Value::as_array).map(|a| a.len() as i64).unwrap_or(0);
+        st.can_go_back = index > 0;
+        st.can_go_forward = index + 1 < count;
     }
-    Ok(url.to_string())
+    let ready = tab
+        .cdp
+        .evaluate_in_isolated_world(ISOLATED_WORLD, "document.readyState")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    st.loading = !ready.is_empty() && ready != "complete";
+    if let Some((w, h)) = *tab.viewport.lock().await {
+        st.viewport_w = w;
+        st.viewport_h = h;
+    }
+    Ok(st)
+}
+
+fn check_url(url: &str) -> Result<(), BrowserError> {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank" {
+        Ok(())
+    } else {
+        Err(BrowserError::new(
+            ErrorCode::NavigationBlocked,
+            "地址必须以 http:// / https:// / file:// 开头（或 about:blank）",
+        ))
+    }
 }
 
 /// 在标签页里导航并等加载完成；返回超时提示（None=正常）。会话死了返回 Err。
@@ -822,165 +1322,820 @@ async fn navigate_tab(tab: &WebTab, url: &str) -> Result<Option<&'static str>, S
         .call_and_wait_event("Page.navigate", json!({ "url": url }), "Page.loadEventFired", LOAD_TIMEOUT)
         .await;
     match nav {
-        Ok(_) => Ok(None),
+        Ok(_) => {
+            tab.cdp.invalidate_worlds(); // 导航销毁了旧的隔离世界 context
+            Ok(None)
+        }
         Err(e) if e.contains("等待事件超时") => Ok(Some("（页面加载未在预算内完成，以下为当前状态）\n")),
         Err(e) => Err(e),
     }
 }
 
-/// browser_open：加载页面（无会话则拉起浏览器），返回快照。
-pub async fn open(args: &str, max_chars: usize) -> Result<String, String> {
-    let v = parse_args(args)?;
-    let url = require_url(&v)?;
-    let session = ensure_session().await?;
-    session.touch();
-    let tab = agent_tab(&session).await?;
-    log("browser.navigate", json!({ "url": url }));
-    let note = match navigate_tab(&tab, &url).await {
-        Ok(note) => note.unwrap_or(""),
-        Err(e) => {
-            // 会话死了：清掉，下次自动重拉
-            close_internal("dead").await;
-            return Err(format!("浏览器会话异常已重置（重试 browser_open 即可）: {e}"));
-        }
-    };
-    let snap = take_snapshot(&tab, max_chars).await?;
-    Ok(format!("{note}{snap}"))
-}
-
-/// browser_snapshot：当前页面结构 + 增量 diff。
-pub async fn snapshot(args: &str, max_chars: usize) -> Result<String, String> {
-    let _ = parse_args(args)?;
-    let session = current_session().await?;
-    session.touch();
-    let tab = agent_tab(&session).await?;
-    take_snapshot(&tab, max_chars).await
-}
-
-async fn current_session() -> Result<Arc<BrowserSession>, String> {
-    let guard = SESSION.lock().await;
-    match guard.as_ref() {
-        Some(s) => Ok(s.clone()),
-        None => Err("浏览器未打开：先调用 browser_open".into()),
-    }
-}
-
-/// browser_click：语义定位点击，返回点击目标与最新快照。
-pub async fn click(args: &str, max_chars: usize) -> Result<String, String> {
-    let v = parse_args(args)?;
-    let session = current_session().await?;
-    session.touch();
-    let tab = agent_tab(&session).await?;
-    let (x, y, desc) = locate(&tab, &v, "ref", "text").await?;
-    if let Err(e) = click_and_settle(&tab, x, y).await {
-        if e.contains("连接已断开") {
-            close_internal("dead").await;
-        }
-        return Err(format!("点击失败: {e}"));
-    }
-    log("browser.click", json!({ "target": desc, "x": x, "y": y }));
-    let snap = take_snapshot(&tab, max_chars).await?;
-    Ok(format!("已点击 {desc}（{x},{y}）\n{snap}"))
-}
-
-/// browser_type：语义定位输入框，输入文字（可先清空、可回车提交）。
-pub async fn type_text(args: &str, max_chars: usize) -> Result<String, String> {
-    let v = parse_args(args)?;
-    let text = v.get("text").and_then(Value::as_str).unwrap_or("");
-    let submit = v.get("submit").and_then(Value::as_bool).unwrap_or(false);
-    let clear = v.get("clear").and_then(Value::as_bool).unwrap_or(false);
-    let session = current_session().await?;
-    session.touch();
-    let tab = agent_tab(&session).await?;
-    // 输入框定位允许用 label（占位符/名称）匹配，text 参数留给输入内容
-    let locator: Value = json!({
-        "ref": v.get("ref"),
-        "label": v.get("label"),
-    });
-    let (x, y, desc) = locate(&tab, &locator, "ref", "label").await?;
-    // 聚焦：点击一次输入框中央（真实事件，能触发站点自己的聚焦逻辑）
-    dispatch_click(&tab, x, y).await?;
-    if clear {
+/// 历史导航（后退/前进）：Page.getNavigationHistory + navigateToHistoryEntry。
+async fn history_go(tab: &WebTab, offset: i64) -> Result<(), BrowserError> {
+    let hist = tab
+        .cdp
+        .call("Page.getNavigationHistory", json!({}))
+        .await
+        .map_err(exec_err)?;
+    let index = hist.get("currentIndex").and_then(Value::as_i64).unwrap_or(0);
+    let entries = hist.get("entries").and_then(Value::as_array);
+    let target = index + offset;
+    if let Some(entries) = entries
+        && target >= 0
+        && let Some(entry) = entries.get(target as usize)
+        && let Some(entry_id) = entry.get("id").and_then(Value::as_i64)
+    {
         tab.cdp
+            .call("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }))
+            .await
+            .map_err(exec_err)?;
+        // 给导航一点沉降时间（不硬等 load：历史条目可能早已缓存）
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        return Ok(());
+    }
+    Err(BrowserError::new(
+        ErrorCode::CapabilityUnsupported,
+        "没有更早/更晚的历史页",
+    ))
+}
+
+/// wait_for 轮询 JS（隔离世界）：selector 出现/消失、文本出现/消失。
+const WAIT_FOR_JS: &str = r#"((mode, needle) => {
+  if (mode === 'selector') return !!document.querySelector(needle);
+  if (mode === 'selectorGone') return !document.querySelector(needle);
+  const body = document.body ? document.body.innerText : '';
+  if (mode === 'text') return body.includes(needle);
+  return !body.includes(needle);
+})"#;
+
+async fn wait_for(tab: &WebTab, cmd: &BrowserCommand) -> Result<String, BrowserError> {
+    let (selector, text, text_gone, timeout_ms) = match cmd {
+        BrowserCommand::WaitFor { selector, text, text_gone, timeout_ms, .. } => {
+            (selector.clone(), text.clone(), text_gone.clone(), *timeout_ms)
+        }
+        _ => unreachable!(),
+    };
+    let (mode, needle) = if let Some(s) = selector {
+        ("selector", s)
+    } else if let Some(t) = text {
+        ("text", t)
+    } else if let Some(t) = text_gone {
+        ("textGone", t)
+    } else {
+        return Err(BrowserError::new(
+            ErrorCode::CapabilityUnsupported,
+            "wait_for 需要 selector / text / text_gone 之一",
+        ));
+    };
+    let budget = Duration::from_millis(timeout_ms.unwrap_or(WAIT_FOR_DEFAULT_MS).min(WAIT_FOR_MAX_MS));
+    let expr = format!(
+        "{WAIT_FOR_JS}({}, {})",
+        serde_json::to_string(mode).unwrap(),
+        serde_json::to_string(&needle).unwrap()
+    );
+    let deadline = Instant::now() + budget;
+    loop {
+        let hit = tab
+            .cdp
+            .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if hit {
+            return Ok(match mode {
+                "selector" => format!("已出现：selector「{needle}」"),
+                "selectorGone" => format!("已消失：selector「{needle}」"),
+                "text" => format!("已出现：文本「{needle}」"),
+                _ => format!("已消失：文本「{needle}」"),
+            });
+        }
+        if Instant::now() > deadline {
+            return Err(BrowserError::new(
+                ErrorCode::Timeout,
+                format!("等待超时（{}ms）：{mode}「{needle}」未满足。可先 snapshot 看当前页面", budget.as_millis()),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+}
+
+/// element_info：给坐标反查命中元素（移植自 ZCode elementInfoRuntime）。
+const ELEMENT_INFO_JS: &str = r#"((x, y) => {
+  const roleOf = (el) => el.getAttribute('role')
+    ?? (el.matches('button,input[type=button],input[type=submit]') ? 'button'
+      : el.matches('a[href]') ? 'link'
+      : el.matches('input:not([type]),input[type=text],textarea') ? 'textbox' : null);
+  const interactable = (el) => Boolean(roleOf(el) || el.matches('input,select,textarea,[tabindex],[contenteditable]'));
+  return document.elementsFromPoint(x, y).filter((el) => interactable(el)).slice(0, 5).map((el) => {
+    const r = el.getBoundingClientRect();
+    return {
+      tag: el.tagName.toLowerCase(),
+      role: roleOf(el),
+      name: (el.getAttribute('aria-label') || el.getAttribute('placeholder') || (el.innerText || '').trim() || el.value || '').slice(0, 60),
+      rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)],
+    };
+  });
+})"#;
+
+/// select：对 <select> 按 value 或可见文本选择。
+const SELECT_JS: &str = r#"((sel, values) => {
+  const el = document.querySelector('[data-agent-ref="' + sel + '"]');
+  if (!el || el.tagName !== 'SELECT') return { ok: false, why: 'ref 不是 select' };
+  const want = new Set(values);
+  let hit = 0;
+  for (const o of el.options) {
+    const match = want.has(o.value) || want.has((o.text || '').trim());
+    if (el.multiple) { o.selected = match; if (match) hit++; }
+    else if (match) { el.value = o.value; hit++; break; }
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: hit > 0, value: el.value };
+})"#;
+
+/// check：设置 checkbox/radio 勾选态。
+const CHECK_JS: &str = r#"((sel, checked) => {
+  const el = document.querySelector('[data-agent-ref="' + sel + '"]');
+  if (!el) return { ok: false, why: 'ref 不存在' };
+  if (el.type !== 'checkbox' && el.type !== 'radio') return { ok: false, why: 'ref 不是 checkbox/radio' };
+  el.checked = checked;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ok: true, checked: el.checked };
+})"#;
+
+/// 统一命令分发：agent 工具唯一入口。缺省 tab = agent 专用页。
+pub async fn command(args: &str, max_chars: usize) -> Result<String, String> {
+    let cmd = commands::parse(args).map_err(String::from)?;
+    dispatch(cmd, max_chars).await.map_err(String::from)
+}
+
+async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, BrowserError> {
+    // 会话级命令（不作用单 tab）
+    match &cmd {
+        BrowserCommand::NewTab => {
+            let session =
+                ensure_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+            session.touch();
+            let tab = create_tab(&session, "about:blank", false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+            session.set_visible(&tab.id);
+            sweep_session(&session).await;
+            return Ok(format!("已新建标签页 {}（about:blank）。browser navigate 可加载地址。", tab.id));
+        }
+        BrowserCommand::List => {
+            let session =
+                current_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+            session.touch();
+            let briefs = session.tab_briefs().await;
+            if briefs.is_empty() {
+                return Ok("当前没有标签页。".into());
+            }
+            let mut out = String::from("标签页：\n");
+            for b in &briefs {
+                out.push_str(&format!(
+                    "  {} {}{}{} 「{}」 {}\n",
+                    b.id,
+                    if b.agent { "[agent] " } else { "" },
+                    if b.visible { "[可见] " } else { "" },
+                    if b.suspended { "[已挂起] " } else { "" },
+                    if b.title.is_empty() { "（无标题）" } else { &b.title },
+                    if b.url.is_empty() { "about:blank".to_string() } else { b.url.clone() },
+                ));
+            }
+            return Ok(out);
+        }
+        BrowserCommand::ActivateTab { tab_id } => {
+            let session =
+                current_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+            session.touch();
+            let tab = get_tab(&session, tab_id).map_err(|e| BrowserError::new(ErrorCode::CapabilityUnsupported, e))?;
+            ensure_live(&tab)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+            session.set_visible(tab_id);
+            sweep_session(&session).await;
+            return Ok(format!("已切换到标签页 {tab_id}（面板可见）。"));
+        }
+        BrowserCommand::Capabilities => {
+            return Ok(format!(
+                "内置浏览器（无头 Edge/Chrome + 页面级 CDP）。方法: {}。\n定位优先级: ref → selector → text/label 语义 → x/y 坐标；快照/定位/求值均在隔离世界执行，页面脚本无法篡改。截图类方法刷新网页面板画面；agent 侧读取页面请用 snapshot。",
+                ALL_METHODS.join(" / ")
+            ));
+        }
+        BrowserCommand::CloseBrowser => {
+            let alive = current_session().await.is_ok();
+            close_internal("tool").await;
+            if alive {
+                return Ok("浏览器已关闭（进程已退出；下次命令会自动重新拉起）。".into());
+            }
+            return Ok("浏览器本来就没在运行。".into());
+        }
+        _ => {}
+    }
+
+    // tab 级命令：解析目标页（缺省 = agent 专用页）
+    let session = ensure_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+    session.touch();
+    let tab = match cmd.tab_id() {
+        Some(id) => get_tab(&session, id).map_err(|e| BrowserError::new(ErrorCode::CapabilityUnsupported, e))?,
+        None => agent_tab(&session)
+            .await
+            .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?,
+    };
+    tab.touch();
+    ensure_live(&tab)
+        .await
+        .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, format!("恢复挂起标签页失败: {e}")))?;
+
+    match cmd {
+        BrowserCommand::Navigate { url, .. } => {
+            check_url(&url)?;
+            log("browser.navigate", json!({ "url": url, "tab": tab.id }));
+            let note = match navigate_tab(&tab, &url).await {
+                Ok(note) => note.unwrap_or(""),
+                Err(e) => {
+                    if e.contains("连接已断开") {
+                        close_internal("dead").await;
+                    }
+                    return Err(BrowserError::new(
+                        ErrorCode::BackendUnavailable,
+                        format!("浏览器会话异常已重置（重试 navigate 即可）: {e}"),
+                    ));
+                }
+            };
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!("{note}{snap}"))
+        }
+        BrowserCommand::Back { .. } | BrowserCommand::Forward { .. } => {
+            let back = matches!(cmd, BrowserCommand::Back { .. });
+            history_go(&tab, if back { -1 } else { 1 }).await?;
+            tab.cdp.invalidate_worlds();
+            let st = page_state(&tab).await?;
+            Ok(format!("已{}。\n{}", if back { "后退" } else { "前进" }, st.render()))
+        }
+        BrowserCommand::Reload { .. } => {
+            tab.cdp.call("Page.reload", json!({})).await.map_err(exec_err)?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            tab.cdp.invalidate_worlds();
+            let st = page_state(&tab).await?;
+            Ok(format!("已刷新。\n{}", st.render()))
+        }
+        BrowserCommand::Snapshot { max_elements, include_hidden, .. } => {
+            take_snapshot(&tab, max_chars, max_elements, include_hidden == Some(true))
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))
+        }
+        BrowserCommand::Click { reference, x, y, text, button, double_click, modifiers, .. } => {
+            let (px, py, desc) = match (reference.as_deref(), text.as_deref(), x, y) {
+                (None, None, Some(x), Some(y)) => (x as i64, y as i64, format!("坐标 ({x},{y})")),
+                (r, t, _, _) => locate(&tab, r.unwrap_or(""), t.unwrap_or(""), "").await?,
+            };
+            let button = button.unwrap_or_default();
+            let mask = modifier_mask(&modifiers);
+            if double_click == Some(true) {
+                dispatch_click(&tab, px, py, button, mask).await.map_err(exec_err)?;
+                dispatch_click(&tab, px, py, button, mask).await.map_err(exec_err)?;
+            } else {
+                click_and_settle(&tab, px, py, button, mask).await.map_err(exec_err)?;
+            }
+            log("browser.click", json!({ "target": desc, "x": px, "y": py, "tab": tab.id }));
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!("已点击 {desc}（{px},{py}）\n{snap}"))
+        }
+        BrowserCommand::Fill { reference, value, .. } => {
+            let (px, py, desc) = locate(&tab, &reference, "", "").await?;
+            input_into(&tab, px, py, &value, false).await.map_err(exec_err)?;
+            log("browser.fill", json!({ "target": desc, "chars": value.chars().count(), "tab": tab.id }));
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!("已填入 {desc}：{} 字符\n{snap}", value.chars().count()))
+        }
+        BrowserCommand::Type { reference, text, label, submit, .. } => {
+            let (px, py, desc) = locate(&tab, reference.as_deref().unwrap_or(""), "", label.as_deref().unwrap_or("")).await?;
+            input_into(&tab, px, py, &text, submit == Some(true)).await.map_err(exec_err)?;
+            log("browser.type", json!({ "target": desc, "chars": text.chars().count(), "tab": tab.id }));
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!(
+                "已向 {desc} 输入 {} 字符{}\n{snap}",
+                text.chars().count(),
+                if submit == Some(true) { " 并回车" } else { "" }
+            ))
+        }
+        BrowserCommand::Press { key, reference, modifiers, .. } => {
+            let mask = modifier_mask(&modifiers);
+            if let Some(r) = reference.as_deref()
+                && !r.is_empty()
+            {
+                // 先点聚焦（真实事件，触发站点自己的聚焦逻辑）
+                if let Ok((px, py, _)) = locate(&tab, r, "", "").await {
+                    let _ = dispatch_click(&tab, px, py, MouseButton::Left, 0).await;
+                }
+            }
+            press_key(&tab, &key, mask).await.map_err(exec_err)?;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            tab.cdp.invalidate_worlds();
+            let st = page_state(&tab).await?;
+            Ok(format!("已按键 {key}。\n{}", st.render()))
+        }
+        BrowserCommand::Scroll { reference, x, y, delta_x, delta_y, .. } => {
+            if let Some(r) = reference.as_deref()
+                && !r.is_empty()
+            {
+                // ref 滚动：把元素滚到视口中央
+                let expr = format!(
+                    "(() => {{ const el = document.querySelector('[data-agent-ref=\"{}\"]'); if (!el) return false; el.scrollIntoView({{block:'center'}}); return true; }})()",
+                    r.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                let ok = tab
+                    .cdp
+                    .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !ok {
+                    return Err(BrowserError::new(
+                        ErrorCode::RefNotFound,
+                        format!("ref {r} 不存在，无法滚动到它"),
+                    ));
+                }
+            } else {
+                let dx = delta_x.unwrap_or(0.0);
+                let dy = delta_y.unwrap_or(0.0);
+                if dx == 0.0 && dy == 0.0 {
+                    return Err(BrowserError::new(
+                        ErrorCode::CapabilityUnsupported,
+                        "scroll 需要 ref（滚到元素）或 delta_x/delta_y（滚轮增量）",
+                    ));
+                }
+                let (ax, ay) = (x.unwrap_or(640.0), y.unwrap_or(450.0));
+                tab.cdp
+                    .call(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": "mouseWheel", "x": ax, "y": ay, "deltaX": dx, "deltaY": dy }),
+                    )
+                    .await
+                    .map_err(exec_err)?;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let pos = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, "[Math.round(scrollX), Math.round(scrollY)]")
+                .await
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .map(|a| {
+                    format!(
+                        "（滚动位置 {},{})",
+                        a.first().and_then(Value::as_i64).unwrap_or(0),
+                        a.get(1).and_then(Value::as_i64).unwrap_or(0)
+                    )
+                })
+                .unwrap_or_default();
+            Ok(format!("已滚动{pos}"))
+        }
+        BrowserCommand::Hover { reference, x, y, .. } => {
+            let (px, py, desc) = match (reference.as_deref(), x, y) {
+                (Some(r), _, _) if !r.is_empty() => locate(&tab, r, "", "").await?,
+                (None, Some(x), Some(y)) => (x as i64, y as i64, format!("坐标 ({x},{y})")),
+                _ => {
+                    return Err(BrowserError::new(ErrorCode::CapabilityUnsupported, "hover 需要 ref 或 x/y"));
+                }
+            };
+            tab.cdp
+                .call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": px as f64, "y": py as f64 }))
+                .await
+                .map_err(exec_err)?;
+            Ok(format!("已悬停 {desc}"))
+        }
+        BrowserCommand::Select { reference, values, .. } => {
+            let expr = format!(
+                "{SELECT_JS}({}, {})",
+                serde_json::to_string(&reference).unwrap(),
+                serde_json::to_string(&values).unwrap()
+            );
+            let res = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            if res.get("ok").and_then(Value::as_bool) != Some(true) {
+                let why = res.get("why").and_then(Value::as_str).unwrap_or("没有匹配选项");
+                return Err(BrowserError::new(ErrorCode::RefNotFound, format!("select 失败: {why}")));
+            }
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!("已选择 {}。\n{snap}", values.join(" / ")))
+        }
+        BrowserCommand::Check { reference, checked, .. } => {
+            let expr = format!(
+                "{CHECK_JS}({}, {})",
+                serde_json::to_string(&reference).unwrap(),
+                serde_json::to_string(&checked.unwrap_or(true)).unwrap()
+            );
+            let res = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            if res.get("ok").and_then(Value::as_bool) != Some(true) {
+                let why = res.get("why").and_then(Value::as_str).unwrap_or("ref 不存在");
+                return Err(BrowserError::new(ErrorCode::RefNotFound, format!("check 失败: {why}")));
+            }
+            let snap = take_snapshot(&tab, max_chars, None, false)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            Ok(format!("已{}。\n{snap}", if checked.unwrap_or(true) { "勾选" } else { "取消勾选" }))
+        }
+        BrowserCommand::Drag { from_reference, to_reference, from, to, .. } => {
+            let (fx, fy, _) = resolve_point(&tab, from_reference.as_deref(), from, "起点").await?;
+            let (tx, ty, _) = resolve_point(&tab, to_reference.as_deref(), to, "终点").await?;
+            tab.cdp
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mousePressed", "x": fx as f64, "y": fy as f64, "button": "left", "clickCount": 1 }),
+                )
+                .await
+                .map_err(exec_err)?;
+            // 中间插几步 move：只发首尾的拖拽很多站点不认
+            let (fx, fy, tx, ty) = (fx as f64, fy as f64, tx as f64, ty as f64);
+            for i in 1..=4 {
+                let mx = fx + (tx - fx) * i as f64 / 5.0;
+                let my = fy + (ty - fy) * i as f64 / 5.0;
+                tab.cdp
+                    .call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": mx, "y": my, "button": "left" }))
+                    .await
+                    .map_err(exec_err)?;
+            }
+            tab.cdp
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseReleased", "x": tx, "y": ty, "button": "left", "clickCount": 1 }),
+                )
+                .await
+                .map_err(exec_err)?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(format!("已从 ({fx},{fy}) 拖到 ({tx},{ty})"))
+        }
+        BrowserCommand::Screenshot { reference, full_page, clip, .. } => {
+            // agent 侧拿不到图片内容（文本通道）：截图落进面板帧缓冲，用户可在面板直接看
+            let mut params = json!({ "format": "jpeg", "quality": 80 });
+            if full_page == Some(true) {
+                params["captureBeyondViewport"] = json!(true);
+            }
+            // ref 元素截图：裁到元素rect（与 clip 互斥，clip 优先）
+            let mut element_clip = None;
+            if clip.is_none()
+                && let Some(r) = reference.as_deref()
+                && !r.is_empty()
+            {
+                let rect = tab
+                    .cdp
+                    .evaluate_in_isolated_world(
+                        ISOLATED_WORLD,
+                        &format!(
+                            "(() => {{ const el = document.querySelector('[data-agent-ref=\"{}\"]'); if (!el) return null; const r = el.getBoundingClientRect(); return [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; }})()",
+                            r.replace('\\', "\\\\").replace('"', "\\\"")
+                        ),
+                    )
+                    .await
+                    .ok();
+                match rect.as_ref().and_then(Value::as_array) {
+                    Some(a) if a.len() == 4 => {
+                        element_clip = Some((
+                            a[0].as_f64().unwrap_or(0.0),
+                            a[1].as_f64().unwrap_or(0.0),
+                            a[2].as_f64().unwrap_or(0.0),
+                            a[3].as_f64().unwrap_or(0.0),
+                        ));
+                    }
+                    _ => {
+                        return Err(BrowserError::new(
+                            ErrorCode::RefNotFound,
+                            format!("ref {r} 不存在，无法裁元素截图"),
+                        ));
+                    }
+                }
+            }
+            if let Some(c) = clip {
+                params["clip"] = json!({ "x": c.x, "y": c.y, "width": c.width, "height": c.height, "scale": 1 });
+            } else if let Some((x, y, w, h)) = element_clip {
+                params["clip"] = json!({ "x": x, "y": y, "width": w.max(1.0), "height": h.max(1.0), "scale": 1 });
+            }
+            let res = tab.cdp.call("Page.captureScreenshot", params).await.map_err(exec_err)?;
+            let data = res
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| BrowserError::new(ErrorCode::ExecutionError, "截图结果缺 data"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, format!("截图 base64 解码失败: {e}")))?;
+            *tab.frame.lock().await = Some(Frame { data: bytes });
+            let st = page_state(&tab).await?;
+            Ok(format!(
+                "截图已刷新到网页面板{}。\n{}",
+                if full_page == Some(true) {
+                    "（整页）"
+                } else if element_clip.is_some() {
+                    "（元素裁剪）"
+                } else {
+                    ""
+                },
+                st.render()
+            ))
+        }
+        BrowserCommand::GetState { .. } => {
+            let st = page_state(&tab).await?;
+            let dialog = tab.dialog.lock().await.clone();
+            let mut out = st.render();
+            if let Some(d) = dialog {
+                out.push_str(&format!("\n弹窗: [{}] {}", d.kind, d.message));
+            }
+            Ok(out)
+        }
+        BrowserCommand::ElementInfo { x, y, .. } => {
+            let expr = format!("{ELEMENT_INFO_JS}({}, {})", x, y);
+            let val = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, &expr)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            let items = val.as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                return Ok(format!("({x},{y}) 处没有可交互元素"));
+            }
+            let mut out = format!("({x},{y}) 命中元素（从顶到底）：\n");
+            for it in &items {
+                let rect = it.get("rect").and_then(Value::as_array);
+                let rect_s = match rect {
+                    Some(r) if r.len() == 4 => format!(
+                        "[{},{},{},{}]",
+                        r[0].as_i64().unwrap_or(0),
+                        r[1].as_i64().unwrap_or(0),
+                        r[2].as_i64().unwrap_or(0),
+                        r[3].as_i64().unwrap_or(0)
+                    ),
+                    _ => "?".into(),
+                };
+                out.push_str(&format!(
+                    "  [{} {}] \"{}\" rect={}\n",
+                    it.get("role").and_then(Value::as_str).unwrap_or("?"),
+                    it.get("tag").and_then(Value::as_str).unwrap_or("?"),
+                    it.get("name").and_then(Value::as_str).unwrap_or(""),
+                    rect_s,
+                ));
+            }
+            Ok(out)
+        }
+        BrowserCommand::Evaluate { expression, .. } => {
+            let val = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, &expression)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            let s = serde_json::to_string(&val).unwrap_or_else(|_| val.to_string());
+            Ok(format!("求值结果: {}", truncate_str(&s, 2000)))
+        }
+        BrowserCommand::WaitFor { .. } => wait_for(&tab, &cmd).await,
+        BrowserCommand::GetDialog { .. } => {
+            let dialog = tab.dialog.lock().await.clone();
+            match dialog {
+                Some(d) => Ok(format!(
+                    "当前弹窗: [{}] {}{}",
+                    d.kind,
+                    d.message,
+                    if d.default_prompt.is_empty() {
+                        String::new()
+                    } else {
+                        format!("（默认值: {}）", d.default_prompt)
+                    }
+                )),
+                None => Ok("当前没有弹窗".into()),
+            }
+        }
+        BrowserCommand::HandleDialog { accept, prompt_text, .. } => {
+            if tab.dialog.lock().await.is_none() {
+                return Err(BrowserError::new(
+                    ErrorCode::CapabilityUnsupported,
+                    "当前没有弹窗可处理",
+                ));
+            }
+            let mut params = json!({ "accept": accept });
+            if let Some(t) = prompt_text {
+                params["promptText"] = json!(t);
+            }
+            tab.cdp.call("Page.handleJavaScriptDialog", params).await.map_err(exec_err)?;
+            *tab.dialog.lock().await = None;
+            Ok(format!("已{}弹窗", if accept { "接受" } else { "取消" }))
+        }
+        BrowserCommand::Close { tab_id } => {
+            let target = match tab_id.as_deref() {
+                Some(id) => id.to_string(),
+                None => tab.id.clone(),
+            };
+            if close_tab(&session, &target).await {
+                Ok(format!("已关闭标签页 {target}"))
+            } else {
+                Err(BrowserError::new(
+                    ErrorCode::CapabilityUnsupported,
+                    format!("标签页不存在: {target}"),
+                ))
+            }
+        }
+        // 会话级命令已在函数开头分发，不会到这里
+        BrowserCommand::NewTab
+        | BrowserCommand::CloseBrowser
+        | BrowserCommand::List
+        | BrowserCommand::ActivateTab { .. }
+        | BrowserCommand::Capabilities => Err(BrowserError::new(
+            ErrorCode::CapabilityUnsupported,
+            "该命令应在会话级处理",
+        )),
+    }
+}
+
+/// 拖拽点解析：ref → 坐标。
+async fn resolve_point(
+    tab: &WebTab,
+    reference: Option<&str>,
+    point: Option<Point>,
+    what: &str,
+) -> Result<(i64, i64, String), BrowserError> {
+    if let Some(p) = point {
+        return Ok((p.x as i64, p.y as i64, format!("{what} 坐标")));
+    }
+    if let Some(r) = reference {
+        return locate(tab, r, "", "").await.map(|(x, y, d)| (x, y, format!("{what} {d}")));
+    }
+    Err(BrowserError::new(
+        ErrorCode::CapabilityUnsupported,
+        format!("drag 的{what}需要 ref 或 x/y"),
+    ))
+}
+
+fn exec_err(e: String) -> BrowserError {
+    if e.contains("连接已断开") {
+        BrowserError::new(
+            ErrorCode::BackendUnavailable,
+            format!("浏览器连接已断开（标签页崩溃或浏览器退出）: {e}"),
+        )
+    } else {
+        BrowserError::new(ErrorCode::ExecutionError, e)
+    }
+}
+
+/// 输入：聚焦（真实点击）→ 全选清空 → 插文本 → 可选回车。
+async fn input_into(tab: &WebTab, x: i64, y: i64, text: &str, submit: bool) -> Result<(), String> {
+    dispatch_click(tab, x, y, MouseButton::Left, 0).await?;
+    // Ctrl+A 全选后输入即替换（真实用户习惯，比直接置 value 更贴站点行为）
+    for t in ["rawKeyDown", "keyUp"] {
+        let _ = tab
+            .cdp
             .call(
-                "Runtime.evaluate",
-                json!({ "expression": "(() => { const el = document.activeElement; if (el && 'value' in el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); } })()" , "returnByValue": true }),
+                "Input.dispatchKeyEvent",
+                json!({ "type": t, "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": 2 }),
             )
-            .await?;
+            .await;
     }
     if !text.is_empty() {
         tab.cdp.call("Input.insertText", json!({ "text": text })).await?;
     }
     if submit {
-        tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "rawKeyDown", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
-        tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": "Enter", "windowsVirtualKeyCode": 13 })).await?;
+        press_key(tab, "Enter", 0).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        tab.cdp.invalidate_worlds();
     }
-    log("browser.type", json!({ "target": desc, "chars": text.chars().count(), "submit": submit }));
-    let snap = take_snapshot(&tab, max_chars).await?;
-    Ok(format!("已向 {desc} 输入 {} 字符{}\n{snap}", text.chars().count(), if submit { " 并回车" } else { "" }))
+    Ok(())
 }
 
-/// browser_close：关闭浏览器进程。
-pub async fn close(_args: &str) -> Result<String, String> {
-    close_internal("tool").await;
-    Ok("浏览器已关闭".into())
+/// 按键（rawKeyDown + keyUp，带修饰键位掩码）。
+async fn press_key(tab: &WebTab, key: &str, modifiers: i64) -> Result<(), String> {
+    let vk = virtual_key_code(key);
+    for t in ["rawKeyDown", "keyUp"] {
+        tab.cdp
+            .call(
+                "Input.dispatchKeyEvent",
+                json!({ "type": t, "key": key, "windowsVirtualKeyCode": vk, "modifiers": modifiers }),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
-// —— 网页面板（P20.1）：与 agent 工具共享同一浏览器，截图渲染 + 坐标回传 ——
+/// 常用键的 Windows 虚拟键码（缺省 0 让 Chromium 按 key 名自己推）。
+fn virtual_key_code(key: &str) -> i64 {
+    match key {
+        "Enter" => 13,
+        "Tab" => 9,
+        "Escape" => 27,
+        "Backspace" => 8,
+        "Delete" => 46,
+        "ArrowUp" => 38,
+        "ArrowDown" => 40,
+        "ArrowLeft" => 37,
+        "ArrowRight" => 39,
+        "Home" => 36,
+        "End" => 35,
+        "PageUp" => 33,
+        "PageDown" => 34,
+        " " => 32,
+        _ => 0,
+    }
+}
 
-/// 视口尺寸（与 launch 的 --window-size 一致；前端按比例换算点击坐标）。
+// —— 网页面板（P20.1 起，P21 帧流/驻留/dialog）——
+
+/// 面板默认视口尺寸（launch 的 --window-size 一致；前端按比例换算点击坐标）。
 pub const VIEWPORT_W: i64 = 1280;
 pub const VIEWPORT_H: i64 = 900;
 
-/// 面板状态：浏览器是否在跑 + 全部标签页。
-pub async fn panel_state() -> Value {
-    let guard = SESSION.lock().await;
-    match guard.as_ref() {
-        None => json!({ "running": false, "tabs": [] }),
-        Some(s) => {
-            if !browser_alive(s.port).await {
-                return json!({ "running": false, "tabs": [] });
-            }
-            let briefs = s.tab_briefs().await;
-            json!({
-                "running": true,
-                "port": s.port,
-                "tabs": briefs.iter().map(|(id, agent, title, url)| json!({
-                    "id": id, "agent": agent, "title": title, "url": url,
-                })).collect::<Vec<_>>(),
-            })
-        }
-    }
+fn check_panel_url(url: &str) -> Result<(), BrowserError> {
+    check_url(url)
 }
 
-fn check_panel_url(url: &str) -> Result<(), String> {
-    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank") {
-        return Err("地址必须以 http:// / https:// / file:// 开头".into());
+/// 面板状态：浏览器是否在跑 + 全部标签页（含可见/加载/挂起）+ 可见页弹窗。
+pub async fn panel_state() -> Value {
+    let guard = SESSION.lock().await;
+    let Some(s) = guard.as_ref() else {
+        return json!({ "running": false, "tabs": [], "dialog": null });
+    };
+    if !browser_alive(s.port).await {
+        return json!({ "running": false, "tabs": [], "dialog": null });
     }
-    Ok(())
+    let mut briefs = s.tab_briefs().await;
+    let visible = s.visible();
+    // loading / dialog 只对可见页细算（其余页不值得花 CDP 往返）
+    let mut dialog = Value::Null;
+    if let Some(vid) = &visible {
+        let tab = s
+            .tabs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|t| &t.id == vid)
+            .cloned();
+        if let Some(tab) = tab {
+            if let Ok(ready) = tab.cdp.evaluate_in_isolated_world(ISOLATED_WORLD, "document.readyState").await
+                && let Some(st) = ready.as_str()
+            {
+                for b in briefs.iter_mut() {
+                    if b.id == tab.id {
+                        b.loading = st != "complete";
+                    }
+                }
+            }
+            if let Some(d) = tab.dialog.lock().await.clone() {
+                dialog = json!({ "kind": d.kind, "message": d.message, "defaultPrompt": d.default_prompt });
+            }
+        }
+    }
+    json!({
+        "running": true,
+        "port": s.port,
+        "tabs": briefs.iter().map(TabBrief::to_json).collect::<Vec<_>>(),
+        "dialog": dialog,
+    })
 }
 
 /// 面板开新标签页（可选直接导航）。
 pub async fn panel_new(url: Option<String>) -> Result<Value, String> {
     let url = url.unwrap_or_else(|| "about:blank".into());
     if url != "about:blank" {
-        check_panel_url(&url)?;
+        check_panel_url(&url).map_err(|e| e.to_string())?;
     }
     let session = ensure_session().await?;
     session.touch();
     let tab = create_tab(&session, &url, false).await?;
+    session.set_visible(&tab.id);
+    sweep_session(&session).await;
     Ok(json!({ "id": tab.id }))
 }
 
 /// 面板导航（地址栏回车）。
 pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
-    check_panel_url(url)?;
+    check_panel_url(url).map_err(|e| e.to_string())?;
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     match navigate_tab(&tab, url).await {
-        Ok(_) => Ok(json!({ "ok": true })),
+        Ok(_) => {
+            sweep_session(&session).await;
+            Ok(json!({ "ok": true }))
+        }
         Err(e) => {
             if e.contains("连接已断开") {
                 close_internal("dead").await;
@@ -990,13 +2145,13 @@ pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
     }
 }
 
-/// 面板截图：PNG 字节（前端 <img> 直链 + 缓存穿透参数）。
-/// 截图前若页面正在加载（readyState=loading）先等它完成——无论调用时序如何，
-/// 都不会拿到半张旧页/白图。
+/// 面板截图：PNG 字节（旧路径保留；帧流不可用时回落）。
 pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     for _ in 0..4 {
         let st = tab
             .cdp
@@ -1012,18 +2167,29 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
             _ => break,
         }
     }
-    let res = tab
-        .cdp
-        .call("Page.captureScreenshot", json!({ "format": "png" }))
-        .await?;
+    let res = tab.cdp.call("Page.captureScreenshot", json!({ "format": "png" })).await?;
     let data = res
         .get("data")
         .and_then(Value::as_str)
         .ok_or_else(|| "截图结果缺 data".to_string())?;
-    use base64::Engine;
     base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|e| format!("截图 base64 解码失败: {e}"))
+}
+
+/// 面板帧（P21）：screencast 最新 JPEG（内存直出，零 CDP 往返）；
+/// 没有帧（screencast 刚起步/失败）时回落 captureScreenshot（PNG）。
+pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let session = current_session().await?;
+    session.touch();
+    session.set_visible(id);
+    let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
+    sweep_session(&session).await; // 可见页 screencast 拉起；首帧到达前走下面的回落
+    if let Some(f) = tab.frame.lock().await.clone() {
+        return Ok((f.data, "image/jpeg"));
+    }
+    Ok((panel_screenshot(id).await?, "image/png"))
 }
 
 /// 面板设置标签页视口（截图尺寸跟随面板大小——固定 1280×900 会在窄面板里
@@ -1031,15 +2197,13 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
 pub async fn panel_viewport(id: &str, w: i64, h: i64) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     let w = w.clamp(320, 1600);
     let h = h.clamp(400, 2400);
-    tab.cdp
-        .call(
-            "Emulation.setDeviceMetricsOverride",
-            json!({ "width": w, "height": h, "deviceScaleFactor": 1, "mobile": false }),
-        )
-        .await?;
+    apply_viewport_override(&tab, w, h).await?;
+    *tab.viewport.lock().await = Some((w, h));
     Ok(json!({ "ok": true, "w": w, "h": h }))
 }
 
@@ -1058,15 +2222,13 @@ pub async fn panel_open_external(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     let url = tab
         .cdp
-        .call(
-            "Runtime.evaluate",
-            json!({ "expression": "location.href", "returnByValue": true }),
-        )
+        .evaluate_in_isolated_world(ISOLATED_WORLD, "location.href")
         .await
         .ok()
-        .and_then(|v| v.get("result").and_then(|r| r.get("value")).and_then(Value::as_str).map(str::to_string))
+        .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default();
     if url.is_empty() || url == "about:blank" {
         return Err("当前是空白页，没有可打开的地址".into());
@@ -1096,8 +2258,12 @@ pub async fn panel_devtools_url(id: &str) -> Result<Value, String> {
 pub async fn panel_click(id: &str, x: i64, y: i64) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
-    click_and_settle(&tab, x, y).await.map_err(|e| format!("点击失败: {e}"))?;
+    ensure_live(&tab).await?;
+    click_and_settle(&tab, x, y, MouseButton::Left, 0)
+        .await
+        .map_err(|e| format!("点击失败: {e}"))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -1105,7 +2271,9 @@ pub async fn panel_click(id: &str, x: i64, y: i64) -> Result<Value, String> {
 pub async fn panel_type(id: &str, text: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     if !text.is_empty() {
         tab.cdp.call("Input.insertText", json!({ "text": text })).await?;
     }
@@ -1116,9 +2284,17 @@ pub async fn panel_type(id: &str, text: &str) -> Result<Value, String> {
 pub async fn panel_key(id: &str, key: &str, code: i64) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
-    tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "rawKeyDown", "key": key, "windowsVirtualKeyCode": code })).await?;
-    tab.cdp.call("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": key, "windowsVirtualKeyCode": code })).await?;
+    ensure_live(&tab).await?;
+    for t in ["rawKeyDown", "keyUp"] {
+        tab.cdp
+            .call(
+                "Input.dispatchKeyEvent",
+                json!({ "type": t, "key": key, "windowsVirtualKeyCode": code }),
+            )
+            .await?;
+    }
     Ok(json!({ "ok": true }))
 }
 
@@ -1126,7 +2302,9 @@ pub async fn panel_key(id: &str, key: &str, code: i64) -> Result<Value, String> 
 pub async fn panel_scroll(id: &str, delta_y: i64) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     tab.cdp
         .call(
             "Input.dispatchMouseEvent",
@@ -1136,44 +2314,37 @@ pub async fn panel_scroll(id: &str, delta_y: i64) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
-/// 历史导航（后退/前进）：Page.getNavigationHistory + navigateToHistoryEntry。
-async fn history_go(id: &str, offset: i64) -> Result<Value, String> {
+pub async fn panel_back(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
-    let hist = tab.cdp.call("Page.getNavigationHistory", json!({})).await?;
-    let index = hist.get("currentIndex").and_then(Value::as_i64).unwrap_or(0);
-    let entries = hist.get("entries").and_then(Value::as_array);
-    let target = index + offset;
-    if let Some(entries) = entries
-        && target >= 0
-        && let Some(entry) = entries.get(target as usize)
-        && let Some(entry_id) = entry.get("id").and_then(Value::as_i64)
-    {
-        tab.cdp
-            .call("Page.navigateToHistoryEntry", json!({ "entryId": entry_id }))
-            .await?;
-        // 给导航一点沉降时间（不硬等 load：历史条目可能早已缓存）
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        return Ok(json!({ "ok": true }));
-    }
-    Err("没有更早/更晚的历史页".into())
-}
-
-pub async fn panel_back(id: &str) -> Result<Value, String> {
-    history_go(id, -1).await
+    ensure_live(&tab).await?;
+    history_go(&tab, -1).await.map_err(|e| e.to_string())?;
+    tab.cdp.invalidate_worlds();
+    Ok(json!({ "ok": true }))
 }
 
 pub async fn panel_forward(id: &str) -> Result<Value, String> {
-    history_go(id, 1).await
+    let session = current_session().await?;
+    session.touch();
+    session.set_visible(id);
+    let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
+    history_go(&tab, 1).await.map_err(|e| e.to_string())?;
+    tab.cdp.invalidate_worlds();
+    Ok(json!({ "ok": true }))
 }
 
 pub async fn panel_reload(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    session.set_visible(id);
     let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
     tab.cdp.call("Page.reload", json!({})).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
+    tab.cdp.invalidate_worlds();
     Ok(json!({ "ok": true }))
 }
 
@@ -1184,12 +2355,41 @@ pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+/// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。
+pub async fn panel_activate(id: &str) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    ensure_live(&tab).await?;
+    session.set_visible(id);
+    sweep_session(&session).await;
+    Ok(json!({ "ok": true }))
+}
+
+/// 面板处理 JS 弹窗（页面被 alert/confirm 卡住时，用户直接在这里确定/取消）。
+pub async fn panel_dialog(id: &str, accept: bool, prompt_text: Option<String>) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    let tab = get_tab(&session, id)?;
+    if tab.dialog.lock().await.is_none() {
+        return Err("当前没有弹窗".into());
+    }
+    let mut params = json!({ "accept": accept });
+    if let Some(t) = prompt_text {
+        params["promptText"] = json!(t);
+    }
+    tab.cdp.call("Page.handleJavaScriptDialog", params).await?;
+    *tab.dialog.lock().await = None;
+    Ok(json!({ "ok": true }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// 真机冒烟（ignored，手工跑：cargo test browser_smoke -- --ignored --nocapture）
-    /// 本机需装 Edge/Chrome。覆盖：拉起 → file:// 快照 → 语义点击 → 增量 diff → 语义输入 → 关闭。
+    /// 本机需装 Edge/Chrome。覆盖：拉起 → file:// 快照 → 语义点击 → 增量 diff →
+    /// fill → scroll → wait_for → tabs list → 关闭。
     #[tokio::test]
     #[ignore]
     async fn browser_smoke_local() {
@@ -1198,7 +2398,7 @@ mod tests {
             "browser-test.jsonl",
             "browser-test".into(),
         );
-        // fixture：一个计数按钮 + 一个搜索输入框
+        // fixture：一个计数按钮 + 一个搜索输入框 + 一个下拉
         let dir = std::env::temp_dir().join("agent-browser-fixture");
         let _ = std::fs::create_dir_all(&dir);
         let page = dir.join("page.html");
@@ -1209,46 +2409,173 @@ mod tests {
 <p id="counter">计数：0</p>
 <button onclick="var p=document.getElementById('counter');var n=parseInt(p.textContent.replace(/\D/g,''))+1;p.textContent='计数：'+n;">点我加一</button>
 <input id="q" placeholder="搜索内容" oninput="document.getElementById('echo').textContent='输入：'+this.value">
+<select id="s"><option value="a">甲</option><option value="b">乙</option></select>
 <p id="echo"></p>
 </body></html>"#,
         )
         .unwrap();
         let url = format!("file://{}", page.display().to_string().replace('\\', "/"));
 
-        // 1) 打开 + 快照
-        let out = open(&format!(r#"{{"url":"{url}"}}"#), 8000).await.expect("browser_open 失败");
-        println!("== open ==\n{out}");
+        // 1) navigate + 快照
+        let out = command(&format!(r#"{{"method":"navigate","url":"{url}"}}"#), 8000)
+            .await
+            .expect("navigate 失败");
+        println!("== navigate ==\n{out}");
         assert!(out.contains("冒烟测试页"), "快照应含标题");
         assert!(out.contains("button"), "快照应含按钮角色");
 
         // 2) 语义点击（文本定位）
-        let out = click(r#"{"text":"点我加一"}"#, 8000).await.expect("click 失败");
+        let out = command(r#"{"method":"click","text":"点我加一"}"#, 8000)
+            .await
+            .expect("click 失败");
         println!("== click ==\n{out}");
         assert!(out.contains("已点击"), "应报告点击目标");
         assert!(out.contains("计数：1"), "点击后计数应变 1");
 
-        // 3) 再点一次：增量 diff 应报「~1 变化」
-        let out = click(r#"{"text":"点我加一"}"#, 8000).await.expect("click2 失败");
-        println!("== click2 ==\n{out}");
-        assert!(out.contains("计数：2"), "第二次点击后计数 2");
-        assert!(out.contains("~1 变化") || out.contains("变化"), "应有增量 diff 摘要: {out}");
-
-        // 4) 语义输入（label 定位）+ 快照 value
-        let out = type_text(r#"{"label":"搜索内容","text":"你好浏览器","clear":true}"#, 8000)
+        // 3) fill（ref 定位输入框）
+        let out = command(r#"{"method":"fill","ref":"e2","value":"你好浏览器"}"#, 8000)
             .await
-            .expect("type 失败");
-        println!("== type ==\n{out}");
+            .expect("fill 失败");
+        println!("== fill ==\n{out}");
         assert!(out.contains("你好浏览器"), "快照应含输入值");
 
-        // 5) ref 定位兜底走一遍（拿快照里 echo 段落 ref 不必要，直接关）
-        let out = close("{}").await.expect("close 失败");
-        assert!(out.contains("已关闭"));
+        // 4) select（下拉选乙）
+        let out = command(r#"{"method":"select","ref":"e3","values":["乙"]}"#, 8000)
+            .await
+            .expect("select 失败");
+        println!("== select ==\n{out}");
+        assert!(out.contains("已选择"), "应报告选择结果");
+
+        // 5) wait_for：等输入回显文本
+        let out = command(r#"{"method":"wait_for","text":"输入：你好浏览器","timeout_ms":3000}"#, 8000)
+            .await
+            .expect("wait_for 失败");
+        assert!(out.contains("已出现"), "wait_for 应命中: {out}");
+
+        // 6) scroll + get_state + list
+        let out = command(r#"{"method":"scroll","delta_y":200}"#, 8000).await.expect("scroll 失败");
+        assert!(out.contains("已滚动"), "scroll 应报告: {out}");
+        let out = command(r#"{"method":"get_state"}"#, 8000).await.expect("get_state 失败");
+        assert!(out.contains("地址:"), "get_state 应含地址: {out}");
+        let out = command(r#"{"method":"list"}"#, 8000).await.expect("list 失败");
+        assert!(out.contains("agent"), "list 应含 agent 页: {out}");
+
+        // 7) evaluate（隔离世界）
+        let out = command(r#"{"method":"evaluate","expression":"document.querySelector('h1').textContent"}"#, 8000)
+            .await
+            .expect("evaluate 失败");
+        assert!(out.contains("冒烟测试页"), "evaluate 应拿到 h1 文本: {out}");
     }
 
-    /// 快照 JS 的 ref 分配规则：新元素不得与存活元素撞号（单测纯逻辑，无浏览器依赖）。
     #[test]
     fn truncate_str_caps_length() {
         assert_eq!(truncate_str("abcdef", 3), "abc…");
         assert_eq!(truncate_str("abc", 5), "abc");
+    }
+
+    #[test]
+    fn diff_outline_first_snapshot_has_no_baseline() {
+        let (summary, detail) = diff_outline(&[], &[]);
+        assert!(summary.contains("首次快照"));
+        assert!(detail.is_empty());
+    }
+
+    #[test]
+    fn diff_outline_reports_added_removed_changed() {
+        let old = vec![OutlineNode {
+            reference: "e1".into(),
+            tag: "button".into(),
+            role: Some("button".into()),
+            name: "旧".into(),
+            text: "旧".into(),
+            value: None,
+            href: None,
+            depth: 0,
+            selector: "#old".into(),
+            in_viewport: true,
+            disabled: false,
+            checked: None,
+            parent_reference: None,
+        }];
+        let new = vec![
+            OutlineNode {
+                reference: "e1".into(),
+                tag: "button".into(),
+                role: Some("button".into()),
+                name: "新".into(),
+                text: "新".into(),
+                value: None,
+                href: None,
+                depth: 0,
+                selector: "#old".into(),
+                in_viewport: true,
+                disabled: false,
+                checked: None,
+                parent_reference: None,
+            },
+            OutlineNode {
+                reference: "e2".into(),
+                tag: "a".into(),
+                role: Some("link".into()),
+                name: "链接".into(),
+                text: "链接".into(),
+                value: None,
+                href: Some("https://example.com".into()),
+                depth: 0,
+                selector: "a".into(),
+                in_viewport: false, // 屏外
+                disabled: false,
+                checked: None,
+                parent_reference: None,
+            },
+        ];
+        let (summary, detail) = diff_outline(&old, &new);
+        assert!(summary.contains("+1 新增"), "应报 1 个新增: {summary}");
+        assert!(summary.contains("~1 变化"), "应报 1 个变化: {summary}");
+        assert!(detail.iter().any(|l| l.contains("e2")), "明细应含新元素");
+        // 渲染：屏外链接要带标记
+        let line = render_node(&new[1]);
+        assert!(line.contains("屏外"), "屏外元素应有标记: {line}");
+        assert!(line.contains("→ https://example.com"), "链接应带 href: {line}");
+    }
+
+    #[test]
+    fn parse_snapshot_splits_elements_and_dom() {
+        let v = json!({
+            "url": "https://x.test",
+            "title": "T",
+            "elements": [{ "ref": "e1", "tag": "button", "role": "button", "name": "OK",
+                "text": "", "value": null, "href": null, "disabled": false, "checked": null,
+                "selector": "#ok", "rect": [1,2,3,4], "inViewport": true, "parentRef": null, "depth": 1 }],
+            "dom": [{ "tag": "p", "depth": 2, "text": "正文", "ref": null, "role": null, "name": "", "inViewport": true }],
+            "truncated": false, "domTruncated": false,
+        });
+        let (elements, dom) = parse_snapshot(&v).unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].selector, "#ok");
+        assert!(elements[0].in_viewport);
+        assert_eq!(dom.len(), 1);
+        assert_eq!(dom[0].text, "正文");
+        // dom 行不带 ref 尖括号内容
+        let line = render_dom_node(&dom[0]);
+        assert!(line.contains("正文"), "dom 行应含正文: {line}");
+    }
+
+    #[test]
+    fn virtual_key_codes_for_common_keys() {
+        assert_eq!(virtual_key_code("Enter"), 13);
+        assert_eq!(virtual_key_code("Tab"), 9);
+        assert_eq!(virtual_key_code("Escape"), 27);
+        assert_eq!(virtual_key_code("x"), 0);
+    }
+
+    #[test]
+    fn modifier_mask_matches_cdp_bits() {
+        let none: Option<Vec<KeyModifier>> = None;
+        assert_eq!(modifier_mask(&none), 0);
+        let ctrl = Some(vec![KeyModifier::Control]);
+        assert_eq!(modifier_mask(&ctrl), 2);
+        let ctrl_shift = Some(vec![KeyModifier::Control, KeyModifier::Shift]);
+        assert_eq!(modifier_mask(&ctrl_shift), 10);
     }
 }

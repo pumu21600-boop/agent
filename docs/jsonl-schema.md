@@ -140,10 +140,15 @@
 | `hook.budget_exceeded` | 单任务累计 token 超预算通知 | `tokens`、`budget`（通知载荷） |
 | `browser.launch` | 内置浏览器已拉起（P20） | `exe`、`port`（CDP 调试端口） |
 | `browser.stale` | 浏览器会话失活（进程退出/连接断开），已清理待重拉（P20） | — |
-| `browser.navigate` | 页面导航（browser_open，P20） | `url` |
-| `browser.click` | 页面点击完成（P20） | `target`（语义定位描述）、`x`、`y` |
-| `browser.type` | 页面输入完成（P20） | `target`、`chars`、`submit` |
+| `browser.navigate` | 页面导航（P20；P20.2 起经统一 browser 工具的 navigate 方法） | `url`、`tab` |
+| `browser.click` | 页面点击完成（P20） | `target`（语义定位描述）、`x`、`y`、`tab` |
+| `browser.type` | 页面输入完成（P20；P20.2 起 type/fill 均记 type） | `target`、`chars`、`tab` |
 | `browser.close` | 浏览器关闭（工具/空转/idle 收割，P20） | `reason`（tool/idle/dead） |
+| `browser.tab.new` | 新标签页（P20.1） | `id`、`agent`、`url` |
+| `browser.tab.close` | 关标签页（P20.1） | `id` |
+| `browser.tab.suspend` | 后台标签页挂起 frozen（P20.2 驻留） | `id` |
+| `browser.tab.restore` | 挂起标签页解冻恢复（P20.2） | `id` |
+| `browser.dialog` | 页面弹出 JS 弹窗（P20.2） | `id`、`type` |
 | `browser.tab.new` | 新开标签页（agent 工作页或面板「+」，P20.1） | `id`、`agent`、`url` |
 | `browser.tab.close` | 关闭标签页（P20.1） | `id` |
 | `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |

@@ -734,15 +734,17 @@
   let rpPreviewContent = '';
 
   // —— P20.1 网页（右侧面板「网页」页签：内置无头浏览器截图渲染 + 坐标回传，与 agent 工具共享实例）——
-  let webTabs = []; // { id, agent, title, url }
+  // P21：截图轮询改 screencast 帧端点（内存直出）；面板可见时 600ms 自动刷帧
+  let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
   let webError = ''; // 建页/导航失败的面板内提示（不再静默）
-  let webShotT = 0; // 截图缓存穿透参数（动作后递增触发 <img> 重载）
+  let webShotT = 0; // 帧缓存穿透参数（自动刷新与动作后递增触发 <img> 重载）
   let webBodyW = 0;
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
   let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 调试工具）
+  let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 右侧面板宽度（左缘拖拽可调，320–820；对齐 ZCode 的自由尺寸）
   let rpWidth = Number(localStorage.getItem('rpWidth')) || 420;
   let rpResizing = false;
@@ -775,6 +777,7 @@
     try {
       const s = await webApi('/api/browser/state', { cache: 'no-store' });
       webTabs = s.tabs || [];
+      webDialog = s.dialog || null;
       if (!keepActive || !webTabs.some((t) => t.id === webActiveId)) {
         webActiveId = webTabs.length ? webTabs[webTabs.length - 1].id : '';
       }
@@ -785,10 +788,40 @@
       if (act && document.activeElement !== addrEl) {
         webAddress = act.url === 'about:blank' ? '' : act.url || '';
       }
+      // 上报可见页：后端据此只给这一页跑 screencast 帧流、挂起其余后台页
+      if (webActiveId) webActivate(webActiveId);
     } catch (e) {
       webTabs = [];
       webError = String((e && e.message) || e);
     }
+  }
+
+  // 面板可见页上报（对齐 ZCode activateTab；驱动 screencast 与后台挂起）
+  function webActivate(id) {
+    webApi('/api/browser/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    }).catch(() => {});
+  }
+
+  // 面板不看了（切走页签/关面板）：通知后端停帧流、放后台页去挂起
+  function webNotifyHidden() {
+    webApi('/api/browser/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: '' }),
+    }).catch(() => {});
+  }
+  $: if (rpTab !== 'web' || !rightPanelOpen) webNotifyHidden();
+
+  // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）
+  let webFrameTimer = null;
+  $: if (rpTab === 'web' && rightPanelOpen && webShowShot && !webFrameTimer) {
+    webFrameTimer = setInterval(() => { webShotT += 1; }, 600);
+  } else if ((rpTab !== 'web' || !rightPanelOpen || !webShowShot) && webFrameTimer) {
+    clearInterval(webFrameTimer);
+    webFrameTimer = null;
   }
 
   // 面板 → 后端的响应统一解析：旧版服务（无 /api/browser/*）会返回 404 空体或 HTML，
@@ -867,7 +900,7 @@
     window.fetch = async function (...args) {
       const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
       const method = (args[1] && args[1].method) || 'GET';
-      if (url.startsWith('/api/browser/screenshot')) return origFetch.apply(this, args); // 截图轮询太吵，不录
+      if (url.startsWith('/api/browser/screenshot') || url.startsWith('/api/browser/frame')) return origFetch.apply(this, args); // 帧轮询太吵，不录
       const t0 = Date.now();
       try {
         const resp = await origFetch.apply(this, args);
@@ -889,6 +922,23 @@
     }).catch((e) => {
       webError = String(e.message || e);
     });
+  }
+
+  // 处理页面 JS 弹窗（确定/取消；prompt 类只能确定或取消，输入内容走后端默认值）
+  async function webDialogAction(accept) {
+    if (!webActive) return;
+    try {
+      await webApi('/api/browser/dialog', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: webActive.id, accept }),
+      });
+      webDialog = null;
+      webShotT += 1;
+      await loadWebState();
+    } catch (e) {
+      webError = String(e.message || e);
+    }
   }
   async function webNewTab() {
     if (webBusy) return;
@@ -4158,7 +4208,7 @@
                     class="web-tab"
                     class:active={t.id === webActiveId}
                     title={t.url || 'about:blank'}
-                    on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; }}
+                    on:click={() => { webActiveId = t.id; if (!webBusy) webAddress = t.url === 'about:blank' ? '' : t.url || ''; webShotT += 1; webActivate(t.id); }}
                   >
                     <span class="web-tab-title">{t.title || (t.url === 'about:blank' ? '空白页' : t.url) || '空白页'}</span>
                     {#if t.agent}<span class="web-tab-agent" title="agent 浏览器工具的工作页">agent</span>{/if}
@@ -4216,6 +4266,16 @@
             {#if webError}
               <div class="web-error">{webError}</div>
             {/if}
+            {#if webDialog}
+              <!-- 页面 JS 弹窗（alert/confirm/prompt）：无头页面的原生弹窗在这处理，不卡死页面 -->
+              <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+              <div class="web-dialog" on:click|stopPropagation>
+                <span class="web-dialog-msg">页面弹窗〔{webDialog.kind}〕{webDialog.message || '（无内容）'}</span>
+                <span class="flex-sp"></span>
+                <button class="btn ghost" on:click={() => webDialogAction(true)}>确定</button>
+                <button class="btn ghost" on:click={() => webDialogAction(false)}>取消</button>
+              </div>
+            {/if}
             <div class="web-body" bind:clientWidth={webBodyW} bind:clientHeight={webBodyH}>
               {#if !webShowShot}
                 <div class="web-empty">
@@ -4224,13 +4284,13 @@
                   <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
                 </div>
               {:else}
-                {#if webBusy}<div class="web-loading">加载中…</div>{/if}
+                {#if webBusy || (webActive && webActive.loading)}<div class="web-loading">加载中…</div>{/if}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <img
                   class="web-shot"
                   class:busy={webBusy}
-                  src={`/api/browser/screenshot?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
-                  alt="页面截图"
+                  src={`/api/browser/frame?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
+                  alt="页面画面"
                   draggable="false"
                   on:click={webShotClick}
                   on:wheel={webShotWheel}
@@ -6199,6 +6259,23 @@
     color: var(--tint-red-fg, #ff6b6b);
     font-size: 12px;
     padding: 4px 2px 0;
+  }
+  .web-dialog {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+    padding: 6px 8px;
+    border: 1px solid var(--g3);
+    border-radius: 6px;
+    background: var(--g1);
+    font-size: 12px;
+  }
+  .web-dialog-msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60%;
   }
   .web-tabbar {
     display: flex;
