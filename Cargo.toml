@@ -24,6 +24,9 @@ uuid = { version = "1", features = ["v4"] }
 rfd = "0.15"
 # P11 WASM 插件宿主（总架构 §7：自带沙箱即边界；wat feature 支持文本格式插件，零工具链依赖）
 wasmtime = "24"
+# 只对准 Windows：Win32 API 面按实际使用收窄（P20.3 专精化清掉零引用的
+# Win32_System_LibraryLoader；注意 ReadFile 经 Win32_System_IO 才能在
+# Storage::FileSystem 下解析到，勿删）
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
@@ -36,7 +39,6 @@ windows-sys = { version = "0.52", features = [
   "Win32_System_Memory",
   "Win32_System_Console",
   "Win32_System_Registry",
-  "Win32_System_LibraryLoader",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
   "Win32_Storage_FileSystem",

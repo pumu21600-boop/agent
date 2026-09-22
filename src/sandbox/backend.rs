@@ -3,12 +3,8 @@
 //! 三档隔离实现早已建成并经探针矩阵真机验证（Job Objects / 受限 token / AppContainer），
 //! 此前由调用方手工拼 SandboxSpec 的 restricted/appcontainer/allow_network 标志位；
 //! 现在统一为 [`SandboxTier`] 对象：工具层选档 = 拿一个 trait 对象，不再关心标志位怎么拼。
-//!
-//! 跨平台留口（bwrap / Seatbelt）：Linux/macOS 档评估过 `ai-sandbox` 0.2.1 crate
-//! （MIT、单维护者、Windows 档只是 Restricted Token 与我们自有实现同级）——本机无法
-//! 验证 bwrap/Seatbelt 行为，引入即不可测试代码，按窄而刚纪律**不引入**；本 trait 即
-//! 插槽，未来在能真机验证的机器上实现 `LinuxBwrapTier` / `MacosSeatbeltTier` 即接入。
-//! 评估记录见 docs/ROADMAP.md P20 行。
+//! 本项目只对准 Windows；Linux/macOS 档（bwrap / Seatbelt）评估过、结论不引入，
+//! 决策记录见 docs/ROADMAP.md P20 行。
 
 use super::{proc, probes::{self, ProbeResult}, SandboxChild, SandboxLimits, SandboxOutput, SandboxSpec};
 

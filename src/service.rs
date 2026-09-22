@@ -29,7 +29,6 @@ pub fn port_open(host: &str, port: u16) -> bool {
 }
 
 /// 本 exe 的其他服务进程（除自己外正在跑的 agent.exe）。
-#[cfg(windows)]
 fn sibling_pids() -> Vec<u32> {
     use std::os::windows::process::CommandExt;
     // 用 tasklist 兜底枚举（零新依赖；沙箱探针里 tasklist 受限，但自管理跑在用户干净环境）
@@ -58,13 +57,7 @@ fn parse_pids(text: &str, me: u32) -> Vec<u32> {
     out
 }
 
-#[cfg(not(windows))]
-fn sibling_pids() -> Vec<u32> {
-    Vec::new()
-}
-
-/// 用系统默认浏览器打开 url（Windows 用 ShellExecute，零新依赖）。
-#[cfg(windows)]
+/// 用系统默认浏览器打开 url（ShellExecute，零新依赖）。
 fn open_browser(url: &str) {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -76,11 +69,7 @@ fn open_browser(url: &str) {
     }
 }
 
-#[cfg(not(windows))]
-fn open_browser(_url: &str) {}
-
 /// 以隐藏窗口方式再起一个自己（后台常驻，关终端不影响）。
-#[cfg(windows)]
 fn spawn_detached(extra_args: &[&str]) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -100,13 +89,7 @@ fn spawn_detached(extra_args: &[&str]) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("后台启动失败: {e}"))
 }
 
-#[cfg(not(windows))]
-fn spawn_detached(_extra_args: &[&str]) -> anyhow::Result<()> {
-    anyhow::bail!("当前平台不支持后台启动")
-}
-
 /// HKCU Run 开机自启：登录后最小化启动（后台跑服务，不弹窗口）。
-#[cfg(windows)]
 fn set_autostart(enable: bool) -> anyhow::Result<()> {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW};
     use std::os::windows::ffi::OsStrExt;
@@ -157,11 +140,6 @@ fn set_autostart(enable: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn set_autostart(_enable: bool) -> anyhow::Result<()> {
-    anyhow::bail!("当前平台不支持开机自启")
 }
 
 /// 自管理命令分发。返回 true = 已接管（main 不再跑服务）；false = 正常跑服务。
@@ -228,7 +206,6 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
         }
         "--minimized" => {
             // 后台子进程入口：隐藏控制台窗口后跑服务
-            #[cfg(windows)]
             unsafe {
                 use windows_sys::Win32::System::Console::GetConsoleWindow;
                 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, ShowWindow};

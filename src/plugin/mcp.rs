@@ -286,7 +286,6 @@ fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null()); // server 的日志走 stderr，丢弃避免干扰（Windows 句柄由 Child drop 关闭）
-    #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：后台服务不起黑窗

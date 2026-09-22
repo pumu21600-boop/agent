@@ -143,16 +143,10 @@ async fn run_hook_cmd(cmd: &str, event_json: &str, timeout_ms: u64) -> Result<Op
     use tokio::io::AsyncWriteExt;
     use std::process::Stdio;
 
-    #[cfg(windows)]
+    // 本项目只对准 Windows：钩子命令一律走 cmd /C（非 Windows 的 sh -c 分支已撤）
     let mut command = {
         let mut c = tokio::process::Command::new("cmd");
         c.args(["/C", cmd]);
-        c
-    };
-    #[cfg(not(windows))]
-    let mut command = {
-        let mut c = tokio::process::Command::new("sh");
-        c.args(["-c", cmd]);
         c
     };
     command
