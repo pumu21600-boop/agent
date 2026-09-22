@@ -116,36 +116,31 @@ fn slog(msg: &str) {
     }
 }
 
-/// 单实例守卫：占住环回端口即视为本机唯一壳。已被占用 → 读 PID 探活，
-/// 活着就退出（不抢 9223 CDP 端口），是残留锁就清掉重来。
+/// 单实例守卫：占住环回端口即视为本机唯一壳。
+/// 端口被占时读 PID 锁判断「占用者是不是另一个壳」：是 → 本实例退出（两个壳会抢
+/// 9223 CDP 端口，第二个的 webview 不可见也不可驱动）；不是（锁是死的/根本没有锁，
+/// 9224 被无关程序占了）→ **放弃守卫继续启动**——不能因为一个无关端口把壳拦死。
 /// 返回的 listener 必须保活（drop 即释放）。
 fn instance_guard() -> Option<TcpListener> {
+    let lock = std::env::temp_dir().join("agent-shell.lock");
+    // 先读后写：写在自己 bind 成功之后，否则第二个壳会把第一个的 PID 覆盖掉、把自己
+    // 误判成"没有别的壳在跑"
+    let other_pid = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|p| *p != std::process::id());
     let addr = ("127.0.0.1", GUARD_PORT);
-    match TcpListener::bind(addr) {
-        Ok(l) => Some(l),
-        Err(_) => {
-            let lock = std::env::temp_dir().join("agent-shell.lock");
-            let alive = std::fs::read_to_string(&lock)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(pid_alive)
-                .unwrap_or(true); // 读不到 PID 时按活着处理，稳妥
-            if alive {
-                slog("另一个 Agent 壳已在运行，本实例退出");
-                println!("[desktop] 另一个 Agent 壳已在运行");
-                std::process::exit(0);
-            }
-            slog("清理残留的单实例锁");
-            let _ = std::fs::remove_file(&lock);
-            match TcpListener::bind(addr) {
-                Ok(l) => Some(l),
-                Err(_) => {
-                    slog("单实例端口重试仍被占用，继续启动（CDP 可能不可用）");
-                    None
-                }
-            }
-        }
+    if let Ok(l) = TcpListener::bind(addr) {
+        let _ = std::fs::write(&lock, std::process::id().to_string());
+        return Some(l);
     }
+    if other_pid.map(pid_alive).unwrap_or(false) {
+        slog("另一个 Agent 壳已在运行，本实例退出");
+        println!("[desktop] 另一个 Agent 壳已在运行");
+        std::process::exit(0);
+    }
+    slog(&format!("单实例端口 {GUARD_PORT} 被非本程序占用，放弃守卫继续启动"));
+    TcpListener::bind(addr).ok()
 }
 
 /// PID 是否活着（tasklist 探活；只在第二个壳启动的罕见路径上跑）。

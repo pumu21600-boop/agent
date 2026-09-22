@@ -207,6 +207,10 @@ struct BrowserSession {
     last_used_ms: AtomicU64,
     /// 面板当前可见的标签页（驱动 screencast 与驻留；None = 面板没在看）
     visible_tab: std::sync::Mutex<Option<String>>,
+    /// **面板是否正在展示网页**（shell 模式壳里 webview 显隐的唯一依据）。
+    /// 只有面板自己的动作（activate/new/viewport/frame/navigate）能置真；agent 工具的
+    /// new_tab/activate_tab 不置——否则 agent 一开工就把 webview 弹到聊天区上空。
+    panel_showing: std::sync::Mutex<bool>,
     /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
     shell_shown: std::sync::Mutex<Option<String>>,
     /// shell 模式：面板内容区最近一次矩形（新建 webview 时的初始位置）
@@ -230,6 +234,13 @@ impl BrowserSession {
     }
     fn clear_visible(&self) {
         *self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// 面板是否正在展示网页（壳里 webview 显隐的唯一依据）。
+    fn showing(&self) -> bool {
+        *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn set_showing(&self, v: bool) {
+        *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner()) = v;
     }
     /// 快照列表（面板展示与 agent list 用）。
     async fn tab_briefs(&self) -> Vec<TabBrief> {
@@ -724,6 +735,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
                     visible_tab: std::sync::Mutex::new(None),
+                    panel_showing: std::sync::Mutex::new(false),
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
@@ -750,6 +762,7 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         tabs: std::sync::Mutex::new(Vec::new()),
         last_used_ms: AtomicU64::new(now_ms()),
         visible_tab: std::sync::Mutex::new(None),
+                    panel_showing: std::sync::Mutex::new(false),
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
@@ -852,28 +865,7 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
         ensure_screencast(t, on).await;
     }
     // shell 显隐同步：只看变化的（壳没连时指令静默丢弃）
-    if session.mode == HostMode::Shell {
-        let want_label: Option<String> = match visible.as_deref() {
-            Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
-            None => None,
-        };
-        let cur = session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if cur != want_label {
-            if let Some(old) = cur.as_deref() {
-                shell::visible(old, false);
-            }
-            if let (Some(label), Some(tab)) = (
-                want_label.as_deref(),
-                tabs.iter().find(|t| t.shell_label.as_deref() == want_label.as_deref()),
-            ) {
-                // 先摆正矩形再显示，避免在错误位置闪一下
-                let (x, y, w, h) = shell_rect_for(session, tab).await;
-                shell::rect(label, x, y, w, h);
-                shell::visible(label, true);
-            }
-            *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
-        }
-    }
+    sync_shell_visibility(session, &tabs, &visible).await;
     // 驻留淘汰：非 agent、非可见、空闲超限、未挂起；活跃数超 LIVE_TAB_LIMIT 才动手
     let live: Vec<&Arc<WebTab>> = tabs.iter().filter(|t| !t.suspended.load(Ordering::Relaxed)).collect();
     if live.len() <= LIVE_TAB_LIMIT {
@@ -898,6 +890,44 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
         }
         suspend_tab(t).await;
     }
+}
+
+/// shell 模式同步壳里 webview 的显隐与矩形。**两道门控缺一不可**：
+/// ① `panel_showing`——只有面板自己在看时才显示。agent 工具的 new_tab/activate_tab
+///    也会写 visible_tab（无头时代那是驱动 screencast 用的），但那不是"人在看"——
+///    不门控的话 agent 一开工就把 webview 弹到聊天区上空（真机踩过）；
+/// ② 矩形已知——面板还没同步过视口（首次打开/切页签的 350ms 防抖窗口）时先藏着，
+///    免得 webview 在错误位置闪一下。
+async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab>], visible: &Option<String>) {
+    if session.mode != HostMode::Shell {
+        return;
+    }
+    let rect_known = session.last_rect.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let want_label: Option<String> = if session.showing() && rect_known {
+        match visible.as_deref() {
+            Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let cur = session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if cur == want_label {
+        return;
+    }
+    if let Some(old) = cur.as_deref() {
+        shell::visible(old, false);
+    }
+    if let (Some(label), Some(tab)) = (
+        want_label.as_deref(),
+        tabs.iter().find(|t| t.shell_label.as_deref() == want_label.as_deref()),
+    ) {
+        // 先摆正矩形再显示，避免在错误位置闪一下
+        let (x, y, w, h) = shell_rect_for(session, tab).await;
+        shell::rect(label, x, y, w, h);
+        shell::visible(label, true);
+    }
+    *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
 }
 
 /// shell 模式下一个标签页该占的矩形：视口覆盖值（宽高，来自面板内容区）拼上面板
@@ -2422,6 +2452,7 @@ pub async fn panel_new(url: Option<String>) -> Result<Value, String> {
     session.touch();
     let tab = create_tab(&session, &url, false).await?;
     session.set_visible(&tab.id);
+    session.set_showing(true); // 面板在建页 = 人在看
     sweep_session(&session).await;
     Ok(json!({ "id": tab.id }))
 }
@@ -2432,6 +2463,7 @@ pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     session.set_visible(id);
+    session.set_showing(true);
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     match navigate_tab(&tab, url).await {
@@ -2493,6 +2525,7 @@ pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
     session.touch();
     session.last_frame_poll_ms.store(now_ms(), Ordering::Relaxed);
     session.set_visible(id);
+    session.set_showing(true); // 轮询帧 = 有客户端在面板里看
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     sweep_session(&session).await; // 可见页 screencast 拉起；首帧到达前走下面的回落
@@ -2509,18 +2542,23 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     let session = current_session().await?;
     session.touch();
     session.set_visible(id);
+    session.set_showing(true);
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     let w = w.clamp(320, 1600);
     let h = h.clamp(400, 2400);
     apply_viewport_override(&tab, w, h).await?;
     *tab.viewport.lock().await = Some((w, h));
-    // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）
+    // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）。
+    // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片
     if session.mode == HostMode::Shell
         && let Some(label) = tab.shell_label.as_deref()
     {
         *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
         shell::rect(label, x as f64, y as f64, w as f64, h as f64);
+        let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let visible = session.visible();
+        sync_shell_visibility(&session, &tabs, &visible).await;
     }
     Ok(json!({ "ok": true, "w": w, "h": h }))
 }
@@ -2680,12 +2718,20 @@ pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
 }
 
 /// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。
+/// 空 id = 「面板不看了」——shell 模式下这是壳里 webview 隐藏的唯一信号。
 pub async fn panel_activate(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    if id.is_empty() {
+        session.clear_visible();
+        session.set_showing(false);
+        sweep_session(&session).await;
+        return Ok(json!({ "ok": true }));
+    }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     session.set_visible(id);
+    session.set_showing(true);
     sweep_session(&session).await;
     Ok(json!({ "ok": true }))
 }
