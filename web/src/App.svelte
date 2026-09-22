@@ -887,13 +887,35 @@
   }
 
   // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）。
-  // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域
+  // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
+  // **触发不能只靠 webBodyW/H 的响应式**：窗口横向拉伸时面板宽高都不变、只有 x 变，
+  // 响应式不重算 → 壳里 webview 停在旧位置（真机错位 bug）。改用 ResizeObserver 看
+  // 尺寸 + window resize 看位置，两条都汇进同一个防抖队列。
   let webViewportTimer = null;
   let webViewportKey = ''; // 已应用的「标签|x,y|宽x高」，防止重复请求打爆 CDP actor
+  let webRectObs = null;
   function webQueueViewport() {
     clearTimeout(webViewportTimer);
     webViewportTimer = setTimeout(webSyncViewport, 350);
   }
+  function webWatchRect(on) {
+    if (on) {
+      if (!webRectObs && typeof ResizeObserver !== 'undefined') {
+        webRectObs = new ResizeObserver(() => webQueueViewport());
+      }
+      if (webRectObs && webBodyEl) webRectObs.observe(webBodyEl);
+      window.addEventListener('resize', webOnWindowResize);
+    } else if (webRectObs && webBodyEl) {
+      webRectObs.unobserve(webBodyEl);
+      window.removeEventListener('resize', webOnWindowResize);
+    }
+  }
+  function webOnWindowResize() {
+    webQueueViewport();
+  }
+  // 面板在原生托管且停在「网页」时才需要跟（壳里 webview 的显隐与它联动）
+  $: if (webNative && rpTab === 'web' && rightPanelOpen && webBodyEl) webWatchRect(true);
+  $: if (!(webNative && rpTab === 'web' && rightPanelOpen)) webWatchRect(false);
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
     const el = webBodyEl;
@@ -918,40 +940,6 @@
       .catch(() => {
         webViewportKey = ''; // 失败重试
       });
-  }
-  // —— agent 调试面板（用户要的「打开整个 agent 的 DevTools」）——
-  // 录两样：前端错误（window.onerror / unhandledrejection）与接口请求（fetch 包装：
-  // 方法/路径/状态/耗时）。无头网页的元素读不到（面板是截图渲染），要调网页请在默认
-  // 浏览器里打开后按 F12。
-  let dbgOpen = false;
-  let dbgErrors = [];
-  let dbgRequests = [];
-  const DBG_MAX = 100;
-  if (typeof window !== 'undefined' && !window.__agentDbgHooked) {
-    window.__agentDbgHooked = true;
-    window.addEventListener('error', (ev) => {
-      dbgErrors = [{ ts: Date.now(), text: String(ev.message || '未知错误') + (ev.filename ? ' @' + ev.filename.split('/').pop() + ':' + ev.lineno : '') },
-        ...dbgErrors].slice(0, DBG_MAX);
-    });
-    window.addEventListener('unhandledrejection', (ev) => {
-      dbgErrors = [{ ts: Date.now(), text: 'Promise 拒绝: ' + String(ev.reason && ev.reason.message ? ev.reason.message : ev.reason) },
-        ...dbgErrors].slice(0, DBG_MAX);
-    });
-    const origFetch = window.fetch;
-    window.fetch = async function (...args) {
-      const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-      const method = (args[1] && args[1].method) || 'GET';
-      if (url.startsWith('/api/browser/screenshot') || url.startsWith('/api/browser/frame')) return origFetch.apply(this, args); // 帧轮询太吵，不录
-      const t0 = Date.now();
-      try {
-        const resp = await origFetch.apply(this, args);
-        dbgRequests = [{ ts: t0, method, url, status: resp.status, ms: Date.now() - t0 }, ...dbgRequests].slice(0, DBG_MAX);
-        return resp;
-      } catch (err) {
-        dbgRequests = [{ ts: t0, method, url, status: 0, ms: Date.now() - t0 }, ...dbgRequests].slice(0, DBG_MAX);
-        throw err;
-      }
-    };
   }
   function webMenuAction(kind) {
     webCloseMenu();
@@ -4308,10 +4296,6 @@
                       开发者工具
                     </button>
                   {/if}
-                  <button on:click={() => { webCloseMenu(); dbgOpen = true; }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
-                    agent 调试
-                  </button>
                 </div>
               {/if}
             </div>
@@ -4359,41 +4343,6 @@
     </aside>
   {/if}
 
-  {#if dbgOpen}
-    <div class="web-dt-backdrop" on:click={() => (dbgOpen = false)}></div>
-    <div class="web-dt-modal">
-      <div class="web-dt-head">
-        <b>agent 调试</b>
-        <span class="mcp-status">前端错误 + 接口请求记录（无头网页的元素在真实 DevTools 里看：菜单 → 在默认浏览器中打开 → F12）</span>
-        <span class="flex-sp"></span>
-        <button class="btn ghost" on:click={() => { dbgErrors = []; dbgRequests = []; }}>清空</button>
-        <button class="btn ghost" on:click={() => (dbgOpen = false)}>关闭</button>
-      </div>
-      <div class="dbg-body">
-        <div class="dbg-col">
-          <div class="dbg-col-title">接口请求（最近 {dbgRequests.length} 条）</div>
-          {#each dbgRequests as r}
-            <div class="dbg-row">
-              <span class="dbg-m">{r.method}</span>
-              <span class="dbg-url" title={r.url}>{r.url.replace(/^https?:\/\/[^/]+/, "")}</span>
-              <span class="dbg-status" class:bad={r.status >= 400 || r.status === 0}>{r.status || "失败"}</span>
-              <span class="dbg-ms">{r.ms}ms</span>
-            </div>
-          {:else}
-            <div class="dbg-empty">还没有请求记录</div>
-          {/each}
-        </div>
-        <div class="dbg-col">
-          <div class="dbg-col-title">前端错误（最近 {dbgErrors.length} 条）</div>
-          {#each dbgErrors as e}
-            <div class="dbg-row err"><span class="dbg-url">{e.text}</span></div>
-          {:else}
-            <div class="dbg-empty">没有错误</div>
-          {/each}
-        </div>
-      </div>
-    </div>
-  {/if}
   {#if extOpen && extCurrent}
     <aside class="ext-panel">
       <div class="rp-tabs">
@@ -6406,93 +6355,6 @@
     position: fixed;
     inset: 0;
     z-index: 30;
-  }
-  .web-dt-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-    background: rgba(0, 0, 0, 0.45);
-  }
-  .web-dt-modal {
-    position: fixed;
-    inset: 5vh 4vw;
-    z-index: 61;
-    display: flex;
-    flex-direction: column;
-    background: var(--g0);
-    border: 1px solid var(--g4);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
-  }
-  .web-dt-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--g3);
-  }
-  .dbg-body {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    overflow: auto;
-  }
-  .dbg-col {
-    flex: 1;
-    min-width: 0;
-    overflow-y: auto;
-    padding: 8px 10px;
-  }
-  .dbg-col + .dbg-col {
-    border-left: 1px solid var(--g3);
-  }
-  .dbg-col-title {
-    font-size: 12px;
-    color: var(--g6);
-    margin-bottom: 6px;
-  }
-  .dbg-row {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    font-size: 12px;
-    padding: 3px 0;
-    border-bottom: 1px solid color-mix(in srgb, var(--g3) 40%, transparent);
-  }
-  .dbg-row.err .dbg-url {
-    color: var(--tint-red-fg, #ff6b6b);
-  }
-  .dbg-m {
-    flex: none;
-    font-family: Consolas, monospace;
-    color: var(--g6);
-  }
-  .dbg-url {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--g7);
-  }
-  .dbg-status {
-    flex: none;
-    font-family: Consolas, monospace;
-    color: var(--g6);
-  }
-  .dbg-status.bad {
-    color: var(--tint-red-fg, #ff6b6b);
-  }
-  .dbg-ms {
-    flex: none;
-    font-family: Consolas, monospace;
-    color: var(--g5);
-  }
-  .dbg-empty {
-    font-size: 12px;
-    color: var(--g5);
-    padding: 8px 0;
   }
   .web-menu {
     position: absolute;
