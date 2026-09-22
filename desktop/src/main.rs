@@ -50,14 +50,19 @@ const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
 
-/// 服务 exe 路径：desktop/ 的上两级 target\release\agent.exe（开发机布局）。
+/// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/agent.exe`
+/// （开发机布局；P13 原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
+/// 服务——以前服务总是手动起着的，bug 一直被掩盖。start.bat 改靠壳保活后必须修）。
+/// 打包分发时改为同级目录探测（留口）。
 fn service_exe() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|repo| repo.join("target").join("release").join("agent.exe"))
-        .unwrap_or_else(|| PathBuf::from("target/release/agent.exe"))
+    if let Some(repo) = manifest.parent() {
+        let p = repo.join("target").join("release").join("agent.exe");
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from("target/release/agent.exe")
 }
 
 fn service_alive() -> bool {
@@ -337,6 +342,17 @@ fn main() {
     tauri::Builder::default()
         .setup(|app| {
             app.manage(WebviewHost::default());
+            // 关窗 = 藏到托盘（不退出）：壳进程是 child webview 的宿主，窗口一销毁
+            // 浏览器宿主连同 CDP 端口一起没——用户习惯点 X，不能一关就没了
+            if let Some(win) = app.get_webview_window("main") {
+                let w = win.clone();
+                win.on_window_event(move |ev| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = ev {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 

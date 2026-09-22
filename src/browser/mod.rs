@@ -35,6 +35,7 @@
 
 mod cdp;
 mod commands;
+mod jobguard;
 pub mod shell;
 
 pub use commands::{
@@ -201,6 +202,8 @@ struct BrowserSession {
     mode: HostMode,
     /// 无头模式的浏览器子进程（shell 模式为 None——没有自己的进程）
     child: Option<std::sync::Mutex<Child>>,
+    /// 无头子进程的生命周期保险丝（kill-on-close；随会话 Drop 一起击杀整棵树）
+    job: Option<jobguard::ChildJob>,
     /// CDP HTTP 端点端口（shell 模式 = 壳的 9223；无头 = 自拉实例的随机端口）
     port: u16,
     tabs: std::sync::Mutex<Vec<Arc<WebTab>>>,
@@ -286,12 +289,17 @@ fn log(kind: &str, extra: Value) {
 }
 
 /// 杀掉浏览器进程并回收（Arc 里的 Child 需经 Mutex 拿可变引用；shell 模式无进程）。
+/// job 字段的存在意义就是把保险丝持有到会话结束（Drop = TerminateJobObject 团灭整树），
+/// 这里读它一面上日志、一面让"字段没被读到"的告警闭嘴。
 fn kill_child(s: &BrowserSession) {
     if let Some(c) = s.child.as_ref()
         && let Ok(mut c) = c.lock()
     {
         let _ = c.kill();
         let _ = c.wait();
+    }
+    if s.job.is_some() {
+        log("browser.job.reap", json!({}));
     }
 }
 
@@ -632,17 +640,32 @@ fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>, String> {
         .ok_or_else(|| format!("标签页不存在: {id}"))
 }
 
+/// 桌面壳没跑时给人的话（不静默、不偷偷拉 Edge）。
+const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。P20.4 起网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
+
+/// 是否允许无头模式（默认关——没有壳就不起 Edge）。
+fn headless_allowed() -> bool {
+    std::env::var("AGENT_BROWSER_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 async fn launch() -> Result<Arc<BrowserSession>, String> {
     // shell 优先：桌面壳在跑就把浏览器搬进壳的 child webview（不再另起无头进程）
     if shell::available() {
         match shell_launch().await {
             Ok(s) => return Ok(s),
             Err(e) => {
-                // 壳接着但 CDP 不可用（端口被抢/旧版壳）：禁用 shell 模式，回落无头
+                // 壳接着但 CDP 不可用（端口被抢/旧版壳）：禁用 shell 模式
                 shell::disable();
                 log("browser.shell.fallback", json!({ "err": e }));
             }
         }
+    }
+    // 没有壳：**默认不再自动拉无头 Edge**——用户多次明令不要起 Edge 进程，而 P20.4 起
+    // 浏览器的家就是壳。确需无头（自动化 / CI / 特意不用壳）时设 AGENT_BROWSER_HEADLESS=1。
+    if !headless_allowed() {
+        return Err(NO_SHELL_HINT.to_string());
     }
     let exe = find_browser_exe()?;
     // 预占一个环回空闲端口（进程退出即释放；极小概率被抢，重试一次）
@@ -684,6 +707,13 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
             Ok(c) => c,
             Err(e) => return Err(format!("拉起浏览器失败（{}）: {e}", exe.display())),
         };
+        // 生命周期保险丝：服务被硬杀（stop.bat 走 taskkill /F）时无头浏览器跟着死，
+        // 不留孤儿 Edge 占内存（真机踩过：用户机器上留了个杀不掉的提权孤儿）
+        let job = jobguard::ChildJob::new();
+        if let Some(j) = job.as_ref() {
+            use std::os::windows::io::AsRawHandle;
+            j.assign(child.as_raw_handle() as isize);
+        }
         // 拉起后立刻探活：老版本 Edge 不认 --headless=new 会秒退
         tokio::time::sleep(Duration::from_millis(300)).await;
         if let Ok(Some(code)) = child.try_wait() {
@@ -725,6 +755,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                 let session = Arc::new(BrowserSession {
                     mode: HostMode::Headless,
                     child: Some(std::sync::Mutex::new(child)),
+                    job,
                     port,
                     tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
@@ -752,6 +783,7 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
     let session = Arc::new(BrowserSession {
         mode: HostMode::Shell,
         child: None,
+        job: None,
         port: shell::SHELL_CDP_PORT,
         tabs: std::sync::Mutex::new(Vec::new()),
         last_used_ms: AtomicU64::new(now_ms()),
