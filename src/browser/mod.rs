@@ -1,6 +1,7 @@
-//! 内置浏览器内核（P20 起，P21 对齐 ZCode 协议）—— 进程内直持 CDP 会话的页面操作能力。
+//! 内置浏览器内核（P20 起，P21 对齐 ZCode 协议，P22 搬进桌面壳）—— 进程内直持 CDP
+//! 会话的页面操作能力。
 //!
-//! 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs）。P21 起：
+//! P20 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs）。P21 起：
 //! - **统一命令面**（commands.rs，协议形状移植自 ZCode `browserCommandSchema`，Apache-2.0）：
 //!   一个 `browser` 工具按 `method` 判别覆盖全部动作；结构化错误码不静默兜底。
 //! - **快照双结构**：`elements`（可动作元素，带 ref/selector/rect/inViewport/parentRef/
@@ -15,17 +16,26 @@
 //! - **JS 弹窗**：`Page.javascriptDialogOpening` 捕获进 tab 状态，面板出「确定/取消」条，
 //!   agent 侧 get_dialog / handle_dialog——弹窗不再把页面卡死。
 //!
+//! P22 起浏览器有两种宿主，**上层协议完全不变**：
+//! - **shell 模式**（桌面壳在跑）：标签页是壳窗口里的 child webview（真页面、真交互、
+//!   复用 App 自己的 WebView2 运行时，不再另起无头 Edge 进程）。壳的 WebView2 环境带
+//!   `--remote-debugging-port=9223`（tauri.conf.json），本服务经页面级 CDP 驱动这些
+//!   webview；标签页的开/关/挪/显隐由服务通过控制通道（shell.rs）指挥壳执行。
+//! - **无头模式**（壳不在：start.bat 直跑服务、或用户在普通浏览器里开 5173）：
+//!   沿用 P20 的无头 Edge/Chrome，行为与此前完全一致。
+//!
 //! 设计约定（窄而刚 v1，承 P20）：
-//! - **单浏览器多标签页**：所有会话共用一个无头实例；面板与 agent 工具共享进程，
+//! - **单浏览器多标签页**：所有会话共用一个浏览器实例；面板与 agent 工具共享进程，
 //!   各标签页独立 CDP 连接互不干扰；agent 工具缺省作用于 agent 专用标签页。
 //! - **DOM 增量 diff**：快照时给元素钉 `data-agent-ref`（已存在的不重打——ref 稳定），
 //!   服务端与上次快照按 ref 对比出「新增/移除/变化」。
 //! - **语义定位为主，坐标兜底**：ref → selector → 文本/占位符 → 视口坐标。
-//! - 浏览器进程自带 Chromium 站点隔离，不在 Windows 沙箱内再包一层；profile 用临时
-//!   目录，空转 10 分钟自动关闭。
+//! - shell 模式下 screencast 只在「有非壳客户端在轮询帧」时开（壳里看的是真页面，
+//!   不白编码）；壳外浏览器打开面板时自动恢复帧流，两条路径并存。
 
 mod cdp;
 mod commands;
+pub mod shell;
 
 pub use commands::{
     ALL_METHODS, BrowserCommand, BrowserError, ErrorCode, KeyModifier, MouseButton, PageState, Point,
@@ -118,6 +128,8 @@ pub struct WebTab {
     /// agent 工具（browser 统一工具）专用标签页
     pub agent: bool,
     pub cdp: cdp::Cdp,
+    /// shell 模式下的 child webview label（关/挪/显隐都靠它；无头模式为 None）
+    pub shell_label: Option<String>,
     /// agent 快照的增量 diff 基线（仅 agent 标签页使用）
     last_outline: Mutex<Vec<OutlineNode>>,
     /// ref → selector 映射（ref 失效后 selector 兜底定位）
@@ -156,14 +168,51 @@ impl WebTab {
     }
 }
 
+impl WebTab {
+    fn new(id: String, agent: bool, cdp: cdp::Cdp, shell_label: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            agent,
+            cdp,
+            shell_label,
+            last_outline: Mutex::new(Vec::new()),
+            ref_selectors: Mutex::new(HashMap::new()),
+            last_active_ms: AtomicU64::new(now_ms()),
+            suspended: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            screencast_on: AtomicBool::new(false),
+            frame: Mutex::new(None),
+            dialog: Mutex::new(None),
+            viewport: Mutex::new(None),
+        })
+    }
+}
+
+/// 浏览器宿主模式（P22）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostMode {
+    /// 无头 Edge/Chrome（壳不在时的兜底）
+    Headless,
+    /// 桌面壳 child webview（服务经 CDP + 控制通道驱动）
+    Shell,
+}
+
 struct BrowserSession {
-    child: std::sync::Mutex<Child>,
-    /// CDP HTTP 端点端口（/json/new、/json/close、探活用）
+    mode: HostMode,
+    /// 无头模式的浏览器子进程（shell 模式为 None——没有自己的进程）
+    child: Option<std::sync::Mutex<Child>>,
+    /// CDP HTTP 端点端口（shell 模式 = 壳的 9223；无头 = 自拉实例的随机端口）
     port: u16,
     tabs: std::sync::Mutex<Vec<Arc<WebTab>>>,
     last_used_ms: AtomicU64,
     /// 面板当前可见的标签页（驱动 screencast 与驻留；None = 面板没在看）
     visible_tab: std::sync::Mutex<Option<String>>,
+    /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
+    shell_shown: std::sync::Mutex<Option<String>>,
+    /// shell 模式：面板内容区最近一次矩形（新建 webview 时的初始位置）
+    last_rect: std::sync::Mutex<Option<(i64, i64, i64, i64)>>,
+    /// 最近一次帧轮询时间（screencast 门控：壳里看真页面，不白编码）
+    last_frame_poll_ms: AtomicU64,
 }
 
 impl BrowserSession {
@@ -225,9 +274,11 @@ fn log(kind: &str, extra: Value) {
     });
 }
 
-/// 杀掉浏览器进程并回收（Arc 里的 Child 需经 Mutex 拿可变引用）。
+/// 杀掉浏览器进程并回收（Arc 里的 Child 需经 Mutex 拿可变引用；shell 模式无进程）。
 fn kill_child(s: &BrowserSession) {
-    if let Ok(mut c) = s.child.lock() {
+    if let Some(c) = s.child.as_ref()
+        && let Ok(mut c) = c.lock()
+    {
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -382,23 +433,19 @@ async fn dev_close_target(port: u16, id: &str) {
 
 /// 建一条标签页连接（Page.enable + 可选导航等待加载完成）并挂进会话。
 async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<Arc<WebTab>, String> {
-    let (id, ws) = dev_new_target(session.port).await?;
+    let (id, ws, shell_label) = match session.mode {
+        // shell 模式一律 about:blank 起步：WebView2 的 child webview 带初始 URL 创建时，
+        // 导航一提交 CDP target 就被换掉（实测 Edg/153：about:blank target 上线 180ms 后
+        // 随导航消失），先建空白页再走 CDP Page.navigate 才能稳住 target
+        HostMode::Shell => shell_create_target(session).await?,
+        HostMode::Headless => {
+            let (id, ws) = dev_new_target(session.port).await?;
+            (id, ws, None)
+        }
+    };
     let cdp = cdp::Cdp::connect(&ws).await?;
     cdp.call("Page.enable", json!({})).await?;
-    let tab = Arc::new(WebTab {
-        id,
-        agent,
-        cdp,
-        last_outline: Mutex::new(Vec::new()),
-        ref_selectors: Mutex::new(HashMap::new()),
-        last_active_ms: AtomicU64::new(now_ms()),
-        suspended: AtomicBool::new(false),
-        retired: AtomicBool::new(false),
-        screencast_on: AtomicBool::new(false),
-        frame: Mutex::new(None),
-        dialog: Mutex::new(None),
-        viewport: Mutex::new(None),
-    });
+    let tab = WebTab::new(id, agent, cdp, shell_label);
     spawn_tab_events(tab.clone());
     session
         .tabs
@@ -408,8 +455,126 @@ async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<
     if url != "about:blank" && !url.is_empty() {
         navigate_tab(&tab, url).await?;
     }
-    log("browser.tab.new", json!({ "id": tab.id, "agent": agent, "url": url }));
+    log(
+        "browser.tab.new",
+        json!({ "id": tab.id, "agent": agent, "url": url, "shell": session.mode == HostMode::Shell }),
+    );
     Ok(tab)
+}
+
+/// shell 模式建标签页：指挥壳建 about:blank child webview → 在壳的 CDP 端点上发现新
+/// target → 连上它的页面级 WS。返回 (target id, ws url, shell label)。
+async fn shell_create_target(session: &BrowserSession) -> Result<(String, String, Option<String>), String> {
+    if !shell::available() {
+        return Err("桌面壳控制通道未连接（壳没跑或已断开）".into());
+    }
+    let label = format!("wv-{}", session.tabs.lock().unwrap_or_else(|e| e.into_inner()).len() + 1);
+    // 初始矩形：面板上次同步的矩形（没有就用个默认值；显示前 sweep 会补发正确矩形）
+    let (x, y, w, h) = session
+        .last_rect
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or((0, 0, 1024, 768));
+    // 发现基线：**发指令前**快照全部 page target id——壳里上一个会话残留的 webview
+    // （服务重启后壳不重启时就有）target 还在列表里，只排除自己的 tab 会认领到将死的
+    // 旧 target，连上就断
+    let known = all_page_target_ids(session.port).await;
+    shell::create(&label, "about:blank", x as f64, y as f64, w as f64, h as f64, false);
+    match wait_new_page_target(session.port, &known, Duration::from_secs(8)).await {
+        Ok((id, ws)) => Ok((id, ws, Some(label))),
+        Err(e) => {
+            shell::close(&label); // 建出来没人认领的 webview 回收掉
+            Err(format!(
+                "等待桌面壳 webview 上线超时（CDP 端口 {port} 不可用？被别的程序占了？）: {e}",
+                port = session.port
+            ))
+        }
+    }
+}
+
+/// 当前 CDP 端口上全部 page target id（发现基线用；端点不可用时返回空）。
+async fn all_page_target_ids(port: u16) -> Vec<String> {
+    let Ok(client) = dev_client() else { return Vec::new() };
+    let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await else {
+        return Vec::new();
+    };
+    let Ok(text) = resp.text().await else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return Vec::new() };
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 等「非壳内部」的 page target 全部消失（reset 后旧 webview 异步销毁，见 shell_launch）。
+/// 只剩壳自己的 UI/DevTools 窗口即算稳了；超时也放行（不阻塞启动）。
+async fn wait_targets_settled(port: u16, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        let client = match dev_client() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let Ok(text) = resp.text().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let pending = v
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                    .filter(|t| !is_shell_internal_target(t))
+                    .count()
+            })
+            .unwrap_or(0);
+        if pending == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 轮询 /json/list 找新 page target（壳的 UI 自己的 webview 与 DevTools 窗口要排除）。
+async fn wait_new_page_target(port: u16, known: &[String], budget: Duration) -> Result<(String, String), String> {
+    let client = dev_client()?;
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await
+            && let Ok(text) = resp.text().await
+            && let Ok(v) = serde_json::from_str::<Value>(&text)
+            && let Some(targets) = v.as_array()
+            && let Some(page) = targets.iter().find(|t| {
+                t.get("type").and_then(Value::as_str) == Some("page")
+                    && !known.iter().any(|k| Some(k.as_str()) == t.get("id").and_then(Value::as_str))
+                    && !is_shell_internal_target(t)
+            })
+            && let Some(id) = page.get("id").and_then(Value::as_str)
+            && let Some(ws) = page.get("webSocketDebuggerUrl").and_then(Value::as_str)
+        {
+            return Ok((id.to_string(), ws.to_string()));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    Err("8s 内没出现新的 page target".into())
+}
+
+/// 壳自己的 UI webview（加载 5173 的那个）与 DevTools 窗口——都不是浏览器标签页。
+fn is_shell_internal_target(t: &Value) -> bool {
+    let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+    url.starts_with("devtools://") || url.starts_with("chrome-devtools://") || url.contains("127.0.0.1:5173")
 }
 
 /// 关闭并移除一个标签页（连接即弃，进程侧异步关）。
@@ -420,6 +585,10 @@ async fn close_tab(session: &BrowserSession, id: &str) -> bool {
         if let Some(pos) = pos {
             let tab = tabs.remove(pos);
             tab.retired.store(true, Ordering::Relaxed);
+            // shell 模式：壳里的 child webview 也要关
+            if let Some(label) = tab.shell_label.as_deref() {
+                shell::close(label);
+            }
         }
         pos.is_some()
     };
@@ -427,7 +596,9 @@ async fn close_tab(session: &BrowserSession, id: &str) -> bool {
         if session.visible().as_deref() == Some(id) {
             session.clear_visible();
         }
-        dev_close_target(session.port, id).await;
+        if session.mode == HostMode::Headless {
+            dev_close_target(session.port, id).await;
+        }
         log("browser.tab.close", json!({ "id": id }));
     }
     removed
@@ -457,6 +628,17 @@ fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>, String> {
 }
 
 async fn launch() -> Result<Arc<BrowserSession>, String> {
+    // shell 优先：桌面壳在跑就把浏览器搬进壳的 child webview（不再另起无头进程）
+    if shell::available() {
+        match shell_launch().await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                // 壳接着但 CDP 不可用（端口被抢/旧版壳）：禁用 shell 模式，回落无头
+                shell::disable();
+                log("browser.shell.fallback", json!({ "err": e }));
+            }
+        }
+    }
     let exe = find_browser_exe()?;
     // 预占一个环回空闲端口（进程退出即释放；极小概率被抢，重试一次）
     let mut last_err = String::new();
@@ -533,27 +715,18 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                 cdp.call("Page.enable", json!({})).await?;
                 log("browser.launch", json!({ "exe": exe.display().to_string(), "port": port }));
                 // 启动自带的 about:blank 页即 agent 工具的专用标签页
-                let first = Arc::new(WebTab {
-                    id: target_id,
-                    agent: true,
-                    cdp,
-                    last_outline: Mutex::new(Vec::new()),
-                    ref_selectors: Mutex::new(HashMap::new()),
-                    last_active_ms: AtomicU64::new(now_ms()),
-                    suspended: AtomicBool::new(false),
-                    retired: AtomicBool::new(false),
-                    screencast_on: AtomicBool::new(false),
-                    frame: Mutex::new(None),
-                    dialog: Mutex::new(None),
-                    viewport: Mutex::new(None),
-                });
+                let first = WebTab::new(target_id, true, cdp, None);
                 spawn_tab_events(first.clone());
                 let session = Arc::new(BrowserSession {
-                    child: std::sync::Mutex::new(child),
+                    mode: HostMode::Headless,
+                    child: Some(std::sync::Mutex::new(child)),
                     port,
                     tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
                     visible_tab: std::sync::Mutex::new(None),
+                    shell_shown: std::sync::Mutex::new(None),
+                    last_rect: std::sync::Mutex::new(None),
+                    last_frame_poll_ms: AtomicU64::new(0),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -567,12 +740,68 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
     Err(last_err)
 }
 
+/// shell 模式起会话：建 agent 专用页（隐藏的 about:blank child webview）即就绪。
+/// 这一步同时验证壳的 CDP 端口真的可用——不可用就整体回退无头模式。
+async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
+    let session = Arc::new(BrowserSession {
+        mode: HostMode::Shell,
+        child: None,
+        port: shell::SHELL_CDP_PORT,
+        tabs: std::sync::Mutex::new(Vec::new()),
+        last_used_ms: AtomicU64::new(now_ms()),
+        visible_tab: std::sync::Mutex::new(None),
+        shell_shown: std::sync::Mutex::new(None),
+        last_rect: std::sync::Mutex::new(None),
+        last_frame_poll_ms: AtomicU64::new(0),
+    });
+    // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
+    // 免得残留 target 干扰发现、白白常驻
+    shell::reset();
+    // 关掉旧 webview 后**等它们的 target 从 /json/list 消失**再建新的：实测旧 webview
+    // 的销毁是异步的（~180ms），这期间建出来的新 webview，其 target 会跟着旧的一起
+    // 从列表里消失（CDP 连上就断）
+    wait_targets_settled(session.port, Duration::from_secs(3)).await;
+    let first = create_tab(&session, "about:blank", true).await?;
+    // agent 页默认隐藏（面板没在看它；用户切过去时 sweep 再显示）
+    if let Some(label) = first.shell_label.as_deref() {
+        shell::visible(label, false);
+    }
+    ensure_reaper();
+    log("browser.launch", json!({ "mode": "shell", "port": shell::SHELL_CDP_PORT }));
+    Ok(session)
+}
+
 /// 确保有一个活的浏览器会话（死会话清理后重新拉起）。
 async fn ensure_session() -> Result<Arc<BrowserSession>, String> {
     let mut guard = SESSION.lock().await;
     if let Some(s) = guard.as_ref() {
         s.touch();
         if browser_alive(s.port).await {
+            // 端口活着不代表会话里的 tab 还活着：壳重启后 9223 复生，但旧连接的
+            // actor 早退了（僵尸 tab，title/url 全空）。摘掉死 tab；全死就重建会话。
+            let dead: Vec<String> = s
+                .tabs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|t| !t.cdp.is_alive())
+                .map(|t| t.id.clone())
+                .collect();
+            if !dead.is_empty() {
+                for id in &dead {
+                    close_tab(s, id).await;
+                }
+                let empty = s.tabs.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+                if empty {
+                    log("browser.stale", json!({ "reason": "tabs-dead" }));
+                    if let Some(dead_session) = guard.take() {
+                        kill_child(&dead_session);
+                    }
+                    let s = launch().await?;
+                    *guard = Some(s.clone());
+                    return Ok(s);
+                }
+            }
             return Ok(s.clone());
         }
         log("browser.stale", json!({}));
@@ -610,14 +839,40 @@ fn ensure_reaper() {
     });
 }
 
-/// 驻留巡检：screencast 只服务面板可见页；后台超时空闲且活跃页超限 → 挂起最久空闲者。
+/// 驻留巡检：screencast 只服务「有客户端在轮询帧」的可见页；后台超时空闲且活跃页
+/// 超限 → 挂起最久空闲者；shell 模式顺带同步壳里 webview 的显隐与矩形。
 async fn sweep_session(session: &Arc<BrowserSession>) {
     let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let visible = session.visible();
-    // screencast 同步：可见页开、其余关
+    // screencast 同步：可见页 + 仍有客户端在轮询帧才开（壳里看的是真页面，不白编码；
+    // 用户从普通浏览器开面板时轮询恢复，帧流自动跟上）
+    let want_frames = now_ms().saturating_sub(session.last_frame_poll_ms.load(Ordering::Relaxed)) < 15_000;
     for t in &tabs {
-        let on = visible.as_deref() == Some(t.id.as_str()) && !t.suspended.load(Ordering::Relaxed);
+        let on = visible.as_deref() == Some(t.id.as_str()) && !t.suspended.load(Ordering::Relaxed) && want_frames;
         ensure_screencast(t, on).await;
+    }
+    // shell 显隐同步：只看变化的（壳没连时指令静默丢弃）
+    if session.mode == HostMode::Shell {
+        let want_label: Option<String> = match visible.as_deref() {
+            Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
+            None => None,
+        };
+        let cur = session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if cur != want_label {
+            if let Some(old) = cur.as_deref() {
+                shell::visible(old, false);
+            }
+            if let (Some(label), Some(tab)) = (
+                want_label.as_deref(),
+                tabs.iter().find(|t| t.shell_label.as_deref() == want_label.as_deref()),
+            ) {
+                // 先摆正矩形再显示，避免在错误位置闪一下
+                let (x, y, w, h) = shell_rect_for(session, tab).await;
+                shell::rect(label, x, y, w, h);
+                shell::visible(label, true);
+            }
+            *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
+        }
     }
     // 驻留淘汰：非 agent、非可见、空闲超限、未挂起；活跃数超 LIVE_TAB_LIMIT 才动手
     let live: Vec<&Arc<WebTab>> = tabs.iter().filter(|t| !t.suspended.load(Ordering::Relaxed)).collect();
@@ -642,6 +897,19 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
             break;
         }
         suspend_tab(t).await;
+    }
+}
+
+/// shell 模式下一个标签页该占的矩形：视口覆盖值（宽高，来自面板内容区）拼上面板
+/// 最近一次上报的左上角；都没有就用默认值。
+async fn shell_rect_for(session: &Arc<BrowserSession>, tab: &WebTab) -> (f64, f64, f64, f64) {
+    let last = *session.last_rect.lock().unwrap_or_else(|e| e.into_inner());
+    let (x, y) = last.map(|(x, y, _, _)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+    match *tab.viewport.lock().await {
+        Some((w, h)) => (x, y, w as f64, h as f64),
+        None => last
+            .map(|(x, y, w, h)| (x as f64, y as f64, w as f64, h as f64))
+            .unwrap_or((0.0, 0.0, 1024.0, 768.0)),
     }
 }
 
@@ -684,6 +952,16 @@ async fn apply_viewport_override(tab: &WebTab, w: i64, h: i64) -> Result<(), Str
 async fn close_internal(reason: &str) {
     let dead = SESSION.lock().await.take();
     if let Some(s) = dead {
+        // shell 模式：壳里的 child webview 逐个关掉（没有进程可杀）
+        if s.mode == HostMode::Shell {
+            let tabs = s.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for t in &tabs {
+                if let Some(label) = t.shell_label.as_deref() {
+                    shell::close(label);
+                }
+            }
+            *s.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         kill_child(&s);
         log("browser.close", json!({ "reason": reason }));
     }
@@ -733,6 +1011,11 @@ fn spawn_tab_events(tab: Arc<WebTab>) {
                     "Page.javascriptDialogClosed" => {
                         *tab.dialog.lock().await = None;
                     }
+                    // 页面导航（用户点链接、JS 跳转等不走 navigate_tab 的路径）会销毁
+                    // 隔离世界 context——这里主动清缓存，下次求值自动重建
+                    "Page.loadEventFired" | "Page.frameNavigated" | "Page.navigatedWithinDocument" => {
+                        tab.cdp.invalidate_worlds();
+                    }
                     _ => {}
                 },
                 // 帧消费慢导致丢中间帧：最新帧胜出，可接受；dialog 低频不受影响
@@ -763,6 +1046,11 @@ async fn ensure_screencast(tab: &Arc<WebTab>, on: bool) {
 
 /// 页面标题与地址（两次轻量求值；隔离世界，页面篡改不了）。
 async fn tab_title_url(tab: &WebTab) -> (String, String) {
+    // 有 JS 弹窗时页面脚本全阻塞（隔离世界求值也跑不了）——别白等 10s 超时，
+    // 标题/URL 留空，面板走弹窗条
+    if tab.dialog.lock().await.is_some() {
+        return (String::new(), String::new());
+    }
     let title = tab
         .cdp
         .evaluate_in_isolated_world(ISOLATED_WORLD, "document.title")
@@ -1521,16 +1809,22 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
             return Ok(format!("已切换到标签页 {tab_id}（面板可见）。"));
         }
         BrowserCommand::Capabilities => {
+            let host = match current_session().await {
+                Ok(s) if s.mode == HostMode::Shell => "桌面壳 child webview（真页面）+ 页面级 CDP".to_string(),
+                _ => "无头 Edge/Chrome + 页面级 CDP".to_string(),
+            };
             return Ok(format!(
-                "内置浏览器（无头 Edge/Chrome + 页面级 CDP）。方法: {}。\n定位优先级: ref → selector → text/label 语义 → x/y 坐标；快照/定位/求值均在隔离世界执行，页面脚本无法篡改。截图类方法刷新网页面板画面；agent 侧读取页面请用 snapshot。",
+                "内置浏览器（{host}）。方法: {}。\n定位优先级: ref → selector → text/label 语义 → x/y 坐标；快照/定位/求值均在隔离世界执行，页面脚本无法篡改。截图类方法刷新网页面板画面；agent 侧读取页面请用 snapshot。",
                 ALL_METHODS.join(" / ")
             ));
         }
         BrowserCommand::CloseBrowser => {
-            let alive = current_session().await.is_ok();
+            let mode = current_session().await.ok().map(|s| s.mode);
+            let alive = mode.is_some();
             close_internal("tool").await;
             if alive {
-                return Ok("浏览器已关闭（进程已退出；下次命令会自动重新拉起）。".into());
+                let how = if mode == Some(HostMode::Shell) { "壳内页面已全部关闭" } else { "进程已退出" };
+                return Ok(format!("浏览器已关闭（{how}；下次命令会自动重新拉起）。"));
             }
             return Ok("浏览器本来就没在运行。".into());
         }
@@ -2069,10 +2363,10 @@ fn check_panel_url(url: &str) -> Result<(), BrowserError> {
 pub async fn panel_state() -> Value {
     let guard = SESSION.lock().await;
     let Some(s) = guard.as_ref() else {
-        return json!({ "running": false, "tabs": [], "dialog": null });
+        return json!({ "running": false, "tabs": [], "dialog": null, "mode": "headless" });
     };
     if !browser_alive(s.port).await {
-        return json!({ "running": false, "tabs": [], "dialog": null });
+        return json!({ "running": false, "tabs": [], "dialog": null, "mode": mode_name(s.mode) });
     }
     let mut briefs = s.tab_briefs().await;
     let visible = s.visible();
@@ -2087,7 +2381,10 @@ pub async fn panel_state() -> Value {
             .find(|t| &t.id == vid)
             .cloned();
         if let Some(tab) = tab {
-            if let Ok(ready) = tab.cdp.evaluate_in_isolated_world(ISOLATED_WORLD, "document.readyState").await
+            // 弹窗开着时先报弹窗（页面脚本阻塞，readyState 求值会白等超时）
+            if let Some(d) = tab.dialog.lock().await.clone() {
+                dialog = json!({ "kind": d.kind, "message": d.message, "defaultPrompt": d.default_prompt });
+            } else if let Ok(ready) = tab.cdp.evaluate_in_isolated_world(ISOLATED_WORLD, "document.readyState").await
                 && let Some(st) = ready.as_str()
             {
                 for b in briefs.iter_mut() {
@@ -2096,17 +2393,23 @@ pub async fn panel_state() -> Value {
                     }
                 }
             }
-            if let Some(d) = tab.dialog.lock().await.clone() {
-                dialog = json!({ "kind": d.kind, "message": d.message, "defaultPrompt": d.default_prompt });
-            }
         }
     }
     json!({
         "running": true,
+        "mode": mode_name(s.mode),
         "port": s.port,
         "tabs": briefs.iter().map(TabBrief::to_json).collect::<Vec<_>>(),
         "dialog": dialog,
     })
+}
+
+/// 宿主模式名（透给前端：shell = 壳里托管真 webview，headless = 截图帧流）。
+fn mode_name(mode: HostMode) -> &'static str {
+    match mode {
+        HostMode::Shell => "shell",
+        HostMode::Headless => "headless",
+    }
 }
 
 /// 面板开新标签页（可选直接导航）。
@@ -2152,7 +2455,12 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
     session.set_visible(id);
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
+    // 弹窗开着时页面脚本阻塞，readyState 求值会白等超时——直接跳过等待
+    let dialog_open = tab.dialog.lock().await.is_some();
     for _ in 0..4 {
+        if dialog_open {
+            break;
+        }
         let st = tab
             .cdp
             .call(
@@ -2179,9 +2487,11 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
 
 /// 面板帧（P21）：screencast 最新 JPEG（内存直出，零 CDP 往返）；
 /// 没有帧（screencast 刚起步/失败）时回落 captureScreenshot（PNG）。
+/// P22：轮询即「有客户端要帧」的信号，驱动 screencast 门控（壳里看真页面不编码）。
 pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
     let session = current_session().await?;
     session.touch();
+    session.last_frame_poll_ms.store(now_ms(), Ordering::Relaxed);
     session.set_visible(id);
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
@@ -2193,8 +2503,9 @@ pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
 }
 
 /// 面板设置标签页视口（截图尺寸跟随面板大小——固定 1280×900 会在窄面板里
-/// 显示得又小又留大黑边，ZCode 的面板浏览器就是视口=面板尺寸）。
-pub async fn panel_viewport(id: &str, w: i64, h: i64) -> Result<Value, String> {
+/// 显示得又小又留大黑边，ZCode 的面板浏览器就是视口=面板尺寸）。P22：x/y 是面板
+/// 内容区在壳窗口里的左上角（shell 模式据此把 child webview 摆到面板位置上）。
+pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     session.set_visible(id);
@@ -2204,6 +2515,13 @@ pub async fn panel_viewport(id: &str, w: i64, h: i64) -> Result<Value, String> {
     let h = h.clamp(400, 2400);
     apply_viewport_override(&tab, w, h).await?;
     *tab.viewport.lock().await = Some((w, h));
+    // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）
+    if session.mode == HostMode::Shell
+        && let Some(label) = tab.shell_label.as_deref()
+    {
+        *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
+        shell::rect(label, x as f64, y as f64, w as f64, h as f64);
+    }
     Ok(json!({ "ok": true, "w": w, "h": h }))
 }
 
@@ -2245,12 +2563,18 @@ pub async fn panel_devtools_url(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     let tab = get_tab(&session, id)?;
+    // shell 模式：child webview 支持真 DevTools——直接指挥壳开（无头时代做不到的事）
+    if session.mode == HostMode::Shell {
+        let Some(label) = tab.shell_label.as_deref() else {
+            return Err("该标签页不在桌面壳里（无头模式）".into());
+        };
+        shell::devtools(label, true);
+        return Ok(json!({ "ok": true, "opened": true }));
+    }
     Ok(json!({
         "ok": true,
-        "url": format!(
-            "devtools://devtools/bundled/inspector.html?ws=127.0.0.1:{}/devtools/page/{}",
-            session.port, tab.id
-        ),
+        "opened": false,
+        "hint": "无头模式的页面没有真 DevTools；点「在默认浏览器中打开」后按 F12"
     }))
 }
 

@@ -102,6 +102,9 @@ async fn main() -> anyhow::Result<()> {
         "用中文简洁回答。".to_string()
     });
     let approval_default = config.agent.default_approval.clone();
+    // P22：桌面壳 webview 控制通道（壳连进来后，内置浏览器搬进壳的 child webview；
+    // 没有壳时 start_listener 空转，浏览器照旧走无头模式）
+    browser::shell::start_listener();
     // 开箱即用：启动时预定位 git.exe（发现链含 PATH/注册表/标准位置/捆绑目录），
     // 并把 git 相关目录登记进沙箱 PATH——shell 工具里按名调 git 也即刻可用
     if let Err(e) = tools::git_exe() {

@@ -1,7 +1,7 @@
 # agent —— Windows 原生类 Codex 自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P20 完成**（浏览器内核：内置无头浏览器 CDP 直连 + 语义定位点击 + DOM 增量 diff；沙箱统一：SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / App.svelte 拆分 / 内置插件试点）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
+当前进度：**P20.4 完成**（内置浏览器搬进桌面壳：壳里跑 child webview 真页面，服务经 CDP + 控制通道驱动，壳不在自动回落无头；此前 P20 内核 = CDP 直连 + 语义定位点击 + DOM 增量 diff；沙箱统一：SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / App.svelte 拆分 / 内置插件试点）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
 P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用）。
 逐阶段排产与踩坑记录见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
@@ -20,8 +20,8 @@ P14 记忆库星云；P13 桌面壳按用户指示搁置（web 定稿后启用�
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，页面以截图渲染、点击滚轮回传真实浏览器，agent 的 browser_* 工具打开的页面同场可见）+ 设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
-- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 180 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser_* 工具打开的页面同场可见）+ 设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
+- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 193 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
 

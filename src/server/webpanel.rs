@@ -143,11 +143,14 @@ pub(super) async fn browser_reload(Json(req): Json<Value>) -> Result<Json<Value>
 }
 
 /// POST /api/browser/viewport —— 设置标签页视口（截图尺寸跟随面板大小）。
+/// x/y = 面板内容区在壳窗口里的左上角（P22 shell 模式把 child webview 摆过去）。
 pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    let x = req.get("x").and_then(Value::as_i64).unwrap_or(0);
+    let y = req.get("y").and_then(Value::as_i64).unwrap_or(0);
     let w = req.get("w").and_then(Value::as_i64).unwrap_or(1280);
     let h = req.get("h").and_then(Value::as_i64).unwrap_or(900);
-    crate::browser::panel_viewport(id, w, h).await.map(Json).map_err(bad)
+    crate::browser::panel_viewport(id, x, y, w, h).await.map(Json).map_err(bad)
 }
 
 /// POST /api/browser/open-external —— 在系统默认浏览器打开当前页。
@@ -156,7 +159,7 @@ pub(super) async fn browser_open_external(Json(req): Json<Value>) -> Result<Json
     crate::browser::panel_open_external(id).await.map(Json).map_err(bad)
 }
 
-/// POST /api/browser/devtools —— 该标签页的 DevTools 内嵌地址（前端弹 iframe 用，零新进程）。
+/// POST /api/browser/devtools —— shell 模式指挥壳开真 DevTools；无头模式返回提示。
 pub(super) async fn browser_devtools(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
     crate::browser::panel_devtools_url(id).await.map(Json).map_err(bad)

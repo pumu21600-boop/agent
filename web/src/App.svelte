@@ -733,8 +733,11 @@
   let rpPreviewPath = '';
   let rpPreviewContent = '';
 
-  // —— P20.1 网页（右侧面板「网页」页签：内置无头浏览器截图渲染 + 坐标回传，与 agent 工具共享实例）——
+  // —— P20.1 网页（右侧面板「网页」页签）——
   // P21：截图轮询改 screencast 帧端点（内存直出）；面板可见时 600ms 自动刷帧
+  // P22：桌面壳在跑时，页面是壳窗口里的 child webview（真页面真交互）——面板只留
+  //      占位区并把矩形报给后端（壳里的 webview 摆到这块）；浏览器直开 5173 时
+  //      仍是 screencast 帧流，两条路径由后端 state.mode + 是否在 Tauri 里共同决定。
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
   let webActiveId = '';
   let webAddress = '';
@@ -743,8 +746,16 @@
   let webShotT = 0; // 帧缓存穿透参数（自动刷新与动作后递增触发 <img> 重载）
   let webBodyW = 0;
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
-  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 调试工具）
+  let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
+  let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
+  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具 / agent 调试）
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
+  // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
+  function inTauriShell() {
+    return typeof window !== 'undefined' && !!(window.__TAURI_INTERNALS__ || window.__TAURI__);
+  }
+  // 原生托管：壳模式 + 本客户端就是壳 → 面板内容区让给 child webview
+  $: webNative = webMode === 'shell' && inTauriShell();
   // 右侧面板宽度（左缘拖拽可调，320–820；对齐 ZCode 的自由尺寸）
   let rpWidth = Number(localStorage.getItem('rpWidth')) || 420;
   let rpResizing = false;
@@ -777,6 +788,7 @@
     try {
       const s = await webApi('/api/browser/state', { cache: 'no-store' });
       webTabs = s.tabs || [];
+      webMode = s.mode || 'headless';
       webDialog = s.dialog || null;
       if (!keepActive || !webTabs.some((t) => t.id === webActiveId)) {
         webActiveId = webTabs.length ? webTabs[webTabs.length - 1].id : '';
@@ -805,7 +817,8 @@
     }).catch(() => {});
   }
 
-  // 面板不看了（切走页签/关面板）：通知后端停帧流、放后台页去挂起
+  // 面板不看了（切走页签/关面板）：通知后端停帧流、放后台页去挂起；
+  // P22 原生托管下空白页（about:blank）也通知隐藏——壳里那个 webview 要让位给空态引导
   function webNotifyHidden() {
     webApi('/api/browser/activate', {
       method: 'POST',
@@ -813,13 +826,14 @@
       body: JSON.stringify({ id: '' }),
     }).catch(() => {});
   }
-  $: if (rpTab !== 'web' || !rightPanelOpen) webNotifyHidden();
+  $: if (rpTab !== 'web' || !rightPanelOpen || (webNative && !webShowShot)) webNotifyHidden();
 
-  // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）
+  // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
+  // P22 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销
   let webFrameTimer = null;
-  $: if (rpTab === 'web' && rightPanelOpen && webShowShot && !webFrameTimer) {
+  $: if (rpTab === 'web' && rightPanelOpen && webShowShot && !webNative && !webFrameTimer) {
     webFrameTimer = setInterval(() => { webShotT += 1; }, 600);
-  } else if ((rpTab !== 'web' || !rightPanelOpen || !webShowShot) && webFrameTimer) {
+  } else if ((rpTab !== 'web' || !rightPanelOpen || !webShowShot || webNative) && webFrameTimer) {
     clearInterval(webFrameTimer);
     webFrameTimer = null;
   }
@@ -851,25 +865,31 @@
     return 'https://' + s;
   }
 
-  // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）
+  // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）。
+  // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域
   let webViewportTimer = null;
-  let webViewportKey = ''; // 已应用的「标签|宽x高」，防止重复请求打爆 CDP actor
+  let webViewportKey = ''; // 已应用的「标签|x,y|宽x高」，防止重复请求打爆 CDP actor
   function webQueueViewport() {
     clearTimeout(webViewportTimer);
     webViewportTimer = setTimeout(webSyncViewport, 350);
   }
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
-    if (!webBodyW || !webBodyH) return;
-    const w = Math.max(320, Math.min(1600, Math.round(webBodyW)));
-    const h = Math.max(400, Math.min(2400, Math.round(webBodyH)));
-    const key = webActive.id + '|' + w + 'x' + h;
+    const el = webBodyEl;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const w = Math.max(320, Math.min(1600, Math.round(r.width)));
+    const h = Math.max(400, Math.min(2400, Math.round(r.height)));
+    if (!w || !h) return;
+    const x = Math.round(r.left);
+    const y = Math.round(r.top);
+    const key = webActive.id + '|' + x + ',' + y + '|' + w + 'x' + h;
     if (key === webViewportKey) return;
     webViewportKey = key;
     webApi('/api/browser/viewport', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: webActive.id, w, h }),
+      body: JSON.stringify({ id: webActive.id, x, y, w, h }),
     })
       .then(() => {
         webShotT += 1;
@@ -4244,6 +4264,9 @@
                   if (e.key === 'Enter') { e.preventDefault(); webGo(); }
                 }}
               />
+              {#if webNative && webActive && webActive.loading}
+                <span class="web-native-loading" title="页面加载中">●</span>
+              {/if}
               <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
               <button class="web-nav" title="更多" on:click={() => (webMenuOpen = !webMenuOpen)}>
                 <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
@@ -4253,9 +4276,16 @@
                 <div class="web-menu-backdrop" on:click={() => (webMenuOpen = false)}></div>
                 <div class="web-menu">
                   <button on:click={() => webMenuAction('open-external')}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/></svg>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
                   </button>
+                  {#if webNative}
+                    <!-- P22：壳里的 child webview 能开真 DevTools（无头时代做不到） -->
+                    <button on:click={() => { webMenuOpen = false; webMenuAction('devtools'); }}>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
+                      开发者工具
+                    </button>
+                  {/if}
                   <button on:click={() => { webMenuOpen = false; dbgOpen = true; }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
                     agent 调试
@@ -4276,13 +4306,17 @@
                 <button class="btn ghost" on:click={() => webDialogAction(false)}>取消</button>
               </div>
             {/if}
-            <div class="web-body" bind:clientWidth={webBodyW} bind:clientHeight={webBodyH}>
+            <div class="web-body" bind:this={webBodyEl} bind:clientWidth={webBodyW} bind:clientHeight={webBodyH}>
               {#if !webShowShot}
                 <div class="web-empty">
                   <svg class="web-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.1 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.1-3.9-8.5s1.3-6.2 3.9-8.5Z"/></svg>
                   <div class="web-empty-title">网页</div>
                   <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
                 </div>
+              {:else if webNative}
+                <!-- P22：壳窗口里的 child webview 就浮在这块区域上（原生 HWND 盖在 Svelte 之上），
+                     这里只留占位——点击/滚动/输入全部走真实网页，不再坐标回传 -->
+                <div class="web-native" aria-hidden="true"></div>
               {:else}
                 {#if webBusy || (webActive && webActive.loading)}<div class="web-loading">加载中…</div>{/if}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
@@ -6558,6 +6592,22 @@
     display: block;
     cursor: pointer;
     user-select: none;
+  }
+  /* P22：壳里 child webview 的占位区（原生 HWND 盖在这块上面，这里只是撑出尺寸） */
+  .web-native {
+    position: absolute;
+    inset: 0;
+    cursor: default;
+  }
+  .web-native-loading {
+    color: var(--g-accent, #6cf);
+    font-size: 9px;
+    line-height: 1;
+    animation: web-pulse 1s ease-in-out infinite;
+  }
+  @keyframes web-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
   }
   .web-shot.busy {
     opacity: 0.6;

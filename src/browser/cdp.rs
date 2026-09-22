@@ -33,6 +33,9 @@ pub struct Cdp {
     events: broadcast::Sender<(String, Value)>,
     /// 隔离世界 executionContextId 缓存（world 名 → contextId；导航销毁后重建）。
     worlds: Arc<Mutex<HashMap<String, i64>>>,
+    /// 连接是否还活着（actor 退出即假——浏览器进程死了/壳重启后旧连接全断）。
+    /// 端口会复生（壳重启后 9223 又起来了），光探端口分不出会话里的 tab 是不是僵尸。
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Cdp {
@@ -45,6 +48,8 @@ impl Cdp {
         let (tx, mut rx) = mpsc::unbounded_channel::<ToActor>();
         let (ev_tx, _rx) = broadcast::channel::<(String, Value)>(EVENT_CHANNEL_CAP);
         let ev_in_actor = ev_tx.clone();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive_in_actor = alive.clone();
 
         tokio::spawn(async move {
             let mut next_id: u64 = 1;
@@ -58,6 +63,7 @@ impl Cdp {
                 oneshot::Sender<Result<Value, String>>,
             >,
                       waiters: &mut Vec<(String, oneshot::Sender<Result<Value, String>>)>| {
+                alive_in_actor.store(false, std::sync::atomic::Ordering::Relaxed);
                 for (_, slot) in pending.drain() {
                     let _ = slot.send(Err("CDP 连接已断开（浏览器退出或标签页崩溃）".to_string()));
                 }
@@ -126,7 +132,7 @@ impl Cdp {
             }
         });
 
-        Ok(Self { tx, events: ev_tx, worlds: Arc::new(Mutex::new(HashMap::new())) })
+        Ok(Self { tx, events: ev_tx, worlds: Arc::new(Mutex::new(HashMap::new())), alive })
     }
 
     /// 订阅全部 CDP 事件（(方法名, params) 流）。慢消费者会拿到 Lagged 并丢中间帧——
@@ -182,8 +188,10 @@ impl Cdp {
     }
 
     /// 在页面的**隔离世界**里执行表达式（移植自 ZCode：worldName 隔离 + contextId 求值）。
-    /// contextId 按 world 名缓存；页面导航会销毁执行上下文，此时清缓存重建一次再试。
+    /// contextId 按 world 名缓存；页面导航会销毁执行上下文——导航事件会主动清缓存
+    /// （见 spawn_tab_events），这里再兜一层：调用报错也清缓存重试一次。
     pub async fn evaluate_in_isolated_world(&self, world: &str, expression: &str) -> Result<Value, String> {
+        let mut last_err = String::new();
         for attempt in 0..2 {
             let context_id = match self.ensure_world_context(world).await {
                 Ok(id) => id,
@@ -194,7 +202,7 @@ impl Cdp {
                     return Err(e);
                 }
             };
-            let res = self
+            let res = match self
                 .call(
                     "Runtime.evaluate",
                     json!({
@@ -204,7 +212,20 @@ impl Cdp {
                         "returnByValue": true,
                     }),
                 )
-                .await?;
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    // 页面刚导航过（用户点链接等不走 navigate_tab 的路径）：context 已销毁，
+                    // 清缓存重试一次
+                    last_err = e;
+                    self.invalidate_worlds();
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(last_err);
+                }
+            };
             if res.get("exceptionDetails").is_some() {
                 let exc = res.get("exceptionDetails").cloned().unwrap_or(Value::Null);
                 let desc = exc
@@ -221,7 +242,7 @@ impl Cdp {
                 .cloned()
                 .ok_or_else(|| "隔离世界求值结果缺 value".to_string());
         }
-        Err("隔离世界求值失败".to_string())
+        Err(if last_err.is_empty() { "隔离世界求值失败".to_string() } else { last_err })
     }
 
     /// 拿（或重建）隔离世界的 executionContextId。
@@ -259,10 +280,15 @@ impl Cdp {
             m.clear();
         }
     }
+
+    /// 连接是否还活着（actor 退出即假）。
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl Clone for Cdp {
     fn clone(&self) -> Self {
-        Self { tx: self.tx.clone(), events: self.events.clone(), worlds: self.worlds.clone() }
+        Self { tx: self.tx.clone(), events: self.events.clone(), worlds: self.worlds.clone(), alive: self.alive.clone() }
     }
 }

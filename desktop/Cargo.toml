@@ -8,7 +8,8 @@ description = "Agent 桌面壳（P13）：窗口 + 托盘 + 服务保活，WebVi
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# unstable：P22 child webview（add_child）所需；devtools：child webview 开真 DevTools
+tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
 serde_json = "1"
 
 [profile.release]
