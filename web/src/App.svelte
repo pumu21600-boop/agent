@@ -726,8 +726,11 @@
   let termInput = '';
   let termRunning = false;
   let termOutEl;
-  let rightPanelOpen = false;
-  let rpTab = 'artifacts';
+  // 右侧面板开合与页签持久化（跟 rpWidth/侧栏宽一个 pattern）——否则每次重开 App 面板
+  // 都是关着的，内置浏览器得点两级才找得到（用户截图反馈过"浏览器不在侧边栏"）。
+  // 首启默认停在「网页」：内置浏览器是该面板最需要被看见的能力。
+  let rightPanelOpen = localStorage.getItem('rpOpen') === null ? true : localStorage.getItem('rpOpen') === '1';
+  let rpTab = localStorage.getItem('rpTab') || 'web';
   let rpFiles = [];
   let rpLoading = false;
   let rpPreviewPath = '';
@@ -780,6 +783,13 @@
   }
 
   $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
+  // 右侧面板开合/页签持久化（换任何路径改这两个状态都会落盘）
+  $: {
+    try {
+      localStorage.setItem('rpOpen', rightPanelOpen ? '1' : '0');
+      localStorage.setItem('rpTab', rpTab);
+    } catch {}
+  }
   // 空白页（about:blank）显示空态引导；有地址就渲染截图
   $: webShowShot = !!(webActive && webActive.url && webActive.url !== 'about:blank');
   $: if (rpTab === 'web' && webBodyW && webActive) webQueueViewport();
@@ -1148,8 +1158,9 @@
   }
 
   function openRightPanel() {
-    rpTab = 'artifacts';
-    loadArtifacts();
+    // 不再强制跳「产物」——记住用户上次停在哪个页签（首启默认「网页」）
+    if (rpTab === 'artifacts') loadArtifacts();
+    if (rpTab === 'web') loadWebState();
   }
 
   // —— 改动条：钉在输入框上方。实时会话用消息流里的检查点；
