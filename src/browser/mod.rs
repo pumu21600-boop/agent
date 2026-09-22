@@ -503,8 +503,8 @@ async fn shell_create_target(session: &BrowserSession) -> Result<(String, String
     }
 }
 
-/// 当前 CDP 端口上全部 page target id（发现基线用；端点不可用时返回空）。
-async fn all_page_target_ids(port: u16) -> Vec<String> {
+/// 拉一次壳 CDP 端点的 page target 列表（端点不可用/解析失败返回空）。
+async fn fetch_page_targets(port: u16) -> Vec<Value> {
     let Ok(client) = dev_client() else { return Vec::new() };
     let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await else {
         return Vec::new();
@@ -515,71 +515,65 @@ async fn all_page_target_ids(port: u16) -> Vec<String> {
         .map(|a| {
             a.iter()
                 .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-                .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+                .cloned()
                 .collect()
         })
         .unwrap_or_default()
 }
 
+/// 轮询 page target 列表直到 `until` 满足或超时，返回最后一次看到的列表。
+async fn poll_page_targets(port: u16, budget: Duration, until: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let list = fetch_page_targets(port).await;
+        if until(&list) {
+            return list;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return list;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
+/// 当前 CDP 端口上全部 page target id（发现基线用；端点不可用时返回空）。
+async fn all_page_target_ids(port: u16) -> Vec<String> {
+    fetch_page_targets(port)
+        .await
+        .iter()
+        .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
 /// 等「非壳内部」的 page target 全部消失（reset 后旧 webview 异步销毁，见 shell_launch）。
 /// 只剩壳自己的 UI/DevTools 窗口即算稳了；超时也放行（不阻塞启动）。
 async fn wait_targets_settled(port: u16, budget: Duration) {
-    let deadline = tokio::time::Instant::now() + budget;
-    while tokio::time::Instant::now() < deadline {
-        let client = match dev_client() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(text) = resp.text().await else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let pending = v
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-                    .filter(|t| !is_shell_internal_target(t))
-                    .count()
-            })
-            .unwrap_or(0);
-        if pending == 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    poll_page_targets(port, budget, |list| {
+        list.iter().filter(|t| !is_shell_internal_target(t)).count() == 0
+    })
+    .await;
 }
 
 /// 轮询 /json/list 找新 page target（壳的 UI 自己的 webview 与 DevTools 窗口要排除）。
 async fn wait_new_page_target(port: u16, known: &[String], budget: Duration) -> Result<(String, String), String> {
-    let client = dev_client()?;
-    let deadline = tokio::time::Instant::now() + budget;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/json/list")).send().await
-            && let Ok(text) = resp.text().await
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-            && let Some(targets) = v.as_array()
-            && let Some(page) = targets.iter().find(|t| {
-                t.get("type").and_then(Value::as_str) == Some("page")
-                    && !known.iter().any(|k| Some(k.as_str()) == t.get("id").and_then(Value::as_str))
-                    && !is_shell_internal_target(t)
-            })
-            && let Some(id) = page.get("id").and_then(Value::as_str)
-            && let Some(ws) = page.get("webSocketDebuggerUrl").and_then(Value::as_str)
-        {
-            return Ok((id.to_string(), ws.to_string()));
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-    Err("8s 内没出现新的 page target".into())
+    let list = poll_page_targets(port, budget, |list| {
+        list.iter().any(|t| {
+            !known.iter().any(|k| Some(k.as_str()) == t.get("id").and_then(Value::as_str))
+                && !is_shell_internal_target(t)
+        })
+    })
+    .await;
+    list.iter()
+        .find(|t| {
+            !known.iter().any(|k| Some(k.as_str()) == t.get("id").and_then(Value::as_str))
+                && !is_shell_internal_target(t)
+        })
+        .and_then(|t| {
+            let id = t.get("id").and_then(Value::as_str)?;
+            let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str)?;
+            Some((id.to_string(), ws.to_string()))
+        })
+        .ok_or_else(|| format!("{budget:?} 内没出现新的 page target"))
 }
 
 /// 壳自己的 UI webview（加载 5173 的那个）与 DevTools 窗口——都不是浏览器标签页。

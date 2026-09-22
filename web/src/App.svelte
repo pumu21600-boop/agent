@@ -752,6 +752,17 @@
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
   let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具 / agent 调试）
+  // 原生模式下下拉弹层会被 child webview 盖住（HWND 永远在网页内容之上，弹层正好
+  // 往 body 区里弹）——菜单开着的时候先让壳把 webview 藏了，关掉再恢复
+  function webToggleMenu() {
+    webMenuOpen = !webMenuOpen;
+    if (webNative && webActiveId) webActivate(webMenuOpen ? '' : webActiveId);
+  }
+  function webCloseMenu() {
+    if (!webMenuOpen) return;
+    webMenuOpen = false;
+    if (webNative && webActiveId) webActivate(webActiveId);
+  }
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
   function inTauriShell() {
@@ -943,7 +954,7 @@
     };
   }
   function webMenuAction(kind) {
-    webMenuOpen = false;
+    webCloseMenu();
     if (!webActive) return;
     webApi(`/api/browser/${kind}`, {
       method: 'POST',
@@ -4279,12 +4290,12 @@
                 <span class="web-native-loading" title="页面加载中">●</span>
               {/if}
               <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
-              <button class="web-nav" title="更多" on:click={() => (webMenuOpen = !webMenuOpen)}>
+              <button class="web-nav" title="更多" on:click={webToggleMenu}>
                 <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
               </button>
               {#if webMenuOpen}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
-                <div class="web-menu-backdrop" on:click={() => (webMenuOpen = false)}></div>
+                <div class="web-menu-backdrop" on:click={webCloseMenu}></div>
                 <div class="web-menu">
                   <button on:click={() => webMenuAction('open-external')}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
@@ -4292,12 +4303,12 @@
                   </button>
                   {#if webNative}
                     <!-- P22：壳里的 child webview 能开真 DevTools（无头时代做不到） -->
-                    <button on:click={() => { webMenuOpen = false; webMenuAction('devtools'); }}>
+                    <button on:click={() => { webCloseMenu(); webMenuAction('devtools'); }}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
                       开发者工具
                     </button>
                   {/if}
-                  <button on:click={() => { webMenuOpen = false; dbgOpen = true; }}>
+                  <button on:click={() => { webCloseMenu(); dbgOpen = true; }}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/></svg>
                     agent 调试
                   </button>

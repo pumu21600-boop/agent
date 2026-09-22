@@ -212,23 +212,39 @@ fn spawn_ctl_client(app: tauri::AppHandle) {
     });
 }
 
+/// 控制指令的取值助手（省掉每个分支里重复的 op.get().and_then().unwrap_or()）。
+fn op_str<'a>(op: &'a Value, key: &str, default: &'a str) -> &'a str {
+    op.get(key).and_then(Value::as_str).unwrap_or(default)
+}
+fn op_f64(op: &Value, key: &str, default: f64) -> f64 {
+    op.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+fn op_bool(op: &Value, key: &str, default: bool) -> bool {
+    op.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+/// 尺寸字段（宽高有下限，防 0 尺寸的 webview）。
+fn op_size(op: &Value) -> (f64, f64) {
+    (
+        op_f64(op, "w", 900.0).max(64.0),
+        op_f64(op, "h", 600.0).max(64.0),
+    )
+}
+
 /// 执行一条控制指令。create 由本（非主）线程发起：add_child 内部
 /// run_on_main_thread + recv，在主线程调用会死锁。
 fn dispatch(app: &tauri::AppHandle, op: &Value) {
-    let kind = op.get("op").and_then(Value::as_str).unwrap_or("");
-    let label = op.get("label").and_then(Value::as_str).unwrap_or("").to_string();
+    let kind = op_str(op, "op", "");
+    let label = op_str(op, "label", "").to_string();
     if !matches!(kind, "hello" | "reset") && label.is_empty() {
         return;
     }
     let host = app.state::<WebviewHost>();
     match kind {
         "create" => {
-            let url = op.get("url").and_then(Value::as_str).unwrap_or("about:blank");
-            let x = op.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-            let y = op.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-            let w = op.get("w").and_then(Value::as_f64).unwrap_or(900.0).max(64.0);
-            let h = op.get("h").and_then(Value::as_f64).unwrap_or(600.0).max(64.0);
-            let visible = op.get("visible").and_then(Value::as_bool).unwrap_or(false);
+            let url = op_str(op, "url", "about:blank");
+            let (x, y) = (op_f64(op, "x", 0.0), op_f64(op, "y", 0.0));
+            let (w, h) = op_size(op);
+            let visible = op_bool(op, "visible", false);
             let Some(win) = app.get_window("main") else {
                 slog("create 失败：没有 main 窗口");
                 return;
@@ -277,10 +293,8 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             }
         }
         "rect" => {
-            let x = op.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-            let y = op.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-            let w = op.get("w").and_then(Value::as_f64).unwrap_or(900.0).max(64.0);
-            let h = op.get("h").and_then(Value::as_f64).unwrap_or(600.0).max(64.0);
+            let (x, y) = (op_f64(op, "x", 0.0), op_f64(op, "y", 0.0));
+            let (w, h) = op_size(op);
             if let Some(wv) = host.get(&label) {
                 let _ = wv.set_position(LogicalPosition::new(x, y));
                 let _ = wv.set_size(LogicalSize::new(w, h));
@@ -288,17 +302,17 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             }
         }
         "visible" => {
-            let visible = op.get("visible").and_then(Value::as_bool).unwrap_or(false);
+            let visible = op_bool(op, "visible", false);
             if let Some(wv) = host.get(&label) {
-                let r = if visible { wv.show() } else { wv.hide() };
-                slog(&format!("visible {label}={visible} ok={}", r.is_ok()));
-                if let Err(e) = r {
+                if let Err(e) = if visible { wv.show() } else { wv.hide() } {
                     slog(&format!("visible {label}={visible} 失败: {e}"));
+                } else {
+                    slog(&format!("visible {label}={visible} ok"));
                 }
             }
         }
         "devtools" => {
-            let open = op.get("open").and_then(Value::as_bool).unwrap_or(true);
+            let open = op_bool(op, "open", true);
             if let Some(wv) = host.get(&label) {
                 if open {
                     wv.open_devtools();

@@ -54,6 +54,9 @@ pub fn disable() {
 }
 
 /// 起控制通道监听（服务启动时调一次；端口被占只记日志，不影响主服务）。
+///
+/// 单连接语义：`slot()` 的 compare-and-set 在锁内完成——已有时新连接直接放掉，
+/// 不会出现两个壳互相顶替；读任务断开时注销，壳重连自然恢复。
 pub fn start_listener() {
     tokio::spawn(async move {
         let listener = match TcpListener::bind(("127.0.0.1", SHELL_CTL_PORT)).await {
@@ -68,19 +71,11 @@ pub fn start_listener() {
         crate::observability::debug(&format!("[shell] 控制通道监听 127.0.0.1:{SHELL_CTL_PORT}"));
         loop {
             let Ok((sock, _)) = listener.accept().await else { continue };
-            // 单连接：已有时直接放掉新的（防两个壳互相顶替）
-            {
-                let g = slot().lock().unwrap_or_else(|e| e.into_inner());
-                if g.is_some() {
-                    drop(g);
-                    continue;
-                }
-            }
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
             {
                 let mut g = slot().lock().unwrap_or_else(|e| e.into_inner());
                 if g.is_some() {
-                    continue; // 竞态：上锁前别的连接刚进来
+                    continue; // 已有一个壳连着，放掉新的（防互相顶替）
                 }
                 *g = Some(Conn { tx });
             }
@@ -106,10 +101,7 @@ pub fn start_listener() {
                             if let Ok(v) = serde_json::from_str::<Value>(line.trim())
                                 && v.get("op").and_then(Value::as_str) == Some("hello")
                             {
-                                crate::observability::debug(&format!(
-                                    "[shell] 壳 hello: {}",
-                                    line.trim()
-                                ));
+                                crate::observability::debug(&format!("[shell] 壳 hello: {}", line.trim()));
                             }
                         }
                         Err(_) => break,
