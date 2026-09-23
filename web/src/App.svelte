@@ -847,42 +847,35 @@
   }
   $: if (rpTab !== 'web' || !rightPanelOpen || (webNative && !webShowShot)) webNotifyHidden();
 
-  // P20.4：agent 操作内置浏览器时自动唤起右侧面板（用户要求「在内置浏览器操作的时候
-  // agent 需要自动唤起右侧边栏」）。面板没在看网页时每 2s 探一次 state，agent 最近
-  // 10s 内碰过浏览器就开面板、切到「网页」、并选中 agent 正在操作的那个页。
+  // P20.4：agent 操作内置浏览器时，面板自动唤起并**跟随 agent 正在操作的页**
+  // （用户要求「agent 操作时自动唤起右侧边栏」+ 预期「面板跟着 agent 走」）。
+  // agent 自己的切页不抢用户视图（服务端 agent_activate 不写 visible_tab），但界面要
+  // 能看见 agent 在哪儿干活——常驻每 2s 探一次，agent 最近 10s 有动作就跟随过去。
   let webAgentWatch = null;
-  let webAgentSeen = 0; // 已响应过的 agent 触碰时间戳（防自动开的面板被用户关上又立刻弹开）
-  function webStopAgentWatch() {
-    if (webAgentWatch) {
-      clearInterval(webAgentWatch);
-      webAgentWatch = null;
-    }
-  }
+  let webAgentSeen = 0; // 已响应过的 agent 触碰时间戳（防同一动作反复弹跳）
   function webStartAgentWatch() {
     if (webAgentWatch) return;
     webAgentWatch = setInterval(async () => {
       try {
         const s = await webApi('/api/browser/state', { cache: 'no-store' });
         if (!s.agentTouched || Date.now() - s.agentTouched > 10000) return;
-        if (s.agentTouched <= webAgentSeen) return; // 这次触碰已响应过，别再弹
+        if (s.agentTouched <= webAgentSeen) return; // 这次触碰已响应过
+        webAgentSeen = s.agentTouched;
         rightPanelOpen = true;
         if (rpTab !== 'web') rpTab = 'web';
-        if (s.tabs && s.tabs.length) {
-          // 优先 agent 正在操作的那个页（用户要的就是看 agent 干活），其次面板可见页
-          const vis = s.tabs.find((t) => t.agent) || s.tabs.find((t) => t.visible) || s.tabs[s.tabs.length - 1];
-          webActiveId = vis.id;
-          const act = s.tabs.find((t) => t.id === webActiveId);
+        if (s.agentTab && s.agentTab !== webActiveId && (s.tabs || []).some((t) => t.id === s.agentTab)) {
+          webActiveId = s.agentTab;
+          const act = (s.tabs || []).find((t) => t.id === webActiveId);
           if (act && document.activeElement !== document.querySelector('.web-address')) {
             webAddress = act.url === 'about:blank' ? '' : act.url || '';
           }
+          webActivate(webActiveId);
         }
-        webAgentSeen = s.agentTouched;
-        webStopAgentWatch();
       } catch {}
     }, 2000);
   }
-  $: if (rpTab === 'web' && rightPanelOpen) webStopAgentWatch();
-  $: if (rpTab !== 'web' || !rightPanelOpen) webStartAgentWatch();
+  webStartAgentWatch();
+
 
   // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
   // P22 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销

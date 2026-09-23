@@ -224,6 +224,10 @@ struct BrowserSession {
     /// 内置浏览器时自动唤起右侧边栏」）。与面板自己的动作分开记：面板的显隐只认
     /// panel_showing，agent 的触碰只用来唤醒界面。
     agent_touched_ms: AtomicU64,
+    /// agent 工具当前操作的页——面板据此跟随（用户预期「agent 干活时面板跟着走」）。
+    /// 与 visible_tab（面板自己的视图）分开：agent 切页不再抢用户的视图，但界面要
+    /// 能看见 agent 在哪儿干活。
+    agent_tab_id: std::sync::Mutex<Option<String>>,
 }
 
 impl BrowserSession {
@@ -241,6 +245,13 @@ impl BrowserSession {
     }
     fn clear_visible(&self) {
         *self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// 记 agent 当前操作的页（面板据此跟随；agent 的切页不抢面板自己的视图）。
+    fn set_agent_tab(&self, id: &str) {
+        *self.agent_tab_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+    }
+    fn agent_tab_now(&self) -> Option<String> {
+        self.agent_tab_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     /// 面板是否正在展示网页（壳里 webview 显隐的唯一依据）。
     fn showing(&self) -> bool {
@@ -626,10 +637,13 @@ async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, String> {
     {
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(t) = tabs.iter().find(|t| t.agent) {
+            session.set_agent_tab(&t.id);
             return Ok(t.clone());
         }
     }
-    create_tab(session, "about:blank", true).await
+    let tab = create_tab(session, "about:blank", true).await?;
+    session.set_agent_tab(&tab.id);
+    Ok(tab)
 }
 
 /// 按 id 取标签页。
@@ -769,6 +783,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
                     agent_touched_ms: AtomicU64::new(0),
+                    agent_tab_id: std::sync::Mutex::new(None),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -798,6 +813,7 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
                     agent_touched_ms: AtomicU64::new(0),
+                    agent_tab_id: std::sync::Mutex::new(None),
     });
     // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
     // 免得残留 target 干扰发现、白白常驻
@@ -947,8 +963,17 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
     if session.mode != HostMode::Shell {
         return;
     }
-    let rect_known = session.last_rect.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-    let want_label: Option<String> = if session.showing() && rect_known {
+    // 矩形合理性门槛：面板内容区永远在页签栏+工具栏下方（实测 y≈125），y<40 只可能是
+    // 量错了元素/量早了——这种矩形下显示 webview 会把它盖到面板 chrome 上（用户看到的
+    // 就是"右侧边栏没了、页面从窗口顶开始"，且被盖住的 chrome 点不到）。宁可先藏着等
+    // 下一次同步，也不能错位显示。
+    let rect_sane = session
+        .last_rect
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|(_, y, w, h)| y >= 40 && w >= 200 && h >= 200)
+        .unwrap_or(false);
+    let want_label: Option<String> = if session.showing() && rect_sane {
         match visible.as_deref() {
             Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
             None => None,
@@ -1858,6 +1883,7 @@ pub async fn command(args: &str, max_chars: usize) -> Result<String, String> {
 /// 点击没反应——真机反馈"AI 点完之后我就点不了网站了"）。无头时代写它只为驱动
 /// screencast，壳里这套语义已经不成立；agent 的页留在 tab 栏里，用户想看去点即可。
 fn agent_activate(session: &Arc<BrowserSession>, id: &str) {
+    session.set_agent_tab(id);
     if session.mode != HostMode::Shell {
         session.set_visible(id);
     }
@@ -2517,6 +2543,7 @@ pub async fn panel_state() -> Value {
         "dialog": dialog,
         // agent 工具最近一次碰浏览器的时间戳（0 = 没有过）——前端据此自动唤起面板
         "agentTouched": s.agent_touched_ms.load(Ordering::Relaxed),
+        "agentTab": s.agent_tab_now(),
     })
 }
 
