@@ -818,30 +818,10 @@ async fn ensure_session() -> Result<Arc<BrowserSession>, String> {
         if browser_alive(s.port).await {
             // 端口活着不代表会话里的 tab 还活着：壳重启后 9223 复生，但旧连接的
             // actor 早退了（僵尸 tab，title/url 全空）。摘掉死 tab；全死就重建会话。
-            let dead: Vec<String> = s
-                .tabs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .filter(|t| !t.cdp.is_alive())
-                .map(|t| t.id.clone())
-                .collect();
-            if !dead.is_empty() {
-                for id in &dead {
-                    close_tab(s, id).await;
-                }
-                let empty = s.tabs.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
-                if empty {
-                    log("browser.stale", json!({ "reason": "tabs-dead" }));
-                    if let Some(dead_session) = guard.take() {
-                        kill_child(&dead_session);
-                    }
-                    let s = launch().await?;
-                    *guard = Some(s.clone());
-                    return Ok(s);
-                }
+            if reap_dead_tabs(&mut guard).await? {
+                return Ok(guard.as_ref().unwrap().clone());
             }
-            return Ok(s.clone());
+            return Ok(guard.as_ref().unwrap().clone());
         }
         log("browser.stale", json!({}));
         if let Some(dead) = guard.take() {
@@ -851,6 +831,39 @@ async fn ensure_session() -> Result<Arc<BrowserSession>, String> {
     let s = launch().await?;
     *guard = Some(s.clone());
     Ok(s)
+}
+
+/// 摘掉 CDP 已断的 tab（壳重启/浏览器进程死了就会这样），全死就连会话一起重建。
+/// **读路径（panel_state / current_session）也必须调**：只挂在 ensure_session 上的话，
+/// 面板一打开拿到的就是僵尸 tab 列表（title/url 全空），地址栏回车打到死连接上直接
+/// 「CDP actor 已退出」——真机复现过。返回 true = 调用方手里的 guard 已 refreshes。
+async fn reap_dead_tabs(guard: &mut Option<Arc<BrowserSession>>) -> Result<bool, String> {
+    let Some(s) = guard.as_ref() else { return Ok(false) };
+    let dead: Vec<String> = s
+        .tabs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|t| !t.cdp.is_alive())
+        .map(|t| t.id.clone())
+        .collect();
+    if dead.is_empty() {
+        return Ok(false);
+    }
+    for id in &dead {
+        close_tab(s, id).await;
+    }
+    let empty = s.tabs.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    if empty {
+        log("browser.stale", json!({ "reason": "tabs-dead" }));
+        if let Some(dead_session) = guard.take() {
+            kill_child(&dead_session);
+        }
+        let s = launch().await?;
+        *guard = Some(s);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// 空转收割 + 驻留巡检 + screencast 同步（5s 一拍）。
@@ -1616,7 +1629,18 @@ async fn click_and_settle(
 // —— 对工具层暴露的操作（统一命令分发；P21）——
 
 async fn current_session() -> Result<Arc<BrowserSession>, String> {
-    let guard = SESSION.lock().await;
+    let mut guard = SESSION.lock().await;
+    // 先自愈：壳重启后旧会话里的 tab 可能全死了，不清就会把僵尸 tab 给出去
+    if let Some(s) = guard.as_ref() {
+        if browser_alive(s.port).await {
+            let _ = reap_dead_tabs(&mut guard).await;
+        } else {
+            log("browser.stale", json!({}));
+            if let Some(dead) = guard.take() {
+                kill_child(&dead);
+            }
+        }
+    }
     match guard.as_ref() {
         Some(s) => Ok(s.clone()),
         None => Err("浏览器未打开：先打开一个网页".into()),
@@ -2417,13 +2441,24 @@ fn check_panel_url(url: &str) -> Result<(), BrowserError> {
 
 /// 面板状态：浏览器是否在跑 + 全部标签页（含可见/加载/挂起）+ 可见页弹窗。
 pub async fn panel_state() -> Value {
-    let guard = SESSION.lock().await;
+    let mut guard = SESSION.lock().await;
     let Some(s) = guard.as_ref() else {
         return json!({ "running": false, "tabs": [], "dialog": null, "mode": "headless" });
     };
+    let mode = mode_name(s.mode);
     if !browser_alive(s.port).await {
-        return json!({ "running": false, "tabs": [], "dialog": null, "mode": mode_name(s.mode) });
+        // 端口没了（壳关了/浏览器进程死了）：会话整体作废——下次动作会自动重建
+        log("browser.stale", json!({}));
+        if let Some(dead) = guard.take() {
+            kill_child(&dead);
+        }
+        return json!({ "running": false, "tabs": [], "dialog": null, "mode": mode });
     }
+    // 端口活着也要摘僵尸 tab：壳重启后 9223 复生，但旧连接的 actor 早退了
+    let _ = reap_dead_tabs(&mut guard).await;
+    let Some(s) = guard.as_ref() else {
+        return json!({ "running": false, "tabs": [], "dialog": null, "mode": "headless" });
+    };
     let mut briefs = s.tab_briefs().await;
     let visible = s.visible();
     // loading / dialog 只对可见页细算（其余页不值得花 CDP 往返）

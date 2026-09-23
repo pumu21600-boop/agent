@@ -1009,8 +1009,9 @@
     webBusy = true;
     webError = '';
     try {
-      if (!webActive) {
-        // 没有标签页：地址栏回车 = 自动开新页并导航
+      // 没有标签页、或当前是空白页（含壳重启后连接已断的失效页）时，直接开新页导航：
+      // 空白页没什么可丢的，也顺带绕开「往死连接上导航 → CDP actor 已退出」
+      if (!webActive || !webActive.url || webActive.url === 'about:blank') {
         const r = await webApi('/api/browser/new', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
