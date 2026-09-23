@@ -40,12 +40,14 @@ pub fn check_api_version(manifest: &Value) -> Result<u32, String> {
     }
 }
 
-/// 解析清单声明的来源；未声明/不合法时按所在位置取默认（应用根=随包，工作区=用户）。
+/// 解析清单声明的来源；未声明/不合法时按所在位置取默认。
+/// **P21 红线3 收口**：只有应用根内置位（`app`）默认 built_in，其余位置（工作区 ui-ext、
+/// plugins/ 自装目录）一律默认 user——「不声明 source」不能成为绕过第三方验签的后门。
 pub fn origin_of(manifest: &Value, location: &str) -> String {
     match manifest.get("source").and_then(Value::as_str) {
         Some(s @ (ORIGIN_BUILT_IN | ORIGIN_USER | ORIGIN_MODEL)) => s.to_string(),
-        _ if location == "workspace" => ORIGIN_USER.to_string(),
-        _ => ORIGIN_BUILT_IN.to_string(),
+        _ if location == "app" => ORIGIN_BUILT_IN.to_string(),
+        _ => ORIGIN_USER.to_string(),
     }
 }
 

@@ -32,6 +32,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::plugin::{contract, ToolBrief};
+use crate::plugin::trust;
 
 /// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "ui-ext";
@@ -70,6 +71,12 @@ pub struct UiExt {
     pub permissions: Vec<String>,
     /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
     pub tools: Vec<ToolBrief>,
+    /// P21 红线3：验签键（`ui-ext:<name>`；draft 为空串）
+    pub trust_key: String,
+    /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
+    pub digest: String,
+    /// P21 红线3：是否可信任（内置/已 pin/模型自产 = true；未 pin 或内容已变 = false）
+    pub trusted: bool,
 }
 
 /// 扫描全部插件（内置 + 当前工作区 + 内存 draft；工作区同名覆盖内置，顺序稳定）。
@@ -123,6 +130,10 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
                 .collect(),
             permissions: Vec::new(),
             tools: Vec::new(),
+            // draft 是模型自产隔离区：豁免验签
+            trust_key: String::new(),
+            digest: String::new(),
+            trusted: true,
         });
     }
     out
@@ -169,6 +180,9 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         ui: Vec::new(),
         permissions: Vec::new(),
         tools: Vec::new(),
+        trust_key: String::new(),
+        digest: String::new(),
+        trusted: true,
     };
     if !safe_segment(name) {
         e.error = Some("目录名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into());
@@ -227,6 +241,29 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             })
             .map(str::to_string)
             .collect();
+    }
+    // P21 红线3：第三方插件（origin=user）先 pin 后代跑——算内容指纹、对 pin 表，
+    // 未 pin / 内容已变 → 拒载（ok=false + 人话理由 + 审计），元数据照常带回供界面提示
+    e.trust_key = trust::key_of(DIR, name);
+    if e.origin == contract::ORIGIN_USER {
+        match trust::digest_dir(dir) {
+            Ok(d) => {
+                let st = trust::state(&e.trust_key, &e.origin, &d);
+                e.digest = d;
+                e.trusted = st.trusted();
+                if !st.trusted() {
+                    trust::audit_blocked(&e.trust_key, &st, "ui.scan");
+                    e.ok = false;
+                    e.error = Some(trust::reject_reason(&st));
+                    return e;
+                }
+            }
+            Err(err) => {
+                e.ok = false;
+                e.error = Some(err);
+                return e;
+            }
+        }
     }
     // 入口必须真实存在且不出目录
     match resolve_in(dir, &e.entry) {
@@ -330,8 +367,18 @@ mod tests {
         d
     }
 
+    /// P21：给测试里的 user 来源插件 pin 指纹（与 promote 自动 pin 同路），
+    /// 否则验签门会按设计拒载。用完由调用方 install 空表清场。
+    fn pin_dir(name: &str, dir: &Path) {
+        let digest = trust::digest_dir(dir).unwrap();
+        let mut pins = std::collections::BTreeMap::new();
+        pins.insert(trust::key_of(DIR, name), digest);
+        trust::install(&pins);
+    }
+
     #[test]
     fn manifest_loaded_and_entry_checked() {
+        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmpdir("manifest");
         let d = root.join("panel");
         std::fs::create_dir_all(&d).unwrap();
@@ -342,10 +389,25 @@ mod tests {
         .unwrap();
         std::fs::write(d.join("index.html"), "<html></html>").unwrap();
         let e = load_one(&d, "panel", "workspace", &[]);
-        assert!(e.ok, "应加载成功: {e:?}");
         assert_eq!(e.title, "记忆看板");
         assert_eq!(e.version, "1.2.3");
         assert_eq!(e.source, "workspace");
+        // P21：workspace 来源 = user → 未 pin 显式拒载（元数据照常带回，界面能提示）
+        assert!(!e.ok, "未 pin 的第三方插件不加载");
+        assert!(!e.trusted);
+        assert!(e.error.as_deref().unwrap_or("").contains("信任"), "{:?}", e.error);
+        // pin 后放行
+        pin_dir("panel", &d);
+        let e = load_one(&d, "panel", "workspace", &[]);
+        assert!(e.ok, "pin 后应加载: {:?}", e.error);
+        assert!(e.trusted);
+        assert!(!e.digest.is_empty(), "user 来源应带内容指纹");
+        // 内容被改 → digest 不符 → 拒载 + 提示重新信任（红线：改动可检出）
+        std::fs::write(d.join("index.html"), "<html>改</html>").unwrap();
+        let tampered = load_one(&d, "panel", "workspace", &[]);
+        assert!(!tampered.ok);
+        assert!(tampered.error.as_deref().unwrap_or("").contains("内容已变"), "{:?}", tampered.error);
+        trust::install(&std::collections::BTreeMap::new()); // 清场
 
         // 入口不存在 → 不 ok 且带原因（不静默）
         std::fs::write(d.join("manifest.json"), r#"{"entry":"missing.html"}"#).unwrap();
@@ -357,6 +419,7 @@ mod tests {
 
     #[test]
     fn workspace_ext_shadows_builtin_with_flag_and_test_two_roots() {
+        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let app = tmpdir("shadow-app");
         let ws = tmpdir("shadow-ws");
         for (root, title) in [(&app, "内置看板"), (&ws, "工作区看板")] {
@@ -382,6 +445,10 @@ mod tests {
         let solo = out.iter().find(|e| e.name == "solo").unwrap();
         assert!(!solo.shadowed, "工作区独有（无同名内置）不该标覆盖");
         assert!(!out.iter().any(|e| e.title == "内置看板"), "被覆盖的内置项应被顶掉");
+        // 内置位（app）不验签；工作区位（user）未 pin → 显式不 ok（红线3）
+        assert!(out.iter().find(|e| e.name == "board").unwrap().origin == contract::ORIGIN_USER);
+        assert!(!out.iter().find(|e| e.name == "board").unwrap().ok, "未 pin 的第三方插件不加载");
+        trust::install(&std::collections::BTreeMap::new()); // 清场
         let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&ws);
     }

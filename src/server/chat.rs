@@ -196,8 +196,18 @@ pub(super) fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel>
     let model = c.effective_model();
     let preset = gateway::providers::find(&c.provider_id);
     let params = build_chat_params(c, preset);
-    let key = s.config_key(c).unwrap_or_default();
+    // B2 key 回落链（施工单 012）：DPAPI key > DEEPSEEK_API_KEY 环境变量。
+    // 角色/降级渠道与主渠道同一把尺子——没单独存 key 的配置靠环境变量兜底
+    // （P21 补：此前只有主渠道走这条链，budget/summary/title 渠道会「未设置 key」）
+    let key = resolve_key(s, c);
     Some(gateway::Channel::new(&base_url, &model, &key, params))
+}
+
+/// B2 key 回落链的角色/降级渠道版：本配置 DPAPI key 优先，缺失回落环境变量。
+fn resolve_key(s: &Settings, c: &crate::config::settings::Config) -> String {
+    s.config_key(c)
+        .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+        .unwrap_or_default()
 }
 
 /// 检查模型是否具备指定模态的输入能力（对齐 DSH acceptsMedia 门禁规范）
@@ -693,7 +703,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
 
                         let mut call_err = None;
                         for prompt_variant in &candidate_prompts {
-                            match gateway.complete(&vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params).await {
+                            // P21：媒体旁路调用记台账（purpose=media，归属本会话）
+                            let media_ctx = gateway::UsageCtx::aux(&session_id, "media");
+                            match gateway.complete(&media_ctx, &vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params).await {
                                 Ok(text) if !text.trim().is_empty() => {
                                     let is_refusal = text.contains("没有能力听音频")
                                         || text.contains("无法听音频")
@@ -806,9 +818,20 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             .iter()
             .filter_map(|n| find_channel(&s, n))
             .collect();
+        // P21：预算降级渠道（[roles] budget）——单任务累计 token 超 [hooks] budget_tokens 后，
+        // 本任务剩余步骤改走它（P18 遗留的「降级策略」在此收口）；未配置 = 维持主渠道 + Notice
+        let budget_name = roles
+            .and_then(|r| r.budget.as_deref())
+            .or_else(|| state.roles_cfg.budget.as_deref());
+        let downgrade = budget_name.and_then(|n| find_channel(&s, n));
+        if let Some(n) = budget_name
+            && downgrade.is_none() {
+                send(json!({ "notice": format!("角色「预算降级」配置的渠道「{n}」解析失败（配置名不存在或地址为空），超预算后维持主渠道") }));
+            }
         // P18 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
+        // P21：同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
         let task_tokens = std::sync::atomic::AtomicU64::new(0);
-        let budget_fired = std::sync::atomic::AtomicBool::new(false);
+        let budget_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             let outcome = agent::run_task(
                 &gateway,
@@ -818,6 +841,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     summary: summary.clone(),
                     title: title.clone(),
                     fallbacks: fallbacks.clone(),
+                    // P21：预算降级渠道 + 共享超预算标志（见上方 budget_fired）
+                    downgrade: downgrade.clone(),
+                    budget_hit: budget_fired.clone(),
                 },
                 // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
                 // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
@@ -1108,5 +1134,40 @@ mod tests {
         std::fs::create_dir_all(&dir2).unwrap();
         ensure_attachments_ignored(&dir2);
         assert!(!dir2.join(".gitignore").exists(), "非 git 仓库不落 .gitignore");
+    }
+
+    /// P21：角色/降级渠道的 key 回落链（B2）——没单独存 key 的配置靠环境变量兜底，
+    /// 否则 budget/summary/title 渠道会一律「API key 未设置」。
+    #[test]
+    fn resolve_key_falls_back_to_env() {
+        use crate::config::settings::{Config, Settings};
+        let s = Settings::default();
+        let mut c = Config {
+            id: "cfg-test".into(),
+            name: "无 key 配置".into(),
+            provider_id: "deepseek".into(),
+            base_url: "http://127.0.0.1:9399".into(),
+            model: "m".into(),
+            models: Vec::new(),
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+            capabilities_user_set: false,
+        };
+        // 无 DPAPI key、无环境变量 → 空
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
+        assert!(resolve_key(&s, &c).is_empty());
+        // 环境变量兜底
+        unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-env-fallback") };
+        assert_eq!(resolve_key(&s, &c), "sk-env-fallback");
+        // DPAPI key 优先（配了 key 时环境变量只是兜底）
+        c.set_key("sk-dpapi").expect("测试配置应能存 key");
+        assert_eq!(resolve_key(&s, &c), "sk-dpapi");
+        unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     }
 }

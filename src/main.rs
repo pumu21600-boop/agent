@@ -20,6 +20,7 @@ mod session;
 mod skills;
 mod storage;
 mod tools;
+mod usage;
 
 use std::{
     path::{Path, PathBuf},
@@ -68,7 +69,19 @@ async fn main() -> anyhow::Result<()> {
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
     crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
     crate::plugin::wasm::set_disabled(&user_settings.disabled_extensions); // P18 027：停用名单贯通工具插件
+    crate::plugin::trust::install(&user_settings.trusted_plugins); // P21 红线3：第三方插件验签（pin digest）
     crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
+    // P21 成本台账：先装价格表（扫盘计价要用），再初始化台账（启动时扫一遍装入累计花费），
+    // 最后装花费硬闸。顺序不能反——先 init 后装价格 = 重启后累计花费从 0 起算，硬闸失效。
+    usage::install_prices_file(&manifest.join("prices.json"));
+    usage::init(&log_dir.join("usage"));
+    usage::set_cap(config.cost.spend_cap_usd);
+    if config.cost.spend_cap_usd > 0.0 {
+        observability::debug(&format!(
+            "[cost] 全局花费上限已开启: ${:.2}（累计达到即拒绝新模型请求）",
+            config.cost.spend_cap_usd
+        ));
+    }
     observability::event(
         observability::EventType::State,
         serde_json::json!({

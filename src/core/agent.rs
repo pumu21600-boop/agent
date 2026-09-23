@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::config::{AgentConfig, ContextConfig, RecoveryConfig, SandboxConfig};
 use crate::context;
 use crate::core::cancel::CancelFlag;
-use crate::gateway::{Channel, ChatOutcome, ChatParams, Gateway, extract_delta};
+use crate::gateway::{Channel, ChatOutcome, ChatParams, Gateway, UsageCtx, extract_delta};
 use crate::observability::{self, EventType};
 use crate::recovery;
 use crate::tools::{self, ExecConfig};
@@ -85,12 +85,14 @@ fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
 
 /// P7 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
 /// P8 角色映射：优先走 [roles] summary 专用渠道，失败回落主渠道再降级占位符。
+/// P21：辅助调用记用量台账（purpose=summary），归属会话由 sid 带入。
 async fn summarize_folded(
     gateway: &Arc<Gateway>,
     primary: &Channel,
     summary_role: Option<&Channel>,
     prior: &Option<String>,
     folded: &[Value],
+    sid: &str,
 ) -> Option<String> {
     let mut text = String::new();
     if let Some(p) = prior {
@@ -130,12 +132,14 @@ async fn summarize_folded(
     if let Some(role) = summary_role {
         let rp = ChatParams { max_tokens: Some(400), ..role.params.clone() };
         let ch = Channel { params: rp, ..role.clone() };
-        out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
+        let ctx = UsageCtx::aux(sid, "summary");
+        out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
     }
     // 回落主渠道
     if out.is_none() {
         let ch = Channel { params, ..primary.clone() };
-        out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
+        let ctx = UsageCtx::aux(sid, "summary");
+        out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
     }
     let out = out?;
     let out = out.trim().to_string();
@@ -143,14 +147,16 @@ async fn summarize_folded(
 }
 
 /// P8 TITLE 角色：用最终回答生成 ≤20 字会话标题。失败返回 None（保留机械截断标题）。
-async fn generate_title(gateway: &Arc<Gateway>, ch: &Channel, answer: &str) -> Option<String> {
+/// P21：辅助调用记用量台账（purpose=title）。
+async fn generate_title(gateway: &Arc<Gateway>, ch: &Channel, answer: &str, sid: &str) -> Option<String> {
     let text: String = answer.chars().take(1200).collect();
     let req = json!([
         {"role": "system", "content": "根据对话内容生成一个不超过20字的中文会话标题。只输出标题本身，不要引号、句号或任何解释。"},
         {"role": "user", "content": text},
     ]);
     let params = ChatParams { max_tokens: Some(50), ..ch.params.clone() };
-    let out = gateway.complete(&ch.base_url, &ch.model, &ch.api_key, &req, &params).await.ok()?;
+    let ctx = UsageCtx::aux(sid, "title");
+    let out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &params).await.ok()?;
     let mut t = out.trim().trim_matches(|c| c == '"' || c == '“' || c == '”' || c == '「' || c == '」').to_string();
     // 防跑偏：截到 30 字符以内（标题超长说明模型没听话，硬截断）
     t = t.chars().take(30).collect();
@@ -167,6 +173,11 @@ pub struct LoopChannels {
     pub title: Option<Channel>,
     /// 降级链：主渠道当轮失败时按序替换重试
     pub fallbacks: Vec<Channel>,
+    /// P21：任务超 token 预算后的降级渠道（[roles] budget；None=不降级，维持主渠道）
+    pub downgrade: Option<Channel>,
+    /// P21：与 server 共享的「本任务已超预算」标志（budget_exceeded 触发时置位，
+    /// 本任务剩余步骤改走 downgrade）。未配 downgrade 时只影响 Notice，不换渠道。
+    pub budget_hit: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
@@ -392,6 +403,11 @@ pub async fn run_task(
     };
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
+    // P21 用量台账归属：本任务的会话 id（辅助调用与主流程同一归属）
+    let sid = gate.session_id().to_string();
+    let usage_ctx = UsageCtx::main(&sid);
+    // P21：任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
+    let mut downgrade_noticed = false;
     // P10-A：任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
     observability::event(EventType::State, json!({ "kind": "task.start" }));
     if plan_mode {
@@ -474,7 +490,7 @@ pub async fn run_task(
                 );
                 // P7 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
                 if !stats.folded.is_empty() && mem.enabled {
-                    match summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded).await {
+                    match summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid).await {
                         Some(s) => {
                             running_summary = Some(s.clone());
                             observability::event(
@@ -551,8 +567,27 @@ pub async fn run_task(
         observability::debug(&format!("[loop] step {step} 调用模型 {}", primary.model));
 
         // P8 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）
+        // P21：任务已超 token 预算且有降级渠道时，本步起改走降级渠道（便宜模型跑剩余步骤）
         let mut chain: Vec<&Channel> = Vec::with_capacity(1 + channels.fallbacks.len());
-        chain.push(primary);
+        if let (true, Some(cheap)) = (
+            channels.budget_hit.load(std::sync::atomic::Ordering::Relaxed),
+            channels.downgrade.as_ref(),
+        ) {
+            if !downgrade_noticed {
+                downgrade_noticed = true;
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "cost.downgraded", "step": step, "from": primary.model, "to": cheap.model }),
+                );
+                on_event(AgentEvent::Notice(format!(
+                    "本任务累计 token 已超预算（[hooks] budget_tokens），后续步骤改走降级渠道「{}」以节省花费",
+                    cheap.model
+                )));
+            }
+            chain.push(cheap);
+        } else {
+            chain.push(primary);
+        }
         chain.extend(channels.fallbacks.iter());
         let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
         // 本步当前这次尝试已经推给前端的字符数（UTF-16 码元，与 JS String.length 同口径）。
@@ -577,6 +612,7 @@ pub async fn run_task(
             }
             outcome = gateway
                 .stream_chat(
+                    &usage_ctx,
                     ch,
                     &Value::Array(msgs.clone()),
                     tools_def.as_ref(),
@@ -687,7 +723,7 @@ pub async fn run_task(
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
             // P8 TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
             if let Some(tch) = &channels.title
-                && let Some(title) = generate_title(gateway, tch, &final_text).await {
+                && let Some(title) = generate_title(gateway, tch, &final_text, &sid).await {
                     observability::event(
                         EventType::State,
                         json!({ "kind": "session.titled", "title": title }),

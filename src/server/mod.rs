@@ -52,6 +52,7 @@ mod memory;
 mod sessions;
 mod settings;
 mod system;
+mod usage;
 mod webpanel;
 mod workspace;
 
@@ -63,6 +64,7 @@ use memory::*;
 use sessions::*;
 use settings::*;
 use system::*;
+use usage::*;
 use webpanel::*;
 use workspace::*;
 
@@ -149,6 +151,10 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
         .route("/api/ext/draft", post(submit_draft).delete(discard_draft))
         .route("/api/ext/promote", post(promote_draft))
+        // P21 红线3：第三方插件验签（pin/unpin 内容指纹）
+        .route("/api/ext/trust", post(trust_plugin))
+        // P21 成本台账：按供应商/模型的 token、次数、费用报表
+        .route("/api/usage", get(get_usage))
         // P18 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
         .route("/api/plugin/data", get(read_plugin_data).put(write_plugin_data).delete(delete_plugin_data))
         .route("/api/workspace/file", post(write_workspace_file))

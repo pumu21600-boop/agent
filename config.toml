@@ -23,6 +23,13 @@ max_rpm = 0
 # summary = "配置 2"   # 滚动摘要专用渠道
 # title = "配置 2"     # 会话标题生成专用渠道
 # embedding = "配置 2" # 向量嵌入专用渠道（须支持 OpenAI 兼容 /embeddings）
+# budget = "配置 2"    # P21 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+
+[cost]
+# P21 成本台账红线：全局花费上限（美元，硬闸）。台账累计花费达到即拒绝新的模型请求
+# （主对话与摘要/标题等辅助调用同一道闸），调高上限即恢复；0 = 不限（默认）。
+# 单价表在同级 prices.json（美元 / 1M tokens，带生效时间；缺省全部记录未计价）。
+spend_cap_usd = 0.0
 
 [logging]
 dir = "logs"

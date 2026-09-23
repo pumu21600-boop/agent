@@ -95,6 +95,10 @@ pub struct RolesSettings {
     /// 向量嵌入专用配置名或 id（记忆库语义检索；未设时用本地哈希向量，不用主渠道兜底）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<String>,
+    /// P21：预算降级渠道——单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+    /// （B3 解析链：settings.roles.budget > config.toml [roles].budget > 不降级）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<String>,
     /// 降级备用配置名列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
@@ -273,6 +277,12 @@ pub struct Settings {
     /// P17：停用的 UI 扩展名单（ui-ext 目录名；停用的不加载、不参与界面插槽与数据桥）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_extensions: Vec<String>,
+
+    /// P21 红线3（第三方插件验签）：已 pin 的内容指纹表。
+    /// 键 = `ui-ext:<name>` / `plugins:<name>`，值 = canonical digest（sha256）。
+    /// user 来源插件必须在这里有且 digest 一致才会加载；draft 转正时自动写入。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_plugins: BTreeMap<String, String>,
 
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]

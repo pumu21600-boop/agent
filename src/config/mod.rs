@@ -64,6 +64,18 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// P21 成本台账：全局花费上限（硬闸）等成本红线参数
+    #[serde(default)]
+    pub cost: CostConfig,
+}
+
+/// 成本红线参数（施工单 030，P21）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostConfig {
+    /// 全局花费上限（美元，硬闸）：台账累计花费达到即拒绝新的模型请求；0 = 不限（默认）。
+    /// 单价来自 app_root/prices.json（美元 / 1M tokens，带生效时间）。
+    #[serde(default)]
+    pub spend_cap_usd: f64,
 }
 
 /// P8 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的
@@ -79,6 +91,10 @@ pub struct RolesConfig {
     /// 向量嵌入（EMBEDDING，记忆库语义检索消费；未配置时用本地哈希向量）
     #[serde(default)]
     pub embedding: Option<String>,
+    /// P21 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，本任务剩余步骤改走它
+    /// （未配置 = 维持主渠道 + Notice，行为与 P18 一致）
+    #[serde(default)]
+    pub budget: Option<String>,
 }
 
 /// 记忆系统参数（施工单 009）。

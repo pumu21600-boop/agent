@@ -240,6 +240,8 @@ pub(super) async fn submit_draft(
 }
 
 /// POST /api/ext/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
+/// P21 红线3：转正是用户显式动作 = 信任决定，落盘后**自动 pin** 内容指纹（不 pin 就会被
+/// 自己的验签门拦下，转正等于白做）。
 pub(super) async fn promote_draft(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -247,6 +249,24 @@ pub(super) async fn promote_draft(
     let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
     match crate::plugin::draft::promote(&name) {
         Ok(paths) => {
+            // 自动 pin：从落盘的 manifest 路径推导插件目录与 digest
+            let pins = crate::plugin::trust::pin_from_manifest_paths(&paths);
+            if !pins.is_empty() {
+                let mut s = state
+                    .settings
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                for (k, d) in &pins {
+                    s.trusted_plugins.insert(k.clone(), d.clone());
+                    crate::plugin::trust::audit_pinned(k, d, "promote");
+                }
+                if let Err(e) = s.save() {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+                }
+                crate::plugin::trust::install(&s.trusted_plugins);
+                *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+            }
             let disabled = state
                 .settings
                 .read()
@@ -255,10 +275,57 @@ pub(super) async fn promote_draft(
                 .clone();
             let mut list = crate::plugin::ui::scan(&disabled);
             list.extend(crate::plugin::wasm::scan_plugins(&disabled));
-            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "extensions": list })))
+            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "pinned": pins.len(), "extensions": list })))
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
     }
+}
+
+/// POST /api/ext/trust {key, action} —— 第三方插件验签的 pin / unpin（P21 红线3）。
+/// key 形如 `ui-ext:<name>` / `plugins:<name>`；pin 时按当前位置重算 digest。
+pub(super) async fn trust_plugin(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let action = req.get("action").and_then(Value::as_str).unwrap_or("pin").trim().to_string();
+    if key.is_empty() || !key.contains(':') {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 ui-ext:<name>）" })));
+    }
+    let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
+    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match action.as_str() {
+        "pin" => {
+            let Some(path) = crate::plugin::trust::resolve(&key) else {
+                return err(format!("找不到插件 {key}（目录不存在或名字非法）"));
+            };
+            let digest = match crate::plugin::trust::digest_of_path(&path) {
+                Ok(d) => d,
+                Err(e) => return err(e),
+            };
+            s.trusted_plugins.insert(key.clone(), digest.clone());
+            crate::plugin::trust::audit_pinned(&key, &digest, "user");
+        }
+        "unpin" => {
+            s.trusted_plugins.remove(&key);
+            observability::event(
+                EventType::State,
+                json!({ "kind": "plugin.trust_unpinned", "key": key, "by": "user" }),
+            );
+        }
+        other => return err(format!("未知操作: {other}（pin | unpin）")),
+    }
+    if let Err(e) = s.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    crate::plugin::trust::install(&s.trusted_plugins);
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // pin/unpin 会改变工具插件的可加载性 → 重扫注册表，清单与工具表同步
+    crate::plugin::wasm::rescan();
+    let disabled = s.disabled_extensions.clone();
+    let mut list = crate::plugin::ui::scan(&disabled);
+    list.extend(crate::plugin::wasm::scan_plugins(&disabled));
+    (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
 }
 
 /// DELETE /api/ext/draft?name= —— 丢弃 draft（内存即清，WASM 注册表同步回收）。
@@ -335,7 +402,7 @@ pub(super) async fn ui_ext_asset(
     serve_ext(&state, &name, &path)
 }
 
-/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用的扩展也 404。
+/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用、未通过验签的也 404。
 fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
     let disabled = state
         .settings
@@ -345,6 +412,18 @@ fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
         .clone();
     if disabled.iter().any(|d| d == name) {
         return (StatusCode::NOT_FOUND, "插件已停用").into_response();
+    }
+    // P21 红线3：第三方验签门与清单拒载同一把尺子——未 pin / 内容已变的插件不服务任何资产
+    // （否则「清单里显示未受信任、面板 iframe 却能打开」自相矛盾）
+    let list = crate::plugin::ui::scan(&disabled);
+    if let Some(e) = list.iter().find(|e| e.name == name)
+        && (!e.ok || !e.trusted)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("插件未通过来源验签：{}", e.error.clone().unwrap_or_else(|| "未受信任".into())),
+        )
+            .into_response();
     }
     // P18（027）：draft 面板资产走内存 overlay——键必须与提交时的文件名完全一致，
     // 不做路径拼接（构造上无穿越）；命中即返回，未命中落回磁盘路径。
@@ -359,12 +438,11 @@ fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
         let ct = crate::plugin::ui::content_type(std::path::Path::new(&eff));
         return ([(CONTENT_TYPE, ct)], bytes).into_response();
     }
-    let entry = crate::plugin::ui::scan(&disabled)
-        .into_iter()
-        .find(|e| e.name == name)
-        .map(|e| e.entry);
     let rel = if rel.trim().is_empty() {
-        entry.unwrap_or_else(|| "index.html".to_string())
+        list.iter()
+            .find(|e| e.name == name)
+            .map(|e| e.entry.clone())
+            .unwrap_or_else(|| "index.html".to_string())
     } else {
         rel.to_string()
     };
