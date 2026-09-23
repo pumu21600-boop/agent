@@ -2973,7 +2973,7 @@
 
   // —— P10.5 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'usage'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
@@ -2982,6 +2982,34 @@
     if (t === 'mcp' || t === 'plugins') loadMcp();
     if (t === 'skills') loadSkills();
     if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
+    if (t === 'usage') loadUsage();
+  }
+
+  // —— P21 成本台账（用量分区）：按供应商/模型的 token、次数、费用报表 ——
+  let usageData = null;
+  let usageGroup = 'provider'; // provider | model
+  let usageRange = 'today'; // today | 7d | 30d | all
+  let usageLoading = false;
+
+  async function loadUsage() {
+    usageLoading = true;
+    try {
+      const r = await fetch(`/api/usage?group=${usageGroup}&range=${usageRange}`, { cache: 'no-store' });
+      usageData = await r.json();
+    } catch (e) {
+      usageData = { error: e.message || String(e) };
+    } finally {
+      usageLoading = false;
+    }
+  }
+
+  function fmtInt(n) {
+    return (n ?? 0).toLocaleString('zh-CN');
+  }
+  function fmtUsd(n) {
+    const v = n ?? 0;
+    if (v > 0 && v < 0.01) return '<$0.01';
+    return `$${v.toFixed(v < 100 ? 4 : 2)}`;
   }
 
   // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
@@ -3339,6 +3367,26 @@
       if (r.extensions) extList = r.extensions;
     } catch (err) {
       extMsg = `丢弃失败: ${err.message || err}`;
+    }
+  }
+
+  // P21 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
+  async function trustExt(e, action) {
+    const key = e.trust_key;
+    if (!key) return;
+    const verb = action === 'pin' ? '信任' : '取消信任';
+    if (action === 'pin' && !confirm(`信任插件「${e.title || e.name}」？\n\n将记录它当前的内容指纹，之后每次加载都比对；文件被改动后会再次要求重新信任。`)) return;
+    try {
+      const r = await fetch('/api/ext/trust', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, action }),
+      });
+      if (r.error) extMsg = `${verb}失败: ${r.error}`;
+      else extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
+      if (r.extensions) extList = r.extensions;
+    } catch (err) {
+      extMsg = `${verb}失败: ${err.message || err}`;
     }
   }
 
@@ -4579,6 +4627,7 @@
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
+          <button class:active={settingsTab === 'usage'} on:click={() => pickSettingsTab('usage')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V9.5M9.3 19.5V4.5M14.7 19.5v-7M20 19.5v-11"/></svg> 用量</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
@@ -5144,6 +5193,10 @@
           （同名时工作区优先）；工具文件放 <b>plugins/</b>（.wasm/.wat 或 目录 + manifest）。
           面板在 <code>sandbox="allow-scripts"</code> 的 iframe 里跑——不透明源、读不到宿主 DOM
           与 localStorage，只能通过白名单接口拿数据。
+          <br />
+          <b>第三方验签</b>：来源为 <code>user</code> 的插件（自装/工作区/plugins 目录）要先点
+          「信任」固定内容指纹才会加载；文件被改动后指纹不符即停用，需重新信任。随包内置与模型自产
+          草稿不在此列。
         </div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
         {#if extList.length}
@@ -5158,12 +5211,26 @@
                   title={e.shadowed ? '同名内置插件存在，被当前工作区的这一份覆盖' : ''}
                 >{e.draft ? '草稿 · 未转正' : e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : (e.tools && e.tools.length ? '工具插件' : '内置')}</span>
                 {#if e.origin === 'model_generated'}<span class="mcp-risk">模型自产</span>{/if}
+                {#if e.origin === 'user'}
+                  {#if e.trusted}
+                    <span class="mcp-risk" title="内容指纹已固定，加载前会比对">已验签</span>
+                  {:else}
+                    <span class="mcp-risk" style="color: var(--tint-orange-fg)" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>
+                  {/if}
+                {/if}
                 {#if e.enabled === false}<span class="mcp-risk">已停用</span>{/if}
                 <span class="flex-sp"></span>
                 {#if e.draft}
                   <button class="btn primary" on:click={() => promoteExt(e)}>转正</button>
                   <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
                 {:else}
+                  {#if e.origin === 'user'}
+                    {#if e.trusted}
+                      <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
+                    {:else}
+                      <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
+                    {/if}
+                  {/if}
                   <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
                   {#if e.entry}<button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
                 {/if}
@@ -5286,6 +5353,110 @@
             只读操作，不会改动任何文件；kill-tree 与内存上限两项较慢，只在 cargo test 里跑。
           </div>
         </div>
+      {/if}
+
+      {#if settingsTab === 'usage'}
+        <div class="param-hint">
+          用量台账（P21）：每一次模型调用都在网关单点记账（token 分 prompt / completion / cache 三路，
+          请求次数、失败与延迟分位、费用），落在 <code>logs/usage/ledger.jsonl</code>。
+          费用按 <code>prices.json</code> 里<b>当时有效</b>的单价算（价格表带生效时间，调价不改历史账）。
+        </div>
+
+        <div class="field mcp-card">
+          <div class="mcp-head">
+            <span class="dot" class:haskey={usageData?.spend_cap_usd > 0}></span>
+            <b>全局花费上限（硬闸）</b>
+            <span class="mcp-status">
+              {usageData?.spend_cap_usd > 0
+                ? `累计 ${fmtUsd(usageData.spend_total_usd)} / 上限 $${usageData.spend_cap_usd}`
+                : '未设置（不限）'}
+            </span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={loadUsage} disabled={usageLoading}>{usageLoading ? '读取中…' : '刷新'}</button>
+          </div>
+          <div class="param-hint">
+            在 <code>config.toml</code> 的 <code>[cost] spend_cap_usd</code> 设置（美元）。累计花费达到上限后，
+            新的模型请求会被直接拒绝（主对话与摘要/标题等辅助调用同一道闸），调高上限即恢复。
+          </div>
+        </div>
+
+        <div class="field">
+          <label>报表口径</label>
+          <div class="mcp-cmd" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <span>分组：</span>
+            <button class="btn ghost" class:active={usageGroup === 'provider'} on:click={() => { usageGroup = 'provider'; loadUsage(); }}>按供应商</button>
+            <button class="btn ghost" class:active={usageGroup === 'model'} on:click={() => { usageGroup = 'model'; loadUsage(); }}>按模型</button>
+            <span style="margin-left:8px;">范围：</span>
+            <button class="btn ghost" class:active={usageRange === 'today'} on:click={() => { usageRange = 'today'; loadUsage(); }}>今天</button>
+            <button class="btn ghost" class:active={usageRange === '7d'} on:click={() => { usageRange = '7d'; loadUsage(); }}>7 天</button>
+            <button class="btn ghost" class:active={usageRange === '30d'} on:click={() => { usageRange = '30d'; loadUsage(); }}>30 天</button>
+            <button class="btn ghost" class:active={usageRange === 'all'} on:click={() => { usageRange = 'all'; loadUsage(); }}>全部</button>
+          </div>
+        </div>
+
+        {#if usageData?.error}
+          <div class="mcp-cmd" style="color: var(--tint-red-fg, #d33)">读取失败：{usageData.error}</div>
+        {:else if usageData}
+          <div class="field mcp-card">
+            <div class="mcp-head">
+              <b>合计</b>
+              <span class="mcp-status">{usageData.range === 'all' ? '全部时间' : usageData.range === 'today' ? '今天（UTC）' : `最近 ${usageData.range}`}</span>
+            </div>
+            <div class="mcp-cmd">
+              输入 {fmtInt(usageData.totals?.prompt_tokens)} token（其中缓存命中 {fmtInt(usageData.totals?.cached_tokens)}）
+              · 输出 {fmtInt(usageData.totals?.completion_tokens)} token
+            </div>
+            <div class="mcp-cmd">
+              请求 {fmtInt(usageData.totals?.requests)} 次（失败 {fmtInt(usageData.totals?.errors)} · 取消 {fmtInt(usageData.totals?.cancelled)}）
+              · 延迟 p50 {fmtInt(usageData.totals?.p50_ms)}ms / p95 {fmtInt(usageData.totals?.p95_ms)}ms
+              · 费用 <b>{fmtUsd(usageData.totals?.cost_usd)}</b>
+            </div>
+            {#if !usageData.priced}
+              <div class="mcp-cmd" style="color: var(--tint-orange-fg)">
+                有请求未能计价（prices.json 里没有匹配的价格）：未计价的不计入费用，请求与 token 仍照记。
+                价格表路径：{usageData.prices_file}
+              </div>
+            {/if}
+          </div>
+
+          {#if usageData.rows?.length}
+            <div class="field">
+              <label>明细（按{usageData.group === 'model' ? '模型' : '供应商'}，花费降序）</label>
+              <table class="usage-table">
+                <thead>
+                  <tr>
+                    <th>{usageData.group === 'model' ? '模型' : '供应商'}</th>
+                    <th>输入 token</th>
+                    <th>其中缓存</th>
+                    <th>输出 token</th>
+                    <th>请求</th>
+                    <th>失败</th>
+                    <th>p50 / p95 (ms)</th>
+                    <th>费用</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each usageData.rows as r}
+                    <tr>
+                      <td><code>{r.key}</code></td>
+                      <td>{fmtInt(r.prompt_tokens)}</td>
+                      <td>{fmtInt(r.cached_tokens)}</td>
+                      <td>{fmtInt(r.completion_tokens)}</td>
+                      <td>{fmtInt(r.requests)}</td>
+                      <td>{fmtInt(r.errors)}{r.unpriced_requests ? `（${fmtInt(r.unpriced_requests)} 未计价）` : ''}</td>
+                      <td>{fmtInt(r.p50_ms)} / {fmtInt(r.p95_ms)}</td>
+                      <td>{fmtUsd(r.cost_usd)}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {:else}
+            <div class="menu-empty">该时间范围内还没有模型调用记录。</div>
+          {/if}
+        {:else}
+          <div class="menu-empty">读取中…</div>
+        {/if}
       {/if}
         </div>
       </div>
@@ -6633,6 +6804,34 @@
   .probe-detail {
     color: var(--g5);
     word-break: break-all;
+  }
+  /* P21 用量台账报表表（设置 → 用量） */
+  .usage-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 4px 0 8px;
+  }
+  .usage-table th,
+  .usage-table td {
+    text-align: right;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--g2);
+    white-space: nowrap;
+  }
+  .usage-table th:first-child,
+  .usage-table td:first-child {
+    text-align: left;
+    white-space: normal;
+    word-break: break-all;
+  }
+  .usage-table th {
+    color: var(--g5);
+    font-weight: 600;
+  }
+  .usage-table td {
+    color: var(--g6);
+    font-variant-numeric: tabular-nums;
   }
   .side-version {
     flex: 0 0 100%;

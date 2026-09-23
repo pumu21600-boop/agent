@@ -125,6 +125,13 @@ body {
 .btn.ghost {
   background: transparent;
 }
+/* 选中态（分段开关：用量报表的分组/范围选择等） */
+.btn.active {
+  background: var(--g3);
+  border-color: var(--g5);
+  color: var(--g7);
+  font-weight: 650;
+}
 
 /* —— 基元：弹窗骨架 —— */
 .modal-backdrop {
