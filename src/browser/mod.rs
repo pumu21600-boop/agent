@@ -126,8 +126,9 @@ struct DialogInfo {
 pub struct WebTab {
     /// CDP target id
     pub id: String,
-    /// agent 工具（browser 统一工具）专用标签页
-    pub agent: bool,
+    /// agent 工具（browser 统一工具）当前的工作页（跨站点导航会迁到新页，旧页摘牌）。
+    /// AtomicBool：agent 换页时要能摘掉旧页的标记（见 `agent_tab`）。
+    pub agent: AtomicBool,
     pub cdp: cdp::Cdp,
     /// shell 模式下的 child webview label（关/挪/显隐都靠它；无头模式为 None）
     pub shell_label: Option<String>,
@@ -173,7 +174,7 @@ impl WebTab {
     fn new(id: String, agent: bool, cdp: cdp::Cdp, shell_label: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             id,
-            agent,
+            agent: AtomicBool::new(agent),
             cdp,
             shell_label,
             last_outline: Mutex::new(Vec::new()),
@@ -269,7 +270,7 @@ impl BrowserSession {
             let (title, url) = tab_title_url(&t).await;
             out.push(TabBrief {
                 id: t.id.clone(),
-                agent: t.agent,
+                agent: t.agent.load(Ordering::Relaxed),
                 title,
                 url,
                 visible: visible.as_deref() == Some(t.id.as_str()),
@@ -632,11 +633,17 @@ async fn close_tab(session: &BrowserSession, id: &str) -> bool {
     removed
 }
 
-/// agent 工具的专用标签页：找活的 agent 页，没有就现开一个。
+/// agent 工具的当前工作页：① 会话记录的 agent 页（跨站点导航迁到新页后指向新页）；
+/// ② 兜底找任何带 agent 标记的页（旧会话迁移）；③ 都没有就建一个。
 async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, String> {
     {
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some(t) = tabs.iter().find(|t| t.agent) {
+        if let Some(id) = session.agent_tab_now()
+            && let Some(t) = tabs.iter().find(|t| t.id == id)
+        {
+            return Ok(t.clone());
+        }
+        if let Some(t) = tabs.iter().find(|t| t.agent.load(Ordering::Relaxed)) {
             session.set_agent_tab(&t.id);
             return Ok(t.clone());
         }
@@ -644,6 +651,41 @@ async fn agent_tab(session: &BrowserSession) -> Result<Arc<WebTab>, String> {
     let tab = create_tab(session, "about:blank", true).await?;
     session.set_agent_tab(&tab.id);
     Ok(tab)
+}
+
+/// URL 的 host（小写、剥开头显 www；解析不了返回空串）。
+fn host_of(url: &str) -> String {
+    let after = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url,
+    };
+    let host = after.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    host.strip_prefix("www.").unwrap_or(&host).to_string()
+}
+
+/// 两个 URL 是否同站点（host 等价，www 显式前缀不算差异）。
+fn same_site(a: &str, b: &str) -> bool {
+    let (ha, hb) = (host_of(a), host_of(b));
+    !ha.is_empty() && ha == hb
+}
+
+/// agent 要浏览的下一个页面：**跨站点就开新标签页**（同站点复用当前 agent 页；当前页
+/// 是空白页时直接用它）。用户预期「打开官网」是新开一页，旧页面也留在面板里可回看；
+/// 与 skills/browser-use 的「同站点复用 tab」一致。返回 (目标页, 是否新开)。
+async fn agent_tab_for_navigate(
+    session: &Arc<BrowserSession>,
+    url: &str,
+) -> Result<(Arc<WebTab>, bool), String> {
+    let cur = agent_tab(session).await?;
+    let cur_url = tab_title_url(&cur).await.1;
+    if cur_url.is_empty() || cur_url == "about:blank" || same_site(&cur_url, url) {
+        return Ok((cur, false));
+    }
+    // 换站点：新开一页给 agent，旧页摘掉 agent 徽标（徽标语义 = agent 当前工作页）
+    let fresh = create_tab(session, "about:blank", true).await?;
+    cur.agent.store(false, Ordering::Relaxed);
+    session.set_agent_tab(&fresh.id);
+    Ok((fresh, true))
 }
 
 /// 按 id 取标签页。
@@ -944,7 +986,7 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
     }
     let mut victims: Vec<&Arc<WebTab>> = live
         .into_iter()
-        .filter(|t| !t.agent && visible.as_deref() != Some(t.id.as_str()) && t.idle_secs() >= SUSPEND_IDLE.as_secs())
+        .filter(|t| !t.agent.load(Ordering::Relaxed) && visible.as_deref() != Some(t.id.as_str()) && t.idle_secs() >= SUSPEND_IDLE.as_secs())
         .collect();
     // 最久空闲者先淘汰
     victims.sort_by_key(|t| t.last_active_ms.load(Ordering::Relaxed));
@@ -1978,9 +2020,19 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
     session.touch();
     let tab = match cmd.tab_id() {
         Some(id) => get_tab(&session, id).map_err(|e| BrowserError::new(ErrorCode::CapabilityUnsupported, e))?,
-        None => agent_tab(&session)
-            .await
-            .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?,
+        // navigate 且没指定页：跨站点开新标签（同站点/空白页复用），其余方法一律用 agent 当前页
+        None => match &cmd {
+            BrowserCommand::Navigate { url, .. } => {
+                check_url(url)?; // 先验地址，别为非法 URL 白开一页
+                agent_tab_for_navigate(&session, url)
+                    .await
+                    .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?
+                    .0
+            }
+            _ => agent_tab(&session)
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?,
+        },
     };
     tab.touch();
     ensure_live(&tab)
@@ -2932,6 +2984,24 @@ pub async fn panel_dialog(id: &str, accept: bool, prompt_text: Option<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// host_of / same_site：agent 跨站点导航是否开新标签的判据（纯函数）。
+    #[test]
+    fn host_and_same_site_edges() {
+        assert_eq!(host_of("https://www.deepseek.com/"), "deepseek.com");
+        assert_eq!(host_of("https://deepseek.com/en/index.html"), "deepseek.com");
+        assert_eq!(host_of("http://127.0.0.1:5173/menu.html?x=1"), "127.0.0.1:5173");
+        assert_eq!(host_of("about:blank"), "about:blank"); // 无 :// 的原样返回（调用方对 about:blank 有专门分支）
+        assert_eq!(host_of(""), "");
+        // 同站点（含 www 显式前缀差异、路径/查询差异）
+        assert!(same_site("https://deepseek.com/", "https://www.deepseek.com/en"));
+        assert!(same_site("https://a.com/x?y=1", "https://a.com/z"));
+        // 跨站点
+        assert!(!same_site("https://www.deepseek.com/", "https://www.google.com"));
+        assert!(!same_site("https://deepseek.com/", "https://chat.deepseek.com/"));
+        // 空 URL 不算同站点（调用方据此直接用空白 agent 页）
+        assert!(!same_site("about:blank", "https://deepseek.com/"));
+    }
 
     /// 真机冒烟（ignored，手工跑：cargo test browser_smoke -- --ignored --nocapture）
     /// 本机需装 Edge/Chrome。覆盖：拉起 → file:// 快照 → 语义点击 → 增量 diff →

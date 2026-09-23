@@ -887,6 +887,23 @@
     webAgentWatch = setInterval(async () => {
       try {
         const s = await webApi('/api/browser/state', { cache: 'no-store' });
+        // 标签清单随时同步：agent 开新页/导航之后，页签条上的标题和地址必须跟着变。
+        // 以前只有 loadWebState 才刷这份清单——agent 操作完面板里留着旧标题，用户看到的
+        // 就是「一个 DeepSeek 标签显示着 Google」这种灵异现象
+        const tabs = s.tabs || [];
+        const stale =
+          tabs.length !== webTabs.length ||
+          tabs.some((t, i) => {
+            const o = webTabs[i];
+            return !o || o.id !== t.id || o.title !== t.title || o.url !== t.url || o.agent !== t.agent;
+          });
+        if (stale) {
+          webTabs = tabs;
+          const act = tabs.find((t) => t.id === webActiveId);
+          if (act && document.activeElement !== document.querySelector('.web-address')) {
+            webAddress = act.url === 'about:blank' ? '' : act.url || '';
+          }
+        }
         if (!s.agentTouched || Date.now() - s.agentTouched > 10000) return;
         if (s.agentTouched <= webAgentSeen) return; // 这次触碰已响应过
         webAgentSeen = s.agentTouched;
