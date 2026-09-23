@@ -327,9 +327,8 @@ cargo run                                # 终端 2：127.0.0.1:5173
   `docs/plugin-contract-v1.md`；「扩展」一词退役，端点与设置字段名保留为兼容。
 - **钩子**：v1 四挂点（before_tool 仅否决权 / after_tool / session_end / budget_exceeded），
   超时与失败一律放行，JSONL `hook.*` 审计；承载形式 = config.toml `[hooks]` 里的本地命令。
-- **eval 任务集**：11 个任务（hello-file / fix-json / read-only-plan / edit-existing-file / delete-file /
+- **eval 任务集**：12 个任务（hello-file / fix-json / read-only-plan / edit-existing-file / delete-file /
   multi-file-scaffold / fix-code-bug / search-and-report / plan-mode-write-guard / run-tests-and-report /
-  plan-approve-execute），
-  但**尚未在真实渠道上跑过一遍**——首次跑建议 `cargo run --bin eval` 观察提示词是否需要微调。
+  plan-approve-execute / csv-clean）。2026-09-23 已在真实渠道（StepFun `step-5-preview`，隔离临时实例 + 独立端口）跑过一遍：**53/53 断言全过、0 驱动失败**，覆盖 025 之后全部影响模型行为的改动（web_search 入表 / 审批四档 / browser 统一工具入表）。复跑流程与两个本机坑（`NO_PROXY`、命令行 `Bearer <key>` 脱敏）见 ROADMAP「eval 真模型验证」行。
 - **CI**：只在 GitHub Actions 上跑（本机没有 hook 强制）。
 - **远端备份**：已推送到 GitHub 私有仓库 `https://github.com/pumu21600-boop/agent`（origin：`dev` 为主线 + 8 个历史阶段分支 + 全部标签）。
