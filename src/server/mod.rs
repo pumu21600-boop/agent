@@ -153,8 +153,10 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/ext/promote", post(promote_draft))
         // P21 红线3：第三方插件验签（pin/unpin 内容指纹）
         .route("/api/ext/trust", post(trust_plugin))
-        // P21 成本台账：按供应商/模型的 token、次数、费用报表
+        // P21 成本台账：按供应商/模型的 token、次数、费用报表 + 价格表与重算
         .route("/api/usage", get(get_usage))
+        .route("/api/usage/prices", get(get_usage_prices).put(put_usage_prices))
+        .route("/api/usage/recompute", post(post_usage_recompute))
         // P18 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
         .route("/api/plugin/data", get(read_plugin_data).put(write_plugin_data).delete(delete_plugin_data))
         .route("/api/workspace/file", post(write_workspace_file))

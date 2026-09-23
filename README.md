@@ -18,10 +18,10 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**第三方验签**：来源为 `user` 的插件（自装 / 工作区 / plugins 目录）要点「信任」固定内容指纹后才加载，文件被改动即停用；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
-- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟 p50/p95、费用；单价表 `prices.json` **带生效时间**（按记录发生时间取当时有效价，调价不改历史账）；`GET /api/usage` 按供应商/模型出报表（设置 → 用量）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
+- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量」插件**（`ui-ext/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser_* 工具打开的页面同场可见）+ 设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **用量**；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser_* 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量」：当前对话 token/请求/费用）；设置面板七分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
 - **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 193 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
@@ -45,11 +45,12 @@ agent/
 │   ├── tools/            # 工具系统（内置 + 并行调度 + git 发现链）
 │   ├── memory/           # 记忆 v1（events.log/AGENTS.md/摘要）+ library.rs 记忆库索引
 │   ├── plugin/           # contract.rs（契约 v1）+ mcp.rs + wasm.rs（工具引擎）+ ui.rs（面板）+ draft.rs（隔离区）+ trust.rs（第三方验签）
+│   ├── usage/            # P21 用量台账：ledger.jsonl 记账（费用冻结）+ prices.rs 价格匹配 + 按会话/分组报表 + 花费硬闸 + 重算
 │   ├── usage/            # P21 用量台账：ledger.jsonl 记账 + prices.rs 价格表 + 聚合报表 + 花费硬闸
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── ui-ext/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览）
+├── ui-ext/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览、trace/ 时间线、usage/ 用量）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
@@ -294,11 +295,16 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
   | `bus.publish` | bus.publish | 插件间通信（宿主转发 `bus.message`）|
   | `workspace.write` | workspace.write | 写工作区文件（宿主弹确认；工作区内 / 512KB / 原子写）|
   | `storage.read / write / delete` | storage | **插件命名空间数据**（`plugin_data/<插件名>/`，键名白名单 ≤64 字符、值 ≤64KB；会话/设置/记忆等内核保留区不在任何插件写路径上）|
+  | `usage.session` | — | **当前会话**的用量统计（token 三路/请求/费用；会话 id 由宿主注入，插件拿不到别的会话）|
+  | `usage.prices` | — | 读价格表、可选渠道、币种与汇率、累计/上限 |
+  | `usage.prices.save` / `usage.recompute` | usage.prices | 写价格表与币种 / 用当前价格重算全部历史账 |
 
 - **来源与版本**：manifest `source` 三值 built_in / user / model_generated；`apiVersion` 不匹配 →
   拒载并提示升级（不做 shim；v0.x 期间不保证插件兼容）。未知字段一律忽略（只增不删 = 向后兼容）。
 - **draft 隔离区**（模型自产，`source=model_generated`）：只在内存（重启即失）、权限一律清空；
   设置 → 插件 里「转正」（落盘持久化、来源改 user）或「丢弃」。
+- **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
+- **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
 - **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 ui-ext、当前工作区 ui-ext、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
 - 参考实现：`ui-ext/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。
@@ -311,23 +317,24 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 {"ts":"2026-09-23T12:00:00.000Z","session_id":"…","parent_session":null,"purpose":"main",
  "provider":"api.deepseek.com","provider_id":"deepseek","model":"deepseek-chat",
  "prompt_tokens":1234,"completion_tokens":567,"cached_tokens":1024,
- "status":"ok","latency_ms":1830,"error":null}
+ "status":"ok","latency_ms":1830,"cost_usd":0.0016}
 ```
 
 - **分计量**：prompt / completion / cache 三路分开；渠道不回 usage 的调用 token 记 0，但请求与延迟照记。
+- **费用冻结构**：`cost_usd` 在记账时按当时价格算定写进记录——之后改价只影响新请求，历史账一分不动（价格页有「按当前价格重算历史」的显式补救按钮）。
 - **`parent_session`**：P22 子代理的父任务归属字段（v1 恒为 null，子代理落地后填值即可按父任务聚合）。
-- **报表**：`GET /api/usage?group=provider|model&range=today|7d|30d|all`，或设置 → 用量（按供应商/模型出 token、请求数、失败数、延迟 p50/p95、费用）。
+- **报表**：`GET /api/usage?group=provider|model&range=today|7d|30d|all&session=<id>`；`session` 非空 = 只算该会话（「用量」插件的「当前对话」口径），缺省 = 全量。
 
-**价格表 `prices.json`（应用根，与 providers.json 同规）**：单价 = 美元 / 1M tokens，`provider` 命中渠道 host 或预设 id（`*` 通配）、`model` 支持 `前缀*`；**`effective_from` 是生效时间**，一条记录按它发生的时间取当时有效的最新价（调价不改历史账）。
+## 「用量」插件（随包内置试点，ui-ext/usage/）
 
-```json
-{ "prices": [
-  { "provider": "api.deepseek.com", "model": "deepseek-*", "effective_from": "2026-01-01",
-    "prompt": 0.27, "completion": 1.10, "cached": 0.027 }
-] }
-```
+右侧面板在「产物 / 预览 / 网页」旁多一个**用量**页签（manifest 声明 `ui:[{slot:"dock"}]`；插件停用则页签与价格设置一起消失，**台账与硬闸照常跑**——内核不受插件停用影响）。插件经只读桥 `usage.session` 拉当前会话统计，显示输入 token（含缓存命中）/ 输出 token / 请求次数 / 本次对话费用，页脚一行累计花费与上限。
 
-缓存命中的 token 按 `cached` 单价、其余输入按 `prompt` 单价计；没有任何命中 = 该条**未计价**（报表显式标出，不静默当 0 元）。不配 `prices.json` = 全部未计价（token 与次数照记）。
+**价格设置**（插件自带页 `prices.html`，设置 → 插件 → 用量 →「设置」打开）：
+
+- 一行 = **渠道 host + 模型 id** + 三个单价（输入 / 缓存输入 / 输出），单位**每百万 token**；host 从已保存的渠道下拉带出，`*` 是通配兜底（精确匹配优先于通配）。
+- **同模型 id 不同供应商是两行**——键含 host，中转与官方同名的模型永远不会搞混。
+- **美元 / 人民币切换**：内部一律以美元记账（台账与上限的口径），人民币值按 `1 USD = N CNY` 汇率折算显示与录入；切币种只换展示，不动任何账。
+- 价格表落 `settings.json` 的 `cost` 节（`prices` / `currency` / `usd_cny_rate`），保存后**新**请求按新价计价；要改历史账点「按当前价格重算历史」。
 
 **红线一：全局花费上限（硬闸）**——config.toml：
 
@@ -336,7 +343,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 spend_cap_usd = 0.0   # 美元；累计花费达到即拒绝新的模型请求（主对话与辅助调用同一道闸），0 = 不限
 ```
 
-累计值启动时扫台账装入、之后随记账增量更新；触发时请求直接返回人话错误并记 `cost.cap_blocked` 审计，调高上限即恢复。
+上限看**全量**台账（与面板的「当前对话」口径分层）；启动时扫台账装入、之后随记账增量更新；触发时请求直接返回人话错误并记 `cost.cap_blocked` 审计，调高上限即恢复。
 
 **预算降级渠道**：`[roles] budget = "<便宜渠道配置名>"`——单任务累计 token 超 `[hooks] budget_tokens` 后，该任务剩余步骤改走这个渠道（Notice 明示），防止一个任务把额度吃满。
 

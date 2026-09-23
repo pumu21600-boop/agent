@@ -44,8 +44,9 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | title / description / version | 否 | 展示元数据；目录形态工具插件未写时用目录名 |
 | entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写 |
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
-| ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer） |
-| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage`；**未声明的一律拒绝** |
+| settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它 |
+| ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量」插件） |
+| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）；**未声明的一律拒绝** |
 
 **契约纪律**：解析器忽略未知字段（只增不删 = 天然向后兼容）；apiVersion 不匹配即拒载 +
 UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件兼容。
@@ -84,6 +85,18 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
 
 > 一句话纪律：**插件可以写自己名下的格子，碰不到昨天存下来的东西。**
 
+## 五之二、成本台账（P21 插件化：ui-ext/usage 试点）
+
+内核（台账 / 计价 / 花费硬闸）**永不插件化**——计量挂在网关唯一出入口、闸门要真能挡住模型请求。插件只拿两层：
+
+- **dock 面板**：manifest `ui:[{slot:"dock",title:"用量"}]` → 右侧面板多一个页签；停用插件页签即消失（台账照记）。
+- **数据桥**：
+  - `usage.session`（只读，不占权限）→ **当前会话**的用量统计（token 三路 / 请求 / 费用；会话 id 由宿主注入，插件看不到别的会话）；
+  - `usage.prices`（只读）→ 价格表 + 可选渠道清单 + 币种汇率 + 累计/上限；
+  - `usage.prices.save` / `usage.recompute`（写，须声明 `usage.prices`）→ 存价格表与币种 / 用当前价格重算全部历史账。
+- 价格表是**内核配置**（settings.json 的 `cost` 节），插件只是编辑器：停用插件不影响计价与硬闸。
+- 金额一律**美元**规范存储；人民币是展示层（`cost.currency` + `usd_cny_rate` 折算），切币种不动账。
+
 ## 六、钩子 v1
 
 config.toml `[hooks]`，四个挂点，承载形式 = 本地命令（stdin 收 JSON 事件、stdout 回 JSON）：
@@ -112,6 +125,7 @@ timeout_ms = 5000
 | --- | --- | --- |
 | trace 时间线 | 纯面板（entry + 只读桥） | 现有字段**够用**；P19 拆 App.svelte 时把 trace 面板拆成独立组件顺势插件化 |
 | web_search | 纯工具 | 现有字段**够用**：以目录形态落 plugins/（或内置注册表直挂）即可，无需新契约字段 |
+| 用量台账（P21 插件化） | dock 面板 + 插件自带设置页 | **要加两口**：`ui` 插槽新值 `dock`（右侧面板页签）+ manifest `settings_entry`（插件设置页，宿主在插件卡上渲染「设置」按钮）；数据走新增桥 `usage.session` / `usage.prices`（写要 `usage.prices` 权限）。内核（台账/计价/硬闸）不插件化 |
 
 试点的意义：自己吃自己的狗粮——内置功能装得进插件壳，契约就够结实；装不进就说明契约
 有缺陷，开源前赶紧改。**执法者（审批门 / 存储 / 并发控制）永不插件化**（裁判不下场）。

@@ -209,6 +209,8 @@ pub(super) async fn put_settings(
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_extensions);
     crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    // P21：设置里若带了价格表（外部编辑 settings.json 的 cost.prices），同步刷新内存价格表
+    crate::usage::install_prices(&s.cost.prices);
     observability::event(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": pid, "model": eff_model }),

@@ -2979,7 +2979,7 @@
 
   // —— P10.5 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'usage'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
@@ -2988,37 +2988,6 @@
     if (t === 'mcp' || t === 'plugins') loadMcp();
     if (t === 'skills') loadSkills();
     if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
-    if (t === 'usage') loadUsage();
-  }
-
-  // —— P21 成本台账（用量分区）：按供应商/模型的 token、次数、费用报表 ——
-  let usageData = null;
-  let usageGroup = 'provider'; // provider | model
-  let usageRange = 'today'; // today | 7d | 30d | all
-  let usageLoading = false;
-
-  async function loadUsage() {
-    usageLoading = true;
-    try {
-      usageData = await apiJson(
-        `/api/usage?group=${usageGroup}&range=${usageRange}`,
-        { cache: 'no-store' },
-        '服务端没有用量台账接口（/api/usage），跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）',
-      );
-    } catch (e) {
-      usageData = { error: e.message || String(e) };
-    } finally {
-      usageLoading = false;
-    }
-  }
-
-  function fmtInt(n) {
-    return (n ?? 0).toLocaleString('zh-CN');
-  }
-  function fmtUsd(n) {
-    const v = n ?? 0;
-    if (v > 0 && v < 0.01) return '<$0.01';
-    return `$${v.toFixed(v < 100 ? 4 : 2)}`;
   }
 
   // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
@@ -3276,6 +3245,7 @@
   let extOpen = false;
   let extCurrent = null; // 当前打开的扩展（{ name, title, ... }）
   let extFrame = null; // 面板里那个 iframe 元素（当前打开的扩展）
+  let dockExtFrame = null; // 右侧面板里承载 dock 插槽插件的 iframe
   let extMsg = '';
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
@@ -3293,6 +3263,16 @@
 
   // 已启用的扩展（停用的不加载、不给按钮）
   $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
+  // P21：声明了 dock 插槽的启用插件 → 右侧面板多一个页签（与「产物/预览/网页」并列）。
+  // 停用插件即从页签消失——插件自己决定要不要这个槽，宿主只认 manifest 声明。
+  $: rpPluginTabs = enabledExts.flatMap((e) =>
+    (e.ui || []).filter((u) => u.slot === 'dock').map((u) => ({ key: 'ext:' + e.name, name: e.name, title: u.title || e.title || e.name }))
+  );
+  function openDockPlugin(t) {
+    rpTab = t.key;
+    const ext = extList.find((e) => e.name === t.name);
+    if (ext) extCurrent = ext;
+  }
   // 声明了 toolbar 插槽的扩展 → 顶栏按钮
   $: slotExts = enabledExts.flatMap((e) =>
     (e.ui || []).filter((u) => u.slot === 'toolbar').map((u) => ({ ext: e, slot: u }))
@@ -3319,6 +3299,8 @@
 
   /// 面板 iframe 加载完成：登记元素 + 发 init + 补投排队中的插槽事件
   function onExtFrameLoad(name) {
+    // dock 页签里的 iframe 也要登记（postToName 靠 extFrameEls 找它）
+    if (dockExtFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = dockExtFrame;
     // 面板那个 iframe 绑的是 extFrame，这里补登记：否则 postToName 找不到它，
     // init / 插槽事件都投不进去（后台 iframe 此时已经卸载）
     if (extFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = extFrame;
@@ -3329,6 +3311,17 @@
       postToName(name, p.msg);
       return false;
     });
+  }
+
+  /// 打开插件的指定页（manifest settings_entry，如「用量」插件的价格设置页）
+  function openExtPage(e, page) {
+    const wasOpenSame = extOpen && extCurrent && extCurrent.name === e.name;
+    extCurrent = { ...e, entry: page };
+    extMsg = '';
+    extOpen = true;
+    rightPanelOpen = false;
+    terminalOpen = false;
+    if (!wasOpenSame) extPendingMsgs.push({ name: e.name, msg: { type: 'agent:init', payload: extInitPayload(e) } });
   }
 
   /// 扩展插槽按钮点击：打开该扩展面板并把事件交给它（面板里自己决定做什么）
@@ -3555,6 +3548,48 @@
           if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
           const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' });
           reply(!!r.ok, r.ok ? { ok: true, found: r.found } : r.error || '删除失败');
+          break;
+        }
+        // —— P21 只读桥：「用量」插件（ui-ext/usage 试点）拉当前会话的用量统计 ——
+        case 'usage.session': {
+          const group = params.group === 'model' ? 'model' : 'provider';
+          const range = ['today', '7d', '30d', 'all'].includes(params.range) ? params.range : 'all';
+          // 面板口径 = 当前对话：session 由宿主注入（插件拿不到别的会话的也不该看）
+          const sid = encodeURIComponent(currentSessionId || '');
+          reply(true, await get(`/api/usage?group=${group}&range=${range}&session=${sid}`));
+          break;
+        }
+        // —— P21 价格设置（写操作，须声明 usage.prices 权限）——
+        case 'usage.prices': {
+          reply(true, await get('/api/usage/prices'));
+          break;
+        }
+        case 'usage.prices.save': {
+          if (!perms.includes('usage.prices')) return reply(false, '未声明权限 usage.prices');
+          const body = {
+            prices: Array.isArray(params.prices) ? params.prices : [],
+            currency: params.currency === 'CNY' ? 'CNY' : 'USD',
+            usd_cny_rate: Number(params.usd_cny_rate) || 7.2,
+          };
+          const r = await fetch('/api/usage/prices', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const j = await r.json().catch(() => ({}));
+          reply(r.ok && j.ok !== false, r.ok ? j : j.error || '保存失败');
+          break;
+        }
+        case 'usage.recompute': {
+          if (!perms.includes('usage.prices')) return reply(false, '未声明权限 usage.prices');
+          if (!confirm(`用当前价格表重算全部历史记录的费用？
+
+之前已记的账会按新价改写（累计花费同步刷新）。`)) {
+            return reply(false, '用户取消');
+          }
+          const r = await fetch('/api/usage/recompute', { method: 'POST' });
+          const j = await r.json().catch(() => ({}));
+          reply(r.ok && j.ok !== false, r.ok ? j : j.error || '重算失败');
           break;
         }
         // —— P19 只读桥：trace 时间线面板（ui-ext/trace 试点）拉最近任务事件流 ——
@@ -4360,6 +4395,9 @@
         <button class:active={rpTab === 'artifacts'} on:click={() => { rpTab = 'artifacts'; loadArtifacts(); }}>产物</button>
         <button class:active={rpTab === 'preview'} on:click={() => { rpTab = 'preview'; if (!rpPreviewContent && rpFiles.length) previewFile(rpFiles[0]); }}>预览</button>
         <button class:active={rpTab === 'web'} on:click={() => { rpTab = 'web'; loadWebState(); }}>网页</button>
+        {#each rpPluginTabs as t (t.key)}
+          <button class:active={rpTab === t.key} on:click={() => openDockPlugin(t)}>{t.title}</button>
+        {/each}
         <span class="flex-sp"></span>
         {#if rpTab === 'artifacts'}
           <button class="rp-refresh" title="刷新产物清单" on:click={loadArtifacts}>↻</button>
@@ -4385,6 +4423,21 @@
           {:else}
             <div class="rp-empty">从「产物」里点一个文件查看内容</div>
           {/if}
+        {:else if rpTab.startsWith('ext:')}
+          <div class="web-wrap">
+            {#if extCurrent}
+              <iframe
+                class="ext-frame"
+                title={extCurrent.title}
+                sandbox="allow-scripts"
+                bind:this={dockExtFrame}
+                src={`/ui-ext/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
+                on:load={() => onExtFrameLoad(extCurrent.name)}
+              ></iframe>
+            {:else}
+              <div class="rp-empty">插件未加载</div>
+            {/if}
+          </div>
         {:else}
           <div class="web-wrap">
             {#if webTabs.length}
@@ -4526,7 +4579,7 @@
   {/if}
 
   <!-- P17 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
-  {#each enabledExts.filter((e) => e.entry) as e (e.name)}
+  {#each enabledExts.filter((e) => e.entry && !(e.ui || []).some((u) => u.slot === 'dock')) as e (e.name)}
     {#if !(extOpen && extCurrent && extCurrent.name === e.name)}
       <iframe
         class="ext-hidden"
@@ -4636,7 +4689,6 @@
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
-          <button class:active={settingsTab === 'usage'} on:click={() => pickSettingsTab('usage')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5V9.5M9.3 19.5V4.5M14.7 19.5v-7M20 19.5v-11"/></svg> 用量</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
@@ -5240,6 +5292,9 @@
                       <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
                     {/if}
                   {/if}
+                  {#if e.settings_entry}
+                    <button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>
+                  {/if}
                   <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
                   {#if e.entry}<button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
                 {/if}
@@ -5364,109 +5419,6 @@
         </div>
       {/if}
 
-      {#if settingsTab === 'usage'}
-        <div class="param-hint">
-          用量台账（P21）：每一次模型调用都在网关单点记账（token 分 prompt / completion / cache 三路，
-          请求次数、失败与延迟分位、费用），落在 <code>logs/usage/ledger.jsonl</code>。
-          费用按 <code>prices.json</code> 里<b>当时有效</b>的单价算（价格表带生效时间，调价不改历史账）。
-        </div>
-
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={usageData?.spend_cap_usd > 0}></span>
-            <b>全局花费上限（硬闸）</b>
-            <span class="mcp-status">
-              {usageData?.spend_cap_usd > 0
-                ? `累计 ${fmtUsd(usageData.spend_total_usd)} / 上限 $${usageData.spend_cap_usd}`
-                : '未设置（不限）'}
-            </span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" on:click={loadUsage} disabled={usageLoading}>{usageLoading ? '读取中…' : '刷新'}</button>
-          </div>
-          <div class="param-hint">
-            在 <code>config.toml</code> 的 <code>[cost] spend_cap_usd</code> 设置（美元）。累计花费达到上限后，
-            新的模型请求会被直接拒绝（主对话与摘要/标题等辅助调用同一道闸），调高上限即恢复。
-          </div>
-        </div>
-
-        <div class="field">
-          <label>报表口径</label>
-          <div class="mcp-cmd" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <span>分组：</span>
-            <button class="btn ghost" class:active={usageGroup === 'provider'} on:click={() => { usageGroup = 'provider'; loadUsage(); }}>按供应商</button>
-            <button class="btn ghost" class:active={usageGroup === 'model'} on:click={() => { usageGroup = 'model'; loadUsage(); }}>按模型</button>
-            <span style="margin-left:8px;">范围：</span>
-            <button class="btn ghost" class:active={usageRange === 'today'} on:click={() => { usageRange = 'today'; loadUsage(); }}>今天</button>
-            <button class="btn ghost" class:active={usageRange === '7d'} on:click={() => { usageRange = '7d'; loadUsage(); }}>7 天</button>
-            <button class="btn ghost" class:active={usageRange === '30d'} on:click={() => { usageRange = '30d'; loadUsage(); }}>30 天</button>
-            <button class="btn ghost" class:active={usageRange === 'all'} on:click={() => { usageRange = 'all'; loadUsage(); }}>全部</button>
-          </div>
-        </div>
-
-        {#if usageData?.error}
-          <div class="mcp-cmd" style="color: var(--tint-red-fg, #d33)">读取失败：{usageData.error}</div>
-        {:else if usageData}
-          <div class="field mcp-card">
-            <div class="mcp-head">
-              <b>合计</b>
-              <span class="mcp-status">{usageData.range === 'all' ? '全部时间' : usageData.range === 'today' ? '今天（UTC）' : `最近 ${usageData.range}`}</span>
-            </div>
-            <div class="mcp-cmd">
-              输入 {fmtInt(usageData.totals?.prompt_tokens)} token（其中缓存命中 {fmtInt(usageData.totals?.cached_tokens)}）
-              · 输出 {fmtInt(usageData.totals?.completion_tokens)} token
-            </div>
-            <div class="mcp-cmd">
-              请求 {fmtInt(usageData.totals?.requests)} 次（失败 {fmtInt(usageData.totals?.errors)} · 取消 {fmtInt(usageData.totals?.cancelled)}）
-              · 延迟 p50 {fmtInt(usageData.totals?.p50_ms)}ms / p95 {fmtInt(usageData.totals?.p95_ms)}ms
-              · 费用 <b>{fmtUsd(usageData.totals?.cost_usd)}</b>
-            </div>
-            {#if !usageData.priced}
-              <div class="mcp-cmd" style="color: var(--tint-orange-fg)">
-                有请求未能计价（prices.json 里没有匹配的价格）：未计价的不计入费用，请求与 token 仍照记。
-                价格表路径：{usageData.prices_file}
-              </div>
-            {/if}
-          </div>
-
-          {#if usageData.rows?.length}
-            <div class="field">
-              <label>明细（按{usageData.group === 'model' ? '模型' : '供应商'}，花费降序）</label>
-              <table class="usage-table">
-                <thead>
-                  <tr>
-                    <th>{usageData.group === 'model' ? '模型' : '供应商'}</th>
-                    <th>输入 token</th>
-                    <th>其中缓存</th>
-                    <th>输出 token</th>
-                    <th>请求</th>
-                    <th>失败</th>
-                    <th>p50 / p95 (ms)</th>
-                    <th>费用</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {#each usageData.rows as r}
-                    <tr>
-                      <td><code>{r.key}</code></td>
-                      <td>{fmtInt(r.prompt_tokens)}</td>
-                      <td>{fmtInt(r.cached_tokens)}</td>
-                      <td>{fmtInt(r.completion_tokens)}</td>
-                      <td>{fmtInt(r.requests)}</td>
-                      <td>{fmtInt(r.errors)}{r.unpriced_requests ? `（${fmtInt(r.unpriced_requests)} 未计价）` : ''}</td>
-                      <td>{fmtInt(r.p50_ms)} / {fmtInt(r.p95_ms)}</td>
-                      <td>{fmtUsd(r.cost_usd)}</td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-            </div>
-          {:else}
-            <div class="menu-empty">该时间范围内还没有模型调用记录。</div>
-          {/if}
-        {:else}
-          <div class="menu-empty">读取中…</div>
-        {/if}
-      {/if}
         </div>
       </div>
     </div>
@@ -6813,34 +6765,6 @@
   .probe-detail {
     color: var(--g5);
     word-break: break-all;
-  }
-  /* P21 用量台账报表表（设置 → 用量） */
-  .usage-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-    margin: 4px 0 8px;
-  }
-  .usage-table th,
-  .usage-table td {
-    text-align: right;
-    padding: 4px 8px;
-    border-bottom: 1px solid var(--g2);
-    white-space: nowrap;
-  }
-  .usage-table th:first-child,
-  .usage-table td:first-child {
-    text-align: left;
-    white-space: normal;
-    word-break: break-all;
-  }
-  .usage-table th {
-    color: var(--g5);
-    font-weight: 600;
-  }
-  .usage-table td {
-    color: var(--g6);
-    font-variant-numeric: tabular-nums;
   }
   .side-version {
     flex: 0 0 100%;

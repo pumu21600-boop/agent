@@ -104,6 +104,48 @@ pub struct RolesSettings {
     pub fallbacks: Vec<String>,
 }
 
+/// 成本台账设置（P21 插件化后由「用量」插件的价格设置页维护）。
+/// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
+/// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostSettings {
+    /// 展示币种："USD"（默认）| "CNY"
+    #[serde(default = "default_currency")]
+    pub currency: String,
+    /// 汇率：1 USD = N CNY（人民币展示与录入折算用；填 0 或负值按 1 处理）
+    #[serde(default = "default_usd_cny_rate")]
+    pub usd_cny_rate: f64,
+    /// 价格表：一行 = 一个「供应商 host + 模型 id」的三个单价（美元 / 1M tokens）。
+    /// host 或 model 可为 `*` = 通配兜底（精确匹配优先于通配）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prices: Vec<ModelPrice>,
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
+}
+fn default_usd_cny_rate() -> f64 {
+    7.2
+}
+
+/// 一条模型价格（美元 / 1M tokens）。`provider` 记渠道 base_url 的 host——
+/// **同模型 id 不同供应商是两行**，靠 host 区分，绝不只看模型名。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// 渠道 host（如 api.deepseek.com；`*` = 任意供应商的通配兜底）
+    pub provider: String,
+    /// 模型 id（如 deepseek-chat；`*` = 该供应商下任意模型的兜底）
+    pub model: String,
+    /// 输入单价（未命中缓存部分）
+    pub prompt: f64,
+    /// 缓存命中输入单价
+    #[serde(default)]
+    pub cached: f64,
+    /// 输出单价
+    #[serde(default)]
+    pub completion: f64,
+}
+
 /// 一套配置（渠道信息 + 模型 + 本配置专属 key + 协议形态与采样参数 + 能力标记）。
 ///
 /// B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
@@ -283,6 +325,10 @@ pub struct Settings {
     /// user 来源插件必须在这里有且 digest 一致才会加载；draft 转正时自动写入。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted_plugins: BTreeMap<String, String>,
+
+    /// P21 成本台账：展示币种 / 汇率 / 模型价格表（美元 / 1M tokens 规范存储）
+    #[serde(default)]
+    pub cost: CostSettings,
 
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]

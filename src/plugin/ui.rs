@@ -71,6 +71,9 @@ pub struct UiExt {
     pub permissions: Vec<String>,
     /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
     pub tools: Vec<ToolBrief>,
+    /// P21：插件自带设置页（manifest settings_entry，如 prices.html）——
+    /// 宿主在设置→插件卡片上渲染「设置」按钮，点了在插件面板里打开该页
+    pub settings_entry: String,
     /// P21 红线3：验签键（`ui-ext:<name>`；draft 为空串）
     pub trust_key: String,
     /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
@@ -125,12 +128,13 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
             enabled: true,
             ui: ui
                 .iter()
-                .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer")))
+                .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer" | "dock")))
                 .cloned()
                 .collect(),
             permissions: Vec::new(),
             tools: Vec::new(),
             // draft 是模型自产隔离区：豁免验签
+            settings_entry: String::new(),
             trust_key: String::new(),
             digest: String::new(),
             trusted: true,
@@ -180,6 +184,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         ui: Vec::new(),
         permissions: Vec::new(),
         tools: Vec::new(),
+        settings_entry: String::new(),
         trust_key: String::new(),
         digest: String::new(),
         trusted: true,
@@ -221,11 +226,18 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
     if let Some(en) = v.get("entry").and_then(Value::as_str) {
         e.entry = en.to_string();
     }
+    // P21：插件自带设置页（如「用量」插件的价格设置页）；必须不出目录
+    if let Some(se) = v.get("settings_entry").and_then(Value::as_str) {
+        match resolve_in(dir, se) {
+            Ok(p) if p.is_file() => e.settings_entry = se.to_string(),
+            _ => e.error = Some(format!("settings_entry {se} 不是插件目录内的文件")),
+        }
+    }
     // P17：界面插槽与写操作权限（只认白名单里的插槽名与动作名）
     if let Some(ui) = v.get("ui").and_then(Value::as_array) {
         e.ui = ui
             .iter()
-            .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer")))
+            .filter(|u| matches!(u.get("slot").and_then(|s| s.as_str()), Some("toolbar" | "composer" | "dock")))
             .cloned()
             .collect();
     }
@@ -236,7 +248,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .filter(|p| {
                 matches!(
                     *p,
-                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage"
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices"
                 )
             })
             .map(str::to_string)

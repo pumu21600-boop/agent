@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>用量</title>
+<style>
+  :root { color-scheme: dark; }
+  .light { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px 16px 20px;
+    font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #17171a; color: #e8e8ea;
+  }
+  .light body { background: #fff; color: #1a1a1c; }
+  h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
+  .sub { color: #9a9aa2; font-size: 12px; margin-bottom: 14px; }
+  .light .sub { color: #6b6b74; }
+  .card { border: 1px solid #2c2c31; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .light .card { border-color: #e4e4e8; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .row .k { color: #9a9aa2; }
+  .light .row .k { color: #6b6b74; }
+  .row .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .big { font-size: 20px; font-weight: 680; font-variant-numeric: tabular-nums; }
+  .foot { margin-top: 12px; padding-top: 10px; border-top: 1px solid #2c2c31; color: #8b8b93; font-size: 12px; }
+  .light .foot { border-color: #e4e4e8; color: #6b6b74; }
+  .warn { color: #e8a33d; font-size: 12px; margin-top: 8px; }
+  .empty { color: #8b8b93; font-size: 12px; padding: 18px 0; text-align: center; }
+  button {
+    font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid #3a3a41; background: transparent; color: #e8e8ea;
+  }
+  .light button { border-color: #d4d4da; color: #1a1a1c; }
+  button:hover { background: #26262b; }
+  .light button:hover { background: #f2f2f5; }
+  .err { color: #e5534b; font-size: 12px; white-space: pre-wrap; }
+  a { color: #6ea8fe; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+  <h3>本次对话用量</h3>
+  <div class="sub" id="sess">（读取中…）</div>
+
+  <div id="body">
+    <div class="empty">读取中…</div>
+  </div>
+
+  <div class="foot">
+    累计花费（全部会话）<span id="spend">—</span><br />
+    全局上限 <span id="cap">未设置</span> · <a id="toPrices">价格设置 →</a>
+  </div>
+
+<script>
+// —— 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对 ——
+let seq = 0;
+const pending = new Map();
+let theme = 'dark';
+let rate = 7.2;
+let currency = 'USD';
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    const p = d.payload || {};
+    theme = p.theme || 'dark';
+    document.body.classList.toggle('light', theme === 'light');
+    boot();
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const num = (n) => (n ?? 0).toLocaleString('zh-CN');
+function money(usd) {
+  const v = usd ?? 0;
+  if (currency === 'CNY') return '¥' + (v * rate).toFixed(v * rate < 100 ? 2 : 0);
+  if (v > 0 && v < 0.01) return '<$0.01';
+  return '$' + v.toFixed(v < 100 ? 4 : 2);
+}
+
+async function boot() {
+  $('toPrices').onclick = () => { location.href = 'prices.html'; };
+  await refresh();
+  setInterval(refresh, 5000); // 面板口径轻，5s 轮询足够
+}
+
+async function refresh() {
+  try {
+    const info = await req('session.info', {});
+    const sid = (info && info.id) || '';
+    $('sess').textContent = (info && info.title) ? `「${info.title}」` : '新对话';
+    const r = await req('usage.session', { group: 'model', range: 'all' });
+    currency = r.currency || 'USD';
+    rate = r.usd_cny_rate || 7.2;
+    render(r, sid);
+  } catch (e) {
+    $('body').innerHTML = `<div class="err">${String(e.message || e).replace(/</g, '&lt;')}</div>`;
+  }
+}
+
+function render(r, sid) {
+  const t = r.totals || {};
+  $('spend').textContent = money(r.spend_total_usd);
+  $('cap').textContent = r.spend_cap_usd > 0 ? money(r.spend_cap_usd) : '未设置（不限）';
+  if (!t.requests) {
+    $('body').innerHTML = '<div class="empty">本次对话还没有模型调用。</div>';
+    return;
+  }
+  const rows = (r.rows || [])
+    .map(
+      (x) => `<div class="row"><span class="k">${x.key}</span><span class="v">${num(x.prompt_tokens)} / ${num(
+        x.completion_tokens
+      )} · ${money(x.cost_usd)}</span></div>`
+    )
+    .join('');
+  $('body').innerHTML = `
+    <div class="card">
+      <div class="row"><span class="k">输入 token（其中缓存命中）</span><span class="v big">${num(t.prompt_tokens)}<span style="font-size:12px;color:#9a9aa2">（${num(t.cached_tokens)}）</span></span></div>
+      <div class="row"><span class="k">输出 token</span><span class="v big">${num(t.completion_tokens)}</span></div>
+      <div class="row"><span class="k">请求次数（失败）</span><span class="v">${num(t.requests)}（${num(t.errors)}）</span></div>
+      <div class="row"><span class="k">本次对话费用</span><span class="v big">${money(t.cost_usd)}</span></div>
+    </div>
+    <div class="card">
+      <div style="color:#9a9aa2;font-size:12px;margin-bottom:4px">按模型</div>
+      ${rows}
+    </div>
+    ${r.priced ? '' : '<div class="warn">有请求未计价（价格表里没有这条渠道+模型）——token 与次数照记，费用不计。「价格设置」里补上即可。</div>'}`;
+}
+</script>
+</body>
+</html>

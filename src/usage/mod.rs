@@ -4,13 +4,16 @@
 //! 出入口），业务代码零埋点。台账落 `<log_dir>/usage/ledger.jsonl`（追加写 + flush，
 //! 与 JSONL 日志同规：落盘即完整），超 32MB 归档一份 `.1`。
 //!
-//! 三条硬语义：
+//! 四条硬语义：
 //! 1. **分计量**：prompt / completion / cache 三路分开记；渠道不回 usage 的调用 token 记 0，
 //!    但请求与延迟照记——报表按「未计价请求数」区分「渠道没给用量」与「价格表没这条」。
-//! 2. **价格表带生效时间**：费用按记录发生时间取当时有效的价格（见 prices.rs），
-//!    调价不改历史账。
+//! 2. **费用冻结构**：记账时用当时的价格算定 `cost_usd` 写进记录，之后改价只影响新请求，
+//!    历史账一分不动（价格表在 settings.json，由「用量」插件维护；要改历史账用 recompute）。
 //! 3. **全局花费上限是硬闸**（红线 1）：累计花费达 `[cost] spend_cap_usd` 即拒绝新的模型
-//!    请求（主流程与辅助调用同一道闸），调高上限即恢复，不锁死数据。
+//!    请求（主流程与辅助调用同一道闸），调高上限即恢复，不锁死数据。上限看**全量**台账，
+//!    与面板的「当前会话」口径分层——面板按会话过滤只是展示口径。
+//! 4. **币种**：单价与花费一律以**美元**为规范存储/计算；人民币只是展示层
+//!    （settings.cost.currency + usd_cny_rate，前端折算），切币种不动任何账。
 //!
 //! P22 衔接：`parent_session` 字段 v1 恒为 None（子代理在 P22）；子会话填父任务 id 后
 //! 报表按父任务聚合即可，无需数据迁移（docs/subagent-draft.md 第 4 节）。
@@ -30,6 +33,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::config::settings::ModelPrice;
 use crate::observability::{try_event, EventType};
 
 pub mod prices;
@@ -51,9 +55,9 @@ pub struct UsageRecord {
     pub parent_session: Option<String>,
     /// 用途：main（主循环）| summary（滚动摘要）| title（标题）| media（媒体旁路）
     pub purpose: String,
-    /// 渠道 host（报表按供应商分组的键）
+    /// 渠道 host（价格表按它 + model 两元组命中）
     pub provider: String,
-    /// 供应商预设 id（自定义中转时为空；价格表可按它命中）
+    /// 供应商预设 id（自定义中转时为空；仅作展示，价格匹配只看 host + model）
     #[serde(default)]
     pub provider_id: String,
     pub model: String,
@@ -66,6 +70,9 @@ pub struct UsageRecord {
     /// 失败原因（截断；绝不含 key）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 费用（美元，**记账时算定冻结**）；None = 当时没配到价格 = 未计价
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl UsageRecord {
@@ -85,6 +92,7 @@ impl UsageRecord {
             status: "ok".to_string(),
             latency_ms: 0,
             error: None,
+            cost_usd: None,
         }
     }
 }
@@ -102,8 +110,8 @@ static LEDGER: OnceLock<Ledger> = OnceLock::new();
 static SPEND: AtomicU64 = AtomicU64::new(0);
 /// 全局花费上限（美元；0 = 不限）。config.toml [cost] spend_cap_usd。
 static CAP: RwLock<f64> = RwLock::new(0.0);
-/// 价格表（启动时从 prices.json 装入；测试可替换）。
-static PRICES: RwLock<prices::PriceTable> = RwLock::new(prices::PriceTable { prices: Vec::new() });
+/// 价格表（settings.json 的 cost.prices；设置变更即同步，测试可替换）。
+static PRICES: RwLock<Vec<ModelPrice>> = RwLock::new(Vec::new());
 
 impl Ledger {
     fn open(dir: &Path) -> anyhow::Result<Self> {
@@ -144,6 +152,16 @@ impl Ledger {
         }
     }
 
+    /// 重开追加句柄（文件被原子替换/轮转后必须调，否则 append 写进旧 inode）。
+    fn reopen(&self) {
+        if let Ok(mut f) = self.file.lock()
+            && let Ok(nf) = OpenOptions::new().create(true).append(true).open(&self.path)
+        {
+            *f = nf;
+            self.bytes.store(std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+
     /// 读全部记录（坏行跳过；报表口径）。
     fn read_all(&self) -> Vec<UsageRecord> {
         let Ok(text) = std::fs::read_to_string(&self.path) else { return Vec::new() };
@@ -163,12 +181,12 @@ pub fn init(dir: &Path) {
             return;
         }
     };
-    // 启动时扫一遍：装入累计花费（硬闸口径 = 台账全量）
+    // 启动时扫一遍：装入累计花费（硬闸口径 = 台账全量；费用已冻结在记录里，直接求和）
     let records = ledger.read_all();
     let mut total = 0.0f64;
     let mut unpriced = 0u64;
     for r in &records {
-        match cost_of(r) {
+        match r.cost_usd {
             Some(c) => total += c,
             None => unpriced += 1,
         }
@@ -181,16 +199,65 @@ pub fn init(dir: &Path) {
     );
 }
 
-/// 装入价格表（main.rs 从 app_root/prices.json 调；测试可直接替换）。
-pub fn install_prices(table: prices::PriceTable) {
+/// 装入价格表（settings.json 的 cost.prices；设置保存/启动时同步，测试可替换）。
+pub fn install_prices(prices: &[ModelPrice]) {
     if let Ok(mut t) = PRICES.write() {
-        *t = table;
+        *t = prices.to_vec();
     }
 }
 
-/// 从文件装价格表（不存在 = 空表）。
-pub fn install_prices_file(path: &Path) {
-    install_prices(prices::PriceTable::load(path));
+/// 算一条记录的费用（用**当前**价格表；None = 未计价）。
+fn cost_now(rec: &UsageRecord) -> Option<f64> {
+    let t = PRICES.read().ok()?;
+    prices::cost(&t, (rec.prompt_tokens, rec.completion_tokens, rec.cached_tokens), &rec.provider, &rec.model)
+}
+
+/// 记录时算定费用（冻结进台账）。未初始化 = 静默跳过（测试/早期启动不 panic）。
+pub fn record(mut rec: UsageRecord) {
+    let Some(ledger) = LEDGER.get() else { return };
+    // 费用按当前价格算定并冻结；未命中价格表 = 未计价（累计值不加，界面显式提示）
+    rec.cost_usd = cost_now(&rec);
+    if let Some(c) = rec.cost_usd {
+        let cur = f64::from_bits(SPEND.load(Ordering::Relaxed));
+        SPEND.store((cur + c).to_bits(), Ordering::Relaxed);
+    }
+    let line = match serde_json::to_string(&rec) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    ledger.append(&line);
+}
+
+/// 用当前价格表**重算全部历史记录**的费用（价格页的显式动作：配错价之后补救）。
+/// 原子重写台账（fsx 原子写），返回 (重算条数, 仍未计价条数)；同步刷新累计花费。
+pub fn recompute() -> Result<(usize, usize), String> {
+    let Some(ledger) = LEDGER.get() else { return Err("台账未初始化".into()) };
+    let mut records = ledger.read_all();
+    let mut unpriced = 0usize;
+    let mut total = 0.0f64;
+    let mut text = String::new();
+    for r in &mut records {
+        r.cost_usd = cost_now(r);
+        match r.cost_usd {
+            Some(c) => total += c,
+            None => unpriced += 1,
+        }
+        match serde_json::to_string(r) {
+            Ok(line) => {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            Err(e) => return Err(format!("序列化失败: {e}")),
+        }
+    }
+    crate::fsx::write_atomic_str(&ledger.path, &text).map_err(|e| format!("重写台账失败: {e}"))?;
+    ledger.reopen(); // 原子替换后重开追加句柄——否则后续记录写进已删除的旧文件
+    SPEND.store(total.to_bits(), Ordering::Relaxed);
+    try_event(
+        EventType::State,
+        json!({ "kind": "usage.ledger_recomputed", "records": records.len(), "spend_usd": total, "unpriced": unpriced }),
+    );
+    Ok((records.len(), unpriced))
 }
 
 /// 设置全局花费上限（美元；0 = 不限）。
@@ -224,21 +291,6 @@ pub fn cap_block() -> Option<String> {
     None
 }
 
-/// 记一条台账（未初始化 = 静默跳过，测试/早期启动不 panic）。
-pub fn record(rec: UsageRecord) {
-    let Some(ledger) = LEDGER.get() else { return };
-    // 费用按记录时间取当时有效的价格；未命中价格表 = 未计价（累计值不加）
-    if let Some(c) = cost_of(&rec) {
-        let cur = f64::from_bits(SPEND.load(Ordering::Relaxed));
-        SPEND.store((cur + c).to_bits(), Ordering::Relaxed);
-    }
-    let line = match serde_json::to_string(&rec) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    ledger.append(&line);
-}
-
 /// 分组口径。
 pub const GROUP_PROVIDER: &str = "provider";
 pub const GROUP_MODEL: &str = "model";
@@ -266,13 +318,15 @@ pub struct Agg {
 pub struct Report {
     pub group: String,
     pub range: String,
+    /// 会话过滤（空 = 全量；面板传当前会话 id）
+    pub session: String,
     /// 时间下界（ISO；all = None）
     pub from: Option<String>,
     pub rows: Vec<Agg>,
     pub totals: Agg,
     pub spend_cap_usd: f64,
     pub spend_total_usd: f64,
-    /// 价格表是否可用（false = 全部记录未计价，界面要显式说明）
+    /// 是否全部记录都已计价（false = 有未计价请求，界面要显式说明）
     pub priced: bool,
 }
 
@@ -352,8 +406,9 @@ fn range_from(range: &str) -> Option<DateTime<Utc>> {
     }
 }
 
-/// 聚合报表。group = provider | model；range = today | 7d | 30d | all。
-pub fn report(group: &str, range: &str) -> Report {
+/// 聚合报表。group = provider | model；range = today | 7d | 30d | all；
+/// `session` 非空 = 只算该会话（面板的「当前对话」口径；不传 = 全量）。
+pub fn report(group: &str, range: &str, session: &str) -> Report {
     let group = if group == GROUP_MODEL { GROUP_MODEL } else { GROUP_PROVIDER };
     let from = range_from(range);
     let records = LEDGER.get().map(|l| l.read_all()).unwrap_or_default();
@@ -361,13 +416,17 @@ pub fn report(group: &str, range: &str) -> Report {
     let mut totals = Acc::default();
     let mut unpriced_total = 0u64;
     for r in &records {
+        if !session.is_empty() && r.session_id != session {
+            continue;
+        }
         if let Some(f) = from {
             let Ok(ts) = DateTime::parse_from_rfc3339(&r.ts) else { continue };
             if ts.with_timezone(&Utc) < f {
                 continue;
             }
         }
-        let cost = cost_of(r);
+        // 费用已冻结在记录里：直接取，不按当前价格回算（改价不动历史账）
+        let cost = r.cost_usd;
         if cost.is_none() {
             unpriced_total += 1;
         }
@@ -392,29 +451,17 @@ pub fn report(group: &str, range: &str) -> Report {
     Report {
         group: group.to_string(),
         range: range.to_string(),
+        session: session.to_string(),
         from: from.map(|f| f.to_rfc3339_opts(SecondsFormat::Secs, true)),
         rows,
         totals: totals.finish(""),
         spend_cap_usd: cap_value(),
         spend_total_usd: spend_total(),
-        priced: prices_available() && unpriced_total == 0,
+        priced: unpriced_total == 0,
     }
 }
 
-/// 算一条记录的费用（美元；未命中价格表 = None = 未计价）。
-/// 价格按**记录发生时间**取（effective_from 语义），调价不改历史账。
-pub fn cost_of(rec: &UsageRecord) -> Option<f64> {
-    let t = PRICES.read().ok()?;
-    let who = prices::PriceWho {
-        provider: &rec.provider,
-        provider_id: &rec.provider_id,
-        model: &rec.model,
-        ts: &rec.ts,
-    };
-    t.cost((rec.prompt_tokens, rec.completion_tokens, rec.cached_tokens), &who)
-}
-
-/// 价格表是否可用（空表 = 全部记录未计价，界面要显式说明）。
+/// 价格表是否为空（没配价 = 全部未计价，界面要显式说明）。
 pub fn prices_available() -> bool {
     PRICES.read().map(|t| !t.is_empty()).unwrap_or(false)
 }
@@ -438,26 +485,22 @@ mod tests {
 
     /// 全通配价格表：prompt 1.0 / completion 2.0 / cached 0.1 美元每 1M tokens。
     fn prices_star() {
-        install_prices(prices::PriceTable {
-            prices: vec![prices::PricePoint {
-                provider: "*".into(),
-                model: "*".into(),
-                effective_from: "2020-01-01".into(),
-                prompt: 1.0,
-                completion: 2.0,
-                cached: 0.1,
-            }],
-        });
+        install_prices(&[ModelPrice { provider: "*".into(), model: "*".into(), prompt: 1.0, cached: 0.1, completion: 2.0 }]);
+    }
+
+    /// (token 三路, status, latency) 打包传，免得八参数触发 clippy。
+    fn rec_at(session: &str, provider: &str, model: &str, m: (u64, u64, u64, &str, u64)) -> UsageRecord {
+        let mut r = UsageRecord::new(session, "main", provider, "", model);
+        r.prompt_tokens = m.0;
+        r.completion_tokens = m.1;
+        r.cached_tokens = m.2;
+        r.status = m.3.to_string();
+        r.latency_ms = m.4;
+        r
     }
 
     fn rec(provider: &str, model: &str, prompt: u64, completion: u64, cached: u64, status: &str, latency: u64) -> UsageRecord {
-        let mut r = UsageRecord::new("sess-test", "main", provider, "", model);
-        r.prompt_tokens = prompt;
-        r.completion_tokens = completion;
-        r.cached_tokens = cached;
-        r.status = status.to_string();
-        r.latency_ms = latency;
-        r
+        rec_at("sess-test", provider, model, (prompt, completion, cached, status, latency))
     }
 
     #[test]
@@ -481,7 +524,7 @@ mod tests {
         let delta = after - before;
         assert!((delta - 0.00434).abs() < 1e-9, "累计应加 0.00434 美元，实际 {delta}");
 
-        let rep = report(GROUP_PROVIDER, "all");
+        let rep = report(GROUP_PROVIDER, "all", "");
         let a = rep.rows.iter().find(|r| r.key == "api.a.com").expect("应有 api.a.com 行");
         assert_eq!(a.requests, 3);
         assert_eq!(a.errors, 1, "失败数只数 error（cancelled 单列）");
@@ -513,9 +556,9 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ledger();
         // 空价格表 → 全部未计价，但请求/延迟照记（不静默当 0 元）
-        install_prices(prices::PriceTable::default());
+        install_prices(&[]);
         record(rec("api.c.com", "mm-x", 10, 5, 0, "ok", 10));
-        let rep = report(GROUP_MODEL, "all");
+        let rep = report(GROUP_MODEL, "all", "");
         let row = rep.rows.iter().find(|r| r.key == "mm-x").expect("应按模型分组出行");
         assert_eq!(row.requests, 1);
         assert_eq!(row.unpriced_requests, 1, "价格表没命中 = 未计价");
@@ -556,12 +599,62 @@ mod tests {
         let mut old = rec("api.old.com", "m", 1, 1, 0, "ok", 1);
         old.ts = "2020-01-01T00:00:00.000Z".to_string();
         record(old);
-        let rep = report(GROUP_PROVIDER, "today");
+        let rep = report(GROUP_PROVIDER, "today", "");
         assert!(!rep.rows.iter().any(|r| r.key == "api.old.com"), "今天范围不该包含 2020 年的记录");
         assert!(rep.from.is_some(), "today 应带下界");
-        let all = report(GROUP_PROVIDER, "all");
+        let all = report(GROUP_PROVIDER, "all", "");
         assert!(all.rows.iter().any(|r| r.key == "api.old.com"), "all 范围应包含");
         assert!(all.from.is_none());
+    }
+
+    #[test]
+    fn report_filters_by_session() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ledger();
+        prices_star();
+        // 两个会话各记一条，面板口径（session 过滤）只认当前对话
+        record(rec_at("sess-A", "api.x.com", "m", (1000, 0, 0, "ok", 10)));
+        record(rec_at("sess-B", "api.x.com", "m", (5000, 0, 0, "ok", 20)));
+        let a = report(GROUP_PROVIDER, "all", "sess-A");
+        assert_eq!(a.totals.requests, 1);
+        assert_eq!(a.totals.prompt_tokens, 1000, "只算 sess-A 的 1000");
+        let b = report(GROUP_PROVIDER, "all", "sess-B");
+        assert_eq!(b.totals.prompt_tokens, 5000);
+        let all = report(GROUP_PROVIDER, "all", "");
+        assert!(all.totals.prompt_tokens >= 6000, "不传 session = 全量");
+    }
+
+    #[test]
+    fn cost_is_frozen_at_record_time_and_recompute_reprices() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ledger();
+        // 先按 1.0/M 记一笔 → 费用冻结为 1.0
+        prices_star();
+        let before = spend_total();
+        record(rec("api.freeze.com", "m", 1_000_000, 0, 0, "ok", 1));
+        let frozen = spend_total() - before;
+        assert!((frozen - 1.0).abs() < 1e-9, "记账时算定 1.0，实际 {frozen}");
+        // 改成 5.0/M 再记一笔 → 新请求按新价，老记录不变
+        install_prices(&[ModelPrice { provider: "*".into(), model: "*".into(), prompt: 5.0, cached: 0.0, completion: 0.0 }]);
+        let mid = spend_total();
+        record(rec("api.freeze.com", "m", 1_000_000, 0, 0, "ok", 1));
+        assert!((spend_total() - mid - 5.0).abs() < 1e-9, "新请求按新价 5.0");
+        // 报表读冻结值：两笔分别 1.0 与 5.0（不是都用当前价 5.0 回算）
+        let rep = report(GROUP_PROVIDER, "all", "");
+        let row = rep.rows.iter().find(|r| r.key == "api.freeze.com").unwrap();
+        assert!((row.cost_usd - 6.0).abs() < 1e-9, "冻结值相加 = 6.0，实际 {}", row.cost_usd);
+        // 显式重算 → 两笔都按当前 5.0/M 改成 5.0（台账是进程级共享的，其它用例的记录也被重算，
+        // 所以只断言本组 + 累计变大，不断言全局精确值）
+        let before_total = spend_total();
+        let (n, unpriced) = recompute().expect("重算应成功");
+        assert!(n >= 2 && unpriced == 0, "重算 {n} 条，未计价 {unpriced}");
+        let rep2 = report(GROUP_PROVIDER, "all", "");
+        let row2 = rep2.rows.iter().find(|r| r.key == "api.freeze.com").unwrap();
+        assert!((row2.cost_usd - 10.0).abs() < 1e-9, "重算后两笔都按 5.0/M = 10.0，实际 {}", row2.cost_usd);
+        assert!(spend_total() > before_total, "重算后累计应变大: {} vs {before_total}", spend_total());
+        // 重算后台账里每条都带 cost_usd（落盘即完整）
+        let text = std::fs::read_to_string(ledger().path.clone()).unwrap();
+        assert!(text.lines().all(|l| l.contains("\"cost_usd\"")), "重算后每条都应有费用字段");
     }
 
     #[test]

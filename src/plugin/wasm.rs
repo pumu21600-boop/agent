@@ -594,7 +594,8 @@ pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
                 ui: Vec::new(),
                 permissions: Vec::new(),
                 tools: e.tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect(),
-                trust_key: if inline {
+                settings_entry: String::new(), // 工具插件没有设置页
+                                trust_key: if inline {
                     String::new()
                 } else {
                     crate::plugin::trust::key_of("plugins", &e.stem)

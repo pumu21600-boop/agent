@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>模型价格</title>
+<style>
+  :root { color-scheme: dark; }
+  .light { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px 16px 24px;
+    font: 13px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #17171a; color: #e8e8ea;
+  }
+  .light body { background: #fff; color: #1a1a1c; }
+  h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
+  .sub { color: #9a9aa2; font-size: 12px; margin-bottom: 14px; }
+  .light .sub { color: #6b6b74; }
+  .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .seg { display: inline-flex; border: 1px solid #3a3a41; border-radius: 7px; overflow: hidden; }
+  .light .seg { border-color: #d4d4da; }
+  .seg button { border: 0; border-radius: 0; padding: 4px 12px; }
+  .seg button.on { background: #2f2f36; font-weight: 650; }
+  .light .seg button.on { background: #ededf2; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 5px 6px; border-bottom: 1px solid #2c2c31; text-align: right; }
+  .light th, .light td { border-color: #ececf0; }
+  th { color: #9a9aa2; font-weight: 600; }
+  .light th { color: #6b6b74; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  input, select {
+    font: inherit; font-size: 12px; width: 100%; padding: 4px 6px;
+    border: 1px solid #3a3a41; border-radius: 5px; background: #1f1f24; color: #e8e8ea;
+  }
+  .light input, .light select { border-color: #d4d4da; background: #fff; color: #1a1a1c; }
+  input[type=number] { font-variant-numeric: tabular-nums; }
+  button {
+    font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid #3a3a41; background: transparent; color: #e8e8ea;
+  }
+  .light button { border-color: #d4d4da; color: #1a1a1c; }
+  button:hover { background: #26262b; }
+  .light button:hover { background: #f2f2f5; }
+  .primary { background: #2f2f36; font-weight: 650; }
+  .light .primary { background: #ededf2; }
+  .foot { margin-top: 14px; padding-top: 10px; border-top: 1px solid #2c2c31; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .light .foot { border-color: #ececf0; }
+  .msg { font-size: 12px; }
+  .ok { color: #4bb543; }
+  .err { color: #e5534b; }
+  .hint { color: #8b8b93; font-size: 12px; margin-top: 10px; }
+  .light .hint { color: #6b6b74; }
+  a { color: #6ea8fe; cursor: pointer; text-decoration: none; }
+</style>
+</head>
+<body>
+  <h3>模型价格</h3>
+  <div class="sub">单价 = <span id="unit">美元</span> / 百万 token · 键是「渠道 + 模型 id」，同模型名不同供应商互不混淆</div>
+
+  <div class="bar">
+    <span class="seg">
+      <button id="curUsd" class="on">美元</button><button id="curCny">人民币</button>
+    </span>
+    <label style="font-size:12px;color:#9a9aa2">1 USD = <input id="rate" type="number" step="0.01" min="0" style="width:70px;display:inline-block" /> CNY</label>
+    <span class="flex-sp" style="flex:1"></span>
+    <button onclick="addRow()">+ 添加一行</button>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>渠道 host</th><th>模型 id</th><th>输入</th><th>缓存输入</th><th>输出</th><th></th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="hint">
+    host 从已保存的渠道里选最省事（下拉带出）；<code>*</code> = 通配兜底。内部一律以美元记账，人民币值按上面的汇率折算——切币种只换显示，不改已记的账。
+  </div>
+
+  <div class="foot">
+    <button class="primary" onclick="save()">保存</button>
+    <button onclick="recompute()">按当前价格重算历史</button>
+    <span class="msg" id="msg"></span>
+    <span style="flex:1"></span>
+    <a href="index.html">← 返回用量面板</a>
+  </div>
+
+<script>
+// —— 插件契约 v1：等宿主 agent:init 再发请求 ——
+let seq = 0;
+const pending = new Map();
+let channels = [];
+let rows = [];
+let currency = 'USD';
+let rate = 7.2;
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    document.body.classList.toggle('light', (d.payload || {}).theme === 'light');
+    boot();
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const say = (text, ok) => { $('msg').textContent = text; $('msg').className = 'msg ' + (ok ? 'ok' : 'err'); };
+
+async function boot() {
+  $('curUsd').onclick = () => setCurrency('USD');
+  $('curCny').onclick = () => setCurrency('CNY');
+  $('rate').onchange = () => { rate = Number($('rate').value) || 7.2; drawRows(); };
+  await load();
+}
+
+function toDisplay(usd) { return currency === 'CNY' ? +(usd * rate).toFixed(4) : usd; }
+function toUsd(v) { return currency === 'CNY' ? +((Number(v) || 0) / rate).toFixed(8) : Number(v) || 0; }
+
+function setCurrency(c) {
+  currency = c;
+  $('curUsd').classList.toggle('on', c === 'USD');
+  $('curCny').classList.toggle('on', c === 'CNY');
+  $('unit').textContent = c === 'CNY' ? '元' : '美元';
+  drawRows();
+}
+
+async function load() {
+  try {
+    const d = await req('usage.prices', {});
+    channels = d.channels || [];
+    rows = (d.prices || []).map((p) => ({ ...p }));
+    currency = d.currency || 'USD';
+    rate = d.usd_cny_rate || 7.2;
+    setCurrency(currency);
+    $('rate').value = rate;
+    drawRows();
+  } catch (e) {
+    say(String(e.message || e), false);
+  }
+}
+
+function drawRows() {
+  const opts = (sel) =>
+    channels.map((c) => `<option value="${c.host}" ${c.host === sel ? 'selected' : ''}>${c.name} · ${c.host}</option>`).join('');
+  $('rows').innerHTML = rows
+    .map(
+      (r, i) => `<tr>
+      <td><select onchange="setHost(${i}, this.value)"><option value=""></option>${opts(r.provider)}</select></td>
+      <td><input value="${r.model}" onchange="setModel(${i}, this.value)" placeholder="模型 id 或 *" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.prompt)}" onchange="setP(${i}, 'prompt', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.cached)}" onchange="setP(${i}, 'cached', this.value)" /></td>
+      <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.completion)}" onchange="setP(${i}, 'completion', this.value)" /></td>
+      <td><button title="删除这一行" onclick="delRow(${i})">×</button></td>
+    </tr>`
+    )
+    .join('');
+  // select 的 value 在 innerHTML 里不生效（option 无 value 时用文本），这里补一次
+  document.querySelectorAll('#rows select').forEach((sel, i) => { sel.value = rows[i].provider || ''; });
+}
+
+function addRow() { rows.push({ provider: '', model: '', prompt: 0, cached: 0, completion: 0 }); drawRows(); }
+function delRow(i) { rows.splice(i, 1); drawRows(); }
+function setHost(i, v) { rows[i].provider = v; }
+function setModel(i, v) { rows[i].model = v.trim(); }
+function setP(i, k, v) { rows[i][k] = toUsd(v); }
+
+async function save() {
+  // host/model 空的行不发（后端也会清，这里先挡一道给即时反馈）
+  const bad = rows.find((r) => !r.provider.trim() || !r.model.trim());
+  if (bad) { say('有行的渠道或模型 id 是空的——补上或删掉该行', false); return; }
+  try {
+    await req('usage.prices.save', {
+      prices: rows.map((r) => ({ provider: r.provider.trim(), model: r.model.trim(), prompt: r.prompt, cached: r.cached, completion: r.completion })),
+      currency,
+      usd_cny_rate: rate,
+    });
+    say('已保存（之后的请求按新价计价，历史账不变）', true);
+  } catch (e) {
+    say(String(e.message || e), false);
+  }
+}
+
+async function recompute() {
+  try {
+    const r = await req('usage.recompute', {});
+    say(`已重算 ${r.records} 条（仍未计价 ${r.unpriced} 条），累计 ${r.spend_total_usd}`, true);
+  } catch (e) {
+    say(String(e.message || e), false);
+  }
+}
+</script>
+</body>
+</html>
