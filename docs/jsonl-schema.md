@@ -155,6 +155,22 @@
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
 
+### 4.x P21 新增 kind（施工单 030，只增）
+
+| `kind` | 说明 | 关键字段 |
+| --- | --- | --- |
+| `usage.ledger_ready` | 用量台账就绪（启动扫盘后） | `records`、`spend_usd`、`unpriced` |
+| `usage.ledger_rotated` | 台账超 32MB 归档成 `ledger.jsonl.1` | `limit_bytes` |
+| `usage.prices_invalid` | prices.json 解析失败（按空表处理） | `path`、`error` |
+| `cost.cap_blocked` | 全局花费上限硬闸拦下一次模型请求 | `session`、`purpose`、`model`、`spend_usd`、`cap_usd` |
+| `cost.downgraded` | 任务超 token 预算，剩余步骤改走降级渠道 | `step`、`from`、`to` |
+| `plugin.trust_pinned` | 插件内容指纹被 pin（用户点信任 / draft 转正自动） | `key`、`digest`、`by` |
+| `plugin.trust_blocked` | 第三方插件未 pin 或内容已变 → 拒载 | `key`、`state`、`via` |
+| `plugin.trust_unpinned` | 取消信任（插件立即停止加载） | `key`、`by` |
+
+> 台账本身**不是** JSONL 事件流：每次模型调用的完整计量（token 三路 / 状态 / 延迟 / 费用）
+> 落独立的 `<日志目录>/usage/ledger.jsonl`，字段见 README「用量台账与成本红线」。
+
 ### 4.5 error —— 错误
 
 ```json

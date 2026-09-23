@@ -40,7 +40,7 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | 字段 | 必填 | 语义 |
 | --- | --- | --- |
 | apiVersion | 否 | 缺失按 v1 读入（老目录自动迁移）；写了但不等于 1 → **拒载并提示升级**，不做 shim |
-| source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；未声明按位置默认（应用根=built_in，工作区=user） |
+| source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；**未声明按位置默认：只有应用根 `ui-ext/` 默认 built_in，其余位置（工作区 ui-ext、plugins/ 自装位）一律默认 user**（P21：不声明不能成为绕过第三方验签的后门） |
 | title / description / version | 否 | 展示元数据；目录形态工具插件未写时用目录名 |
 | entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写 |
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
@@ -93,7 +93,7 @@ config.toml `[hooks]`，四个挂点，承载形式 = 本地命令（stdin 收 J
 | before_tool | 每次工具执行前 | **仅否决权**：stdout `{"decision":"deny","reason":"…"}` = 拦下并回喂模型；放行 ≠ 免审批（审批门单点不动） |
 | after_tool | 工具执行后 | 通知（观测 / 格式化等后续动作） |
 | session_end | 任务结束（含取消/出错） | 通知（沉淀记忆等收尾） |
-| budget_exceeded | 单任务累计 token 超 budget_tokens（每次任务最多一次） | 通知（降级策略留 P21 成本台账） |
+| budget_exceeded | 单任务累计 token 超 budget_tokens（每次任务最多一次） | 通知 + **降级已落地（P21）**：配了 `[roles] budget` 渠道时，该任务剩余步骤改走它 |
 
 语义四条：4 挂点 / 仅否决 / **超时（timeout_ms）与拉起失败一律放行**（坏钩子不卡主循环）/
 JSONL 审计（hook.* 事件只增）。
@@ -124,7 +124,26 @@ timeout_ms = 5000
 > 之前的 postMessage 会被宿主按「未知来源」丢弃。因此**初始拉数据必须等宿主推来的
 > `agent:init` 再发起**（见 ui-ext/trace/index.html），脚本一加载就调用只读桥会一直超时。
 
-## 八、术语对照（退役表）
+## 八、第三方来源验签（P21 红线二，施工单 030）
+
+**诉求**：第三方插件要能验明来源再跑。真实密码学签名体系（CA / 私钥分发 / 吊销列表）
+工程面超出一个阶段的容量，且 manifest 里自称的签名字串在无密钥前提下不构成任何保证
+（复制一份就能伪造）——故采用 **pin digest 模型**（SSH 主机密钥同款思路，零密钥分发）：
+
+- **内容指纹**：canonical digest = sha256(排序后的 `相对路径\n` + sha256(文件内容) + `\n` 序列)；
+  目录形态与裸文件形态各一把尺子（`digest_dir` / `digest_file`），域前缀换算法必须换（历史 pin 全失效重 pin）。
+- **规则**：`source` 为 `user` 的插件（工作区 ui-ext、应用根 ui-ext 自装、plugins/ 目录与裸文件）
+  **必须先被 pin 才能加载**——未 pin → 清单里显式「未受信任」+ 拒载（工具不进注册表、面板不服务资产）；
+  内容被改 → 指纹不符 → 拒载 + 「内容已变，需重新信任」。
+- **pin 表**：settings.json `trusted_plugins{ "<kind>:<name>": digest }`（kind = `ui-ext` / `plugins`）；
+  设置 → 插件 →「信任 / 取消信任」（`POST /api/ext/trust`）即写即生效并重扫注册表。
+- **豁免两类**：`built_in`（随包内置，位置即信任）、`model_generated`（draft 隔离区：
+  内存态 + 权限清空）；**draft「转正」自动 pin**（转正是用户显式动作 = 信任决定，
+  见 `draft::promote` 落盘后由 `trust::pin_from_manifest_paths` 回填）。
+- **审计**：`plugin.trust_pinned` / `plugin.trust_blocked` / `plugin.trust_unpinned` 只增。
+- 不做的事：不做签名 CA、不校验 manifest 自称的 `signature` 字段、不联网验签。
+
+## 九、术语对照（退役表）
 
 | 旧 | 新 |
 | --- | --- |

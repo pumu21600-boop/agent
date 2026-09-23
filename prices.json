@@ -1,0 +1,13 @@
+{
+  "_note": "P21 用量台账价格表：单价 = 美元 / 1M tokens。provider 命中渠道 host 或 providers.json 预设 id（* 通配）；model 支持精确名与「前缀*」。effective_from 是生效时间——一条记录按它发生的时间取当时有效的最新价，调价只加新行、不改旧行（历史账不动）。缓存命中的输入按 cached 单价、其余输入按 prompt 单价、输出按 completion 单价。删掉用不到的条目；整个文件缺失 = 全部请求未计价（报表会显式提示，token 与次数仍照记）。",
+  "prices": [
+    {
+      "provider": "api.deepseek.com",
+      "model": "deepseek-*",
+      "effective_from": "2026-01-01",
+      "prompt": 0.27,
+      "completion": 1.1,
+      "cached": 0.027
+    }
+  ]
+}
