@@ -887,6 +887,12 @@
     webAgentWatch = setInterval(async () => {
       try {
         const s = await webApi('/api/browser/state', { cache: 'no-store' });
+        // 宿主模式也随时同步：webMode 以前只在 loadWebState 时更新，而 agent 自动开面板
+        // 走的是这条路——不同步的话面板按**无头模式**渲染（截图 img 分支），壳里的真
+        // webview 随后才_pop_进来，用户看到的就是「先闪几下」（坏截图/暗区→真页面）。
+        // 壳模式面板直接渲染 .web-native 占位，等 webview 就位即可。
+        if (s.mode && s.mode !== webMode) webMode = s.mode;
+        if (s.dialog !== undefined) webDialog = s.dialog || null;
         // 标签清单随时同步：agent 开新页/导航之后，页签条上的标题和地址必须跟着变。
         // 以前只有 loadWebState 才刷这份清单——agent 操作完面板里留着旧标题，用户看到的
         // 就是「一个 DeepSeek 标签显示着 Google」这种灵异现象

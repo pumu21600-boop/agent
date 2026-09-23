@@ -1017,15 +1017,15 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
     if session.mode != HostMode::Shell {
         return;
     }
-    // 矩形合理性门槛：面板内容区永远在页签栏+工具栏下方（实测 y≈125），y<40 只可能是
-    // 量错了元素/量早了——这种矩形下显示 webview 会把它盖到面板 chrome 上（用户看到的
-    // 就是"右侧边栏没了、页面从窗口顶开始"，且被盖住的 chrome 点不到）。宁可先藏着等
-    // 下一次同步，也不能错位显示。
+    // 矩形合理性门槛：面板内容区永远在页签栏+工具栏下方（实测 y≈125——rp-tabs 44 +
+    // web-tabbar 44 + toolbar 39），y<100 只可能是量早了/量错了元素——这种矩形下显示
+    // webview 会把它盖到面板 chrome 上（用户看到的就是"右侧边栏没了、页面从窗口顶开始"，
+    // 且被盖住的 chrome 点不到）。宁可先藏着等下一次同步，也不能错位显示。
     let rect_sane = session
         .last_rect
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .map(|(_, y, w, h)| y >= 40 && w >= 200 && h >= 200)
+        .map(|(_, y, w, h)| y >= 100 && w >= 200 && h >= 200)
         .unwrap_or(false);
     let want_label: Option<String> = if session.showing() && rect_sane {
         match visible.as_deref() {
@@ -2736,6 +2736,14 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     if session.mode == HostMode::Shell
         && let Some(label) = tab.shell_label.as_deref()
     {
+        // 矩形合理性门槛：面板内容区永远在页签栏+工具栏下方（实测 y≈125——rp-tabs 44 +
+        // web-tabbar 44 + toolbar 39）。y<100 只可能是**量早了**：标签栏比内容区晚一帧
+        // 渲染时实测 y≈91。这种矩形发出去 webview 会跳到错位位置（盖住工具栏）再跳回，
+        // 用户看到的就是"闪一下"。直接丢弃等下一次同步——布局变化会触发 ResizeObserver
+        // 补发正确矩形，比错位闪一下好。
+        if !(y >= 100 && w >= 200 && h >= 200) {
+            return Ok(json!({ "ok": true, "skipped": "rect-insane", "w": w, "h": h }));
+        }
         *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
         shell::rect(label, x as f64, y as f64, w as f64, h as f64);
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
