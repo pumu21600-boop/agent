@@ -1212,7 +1212,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: cmd }),
-      });
+      }).then((r) => r.json());
       termLines = termLines.map((l, i) =>
         i === termLines.length - 1 ? { ...l, out: (r.output || '').trim(), ok: r.ok !== false } : l
       );
@@ -2488,7 +2488,7 @@
     syncCur();
     restoreUsage('@new'); // 新会话：账本里没有它 → 清零
     try {
-      const r = await fetch('/api/sessions/new', { method: 'POST' });
+      const r = await fetch('/api/sessions/new', { method: 'POST' }).then((r) => r.json());
       if (r.ok && r.id) {
         rekey('@new', r.id);
         currentTitle = r.title || '';
@@ -3252,14 +3252,21 @@
 
   async function loadExt() {
     try {
-      const r = await fetch('/api/ext', { cache: 'no-store' });
+      const r = await fetch('/api/ext', { cache: 'no-store' }).then((r) => r.json());
       extList = r.extensions || [];
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
     } catch (e) {
       extList = [];
       extMsg = `读取插件失败: ${e.message || e}`;
+      // 壳可能先于服务就绪（start.bat 是壳拉起服务）：拉不到就 2s 后重试几次，
+      // 否则 dock 插件页签 / 后台 iframe 要等用户手动进一次设置→插件才出现
+      if (extLoadRetry < 5) {
+        extLoadRetry += 1;
+        setTimeout(loadExt, 2000);
+      }
     }
   }
+  let extLoadRetry = 0;
 
   // 已启用的扩展（停用的不加载、不给按钮）
   $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
