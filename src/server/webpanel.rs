@@ -154,10 +154,12 @@ pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Valu
 }
 
 /// POST /api/browser/overlay —— 面板浮层（「⋯」菜单）开合。shell 模式开浮层时
-/// 后端临时藏起 child webview（HWND 永远盖在 HTML 菜单之上），关浮层恢复。
+/// 后端把 child webview 顶部让出 reserve（菜单实测高度，网页缩短一条、不被遮），
+/// reserve≤0 退化为整页隐藏；关浮层恢复完整矩形。
 pub(super) async fn browser_overlay(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let open = req.get("open").and_then(Value::as_bool).unwrap_or(false);
-    crate::browser::panel_overlay(open).await.map(Json).map_err(bad)
+    let reserve = req.get("reserve").and_then(Value::as_i64).unwrap_or(0);
+    crate::browser::panel_overlay(open, reserve).await.map(Json).map_err(bad)
 }
 
 /// POST /api/browser/open-external —— 在系统默认浏览器打开当前页。

@@ -752,25 +752,54 @@
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
   let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具）
-  // shell 模式：开菜单时后端临时藏起 child webview（HWND 永远盖在网页内容之上，
-  // 不藏的话菜单往下弹必然被网页盖住）——藏了网页，菜单就能正常在按钮下方下拉
-  function webMenuOverlay(open) {
+  let webMenuFallback = null; // 让位没生效时的兜底定时器（退回整页隐藏，至少菜单可见）
+  // shell 模式：开菜单时后端把 child webview 顶部让出菜单那一条（网页缩短一条、
+  // 完全可见——不遮网页）；reserve = 菜单实测高度。关菜单恢复完整矩形。
+  function webMenuOverlay(open, reserve) {
     if (!webNative) return;
     webApi('/api/browser/overlay', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ open }),
-    }).catch(() => {});
+      body: JSON.stringify({ open, reserve: reserve || 0 }),
+    })
+      .then((r) => {
+        if (open && r && r.reserve) {
+          clearTimeout(webMenuFallback); // 让位已生效，兜底取消
+          webMenuFallback = null;
+        }
+      })
+      .catch(() => {});
   }
   function webToggleMenu() {
-    webMenuOpen = !webMenuOpen;
-    webMenuOverlay(webMenuOpen);
+    if (webMenuOpen) {
+      webCloseMenu();
+      return;
+    }
+    webMenuOpen = true;
+    // 菜单先渲染（此刻还在完整网页底下看不见），下一帧量它的高度再让后端让位——
+    // 矩形一到位，菜单就浮在网页让出的那条里：网页还在，菜单在旁边
+    requestAnimationFrame(() => {
+      const m = document.querySelector('.web-menu');
+      const h = m ? Math.ceil(m.getBoundingClientRect().height) + 2 : 0;
+      webMenuOverlay(true, h);
+      if (h > 0) {
+        clearTimeout(webMenuFallback);
+        webMenuFallback = setTimeout(() => {
+          webMenuFallback = null;
+          if (webMenuOpen) webMenuOverlay(true, 0); // 让位没生效→退回整页隐藏
+        }, 300);
+      } else {
+        webMenuOverlay(true, 0);
+      }
+    });
   }
   function webCloseMenu() {
-    if (webMenuOpen) webMenuOverlay(false);
+    clearTimeout(webMenuFallback);
+    webMenuFallback = null;
+    if (webMenuOpen) webMenuOverlay(false, 0);
     webMenuOpen = false;
   }
-  // 离开网页页签/关面板时开着菜单要连浮层一起收（不然壳里 webview 一直藏着）
+  // 离开网页页签/关面板时开着菜单要连浮层一起收（不然壳里 webview 一直让着位）
   $: if ((rpTab !== 'web' || !rightPanelOpen) && webMenuOpen) webCloseMenu();
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
@@ -925,7 +954,7 @@
     return 'https://' + s;
   }
 
-  // 浏览器视口跟随面板内容区（100ms 节流；截图铺满无黑边，网页按真实窗口宽度排版）。
+  // 浏览器视口跟随面板内容区（16ms 节流≈每帧；截图铺满无黑边，网页按真实窗口宽度排版）。
   // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
   // **触发不能只靠 webBodyW/H 的响应式**：窗口横向拉伸时面板宽高都不变、只有 x 变，
   // 响应式不重算 → 壳里 webview 停在旧位置（真机错位 bug）。改用 ResizeObserver 看
@@ -936,10 +965,11 @@
   let webRectObs = null;
   // 拖面板宽度/拉伸窗口时**马上跟**：旧实现是 350ms 尾防抖——拖的过程中定时器被不断
   // 重置、一次都不发，停手才补一发，用户看到的就是"网页宽度不跟着变、很迟钝"。
-  // 改成 100ms 节流：首次变化立即发，拖动期间至多每 100ms 一发，停手补最后一发。
+  // 100ms 节流仍能看出台阶，压到 16ms（≈每帧一次）：首变化立即发，拖动期间至多每
+  // 16ms 一发，停手补最后一发。
   function webQueueViewport() {
     const now = Date.now();
-    const wait = 100 - (now - webViewportLast);
+    const wait = 16 - (now - webViewportLast);
     if (wait <= 0) {
       if (webViewportTimer) {
         clearTimeout(webViewportTimer);

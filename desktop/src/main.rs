@@ -301,8 +301,13 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             let (x, y) = (op_f64(op, "x", 0.0), op_f64(op, "y", 0.0));
             let (w, h) = op_size(op);
             if let Some(wv) = host.get(&label) {
-                let _ = wv.set_position(LogicalPosition::new(x, y));
-                let _ = wv.set_size(LogicalSize::new(w, h));
+                // set_bounds = 位置+尺寸一条用户消息，主线程原子应用；比 set_position +
+                // set_size 两条消息少一次中间帧（拖动时那一帧就是"移位没缩放"的残影）
+                let bounds = tauri_runtime::dpi::Rect {
+                    position: tauri::LogicalPosition::new(x, y).into(),
+                    size: tauri::LogicalSize::new(w, h).into(),
+                };
+                let _ = wv.set_bounds(bounds);
                 slog(&format!("rect {label} {x},{y} {w}x{h}"));
             }
         }
