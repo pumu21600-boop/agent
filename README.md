@@ -245,7 +245,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/version` | 版本与运行形态（`root` = 当前生效的应用根） |
 | GET | `/api/sandbox/selftest` | 沙箱探针套件（真实拉起受限进程） |
 | GET | `/api/sandbox/info` | 当前沙箱档位（配置档/生效档/回退原因/探测链明细；`?refresh=1` 强制重探） |
-| GET/POST/DELETE | `/api/browser/*` | 网页面板后端：state（标签清单）/ new / navigate / screenshot（PNG）/ click / type / key / scroll / back / forward / reload / tab（关标签）——与 agent 浏览器工具共享实例 |
+| GET/POST/DELETE | `/api/browser/*` | 网页面板后端：state（标签清单）/ new / navigate / screenshot（PNG）/ click / type / key / scroll / back / forward / reload / viewport（视口跟随面板）/ overlay（「⋯」菜单开合，壳模式开时临时藏 child webview）/ tab（关标签）——与 agent 浏览器工具共享实例 |
 
 ## MCP 双 transport
 

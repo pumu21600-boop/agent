@@ -153,6 +153,13 @@ pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Valu
     crate::browser::panel_viewport(id, x, y, w, h).await.map(Json).map_err(bad)
 }
 
+/// POST /api/browser/overlay —— 面板浮层（「⋯」菜单）开合。shell 模式开浮层时
+/// 后端临时藏起 child webview（HWND 永远盖在 HTML 菜单之上），关浮层恢复。
+pub(super) async fn browser_overlay(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let open = req.get("open").and_then(Value::as_bool).unwrap_or(false);
+    crate::browser::panel_overlay(open).await.map(Json).map_err(bad)
+}
+
 /// POST /api/browser/open-external —— 在系统默认浏览器打开当前页。
 pub(super) async fn browser_open_external(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };

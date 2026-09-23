@@ -178,6 +178,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/browser/forward", post(browser_forward))
         .route("/api/browser/reload", post(browser_reload))
         .route("/api/browser/viewport", post(browser_viewport))
+        .route("/api/browser/overlay", post(browser_overlay))
         .route("/api/browser/open-external", post(browser_open_external))
         .route("/api/browser/devtools", post(browser_devtools))
         .route("/api/browser/tab", delete(browser_close_tab))

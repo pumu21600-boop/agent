@@ -214,6 +214,11 @@ struct BrowserSession {
     /// 只有面板自己的动作（activate/new/viewport/frame/navigate）能置真；agent 工具的
     /// new_tab/activate_tab 不置——否则 agent 一开工就把 webview 弹到聊天区上空。
     panel_showing: std::sync::Mutex<bool>,
+    /// 面板浮层（「⋯」菜单）是否开着。shell 模式下开浮层要**临时藏起 child
+    /// webview**：HWND 永远盖在 Svelte 菜单之上，不藏的话菜单往下弹必然被网页
+    /// 盖住（P20.4 曾因此改成向上弹，用户反馈"怎么跑到上面去了"——现在改回正常
+    /// 下拉，开菜单期间藏网页）。
+    overlay_open: std::sync::Mutex<bool>,
     /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
     shell_shown: std::sync::Mutex<Option<String>>,
     /// shell 模式：面板内容区最近一次矩形（新建 webview 时的初始位置）
@@ -259,6 +264,13 @@ impl BrowserSession {
     }
     fn set_showing(&self, v: bool) {
         *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+    /// 面板浮层（⋯ 菜单）开合——开着时壳里 webview 让位（见字段注释）。
+    fn overlay(&self) -> bool {
+        *self.overlay_open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn set_overlay(&self, v: bool) {
+        *self.overlay_open.lock().unwrap_or_else(|e| e.into_inner()) = v;
     }
     /// 快照列表（面板展示与 agent list 用）。
     async fn tab_briefs(&self) -> Vec<TabBrief> {
@@ -779,6 +791,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     last_used_ms: AtomicU64::new(now_ms()),
                     visible_tab: std::sync::Mutex::new(None),
                     panel_showing: std::sync::Mutex::new(false),
+                    overlay_open: std::sync::Mutex::new(false),
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
@@ -797,8 +810,20 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
     Err(last_err)
 }
 
-/// shell 模式起会话：建 agent 专用页（隐藏的 about:blank child webview）即就绪。
-/// 这一步同时验证壳的 CDP 端口真的可用——不可用就整体回退无头模式。
+/// 壳 CDP 端口轻量探活（GET /json/version）——shell_launch 用它验证壳的 CDP 真的
+/// 可用（不可用就整体回退无头模式）。**不再靠预建一个空白 agent 页来验证**：那个页
+/// 会以「空白页 agent」的身份排在用户标签前面，用户明确反馈多余（ agent 页按需创建）。
+async fn probe_shell_cdp(port: u16) -> bool {
+    let Ok(client) = dev_client() else { return false };
+    matches!(
+        client.get(format!("http://127.0.0.1:{port}/json/version")).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+/// shell 模式起会话：不预建任何页（用户打开面板看到的就是空态；agent 页在模型第一次
+/// 用浏览器工具时按需创建）。这一步同时验证壳的 CDP 端口真的可用——不可用就整体
+/// 回退无头模式。
 async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
     let session = Arc::new(BrowserSession {
         mode: HostMode::Shell,
@@ -808,24 +833,23 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         tabs: std::sync::Mutex::new(Vec::new()),
         last_used_ms: AtomicU64::new(now_ms()),
         visible_tab: std::sync::Mutex::new(None),
-                    panel_showing: std::sync::Mutex::new(false),
+        panel_showing: std::sync::Mutex::new(false),
+        overlay_open: std::sync::Mutex::new(false),
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
-                    agent_touched_ms: AtomicU64::new(0),
-                    agent_tab_id: std::sync::Mutex::new(None),
+        agent_touched_ms: AtomicU64::new(0),
+        agent_tab_id: std::sync::Mutex::new(None),
     });
     // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
     // 免得残留 target 干扰发现、白白常驻
     shell::reset();
-    // 关掉旧 webview 后**等它们的 target 从 /json/list 消失**再建新的：实测旧 webview
-    // 的销毁是异步的（~180ms），这期间建出来的新 webview，其 target 会跟着旧的一起
-    // 从列表里消失（CDP 连上就断）
+    // 关掉旧 webview 后**等它们的 target 从 /json/list 消失**：实测旧 webview 的销毁
+    // 是异步的（~180ms），这期间建出来的新 webview，其 target 会跟着旧的一起从列表
+    // 里消失（CDP 连上就断）
     wait_targets_settled(session.port, Duration::from_secs(3)).await;
-    let first = create_tab(&session, "about:blank", true).await?;
-    // agent 页默认隐藏（面板没在看它；用户切过去时 sweep 再显示）
-    if let Some(label) = first.shell_label.as_deref() {
-        shell::visible(label, false);
+    if !probe_shell_cdp(session.port).await {
+        return Err(format!("壳 CDP 端口 {} 探活失败", session.port));
     }
     ensure_reaper();
     log("browser.launch", json!({ "mode": "shell", "port": shell::SHELL_CDP_PORT }));
@@ -953,11 +977,13 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
     }
 }
 
-/// shell 模式同步壳里 webview 的显隐与矩形。**两道门控缺一不可**：
+/// shell 模式同步壳里 webview 的显隐与矩形。**三道门控缺一不可**：
 /// ① `panel_showing`——只有面板自己在看时才显示。agent 工具的 new_tab/activate_tab
 ///    也会写 visible_tab（无头时代那是驱动 screencast 用的），但那不是"人在看"——
 ///    不门控的话 agent 一开工就把 webview 弹到聊天区上空（真机踩过）；
-/// ② 矩形已知——面板还没同步过视口（首次打开/切页签的 350ms 防抖窗口）时先藏着，
+/// ② `overlay_open`——面板浮层（⋯ 菜单）开着时藏起网页，让菜单正常下拉（HWND 永远
+///    在 HTML 之上，不藏菜单就被盖住；P20.4 曾因这事把菜单改成向上弹，用户不买账）；
+/// ③ 矩形已知——面板还没同步过视口（首次打开/切页签的防抖窗口）时先藏着，
 ///    免得 webview 在错误位置闪一下。
 async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab>], visible: &Option<String>) {
     if session.mode != HostMode::Shell {
@@ -973,7 +999,7 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
         .unwrap_or_else(|e| e.into_inner())
         .map(|(_, y, w, h)| y >= 40 && w >= 200 && h >= 200)
         .unwrap_or(false);
-    let want_label: Option<String> = if session.showing() && rect_sane {
+    let want_label: Option<String> = if session.showing() && !session.overlay() && rect_sane {
         match visible.as_deref() {
             Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
             None => None,
@@ -2660,7 +2686,11 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     ensure_live(&tab).await?;
     let w = w.clamp(320, 1600);
     let h = h.clamp(400, 2400);
-    apply_viewport_override(&tab, w, h).await?;
+    // shell 模式跳过 Emulation 覆盖：壳里 webview 的 HWND 尺寸就是视口，页面按新尺寸
+    // 自己重排，CDP 覆盖既多余又每次多一个往返（拖面板宽度时 100ms 一同步，能省则省）
+    if session.mode != HostMode::Shell {
+        apply_viewport_override(&tab, w, h).await?;
+    }
     *tab.viewport.lock().await = Some((w, h));
     // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）。
     // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片
@@ -2828,6 +2858,16 @@ pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     close_tab(&session, id).await;
     Ok(json!({ "ok": true }))
+}
+
+/// 面板浮层（「⋯」菜单）开合。shell 模式下开浮层要临时藏起 child webview——
+/// HWND 永远盖在 Svelte 菜单之上，不藏的话菜单下拉必然被网页盖住（关浮层即恢复）。
+pub async fn panel_overlay(open: bool) -> Result<Value, String> {
+    let session = current_session().await?;
+    session.touch();
+    session.set_overlay(open);
+    sweep_session(&session).await;
+    Ok(json!({ "ok": true, "open": open }))
 }
 
 /// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。

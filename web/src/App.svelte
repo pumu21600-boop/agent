@@ -752,15 +752,26 @@
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
   let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具）
-  // P20.4：菜单改为向上弹（.web-menu-up）——往下弹会落进 .web-body，那块被壳里的
-  // child webview（HWND，永远在网页内容之上）盖住，菜单等于看不见；向上弹到页签/
-  // 工具栏一带（纯网页内容，实测 71px 菜单 < 88px 可用空间），网页全程不用藏
+  // shell 模式：开菜单时后端临时藏起 child webview（HWND 永远盖在网页内容之上，
+  // 不藏的话菜单往下弹必然被网页盖住）——藏了网页，菜单就能正常在按钮下方下拉
+  function webMenuOverlay(open) {
+    if (!webNative) return;
+    webApi('/api/browser/overlay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ open }),
+    }).catch(() => {});
+  }
   function webToggleMenu() {
     webMenuOpen = !webMenuOpen;
+    webMenuOverlay(webMenuOpen);
   }
   function webCloseMenu() {
+    if (webMenuOpen) webMenuOverlay(false);
     webMenuOpen = false;
   }
+  // 离开网页页签/关面板时开着菜单要连浮层一起收（不然壳里 webview 一直藏着）
+  $: if ((rpTab !== 'web' || !rightPanelOpen) && webMenuOpen) webCloseMenu();
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
   function inTauriShell() {
@@ -914,17 +925,33 @@
     return 'https://' + s;
   }
 
-  // 浏览器视口跟随面板内容区（防抖 350ms；截图铺满无黑边，网页按真实窗口宽度排版）。
+  // 浏览器视口跟随面板内容区（100ms 节流；截图铺满无黑边，网页按真实窗口宽度排版）。
   // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
   // **触发不能只靠 webBodyW/H 的响应式**：窗口横向拉伸时面板宽高都不变、只有 x 变，
   // 响应式不重算 → 壳里 webview 停在旧位置（真机错位 bug）。改用 ResizeObserver 看
   // 尺寸 + window resize 看位置，两条都汇进同一个防抖队列。
   let webViewportTimer = null;
+  let webViewportLast = 0; // 最近一次实际发出的时间戳（节流窗口用）
   let webViewportKey = ''; // 已应用的「标签|x,y|宽x高」，防止重复请求打爆 CDP actor
   let webRectObs = null;
+  // 拖面板宽度/拉伸窗口时**马上跟**：旧实现是 350ms 尾防抖——拖的过程中定时器被不断
+  // 重置、一次都不发，停手才补一发，用户看到的就是"网页宽度不跟着变、很迟钝"。
+  // 改成 100ms 节流：首次变化立即发，拖动期间至多每 100ms 一发，停手补最后一发。
   function webQueueViewport() {
-    clearTimeout(webViewportTimer);
-    webViewportTimer = setTimeout(webSyncViewport, 350);
+    const now = Date.now();
+    const wait = 100 - (now - webViewportLast);
+    if (wait <= 0) {
+      if (webViewportTimer) {
+        clearTimeout(webViewportTimer);
+        webViewportTimer = null;
+      }
+      webSyncViewport();
+    } else if (!webViewportTimer) {
+      webViewportTimer = setTimeout(() => {
+        webViewportTimer = null;
+        webSyncViewport();
+      }, wait);
+    }
   }
   function webWatchRect(on) {
     if (on) {
@@ -957,6 +984,7 @@
     const key = webActive.id + '|' + x + ',' + y + '|' + w + 'x' + h;
     if (key === webViewportKey) return;
     webViewportKey = key;
+    webViewportLast = Date.now();
     webApi('/api/browser/viewport', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4313,7 +4341,7 @@
               {#if webMenuOpen}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="web-menu-backdrop" on:click={webCloseMenu}></div>
-                <div class="web-menu" class:web-menu-up={webNative}>
+                <div class="web-menu">
                   <button on:click={() => webMenuAction('open-external')}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
@@ -6397,13 +6425,9 @@
     min-width: 180px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
   }
-  /* P20.4 原生托管：菜单向上弹。往下弹会落进 .web-body —— 那块被壳里的 child
-     webview（HWND，永远在网页内容之上）盖住，菜单等于看不见。向上弹到页签/工具栏
-     一带（纯网页内容，实测 71px 菜单 < 88px 可用空间），网页全程不用藏。 */
-  .web-menu-up {
-    top: auto;
-    bottom: calc(100% + 2px);
-  }
+  /* P20.4 补丁（用户反馈「菜单怎么跑到上面去了」）：shell 模式下开菜单时后端会临时
+     藏起 child webview（见 webMenuOverlay），菜单不再被 HWND 盖住——恢复正常下拉，
+     向上弹的 .web-menu-up 已删除 */
   .web-menu button {
     display: flex;
     align-items: center;
