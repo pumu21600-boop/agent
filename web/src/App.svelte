@@ -939,9 +939,10 @@
     webFrameTimer = null;
   }
 
-  // 面板 → 后端的响应统一解析：旧版服务（无 /api/browser/*）会返回 404 空体或 HTML，
+  // 面板 → 后端的响应统一解析：旧版服务（没有新接口）会返回 404 或 SPA 兜底的 HTML，
   // 直接 r.json() 只会报天书——这里翻成「请重启服务」的明确提示。
-  async function webApi(path, opts) {
+  // missingMsg 说明缺的是哪类接口（浏览器 / 用量台账…）。
+  async function apiJson(path, opts, missingMsg) {
     let resp;
     try {
       resp = await fetch(path, opts);
@@ -953,11 +954,16 @@
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
-      if (resp.status === 404) throw new Error('服务端没有浏览器接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
+      // 接口路径落到 SPA 兜底 = 服务端没这个路由（旧版程序），HTML 开头就是铁证
+      if (text.trimStart().startsWith('<')) throw new Error(missingMsg);
+      if (resp.status === 404) throw new Error(missingMsg);
       throw new Error('服务返回异常（HTTP ' + resp.status + '），请重启服务后重试');
     }
     if (!resp.ok) throw new Error((data && data.error) || '请求失败（HTTP ' + resp.status + '）');
     return data || {};
+  }
+  async function webApi(path, opts) {
+    return apiJson(path, opts, '服务端没有浏览器接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
   }
   function webNormalizeUrl(u) {
     const s = (u || '').trim();
@@ -2994,8 +3000,11 @@
   async function loadUsage() {
     usageLoading = true;
     try {
-      const r = await fetch(`/api/usage?group=${usageGroup}&range=${usageRange}`, { cache: 'no-store' });
-      usageData = await r.json();
+      usageData = await apiJson(
+        `/api/usage?group=${usageGroup}&range=${usageRange}`,
+        { cache: 'no-store' },
+        '服务端没有用量台账接口（/api/usage），跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）',
+      );
     } catch (e) {
       usageData = { error: e.message || String(e) };
     } finally {
