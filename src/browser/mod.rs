@@ -220,6 +220,10 @@ struct BrowserSession {
     last_rect: std::sync::Mutex<Option<(i64, i64, i64, i64)>>,
     /// 最近一次帧轮询时间（screencast 门控：壳里看真页面，不白编码）
     last_frame_poll_ms: AtomicU64,
+    /// agent 工具最近一次碰浏览器的时间戳——面板据此自动唤起（用户要求「agent 操作
+    /// 内置浏览器时自动唤起右侧边栏」）。与面板自己的动作分开记：面板的显隐只认
+    /// panel_showing，agent 的触碰只用来唤醒界面。
+    agent_touched_ms: AtomicU64,
 }
 
 impl BrowserSession {
@@ -764,6 +768,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
+                    agent_touched_ms: AtomicU64::new(0),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -792,6 +797,7 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
+                    agent_touched_ms: AtomicU64::new(0),
     });
     // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
     // 免得残留 target 干扰发现、白白常驻
@@ -1837,7 +1843,24 @@ const CHECK_JS: &str = r#"((sel, checked) => {
 /// 统一命令分发：agent 工具唯一入口。缺省 tab = agent 专用页。
 pub async fn command(args: &str, max_chars: usize) -> Result<String, String> {
     let cmd = commands::parse(args).map_err(String::from)?;
-    dispatch(cmd, max_chars).await.map_err(String::from)
+    let out = dispatch(cmd, max_chars).await.map_err(String::from);
+    // agent 碰过浏览器（不论成败）就记时间戳——面板据此自动唤起右侧栏（用户要求）。
+    // 与面板显隐分开：agent 的触碰只唤醒界面，不直接把 webview 弹到聊天区上空。
+    if let Ok(s) = current_session().await {
+        s.agent_touched_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    out
+}
+
+/// agent 工具的 tab 切换（new_tab / activate_tab）。**shell 模式下不写 visible_tab**：
+/// visible_tab 是「面板正在看哪个页」，agent 一激活就把用户正在看的页换掉，紧接着那页
+/// 还会因为「非可见 + 空闲」被驻留巡检挂起（frozen 的页面看着正常但 JS 停了，用户
+/// 点击没反应——真机反馈"AI 点完之后我就点不了网站了"）。无头时代写它只为驱动
+/// screencast，壳里这套语义已经不成立；agent 的页留在 tab 栏里，用户想看去点即可。
+fn agent_activate(session: &Arc<BrowserSession>, id: &str) {
+    if session.mode != HostMode::Shell {
+        session.set_visible(id);
+    }
 }
 
 async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, BrowserError> {
@@ -1850,7 +1873,7 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
             let tab = create_tab(&session, "about:blank", false)
                 .await
                 .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
-            session.set_visible(&tab.id);
+            agent_activate(&session, &tab.id);
             sweep_session(&session).await;
             return Ok(format!("已新建标签页 {}（about:blank）。browser navigate 可加载地址。", tab.id));
         }
@@ -1884,7 +1907,7 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
             ensure_live(&tab)
                 .await
                 .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
-            session.set_visible(tab_id);
+            agent_activate(&session, tab_id);
             sweep_session(&session).await;
             return Ok(format!("已切换到标签页 {tab_id}（面板可见）。"));
         }
@@ -2492,6 +2515,8 @@ pub async fn panel_state() -> Value {
         "port": s.port,
         "tabs": briefs.iter().map(TabBrief::to_json).collect::<Vec<_>>(),
         "dialog": dialog,
+        // agent 工具最近一次碰浏览器的时间戳（0 = 没有过）——前端据此自动唤起面板
+        "agentTouched": s.agent_touched_ms.load(Ordering::Relaxed),
     })
 }
 

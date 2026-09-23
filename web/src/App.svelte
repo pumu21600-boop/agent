@@ -751,17 +751,15 @@
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
-  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具 / agent 调试）
-  // 原生模式下下拉弹层会被 child webview 盖住（HWND 永远在网页内容之上，弹层正好
-  // 往 body 区里弹）——菜单开着的时候先让壳把 webview 藏了，关掉再恢复
+  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具）
+  // P20.4：菜单改为向上弹（.web-menu-up）——往下弹会落进 .web-body，那块被壳里的
+  // child webview（HWND，永远在网页内容之上）盖住，菜单等于看不见；向上弹到页签/
+  // 工具栏一带（纯网页内容，实测 71px 菜单 < 88px 可用空间），网页全程不用藏
   function webToggleMenu() {
     webMenuOpen = !webMenuOpen;
-    if (webNative && webActiveId) webActivate(webMenuOpen ? '' : webActiveId);
   }
   function webCloseMenu() {
-    if (!webMenuOpen) return;
     webMenuOpen = false;
-    if (webNative && webActiveId) webActivate(webActiveId);
   }
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
@@ -848,6 +846,43 @@
     }).catch(() => {});
   }
   $: if (rpTab !== 'web' || !rightPanelOpen || (webNative && !webShowShot)) webNotifyHidden();
+
+  // P20.4：agent 操作内置浏览器时自动唤起右侧面板（用户要求「在内置浏览器操作的时候
+  // agent 需要自动唤起右侧边栏」）。面板没在看网页时每 2s 探一次 state，agent 最近
+  // 10s 内碰过浏览器就开面板、切到「网页」、并选中 agent 正在操作的那个页。
+  let webAgentWatch = null;
+  let webAgentSeen = 0; // 已响应过的 agent 触碰时间戳（防自动开的面板被用户关上又立刻弹开）
+  function webStopAgentWatch() {
+    if (webAgentWatch) {
+      clearInterval(webAgentWatch);
+      webAgentWatch = null;
+    }
+  }
+  function webStartAgentWatch() {
+    if (webAgentWatch) return;
+    webAgentWatch = setInterval(async () => {
+      try {
+        const s = await webApi('/api/browser/state', { cache: 'no-store' });
+        if (!s.agentTouched || Date.now() - s.agentTouched > 10000) return;
+        if (s.agentTouched <= webAgentSeen) return; // 这次触碰已响应过，别再弹
+        rightPanelOpen = true;
+        if (rpTab !== 'web') rpTab = 'web';
+        if (s.tabs && s.tabs.length) {
+          // 优先 agent 正在操作的那个页（用户要的就是看 agent 干活），其次面板可见页
+          const vis = s.tabs.find((t) => t.agent) || s.tabs.find((t) => t.visible) || s.tabs[s.tabs.length - 1];
+          webActiveId = vis.id;
+          const act = s.tabs.find((t) => t.id === webActiveId);
+          if (act && document.activeElement !== document.querySelector('.web-address')) {
+            webAddress = act.url === 'about:blank' ? '' : act.url || '';
+          }
+        }
+        webAgentSeen = s.agentTouched;
+        webStopAgentWatch();
+      } catch {}
+    }, 2000);
+  }
+  $: if (rpTab === 'web' && rightPanelOpen) webStopAgentWatch();
+  $: if (rpTab !== 'web' || !rightPanelOpen) webStartAgentWatch();
 
   // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
   // P22 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销
@@ -4285,7 +4320,7 @@
               {#if webMenuOpen}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="web-menu-backdrop" on:click={webCloseMenu}></div>
-                <div class="web-menu">
+                <div class="web-menu" class:web-menu-up={webNative}>
                   <button on:click={() => webMenuAction('open-external')}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
@@ -6368,6 +6403,13 @@
     padding: 4px;
     min-width: 180px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  }
+  /* P20.4 原生托管：菜单向上弹。往下弹会落进 .web-body —— 那块被壳里的 child
+     webview（HWND，永远在网页内容之上）盖住，菜单等于看不见。向上弹到页签/工具栏
+     一带（纯网页内容，实测 71px 菜单 < 88px 可用空间），网页全程不用藏。 */
+  .web-menu-up {
+    top: auto;
+    bottom: calc(100% + 2px);
   }
   .web-menu button {
     display: flex;
