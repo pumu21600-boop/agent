@@ -214,12 +214,6 @@ struct BrowserSession {
     /// 只有面板自己的动作（activate/new/viewport/frame/navigate）能置真；agent 工具的
     /// new_tab/activate_tab 不置——否则 agent 一开工就把 webview 弹到聊天区上空。
     panel_showing: std::sync::Mutex<bool>,
-    /// 面板浮层（「⋯」菜单）是否开着。shell 模式下开浮层要把壳里 webview 的**顶部
-    /// 让出 `overlay_reserve` 像素**（菜单浮在那一条里，网页缩短一条、完全可见——
-    /// 既不遮网页也不是整页藏掉）；reserve≤0 时退化为整页隐藏（兜底）。
-    overlay_open: std::sync::Mutex<bool>,
-    /// 浮层让位高度（px，菜单实测高度 + 2px 间隙）；0 = 不留位（整页隐藏）。
-    overlay_reserve: std::sync::Mutex<i64>,
     /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
     shell_shown: std::sync::Mutex<Option<String>>,
     /// shell 模式：面板内容区最近一次矩形（新建 webview 时的初始位置）
@@ -265,19 +259,6 @@ impl BrowserSession {
     }
     fn set_showing(&self, v: bool) {
         *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner()) = v;
-    }
-    /// 面板浮层（⋯ 菜单）开合——开着时壳里 webview 让位（见字段注释）。
-    fn overlay(&self) -> bool {
-        *self.overlay_open.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    fn set_overlay(&self, v: bool) {
-        *self.overlay_open.lock().unwrap_or_else(|e| e.into_inner()) = v;
-    }
-    fn overlay_reserve(&self) -> i64 {
-        *self.overlay_reserve.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    fn set_overlay_reserve(&self, v: i64) {
-        *self.overlay_reserve.lock().unwrap_or_else(|e| e.into_inner()) = v;
     }
     /// 快照列表（面板展示与 agent list 用）。
     async fn tab_briefs(&self) -> Vec<TabBrief> {
@@ -798,8 +779,6 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     last_used_ms: AtomicU64::new(now_ms()),
                     visible_tab: std::sync::Mutex::new(None),
                     panel_showing: std::sync::Mutex::new(false),
-                    overlay_open: std::sync::Mutex::new(false),
-                    overlay_reserve: std::sync::Mutex::new(0),
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
                     last_frame_poll_ms: AtomicU64::new(0),
@@ -842,8 +821,6 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         last_used_ms: AtomicU64::new(now_ms()),
         visible_tab: std::sync::Mutex::new(None),
         panel_showing: std::sync::Mutex::new(false),
-        overlay_open: std::sync::Mutex::new(false),
-        overlay_reserve: std::sync::Mutex::new(0),
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
         last_frame_poll_ms: AtomicU64::new(0),
@@ -986,15 +963,14 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
     }
 }
 
-/// shell 模式同步壳里 webview 的显隐与矩形。**三道门控缺一不可**：
+/// shell 模式同步壳里 webview 的显隐与矩形。**两道门控缺一不可**：
 /// ① `panel_showing`——只有面板自己在看时才显示。agent 工具的 new_tab/activate_tab
 ///    也会写 visible_tab（无头时代那是驱动 screencast 用的），但那不是"人在看"——
 ///    不门控的话 agent 一开工就把 webview 弹到聊天区上空（真机踩过）；
 /// ② 矩形已知——面板还没同步过视口（首次打开/切页签的防抖窗口）时先藏着，
-///    免得 webview 在错误位置闪一下；
-/// ③ 浮层让位信息可用——「⋯」菜单开着但没有 reserve 高度（客户端没量到）时整体
-///    隐藏（兜底：HWND 盖在菜单之上，不藏菜单看不见）；有 reserve 时**不藏**——
-///    改为把矩形顶部让出 reserve，网页缩短一条、完全可见（用户："就不能不遮网页吗"）。
+///    免得 webview 在错误位置闪一下。
+/// 「⋯」菜单不走这里的显隐——它是壳里一个**透明置顶的独立 webview**（见 `shell::menu`），
+/// 浮在下层内容 webview 之上，网页全程不动、不被遮也不被藏。
 async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab>], visible: &Option<String>) {
     if session.mode != HostMode::Shell {
         return;
@@ -1009,8 +985,7 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
         .unwrap_or_else(|e| e.into_inner())
         .map(|(_, y, w, h)| y >= 40 && w >= 200 && h >= 200)
         .unwrap_or(false);
-    let reserve_ok = !session.overlay() || session.overlay_reserve() > 0;
-    let want_label: Option<String> = if session.showing() && rect_sane && reserve_ok {
+    let want_label: Option<String> = if session.showing() && rect_sane {
         match visible.as_deref() {
             Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
             None => None,
@@ -1037,21 +1012,8 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
     *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
 }
 
-/// 浮层（⋯ 菜单）开着时把矩形**顶部**让出 reserve：菜单浮在那一条里，网页缩短一条、
-/// 完全可见（既不遮网页也不是整页藏掉）。reserve≤0 或浮层没开时原样返回。
-fn apply_overlay_reserve(session: &BrowserSession, x: f64, y: f64, w: f64, h: f64) -> (f64, f64, f64, f64) {
-    if !session.overlay() {
-        return (x, y, w, h);
-    }
-    let r = session.overlay_reserve() as f64;
-    if r <= 0.0 {
-        return (x, y, w, h);
-    }
-    (x, y + r, w, (h - r).max(200.0))
-}
-
 /// shell 模式下一个标签页该占的矩形：视口覆盖值（宽高，来自面板内容区）拼上面板
-/// 最近一次上报的左上角；都没有就用默认值。浮层开着时顶部让出菜单高度。
+/// 最近一次上报的左上角；都没有就用默认值。
 async fn shell_rect_for(session: &Arc<BrowserSession>, tab: &WebTab) -> (f64, f64, f64, f64) {
     let last = *session.last_rect.lock().unwrap_or_else(|e| e.into_inner());
     let (x, y) = last.map(|(x, y, _, _)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
@@ -1061,7 +1023,7 @@ async fn shell_rect_for(session: &Arc<BrowserSession>, tab: &WebTab) -> (f64, f6
             .map(|(_, _, w, h)| (w as f64, h as f64))
             .unwrap_or((1024.0, 768.0)),
     };
-    apply_overlay_reserve(session, x, y, w, h)
+    (x, y, w, h)
 }
 
 /// 挂起一个后台标签页：停 screencast → frozen（停 JS 定时器与渲染产出）。
@@ -2718,14 +2680,12 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     }
     *tab.viewport.lock().await = Some((w, h));
     // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）。
-    // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片。
-    // 浮层（⋯ 菜单）开着时顶部让出 reserve：网页缩短一条、不被菜单遮。
+    // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片
     if session.mode == HostMode::Shell
         && let Some(label) = tab.shell_label.as_deref()
     {
         *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
-        let (rx, ry, rw, rh) = apply_overlay_reserve(&session, x as f64, y as f64, w as f64, h as f64);
-        shell::rect(label, rx, ry, rw, rh);
+        shell::rect(label, x as f64, y as f64, w as f64, h as f64);
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let visible = session.visible();
         sync_shell_visibility(&session, &tabs, &visible).await;
@@ -2887,25 +2847,46 @@ pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
-/// 面板浮层（「⋯」菜单）开合。shell 模式下开浮层时把壳里 webview 的**顶部让出
-/// reserve 像素**（菜单浮在那一条里，网页缩短一条、完全可见——不遮网页）；reserve≤0
-/// 时退化为整页隐藏（兜底）。关浮层立即恢复完整矩形。
-pub async fn panel_overlay(open: bool, reserve: i64) -> Result<Value, String> {
+/// 「⋯」菜单开关的**服务端唯一真相源**。壳模式菜单是壳里的浮层 webview，它的关闭
+/// （点菜单项/backdrop/Esc）由浮层页面自己发请求，前端主界面未必知道——所以状态记在
+/// 服务端：前端的「⋯」点击一律发 toggle，由这里翻转，两边不会失同步。
+static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 「⋯」菜单开合（P20.4 补丁四）。shell 模式下开菜单 = 让壳建一个**透明置顶的菜单
+/// webview** 铺在面板矩形上（`shell::menu`）：它压在下层内容 webview 之上，菜单因此浮在
+/// 网页上面——**网页纹丝不动、不被遮也不被藏**（对齐 ZCode；主界面的 HTML 菜单做不到，
+/// 因为 child webview 是 HWND，永远盖在 Svelte 之上）。菜单页由服务同源提供
+/// （/menu.html，锚点走 URL query），点击经同源 fetch 调 open-external/devtools 端点。
+/// 无头模式没有壳：菜单是前端 HTML 下拉（盖在截图上，z-index 正常），这里只记账。
+pub async fn panel_overlay(
+    open: bool,
+    toggle: bool,
+    panel: Option<(f64, f64, f64, f64)>,
+    anchor: Option<(f64, f64, f64, f64)>,
+) -> Result<Value, String> {
+    let open = if toggle {
+        !MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        open
+    };
+    MENU_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
+    if !open {
+        shell::menu_close();
+        return Ok(json!({ "ok": true, "open": false }));
+    }
+    let (Some(panel), Some(anchor)) = (panel, anchor) else {
+        MENU_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+        return Err("开菜单需要面板矩形与按钮锚点".into());
+    };
     let session = current_session().await?;
     session.touch();
-    session.set_overlay(open);
-    session.set_overlay_reserve(if open { reserve.max(0) } else { 0 });
-    // label 没变，sync_shell_visibility 不会重发矩形——这里按新状态立即重摆一次
-    let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let visible = session.visible();
-    if let Some(tab) = visible.as_deref().and_then(|vid| tabs.iter().find(|t| t.id == vid))
-        && let Some(label) = tab.shell_label.as_deref()
-    {
-        let (rx, ry, rw, rh) = shell_rect_for(&session, tab).await;
-        shell::rect(label, rx, ry, rw, rh);
+    if session.mode != HostMode::Shell {
+        return Ok(json!({ "ok": true, "open": true, "shell": false }));
     }
-    sync_shell_visibility(&session, &tabs, &visible).await;
-    Ok(json!({ "ok": true, "open": open, "reserve": if open { reserve.max(0) } else { 0 } }))
+    // 菜单项要操作的那一页：当前可见标签（没有就空——页面会禁用菜单项）
+    let tab = session.visible().unwrap_or_default();
+    shell::menu(panel.0, panel.1, panel.2, panel.3, anchor, &tab);
+    Ok(json!({ "ok": true, "open": true, "shell": true, "tab": tab }))
 }
 
 /// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。
@@ -2913,6 +2894,10 @@ pub async fn panel_overlay(open: bool, reserve: i64) -> Result<Value, String> {
 pub async fn panel_activate(id: &str) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
+    // 菜单开着时激活/切页签 = 浮层锚定的那一页失效了，顺手关掉壳里浮层（幂等）
+    if MENU_OPEN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        shell::menu_close();
+    }
     if id.is_empty() {
         session.clear_visible();
         session.set_showing(false);

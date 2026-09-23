@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>menu</title>
+    <style>
+      /* 壳里置顶透明 webview 的「⋯」菜单页（P20.4 补丁四）：
+         整页透明 backdrop 负责接住点击（点哪都关），只有菜单卡片是不透明的。
+         配色与 App 深色主题一致（--g1 底 / --g3 边 / --g7 字 / --g2 悬停）。 */
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      }
+      .backdrop {
+        position: absolute;
+        inset: 0;
+        background: transparent;
+      }
+      .card {
+        position: absolute;
+        display: none;
+        min-width: 180px;
+        padding: 4px;
+        background: #17171a;
+        border: 1px solid #2c2c31;
+        border-radius: 9px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+      }
+      .card.show {
+        display: block;
+      }
+      .card button {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        padding: 7px 10px;
+        border: none;
+        background: transparent;
+        color: #f4f5f7;
+        font-size: 12.5px;
+        line-height: 1;
+        border-radius: 6px;
+        cursor: pointer;
+        text-align: left;
+      }
+      .card button:hover {
+        background: #202024;
+      }
+      .card button:disabled {
+        color: #777b85;
+        cursor: default;
+      }
+      .card svg {
+        width: 14px;
+        height: 14px;
+        flex: none;
+        color: #a7abb5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="backdrop" id="backdrop"></div>
+    <div class="card" id="card">
+      <button id="btn-external">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
+        在默认浏览器中打开
+      </button>
+      <button id="btn-devtools">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
+        开发者工具
+      </button>
+    </div>
+    <script>
+      // 壳按需创建本 webview 时把锚点放进了 URL query（ax/ay = 「⋯」按钮相对本 webview
+      // 左上角的坐标，aw/ah = 按钮尺寸，tab = 当前可见标签）。加载即得，无时序竞态。
+      const params = new URLSearchParams(location.search);
+      const anchor = {
+        ax: parseFloat(params.get('ax') || '0'),
+        ay: parseFloat(params.get('ay') || '0'),
+        aw: parseFloat(params.get('aw') || '0'),
+        ah: parseFloat(params.get('ah') || '0'),
+        tab: params.get('tab') || '',
+      };
+      const card = document.getElementById('card');
+      const backdrop = document.getElementById('backdrop');
+      const btnExternal = document.getElementById('btn-external');
+      const btnDevtools = document.getElementById('btn-devtools');
+
+      function place(a) {
+        // 右缘对齐按钮右缘、贴在按钮下沿（与 App 里 .web-menu 的几何一致）
+        const cardW = 189;
+        let left = Math.round(a.ax + a.aw - cardW);
+        left = Math.max(4, Math.min(left, window.innerWidth - cardW - 4));
+        const top = Math.round(a.ay + a.ah + 2);
+        card.style.left = left + 'px';
+        card.style.top = top + 'px';
+        card.classList.add('show');
+      }
+
+      async function post(url, body) {
+        try {
+          await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {}),
+          });
+        } catch {}
+      }
+
+      function dismiss() {
+        card.classList.remove('show');
+        post('/api/browser/overlay', { open: false });
+      }
+
+      backdrop.addEventListener('click', dismiss);
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') dismiss();
+      });
+
+      btnExternal.addEventListener('click', async () => {
+        if (!anchor.tab) return;
+        await post('/api/browser/open-external', { id: anchor.tab });
+        dismiss();
+      });
+      btnDevtools.addEventListener('click', async () => {
+        if (!anchor.tab) return;
+        await post('/api/browser/devtools', { id: anchor.tab });
+        dismiss();
+      });
+
+      // 没有可见标签时禁用菜单项（此时也不该有菜单，防御）
+      btnExternal.disabled = !anchor.tab;
+      btnDevtools.disabled = !anchor.tab;
+      place(anchor);
+    </script>
+  </body>
+</html>

@@ -153,13 +153,27 @@ pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Valu
     crate::browser::panel_viewport(id, x, y, w, h).await.map(Json).map_err(bad)
 }
 
-/// POST /api/browser/overlay —— 面板浮层（「⋯」菜单）开合。shell 模式开浮层时
-/// 后端把 child webview 顶部让出 reserve（菜单实测高度，网页缩短一条、不被遮），
-/// reserve≤0 退化为整页隐藏；关浮层恢复完整矩形。
+/// POST /api/browser/overlay —— 「⋯」菜单开合。shell 模式开菜单时壳建一个透明置顶的
+/// 菜单 webview 浮在网页上（网页不动、不被遮）：body 带 panel（面板矩形，窗口坐标）与
+/// anchor（⋯ 按钮矩形，窗口坐标）。toggle=true 时按服务端状态翻转（前端不记壳模式菜单
+/// 的开合——浮层页面自己关闭时前端不知道，服务端记账才是唯一真相源）。无头模式不弹壳
+/// 菜单（前端走自己的 HTML 下拉）。
 pub(super) async fn browser_overlay(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let open = req.get("open").and_then(Value::as_bool).unwrap_or(false);
-    let reserve = req.get("reserve").and_then(Value::as_i64).unwrap_or(0);
-    crate::browser::panel_overlay(open, reserve).await.map(Json).map_err(bad)
+    let toggle = req.get("toggle").and_then(Value::as_bool).unwrap_or(false);
+    let rect = |key: &str| -> Option<(f64, f64, f64, f64)> {
+        let o = req.get(key)?;
+        Some((
+            o.get("x").and_then(Value::as_f64)?,
+            o.get("y").and_then(Value::as_f64)?,
+            o.get("w").and_then(Value::as_f64)?,
+            o.get("h").and_then(Value::as_f64)?,
+        ))
+    };
+    crate::browser::panel_overlay(open, toggle, rect("panel"), rect("anchor"))
+        .await
+        .map(Json)
+        .map_err(bad)
 }
 
 /// POST /api/browser/open-external —— 在系统默认浏览器打开当前页。

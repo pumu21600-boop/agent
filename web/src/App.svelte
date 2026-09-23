@@ -751,56 +751,45 @@
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
-  let webMenuOpen = false; // 「⋯」菜单（默认浏览器打开 / 开发者工具）
-  let webMenuFallback = null; // 让位没生效时的兜底定时器（退回整页隐藏，至少菜单可见）
-  // shell 模式：开菜单时后端把 child webview 顶部让出菜单那一条（网页缩短一条、
-  // 完全可见——不遮网页）；reserve = 菜单实测高度。关菜单恢复完整矩形。
-  function webMenuOverlay(open, reserve) {
+  let webMenuOpen = false; // 「⋯」菜单（仅无头模式的 HTML 下拉；壳模式是壳里浮层，前端不记状态）
+  // 壳模式：「⋯」菜单是壳里一个**透明置顶的 webview**，浮在网页之上——网页纹丝不动、
+  // 不被遮也不被藏（对齐 ZCode）。前端把面板矩形和按钮矩形交给服务端，壳负责建浮层；
+  // 浮层自己关闭（点项/backdrop/Esc）时前端不知道，所以开合状态以服务端为准——这里
+  // 的点击一律发 toggle。无头模式没有壳：菜单就是下面的 HTML 下拉（盖在截图上没问题）。
+  function webMenuOverlay(body) {
     if (!webNative) return;
     webApi('/api/browser/overlay', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ open, reserve: reserve || 0 }),
-    })
-      .then((r) => {
-        if (open && r && r.reserve) {
-          clearTimeout(webMenuFallback); // 让位已生效，兜底取消
-          webMenuFallback = null;
-        }
-      })
-      .catch(() => {});
+      body: JSON.stringify(body),
+    }).catch(() => {});
   }
-  function webToggleMenu() {
-    if (webMenuOpen) {
-      webCloseMenu();
+  function webToggleMenu(e) {
+    if (!webNative) {
+      webMenuOpen = !webMenuOpen; // 无头：HTML 下拉本地切换
       return;
     }
-    webMenuOpen = true;
-    // 菜单先渲染（此刻还在完整网页底下看不见），下一帧量它的高度再让后端让位——
-    // 矩形一到位，菜单就浮在网页让出的那条里：网页还在，菜单在旁边
-    requestAnimationFrame(() => {
-      const m = document.querySelector('.web-menu');
-      const h = m ? Math.ceil(m.getBoundingClientRect().height) + 2 : 0;
-      webMenuOverlay(true, h);
-      if (h > 0) {
-        clearTimeout(webMenuFallback);
-        webMenuFallback = setTimeout(() => {
-          webMenuFallback = null;
-          if (webMenuOpen) webMenuOverlay(true, 0); // 让位没生效→退回整页隐藏
-        }, 300);
-      } else {
-        webMenuOverlay(true, 0);
-      }
+    // 壳模式：面板矩形 + ⋯ 按钮矩形（都是窗口坐标）交给后端
+    const p = document.querySelector('.right-panel');
+    const btn = e && e.currentTarget;
+    if (!p || !btn) return;
+    const pr = p.getBoundingClientRect();
+    const br = btn.getBoundingClientRect();
+    webMenuOverlay({
+      toggle: true,
+      panel: { x: pr.x, y: pr.y, w: pr.width, h: pr.height },
+      anchor: { x: br.x, y: br.y, w: br.width, h: br.height },
     });
   }
   function webCloseMenu() {
-    clearTimeout(webMenuFallback);
-    webMenuFallback = null;
-    if (webMenuOpen) webMenuOverlay(false, 0);
+    if (webNative) webMenuOverlay({ open: false });
     webMenuOpen = false;
   }
-  // 离开网页页签/关面板时开着菜单要连浮层一起收（不然壳里 webview 一直让着位）
-  $: if ((rpTab !== 'web' || !rightPanelOpen) && webMenuOpen) webCloseMenu();
+  // 离开网页页签/关面板：壳模式让壳关浮层（幂等），无头模式收起 HTML 下拉
+  $: if (rpTab !== 'web' || !rightPanelOpen) {
+    if (webNative) webMenuOverlay({ open: false });
+    else if (webMenuOpen) webMenuOpen = false;
+  }
   let webDialog = null; // 页面 JS 弹窗（alert/confirm/prompt）：面板内确定/取消，不卡死页面
   // 是否跑在 Tauri 壳里（决定壳内 webview 能不能落到本客户端窗口）
   function inTauriShell() {
@@ -4365,10 +4354,10 @@
                 <span class="web-native-loading" title="页面加载中">●</span>
               {/if}
               <button class="web-add" title="新建标签页" on:click={webNewTab}>+</button>
-              <button class="web-nav" title="更多" on:click={webToggleMenu}>
+              <button class="web-nav" title="更多" on:click={(e) => webToggleMenu(e)}>
                 <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
               </button>
-              {#if webMenuOpen}
+              {#if webMenuOpen && !webNative}
                 <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
                 <div class="web-menu-backdrop" on:click={webCloseMenu}></div>
                 <div class="web-menu">
@@ -6455,9 +6444,9 @@
     min-width: 180px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
   }
-  /* P20.4 补丁（用户反馈「菜单怎么跑到上面去了」）：shell 模式下开菜单时后端会临时
-     藏起 child webview（见 webMenuOverlay），菜单不再被 HWND 盖住——恢复正常下拉，
-     向上弹的 .web-menu-up 已删除 */
+  /* 「⋯」菜单（仅无头模式：HTML 下拉盖在截图上，z-index 正常）。
+     shell 模式不用这个浮层——菜单是壳里一个透明置顶的 webview（见 webToggleMenu：
+     浮在网页之上、网页不动），因为 child webview 是 HWND，HTML 永远盖不过它。 */
   .web-menu button {
     display: flex;
     align-items: center;

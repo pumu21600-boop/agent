@@ -10,9 +10,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # unstable：P22 child webview（add_child）所需；devtools：child webview 开真 DevTools
 tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
-# rect 指令用 set_bounds（位置+尺寸一条消息原子生效；set_position+set_size 是两条，
-# 拖动时会有一帧"移位了没缩放"的残影）
-tauri-runtime = "2.11"
 serde_json = "1"
 
 [profile.release]

@@ -49,6 +49,8 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
+/// 「⋯」菜单浮层的 webview label（与 src/browser/shell.rs 的 MENU_LABEL 一致）
+const MENU_LABEL: &str = "wv-menu";
 
 /// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/agent.exe`
 /// （开发机布局；P13 原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
@@ -301,13 +303,8 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             let (x, y) = (op_f64(op, "x", 0.0), op_f64(op, "y", 0.0));
             let (w, h) = op_size(op);
             if let Some(wv) = host.get(&label) {
-                // set_bounds = 位置+尺寸一条用户消息，主线程原子应用；比 set_position +
-                // set_size 两条消息少一次中间帧（拖动时那一帧就是"移位没缩放"的残影）
-                let bounds = tauri_runtime::dpi::Rect {
-                    position: tauri::LogicalPosition::new(x, y).into(),
-                    size: tauri::LogicalSize::new(w, h).into(),
-                };
-                let _ = wv.set_bounds(bounds);
+                let _ = wv.set_position(LogicalPosition::new(x, y));
+                let _ = wv.set_size(LogicalSize::new(w, h));
                 slog(&format!("rect {label} {x},{y} {w}x{h}"));
             }
         }
@@ -330,6 +327,51 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
                     wv.close_devtools();
                 }
                 slog(&format!("devtools {label} open={open}"));
+            }
+        }
+        "menu" => {
+            // 「⋯」菜单浮层（P20.4 补丁四）：透明置顶的 child webview 铺在面板矩形上，
+            // 菜单页由服务同源提供（URL query 带锚点与 tab）。它压在下层内容 webview
+            // 之上——菜单因此浮在网页上面，网页纹丝不动（HTML 菜单做不到：HWND 永远
+            // 盖在主界面之上）。按需创建 = 最新的子窗口 = 天然置顶；同名先关旧的。
+            let Some(win) = app.get_window("main") else {
+                slog("menu 失败：没有 main 窗口");
+                return;
+            };
+            if let Some(old) = host.remove(MENU_LABEL) {
+                let _ = old.close();
+            }
+            let (x, y) = (op_f64(op, "x", 0.0), op_f64(op, "y", 0.0));
+            let (w, h) = op_size(op);
+            // 锚点换算成相对面板左上角（webview 内坐标）
+            let (ax, ay) = (op_f64(op, "ax", 0.0) - x, op_f64(op, "ay", 0.0) - y);
+            let (aw, ah) = (op_f64(op, "aw", 26.0), op_f64(op, "ah", 26.0));
+            let tab = op_str(op, "tab", "");
+            let url = format!(
+                "http://{SERVICE_URL}/menu.html?ax={ax}&ay={ay}&aw={aw}&ah={ah}&tab={tab}"
+            );
+            let Ok(parsed) = url.parse::<tauri::Url>() else {
+                slog("menu 失败：URL 解析不了");
+                return;
+            };
+            let builder = WebviewBuilder::new(MENU_LABEL, WebviewUrl::External(parsed))
+                .additional_browser_args(BROWSER_ARGS)
+                .transparent(true)
+                .initialization_script(POPUP_GUARD_JS)
+                .on_new_window(|_url, _features| tauri::webview::NewWindowResponse::Deny);
+            match win.add_child(builder, LogicalPosition::new(x, y), LogicalSize::new(w, h)) {
+                Ok(wv) => {
+                    let _ = wv.set_focus();
+                    host.insert(MENU_LABEL.to_string(), wv);
+                    slog(&format!("menu {MENU_LABEL} {x},{y} {w}x{h} anchor={ax},{ay}"));
+                }
+                Err(e) => slog(&format!("menu {MENU_LABEL} 失败: {e}")),
+            }
+        }
+        "menu_close" => {
+            if let Some(wv) = host.remove(MENU_LABEL) {
+                let _ = wv.close();
+                slog(&format!("menu_close {MENU_LABEL}"));
             }
         }
         "hello" => {}

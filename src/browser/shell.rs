@@ -11,6 +11,8 @@
 //! | `rect` | 移动+缩放（跟随网页面板内容区） |
 //! | `visible` | 显示/隐藏（面板切走即隐藏，免得浮层盖住 UI） |
 //! | `devtools` | 开/关真 DevTools（child webview 支持，补上无头时代的缺口） |
+//! | `menu` | 开「⋯」菜单：建透明置顶的菜单 webview 浮在网页上（页面不动） |
+//! | `menu_close` | 关菜单 webview |
 //!
 //! 设计约束：
 //! - **单向**：壳只收指令不回 ack——create 的确认靠 /json/list 里出现新 target
@@ -142,6 +144,28 @@ pub fn reset() {
 pub fn close(label: &str) {
     send(&json!({ "op": "close", "label": label }));
 }
+
+/// 开「⋯」菜单：壳建一个**透明置顶**的 child webview（label 固定 wv-menu，页面由服务
+/// 同源提供 http://127.0.0.1:5173/menu.html），铺在面板矩形上——它压在下层内容 webview
+/// 之上，菜单因此能浮在网页上面（页面纹丝不动，对齐 ZCode）。anchor 是「⋯」按钮相对面板
+/// 左上角的矩形，tab 是当前可见标签（菜单项要操作的那一页）。按需创建=最新的子窗口=
+/// 天然置顶。URL 由壳用自己的 SERVICE_URL 拼（不依赖服务的端口配置）。
+pub fn menu(x: f64, y: f64, w: f64, h: f64, anchor: (f64, f64, f64, f64), tab: &str) {
+    send(&json!({
+        "op": "menu", "label": MENU_LABEL,
+        "x": x, "y": y, "w": w, "h": h,
+        "ax": anchor.0, "ay": anchor.1, "aw": anchor.2, "ah": anchor.3,
+        "tab": tab
+    }));
+}
+
+/// 关菜单 webview（点了菜单项/backdrop/切走面板）。
+pub fn menu_close() {
+    send(&json!({ "op": "menu_close", "label": MENU_LABEL }));
+}
+
+/// 菜单浮层的 webview label（壳侧同名常量）。
+pub const MENU_LABEL: &str = "wv-menu";
 
 pub fn rect(label: &str, x: f64, y: f64, w: f64, h: f64) {
     send(&json!({ "op": "rect", "label": label, "x": x, "y": y, "w": w, "h": h }));
