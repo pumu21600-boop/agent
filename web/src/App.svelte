@@ -3053,6 +3053,14 @@
   }
   // 打开设置面板 / 切到记忆分区时都回读文件（含直接打开面板、持久化分区的情形）
   $: if (settingsOpen && settingsTab === 'memory') loadMemory();
+  // 同上：技能/MCP/插件分区的数据原先只在 pickSettingsTab 的点击里拉，页签从 localStorage
+  // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
+  $: if (settingsOpen && settingsTab === 'skills') loadSkills();
+  $: if (settingsOpen && settingsTab === 'mcp') loadMcp();
+  $: if (settingsOpen && settingsTab === 'ext') {
+    loadGitRuntime();
+    loadSandboxInfo();
+  }
 
   // —— 技能（Skill / SKILL.md）分区 ——
   let skillsData = [];
@@ -3279,6 +3287,17 @@
     rpTab = t.key;
     const ext = extList.find((e) => e.name === t.name);
     if (ext) extCurrent = ext;
+  }
+  // 开机恢复 dock 页签：rpTab 存在 localStorage 里、extCurrent 不在。上次停在「用量」这类
+  // dock 页签时，插件清单（/api/ext）还没拉回来，右侧面板已经照着 ext:xxx 渲染 → extCurrent
+  // 还是 null → 显示「插件未加载」，必须切到别的页签再点回来才好（openDockPlugin 才补 extCurrent）。
+  // 这里等清单一到就补上；插件被停用/删了则退回「产物」，别把用户留在死页签上。
+  // 只在插件面板没占屏时同步——extOpen 时 extCurrent 归那个面板的 iframe 用，别抢。
+  $: if (!extOpen && rpTab.startsWith('ext:')) {
+    const want = rpTab.slice(4);
+    const ext = enabledExts.find((e) => e.name === want);
+    if (ext && (!extCurrent || extCurrent.name !== want)) extCurrent = ext;
+    else if (!ext && extList.length && (!extCurrent || extCurrent.name !== want)) rpTab = 'artifacts';
   }
   // 声明了 toolbar 插槽的扩展 → 顶栏按钮
   $: slotExts = enabledExts.flatMap((e) =>
@@ -4450,7 +4469,7 @@
                 on:load={() => onExtFrameLoad(extCurrent.name)}
               ></iframe>
             {:else}
-              <div class="rp-empty">插件未加载</div>
+              <div class="rp-empty">{extList.length || extMsg ? '插件未加载' : '加载中…'}</div>
             {/if}
           </div>
         {:else}

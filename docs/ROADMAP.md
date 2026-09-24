@@ -121,6 +121,7 @@
     - **Response 当数据用**：`r.path` / `r.extensions` / `r.title` / `r.tools_found` / `r.found` 在裸 Response 上恒 `undefined`——界面静默显示空值或「已保存到 undefined」，**一个报错都没有**，比第一种更阴（ext 启停不刷新清单、会话打开不带标题、分叉不跳新会话、选文件夹没反应、版本号与沙箱档位卡空白，全是它）。
     - **纪律**：`await fetch(...)` 之后 16 行内必须出现 `.json()` / `.text()`；确实不读响应体的（流式 SSE `/api/chat` 走 `res.body.getReader()`、发了就忘的 DELETE）进脚本 `ALLOW` 白名单并写理由，别静默跳过。只读桥统一走 `apiJson(path, opts, missingMsg)`——旧版服务没这个接口时请求落进 SPA 兜底返回 HTML，裸 `.json()` 只会炸 `Unexpected token '<'`，apiJson 按「响应体以 `<` 开头」识别并翻成「请重启服务」的人话。
     - 前端没有单测框架，这类回归靠静态体检 + 真机点一遍（坑 17 流程）；`web/dist` 是 gitignore 的构建产物，服务从磁盘读它，改完 `cd web && npm run build` 即对常驻实例生效（index.html 不缓存）。
+21. **localStorage 恢复的页签 ≠ 已加载的数据**（2026-09-24 用户报「用量面板显示插件未加载，切走再回来才好」）：`rpTab`（右侧面板停在哪个页签）存 localStorage、`extCurrent`（当前是哪个插件）只在内存——开机时 `/api/ext` 清单还没回来，右侧面板已照着 `ext:usage` 渲染，`extCurrent` 还是 null → 显示「插件未加载」，必须切到别的页签再点回来（`openDockPlugin` 才补 `extCurrent`）。**同一个坑还埋在设置分区**：`settingsTab` 也持久化，而技能/MCP/插件分区的数据原先只在 `pickSettingsTab` 的点击里拉，上次停在「技能」再开机，打开设置看到的是空列表。**纪律**：① 凡是从 localStorage 恢复的「选中项」，都要有一条响应式语句把对应数据补齐（照记忆分区的 `$: if (settingsOpen && settingsTab === 'memory') loadMemory();` 写），别只挂在点击处理函数上；② 选中项指向的东西没了（插件停用/删除）要主动退回默认项，别把用户留在死页签上；③ 清单还没回来时占位文案说「加载中…」，别用「未加载」这种结论性措辞（会骗人）。
 
 ## 五、剩余任务清单（2026-09-23 梳理，P21 收尾时点）
 
