@@ -49,7 +49,7 @@ mod ext;
 mod gate;
 mod git;
 mod headless;
-mod memory;
+pub(crate) mod memory;
 mod schedule;
 mod sessions;
 mod settings;

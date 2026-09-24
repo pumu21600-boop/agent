@@ -25,9 +25,11 @@ pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value>
             json!({
                 "id": t.id,
                 "name": t.name,
+                "kind": t.kind(),
                 "cron": t.cron,
                 "cron_text": schedule::parse_cron(&t.cron).map(|c| c.describe()).unwrap_or_default(),
                 "message": t.message,
+                "memory_days": t.memory_days,
                 "session_mode": if t.session_mode.is_empty() { "new".to_string() } else { t.session_mode.clone() },
                 "session_id": t.session_id,
                 "approval_mode": t.approval_mode,

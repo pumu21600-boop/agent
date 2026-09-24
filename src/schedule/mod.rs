@@ -40,9 +40,16 @@ pub struct ScheduleTask {
     /// 5 段 cron（分 时 日 月 周，本地时区）；保存时校验可解析
     #[serde(default)]
     pub cron: String,
-    /// 到点唤醒无头会话的消息内容
+    /// 到点唤醒无头会话的消息内容（kind=memory 时忽略，内容由记忆检索生成）
     #[serde(default)]
     pub message: String,
+    /// 任务类型："message"（缺省，固定消息）| "memory"（P22-D 主动记忆提醒：
+    /// 到点先检索最近 memory_days 天的对话记录，生成回顾指令再唤醒）
+    #[serde(default)]
+    pub kind: String,
+    /// memory 类型的回顾窗口（天，1–90，缺省 3）
+    #[serde(default)]
+    pub memory_days: u32,
     /// 会话模式："new"（缺省，每轮新会话）| "fixed"（复用 session_id）
     #[serde(default)]
     pub session_mode: String,
@@ -91,14 +98,34 @@ impl ScheduleTask {
         if self.name.trim().is_empty() {
             return Err("任务名称不能为空".into());
         }
-        if self.message.trim().is_empty() {
-            return Err("唤醒消息不能为空".into());
-        }
         cron::parse(&self.cron).map_err(|e| format!("cron 表达式：{e}"))?;
+        match self.kind.as_str() {
+            "" | "message" => {
+                if self.message.trim().is_empty() {
+                    return Err("唤醒消息不能为空".into());
+                }
+            }
+            "memory" => {
+                if self.memory_days == 0 || self.memory_days > 90 {
+                    return Err("回顾天数要在 1–90 之间".into());
+                }
+            }
+            other => return Err(format!("未知任务类型: {other}")),
+        }
         if self.session_mode == "fixed" && self.session_id.trim().is_empty() {
             return Err("固定会话模式要填会话 id".into());
         }
         Ok(())
+    }
+
+    /// 生效的任务类型（缺省 message）。
+    pub fn kind(&self) -> &str {
+        if self.kind == "memory" { "memory" } else { "message" }
+    }
+
+    /// 生效的回顾窗口（memory 类型；越界值兜底 3）。
+    pub fn memory_days(&self) -> u32 {
+        if self.memory_days == 0 || self.memory_days > 90 { 3 } else { self.memory_days }
     }
 }
 
@@ -237,8 +264,40 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
     }
     let state = state.clone();
     tokio::spawn(async move {
+        // P22-D：记忆提醒类型——到点先同步记忆库（本地索引，零网络）并生成回顾指令；
+        // 窗口内没有可回顾的对话就跳过本轮（标记已处理，不每跳重复到点、不白烧模型调用）
+        let message = if task.kind() == "memory" {
+            // 先同步记忆库（有界增量，配了嵌入渠道走语义向量），再检索回顾窗口内的对话
+            crate::server::memory::sync_library_for_schedule(&state).await;
+            let lib = crate::memory::library::load(&state.log_dir);
+            match build_memory_message(&lib.entries, task.memory_days(), chrono::Local::now().timestamp()) {
+                Some(m) => m,
+                None => {
+                    let now = chrono::Local::now().timestamp();
+                    write_back(&state, &task.id, !manual, now, "skipped", Some("回顾窗口内没有可回顾的对话"), None);
+                    push_notice(ScheduleNotice {
+                        ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        trigger: trigger.to_string(),
+                        task_id: task.id.clone(),
+                        task_name: task.name.clone(),
+                        status: "skipped".into(),
+                        title: format!("定时任务「{}」跳过：没有可回顾的对话", task.name),
+                        detail: String::new(),
+                        session_id: String::new(),
+                        duration_ms: 0,
+                    });
+                    running_slot()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&task.id);
+                    return;
+                }
+            }
+        } else {
+            task.message.clone()
+        };
         let req = crate::server::HeadlessRequest {
-            message: task.message.clone(),
+            message,
             session_id: task.fixed_session().unwrap_or("").to_string(),
             model: String::new(),
             base_url: String::new(),
@@ -265,31 +324,16 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             ),
             Err((_code, msg)) => ("error".to_string(), String::new(), String::new(), msg, 0),
         };
-        let now = chrono::Local::now().timestamp();
         // 回写任务状态（自动触发才动 last_run_ts——排期基准不能被手动跑打乱）
-        {
-            let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
-            if let Some(t) = s.schedules.iter_mut().find(|x| x.id == task.id) {
-                if !manual {
-                    t.last_run_ts = Some(now);
-                } else {
-                    t.last_manual_ts = Some(now);
-                }
-                t.last_status = Some(status.clone());
-                t.last_error = if error.is_empty() { None } else { Some(error.clone()) };
-                if !session_id.is_empty() {
-                    t.last_session_id = Some(session_id.clone());
-                }
-            }
-            let snapshot = s.clone();
-            drop(s);
-            if let Err(e) = snapshot.save() {
-                crate::observability::event(
-                    crate::observability::EventType::Error,
-                    serde_json::json!({ "message": format!("定时任务状态落盘失败: {e}") }),
-                );
-            }
-        }
+        write_back(
+            &state,
+            &task.id,
+            !manual,
+            chrono::Local::now().timestamp(),
+            &status,
+            Some(error.as_str()),
+            Some(session_id.as_str()),
+        );
         push_notice(ScheduleNotice {
             ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             trigger: trigger.to_string(),
@@ -329,12 +373,87 @@ fn preview(s: &str) -> String {
     flat.trim().to_string()
 }
 
+/// 回写任务状态到 settings.json（自动触发才动 last_run_ts——排期基准不能被手动跑打乱）。
+/// `session` 为空 = 不更新会话 id（如跳过轮没有会话）。
+fn write_back(
+    state: &AppState,
+    task_id: &str,
+    auto: bool,
+    now: i64,
+    status: &str,
+    error: Option<&str>,
+    session: Option<&str>,
+) {
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = s.schedules.iter_mut().find(|x| x.id == task_id) {
+        if auto {
+            t.last_run_ts = Some(now);
+        } else {
+            t.last_manual_ts = Some(now);
+        }
+        t.last_status = Some(status.to_string());
+        t.last_error = error.filter(|e| !e.is_empty()).map(|e| e.to_string());
+        if let Some(sid) = session.filter(|s| !s.is_empty()) {
+            t.last_session_id = Some(sid.to_string());
+        }
+    }
+    let snapshot = s.clone();
+    drop(s);
+    if let Err(e) = snapshot.save() {
+        crate::observability::event(
+            crate::observability::EventType::Error,
+            serde_json::json!({ "message": format!("定时任务状态落盘失败: {e}") }),
+        );
+    }
+}
+
 /// 计算某任务的下次触发时间（unix 秒；解析失败/无下一次返回 None）。
 pub fn next_run_ts(task: &ScheduleTask) -> Option<i64> {
     let spec = cron::parse(&task.cron).ok()?;
     let base = task.last_run_ts.unwrap_or(task.created_ts);
     let from = DateTime::from_timestamp(base, 0)?.with_timezone(&Local);
     spec.next_after(from).map(|d| d.timestamp())
+}
+
+/// P22-D：从记忆库条目生成「主动记忆提醒」的回顾指令（纯函数，可单测）。
+/// 口径：最近 `days` 天内有更新、非归档、至少 2 条消息的真对话；按更新时间倒序取 12 条。
+/// 没有可回顾的返回 None（调度器据此跳过本轮，不白烧一次模型调用）。
+pub fn build_memory_message(
+    entries: &[crate::memory::library::Entry],
+    days: u32,
+    now_ts: i64,
+) -> Option<String> {
+    let cutoff = now_ts - (days as i64) * 86_400;
+    let mut picked: Vec<&crate::memory::library::Entry> = entries
+        .iter()
+        .filter(|e| {
+            !e.archived
+                && e.count >= 2
+                && parse_rfc3339(&e.updated_at).is_some_and(|t| t >= cutoff)
+        })
+        .collect();
+    // RFC3339（UTC 定长）字典序即时间序，倒序 = 最近更新在前
+    picked.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    picked.truncate(12);
+    if picked.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = picked
+        .iter()
+        .map(|e| {
+            let day: String = e.updated_at.chars().take(10).collect();
+            let head: String = e.digest.chars().take(160).collect();
+            format!("- 《{}》（{}，更新于 {}）：{}", e.title, e.project, day, head.trim())
+        })
+        .collect();
+    Some(format!(
+        "【主动记忆提醒】以下是最近 {days} 天里有更新的对话记录（最多 12 条）：\n{}\n\n请从这些记录里找出用户提到「要跟进 / 待办 / 之后再做 / 计划中 / 约好了」的事项，逐条列出并给出建议动作；没有任何值得提醒的就明确说「没有需要提醒的事」，不要编造不存在的事项。",
+        lines.join("\n")
+    ))
+}
+
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp())
 }
 
 #[cfg(test)]
@@ -347,6 +466,8 @@ mod tests {
             name: "巡检".into(),
             cron: cron.into(),
             message: "跑一遍构建".into(),
+            kind: String::new(),
+            memory_days: 0,
             session_mode: mode.into(),
             session_id: sid.into(),
             approval_mode: String::new(),
@@ -377,6 +498,78 @@ mod tests {
         assert!(t.validate().is_err(), "fixed 模式必须带会话 id");
         let t = task("0 9 * * *", "fixed", "sess-1");
         assert!(t.validate().is_ok());
+        // P22-D：memory 类型不要求 message，但 days 要在 1–90
+        let mut t = task("0 9 * * *", "new", "");
+        t.kind = "memory".into();
+        t.message = String::new();
+        t.memory_days = 3;
+        assert!(t.validate().is_ok(), "memory 类型不要求固定消息");
+        t.memory_days = 0;
+        assert!(t.validate().is_err(), "days=0 拒绝（kind() 兜底另算）");
+        t.memory_days = 91;
+        assert!(t.validate().is_err());
+        let mut t = task("0 9 * * *", "new", "");
+        t.kind = "weird".into();
+        assert!(t.validate().unwrap_err().contains("未知任务类型"));
+    }
+
+    /// P22-D：类型与回顾窗口的生效值（缺省 message / days 越界兜底 3）。
+    #[test]
+    fn kind_and_days_defaults() {
+        let t = task("0 9 * * *", "new", "");
+        assert_eq!(t.kind(), "message");
+        assert_eq!(t.memory_days(), 3);
+        let mut t = task("0 9 * * *", "new", "");
+        t.kind = "memory".into();
+        t.memory_days = 7;
+        assert_eq!(t.kind(), "memory");
+        assert_eq!(t.memory_days(), 7);
+        // 越界值：validate 已拦，kind()/memory_days() 兜底不 panic
+        let mut t = task("0 9 * * *", "new", "");
+        t.kind = "memory".into();
+        t.memory_days = 999;
+        assert_eq!(t.memory_days(), 3);
+    }
+
+    /// P22-D：回顾指令生成——窗口过滤 / 归档与空会话排除 / 倒序取 12 / 空窗 None。
+    #[test]
+    fn build_memory_message_filters_and_composes() {
+        use crate::memory::library::Entry;
+        let now = 1_800_000_000i64; // 2027-01-15 前后
+        let mk = |id: &str, upd: &str, count: usize, archived: bool| Entry {
+            id: id.into(),
+            title: format!("会话{id}"),
+            workspace: "/ws".into(),
+            project: "proj".into(),
+            created_at: upd.into(),
+            updated_at: upd.into(),
+            count,
+            chars: 100,
+            pinned: false,
+            archived,
+            digest: format!("{id} 的摘要内容"),
+            snippet: String::new(),
+            fp: String::new(),
+            vec: Vec::new(),
+        };
+        // 窗口内（1 天前）/ 窗口外（10 天前）/ 归档 / 空会话各一条
+        let in_win = chrono::DateTime::from_timestamp(now - 86_400, 0).unwrap().to_rfc3339();
+        let out_win = chrono::DateTime::from_timestamp(now - 10 * 86_400, 0).unwrap().to_rfc3339();
+        let entries = vec![
+            mk("a", &in_win, 4, false),
+            mk("b", &out_win, 6, false),
+            mk("c", &in_win, 5, true),
+            mk("d", &in_win, 1, false),
+        ];
+        let msg = build_memory_message(&entries, 3, now).expect("应生成");
+        assert!(msg.contains("会话a"), "窗口内的真对话要在");
+        assert!(!msg.contains("会话b"), "窗口外的不要");
+        assert!(!msg.contains("会话c"), "归档的不要");
+        assert!(!msg.contains("会话d"), "空会话不要");
+        assert!(msg.contains("最近 3 天"), "{msg}");
+        // 全部不合格 → None（调度器据此跳过，不白烧模型调用）
+        assert!(build_memory_message(&entries[1..], 3, now).is_none());
+        assert!(build_memory_message(&[], 3, now).is_none());
     }
 
     #[test]

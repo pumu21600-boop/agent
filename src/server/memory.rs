@@ -154,6 +154,14 @@ pub(super) async fn get_memory_library(State(state): State<AppState>) -> Json<Va
     Json(build_library(&state, false).await)
 }
 
+/// P22-D：定时任务「记忆提醒」到点前的记忆库同步（有界增量；配了嵌入渠道就走语义向量，
+/// 没配走本地词法——与记忆库面板同一路径，只是没人看着时也要保新鲜）。
+pub(crate) async fn sync_library_for_schedule(state: &AppState) {
+    let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let embedder = resolve_embedder(state, &settings);
+    let _ = crate::memory::library::sync(&state.session, &state.log_dir, embedder, false).await;
+}
+
 /// POST /api/memory/library/reindex —— 强制重建向量（忽略指纹），返回同款光点数据。
 pub(super) async fn reindex_memory_library(State(state): State<AppState>) -> Json<Value> {
     observability::event(EventType::State, json!({ "kind": "memory.reindex" }));

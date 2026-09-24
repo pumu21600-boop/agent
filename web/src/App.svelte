@@ -3096,8 +3096,10 @@
     schedEditor = {
       id: '',
       name: '',
+      kind: 'message',
       cron: '0 9 * * *',
       message: '',
+      memory_days: 3,
       session_mode: 'new',
       session_id: '',
       approval_mode: 'auto',
@@ -3114,22 +3116,26 @@
   async function saveSchedule() {
     const e = schedEditor;
     if (!e) return;
+    // body 先组装：fetch 调用点往后 16 行内必须出现 .json()（scripts/check_fetch_json.mjs 硬体检）
+    const body = {
+      id: e.id || '',
+      name: e.name,
+      kind: e.kind || 'message',
+      cron: e.cron,
+      message: e.message,
+      memory_days: Number(e.memory_days) || 0,
+      session_mode: e.session_mode,
+      session_id: e.session_id,
+      approval_mode: e.approval_mode,
+      on_approval: e.on_approval,
+      enabled: e.enabled !== false,
+      timeout_secs: Number(e.timeout_secs) || 0,
+    };
     try {
       const r = await fetch('/api/schedules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: e.id || '',
-          name: e.name,
-          cron: e.cron,
-          message: e.message,
-          session_mode: e.session_mode,
-          session_id: e.session_id,
-          approval_mode: e.approval_mode,
-          on_approval: e.on_approval,
-          enabled: e.enabled !== false,
-          timeout_secs: Number(e.timeout_secs) || 0,
-        }),
+        body: JSON.stringify(body),
       }).then((r) => r.json());
       if (r.ok) {
         schedEditor = null;
@@ -5531,15 +5537,33 @@
             <label>{schedEditor.isNew ? '新建定时任务' : `编辑：${schedEditor.name}`}</label>
             <div class="sub-row">
               <input placeholder="名称" bind:value={schedEditor.name} style="max-width:220px" />
-              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} style="max-width:220px" />
+              <Select
+                value={schedEditor.kind || 'message'}
+                title="任务类型"
+                options={[
+                  { value: 'message', label: '固定消息' },
+                  { value: 'memory', label: '记忆提醒（回顾最近对话）' },
+                ]}
+                on:change={(e) => (schedEditor.kind = e.detail)}
+              />
             </div>
-            <textarea
-              class="agents-editor"
-              rows="4"
-              spellcheck="false"
-              placeholder="到点时唤醒 agent 的消息"
-              bind:value={schedEditor.message}
-            ></textarea>
+            <div class="sub-row">
+              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} style="max-width:220px" />
+              {#if (schedEditor.kind || 'message') === 'memory'}
+                <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
+              {/if}
+            </div>
+            {#if (schedEditor.kind || 'message') === 'message'}
+              <textarea
+                class="agents-editor"
+                rows="4"
+                spellcheck="false"
+                placeholder="到点时唤醒 agent 的消息"
+                bind:value={schedEditor.message}
+              ></textarea>
+            {:else}
+              <div class="mcp-cmd">到点先检索最近 {schedEditor.memory_days || 3} 天的对话，让 agent 找出要跟进的事项</div>
+            {/if}
             <div class="sub-row">
               <Select
                 value={schedEditor.session_mode}
@@ -5587,6 +5611,7 @@
               <div class="mcp-head">
                 <span class="dot" class:haskey={t.enabled !== false}></span>
                 <b>{t.name}</b>
+                {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
                 <span class="mcp-status">{t.cron}</span>
                 <span class="mcp-risk">{t.cron_text}</span>
                 <span class="flex-sp"></span>
@@ -5594,7 +5619,11 @@
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
                 <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
               </div>
-              <div class="mcp-cmd">{t.message}</div>
+              {#if t.kind === 'memory'}
+                <div class="mcp-cmd">到点回顾最近 {t.memory_days || 3} 天的对话，找出要跟进的事项</div>
+              {:else}
+                <div class="mcp-cmd">{t.message}</div>
+              {/if}
               <div class="mcp-cmd">
                 下次运行 {schedNextText(t)}{t.last_status
                   ? ` · 上次${t.last_status === 'done' ? '完成' : t.last_status === 'timeout' ? '超时' : t.last_status === 'cancelled' ? '取消' : '出错'}`
