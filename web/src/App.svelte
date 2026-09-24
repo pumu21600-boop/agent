@@ -4714,7 +4714,6 @@
               <button class="theme-opt" class:active={themeMode === 'light'} on:click={() => applyThemeMode('light')}>浅色</button>
               <button class="theme-opt" class:active={themeMode === 'system'} on:click={() => applyThemeMode('system')}>跟随系统</button>
             </div>
-            <div class="param-hint">即时生效并记住；侧栏顶部可快速切换</div>
           </div>
           <div class="field">
             <label>背景壁纸</label>
@@ -4727,8 +4726,6 @@
                 <span class="wp-opacity">不透明度 <b>{wallpaperOpacity}</b>
                   <input type="range" min="0" max="100" bind:value={wallpaperOpacity} />
                 </span>
-              {:else}
-                <span class="param-hint">聊天区背景图（0=隐藏，100=不透明）</span>
               {/if}
             </div>
             {#if wallpaperMsg}<div class="param-hint">{wallpaperMsg}</div>{/if}
@@ -4743,9 +4740,8 @@
               on:input={() => applyCustomCss()}
               placeholder={'直接写 CSS 规则，实时生效并记住。例如：\n.composer { border-radius: 24px; }\n.chat-head { display: none; }'}
             ></textarea>
-            <div class="param-hint">手写 CSS 优先级最高；改崩了就清空重来</div>
             {#if microCss(microTweaks)}
-              <label>微调生成的规则（只读预览，实际已生效）</label>
+              <label>微调生成的规则（只读预览）</label>
               <textarea
                 class="agents-editor css-injector micro-readonly"
                 rows="6"
@@ -4755,7 +4751,6 @@
               ></textarea>
               <div class="sub-row">
                 <button class="btn" on:click={clearAllMicro}>清空全部微调规则</button>
-                <span class="param-hint" style="align-self:center">一键清空微调规则（不影响手写 CSS）</span>
               </div>
             {/if}
             <div class="sub-row">
@@ -4768,7 +4763,7 @@
                 bind:this={cssImportInput}
                 on:change={onImportCssRules}
               />
-              <span class="param-hint" style="align-self:center">导出 JSON 含微调+手写；导入 JSON 覆盖两者，.css 只覆盖手写</span>
+              <span class="param-hint" style="align-self:center">导入会覆盖现有规则</span>
             </div>
           </div>
           <div class="field">
@@ -4778,13 +4773,12 @@
                 {editMode ? '● 微调中：右击界面元素即可修改（再点关闭）' : '开启微调：右击界面元素修改样式'}
               </button>
             </div>
-            <div class="param-hint">开启后右击元素弹出属性面板，改动实时预览并保存；刷新后需重新开启</div>
           </div>
         {/if}
         {#if settingsTab === 'model'}
 
       <div class="field">
-        <label>配置（点一下切换，改动自动保存即时生效）</label>
+        <label>配置</label>
         <div class="chips">
           {#each configs as c}
             <button
@@ -4833,7 +4827,7 @@
       </div>
 
       <div class="field">
-        <label>API Key（按配置独立保存）</label>
+        <label>API Key</label>
         <div class="sub-row">
           <input
             bind:value={apiKey}
@@ -4872,7 +4866,7 @@
       </div>
 
       <div class="field">
-        <label>模型参数（tokens，0=恢复默认）</label>
+        <label>模型参数（0=恢复默认）</label>
         <div class="sub-row">
           <input
             class="num-input"
@@ -4891,7 +4885,6 @@
             on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
           />
         </div>
-        <div class="param-hint">左：上下文长度　右：最大输出长度；以下参数均随当前配置独立保存，切换配置即切换参数</div>
       </div>
 
       <div class="field">
@@ -4914,11 +4907,11 @@
             on:change={() => autoSave({ top_p: topP === null || topP === '' ? -1 : Number(topP) }, 0)}
           />
         </div>
-        <div class="param-hint">左：temperature（-1 清除）　右：top_p（-1 清除）</div>
+        <div class="param-hint">-1 = 清除该项</div>
       </div>
 
       <div class="field">
-        <label>模型能力标记（多模态转接与工具调用依据）</label>
+        <label>模型能力标记</label>
         <div class="caps-row">
           <label class="cap-check">
             <input
@@ -4953,13 +4946,12 @@
             音频解析
           </label>
         </div>
-        <div class="param-hint">勾选即时保存；未勾的模态自动转给「角色分工」的解析专家</div>
       </div>
 
       {/if}
       {#if settingsTab === 'roles'}
       <div class="field roles-section">
-        <label>角色分工与多模态转接（专职专家席位）</label>
+        <label>角色分工</label>
         <div class="roles-grid">
           <div class="role-item">
             <span class="role-name">会话摘要 (Summary)</span>
@@ -5070,28 +5062,26 @@
             />
           </div>
         </div>
-        <div class="param-hint">留空 = 自动兜底（摘要/标题用主力，嵌入用本地向量）；专家下拉只列勾了对应解析能力的配置</div>
+        <div class="param-hint">留空 = 自动兜底</div>
       </div>
       {/if}
       {#if settingsTab === 'memory'}
         {#if memData}
           <div class="field">
-            <label>记忆存储（自动记录，非约定）</label>
+            <label>记忆存储（自动记录）</label>
             <div class="mem-stats">
               <div>· 全局目录 <code>{memData.global_dir}</code> · {memData.projects_registered} 个项目</div>
               <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
             </div>
-            <div class="param-hint">events.log 是自动流水，不是约定。</div>
           </div>
           <div class="field">
             <label>记忆库</label>
             <div class="sub-row">
               <button class="btn" on:click={() => { settingsOpen = false; galaxyOpen = true; }}>打开记忆库</button>
-              <span class="hint">一次会话 = 一个光点，可搜索</span>
             </div>
           </div>
           <div class="field">
-            <label>约定文件（注入 system，留空 = 不注入）</label>
+            <label>约定文件</label>
             <div class="chips">
               <button class="chip" class:active={memTab === 'system'} on:click={() => pickMemTab('system')}>系统约定</button>
               <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定</button>
@@ -5102,19 +5092,14 @@
               <button class="btn" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
               <span class="hint">{memMsg}</span>
             </div>
-            <div class="param-hint">
-              {#if memTab === 'system'}基础提示词。{/if}
-              {#if memTab === 'global'}所有项目共用。{/if}
-              {#if memTab === 'project'}仅当前工作区。{/if}
-              文件：<code>{memPath}</code>
-            </div>
+            <div class="param-hint">文件：<code>{memPath}</code></div>
           </div>
         {:else}
           <div class="trace-empty">{memMsg || '加载中…'}</div>
         {/if}
       {/if}
       {#if settingsTab === 'skills'}
-        <div class="param-hint">一个技能 = 一个文件夹 + SKILL.md；目录：工作区 skills/ 与 ~/.agent/skills/（同名项目优先）。system 只注入名字+描述，消息写 $技能名 指定</div>
+        <div class="param-hint">消息里写 $技能名 指定</div>
         <div class="sub-row">
           <button class="btn primary" on:click={newSkill}>新建技能</button>
           <button class="btn" on:click={loadSkills}>刷新</button>
@@ -5122,10 +5107,10 @@
         </div>
         {#if skillEditor}
           <div class="field">
-            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}{skillEditor.source === 'global' ? '（全局技能 · 保存将在工作区生成同名项目级覆盖）' : ''}</label>
+            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}{skillEditor.source === 'global' ? '（全局技能）' : ''}</label>
             <div class="sub-row">
-              <input placeholder="技能名（可中文，禁 / \ ..）" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
-              <input placeholder="一句话描述（注入索引给模型看）" bind:value={skillEditor.description} />
+              <input placeholder="技能名" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
+              <input placeholder="一句话描述" bind:value={skillEditor.description} />
             </div>
             <textarea class="agents-editor" rows="14" spellcheck="false" bind:value={skillEditor.content}></textarea>
             <div class="sub-row">
@@ -5154,7 +5139,7 @@
         {/if}
       {/if}
       {#if settingsTab === 'mcp'}
-        <div class="param-hint">接入外部工具（mcp__服务__工具）。首次接入要先确认工具清单；每服务可设审批档</div>
+        <div class="param-hint">工具调用名：mcp__服务__工具</div>
         {#each mcpServers as sv}
           <div class="field mcp-card">
             <div class="mcp-head">
@@ -5219,7 +5204,7 @@
           </div>
         {/each}
         <div class="field">
-          <label>添加 MCP server（stdio：本地命令；HTTP：远端 Streamable HTTP 端点）</label>
+          <label>添加 MCP server</label>
           <div class="sub-row">
             <input placeholder="名称（字母数字-_）" bind:value={mcpForm.name} style="max-width:160px" />
             <Select
@@ -5252,28 +5237,13 @@
                 rows="2"
               ></textarea>
             </div>
-            <div class="param-hint">
-              远端 MCP 走规范里的 Streamable HTTP：POST JSON-RPC，响应支持 application/json 与
-              text/event-stream（SSE 帧），initialize 拿到的 Mcp-Session-Id 会自动回带。
-              请求头只存在本地 settings.json 与内存，绝不进日志。
-            </div>
           {:else}
-            <div class="param-hint">示例（官方 filesystem）：名称 fs · 命令 npx · 参数 -y @modelcontextprotocol/server-filesystem D://some//dir</div>
+            <div class="param-hint">例：npx -y @modelcontextprotocol/server-filesystem &lt;目录&gt;</div>
           {/if}
         </div>
       {/if}
       {#if settingsTab === 'ext'}
-        <div class="param-hint">
-          插件（契约 v1）：一个目录 + 一份 manifest.json = 一个插件，面板与工具都在清单里声明，
-          不分类型。<b>应用根 ui-ext/</b> 放随包插件，<b>当前工作区 ui-ext/</b> 放项目自带插件
-          （同名时工作区优先）；工具文件放 <b>plugins/</b>（.wasm/.wat 或 目录 + manifest）。
-          面板在 <code>sandbox="allow-scripts"</code> 的 iframe 里跑——不透明源、读不到宿主 DOM
-          与 localStorage，只能通过白名单接口拿数据。
-          <br />
-          <b>第三方验签</b>：来源为 <code>user</code> 的插件（自装/工作区/plugins 目录）要先点
-          「信任」固定内容指纹才会加载；文件被改动后指纹不符即停用，需重新信任。随包内置与模型自产
-          草稿不在此列。
-        </div>
+        <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
         {#if extList.length}
           {#each extList as e}
@@ -5319,10 +5289,10 @@
                 <div class="mcp-cmd">工具：{e.tools.map((t) => `wasm__${e.name}__${t[0] ?? t.name}`).join('、')}</div>
               {/if}
               {#if e.permissions && e.permissions.length}
-                <div class="mcp-cmd">权限：{e.permissions.join('、')}（未声明的写操作一律拒绝）</div>
+                <div class="mcp-cmd">权限：{e.permissions.join('、')}</div>
               {/if}
               {#if e.ui && e.ui.length}
-                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}（顶栏按钮 → 插件收到 agent:slot 事件）</div>
+                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}</div>
               {/if}
               {#if e.error}
                 <div class="mcp-cmd">{e.error}</div>
@@ -5341,17 +5311,8 @@
           <label>插件目录约定</label>
           <div class="mcp-cmd">内置：{extInfo.app_dir || '（读取中）'}</div>
           <div class="mcp-cmd">工作区：{extInfo.workspace_dir || '（读取中）'}</div>
-          <div class="param-hint">
-            manifest.json 形如 {`{"apiVersion":1,"source":"user","title":"记忆看板","description":"…","version":"0.1.0","entry":"index.html","ui":[],"permissions":[]}`}；
-            apiVersion 不匹配的插件会被拒载并提示升级；permissions 可声明
-            composer.insert / workspace.write / bus.publish / notify / storage（storage =
-            插件自己命名空间内的读写，碰不到会话与设置）。
-            入口页里用 <code>postMessage({'{'}type:'agent:hello'{'}'})</code> 握手，之后可调
-            app.info / workspace.info / workspace.files / git.status / memory.search / session.info /
-            storage.read / storage.write / storage.delete。
-          </div>
         </div>
-        <div class="field"><label>运行状态（本机环境）</label></div>
+        <div class="field"><label>运行状态</label></div>
         <div class="field mcp-card">
           <div class="mcp-head">
             <span class="dot" class:haskey={sandboxInfo?.ok === true}></span>
@@ -5369,7 +5330,6 @@
             {#if sandboxInfo.fallback_reason}
               <div class="mcp-cmd" style="color: var(--tint-orange-fg)">⚠ {sandboxInfo.fallback_reason}</div>
             {/if}
-            <div class="param-hint">{sandboxInfo.describe}</div>
           {/if}
         </div>
         <div class="field mcp-card">
@@ -5395,11 +5355,6 @@
           {:else if gitRuntime}
             <div class="mcp-cmd">{gitRuntime.error}</div>
           {/if}
-          <div class="param-hint">
-            优先使用你机器上已装的 Git（PATH / 注册表 / 常见安装位置）；没装时才解压随包内置的
-            MinGit 到 {gitRuntime?.runtime_dir || '%LOCALAPPDATA%\\agent\\runtime\\git'}（无需联网、不要管理员）。
-            内置包{gitRuntime?.zip_available ? '已随发行包携带' : '未携带'}；新装 Git 后需重启服务才会重新检测。
-          </div>
         </div>
         <div class="field mcp-card">
           <div class="mcp-head">
@@ -5427,10 +5382,6 @@
           {:else if sandboxProbe?.error}
             <div class="mcp-cmd">{sandboxProbe.error}</div>
           {/if}
-          <div class="param-hint">
-            真实拉起受限进程跑一遍隔离面（输出捕获 / 环境白名单 / 特权剥离 / 工作目录可达 / 超时团灭）。
-            只读操作，不会改动任何文件；kill-tree 与内存上限两项较慢，只在 cargo test 里跑。
-          </div>
         </div>
       {/if}
 
@@ -5445,7 +5396,7 @@
     <div class="modal ctx-modal" on:click|stopPropagation>
       <div class="modal-head">
         <b>使用 @ 添加上下文</b>
-        <span class="hint">选择工作区文件，以 @相对路径 插入消息，模型会自行读取</span>
+        <span class="hint">插入 @相对路径（模型自行读取）</span>
         <button class="btn ghost" on:click={() => (ctxPickerOpen = false)}>关闭</button>
       </div>
       <input class="ctx-search" placeholder="搜索文件…" bind:value={ctxQuery} />

@@ -56,7 +56,7 @@
 </head>
 <body>
   <h3>模型价格</h3>
-  <div class="sub">单价 = <span id="unit">美元</span> / 百万 token · 键是「渠道 + 模型 id」，同模型名不同供应商互不混淆</div>
+  <div class="sub">单价 = <span id="unit">美元</span> / 百万 token · 键 = 渠道 host + 模型 id</div>
 
   <div class="bar">
     <span class="seg">
@@ -74,9 +74,7 @@
     <tbody id="rows"></tbody>
   </table>
 
-  <div class="hint">
-    host 从已保存的渠道里选最省事（下拉带出）；<code>*</code> = 通配兜底。内部一律以美元记账，人民币值按上面的汇率折算——切币种只换显示，不改已记的账。
-  </div>
+  <div class="hint">* = 通配兜底；人民币只换显示，不改已记的账</div>
 
   <div class="foot">
     <button class="primary" onclick="save()">保存</button>
