@@ -246,13 +246,14 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             approval_mode: task.approval_mode.clone(),
             plan_mode: false,
             on_approval: task.on_approval.clone(),
-            timeout_secs: if task.timeout_secs == 0 {
-                DEFAULT_TIMEOUT_SECS
-            } else {
-                task.timeout_secs
-            },
-            purpose: "schedule".into(),
-        };
+                timeout_secs: if task.timeout_secs == 0 {
+                    DEFAULT_TIMEOUT_SECS
+                } else {
+                    task.timeout_secs
+                },
+                purpose: "schedule".into(),
+                parent_session: String::new(),
+            };
         let result = crate::server::run_headless_inner(state.clone(), req).await;
         let (status, detail, session_id, error, duration_ms) = match result {
             Ok(r) => (

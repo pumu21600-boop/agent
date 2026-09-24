@@ -7,3 +7,4 @@ pub mod agent;
 pub mod cancel;
 pub mod rules;
 pub mod steer;
+pub mod subagent;

@@ -12,6 +12,7 @@
 use super::*;
 use super::chat::{CancelRun, assemble_turn_channels, normalize_mode, turn_system_prompt};
 use super::gate::ChatGate;
+use super::subagent;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +46,9 @@ pub(crate) struct HeadlessRequest {
     /// 唤醒来源（cli / schedule / subagent / webhook…），只进审计与台账口径
     #[serde(default)]
     pub purpose: String,
+    /// P22-C：父任务会话 id（子代理派发时填）——台账按父任务聚合 + 取消级联
+    #[serde(default)]
+    pub parent_session: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +90,8 @@ struct HeadlessGate {
     inner: ChatGate,
     auto_approve: bool,
     session_id: String,
+    /// P22-C：父任务会话 id（子代理派发；主任务为空）
+    parent_session: String,
 }
 
 impl agent::ApprovalGate for HeadlessGate {
@@ -106,6 +112,14 @@ impl agent::ApprovalGate for HeadlessGate {
     }
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+    /// P22-C：子代理会话的模型调用记父任务 id（台账按父任务聚合）
+    fn usage_parent_session(&self) -> Option<&str> {
+        if self.parent_session.is_empty() {
+            None
+        } else {
+            Some(&self.parent_session)
+        }
     }
     /// 无头不吃「立即发送」引导消息：UI 给这条会话发的追加消息进排队队列，
     /// 由本轮收尾处的有界续跑处理（见 run_headless 尾部）。
@@ -253,6 +267,7 @@ pub(crate) async fn run_headless_inner(
         },
         auto_approve,
         session_id: session_id.clone(),
+        parent_session: req.parent_session.clone(),
     };
     let mem = state
         .memory
@@ -268,7 +283,20 @@ pub(crate) async fn run_headless_inner(
     let col_task = col.clone();
     let notices_task = notices_cell.clone();
     let task_tokens = AtomicU64::new(0);
+    // P22-C：子代理 token 并入本任务预算的水印（无头父任务同样防拆解绕过预算）
+    let subagent_seen = AtomicU64::new(subagent::subagent_tokens(&session_id));
     let budget_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // P22-C 派发器：主任务（CLI/定时/脚本唤醒）才挂；**子代理自己的轮不挂**——
+    // 靠 parent_session 识别（v1 禁嵌套，深度表是第二道闸）。
+    let subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>> =
+        if req.parent_session.trim().is_empty() {
+            Some(Arc::new(subagent::SubagentDispatcher {
+                state: state.clone(),
+                limits: (*state.subagent_cfg).clone(),
+            }))
+        } else {
+            None
+        };
 
     // 整轮（含排队追加消息的有界续跑）跑在独立任务里：取消守卫随任务生命周期，
     // 超时后任务仍在后台收尾也保持着「会话在跑」的登记——不会出现双写会话文件。
@@ -288,6 +316,8 @@ pub(crate) async fn run_headless_inner(
                     fallbacks: ch.fallbacks.clone(),
                     downgrade: ch.downgrade.clone(),
                     budget_hit: budget_fired.clone(),
+                    // P22-C：主任务挂派发器；子代理轮不挂（禁嵌套）
+                    subagents: subagents.clone(),
                 },
                 &system_prompt,
                 &history,
@@ -316,7 +346,12 @@ pub(crate) async fn run_headless_inner(
                     }
                     agent::AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                         // P18 钩子 + P21 预算降级：与 /api/chat 同一套记账
-                        let total = task_tokens.fetch_add(prompt_tokens, Ordering::Relaxed) + prompt_tokens;
+                        // P22-C：子代理花销并进本任务预算（水印增量）
+                        let sub_total = subagent::subagent_tokens(&sid);
+                        let sub_fresh = sub_total.saturating_sub(subagent_seen.swap(sub_total, Ordering::Relaxed));
+                        let total = task_tokens.fetch_add(prompt_tokens + sub_fresh, Ordering::Relaxed)
+                            + prompt_tokens
+                            + sub_fresh;
                         let budget = crate::hooks::budget_tokens();
                         if crate::hooks::budget_exceeded(total, budget)
                             && !budget_fired.swap(true, Ordering::Relaxed)
@@ -412,6 +447,8 @@ pub(crate) async fn run_headless_inner(
             Ok(Err(e)) => ("error".to_string(), Some(format!("无头任务异常退出: {e}"))),
             Err(_) => {
                 state.cancel.cancel(&session_id);
+                // P22-C：父任务超时取消 → 级联取消它的活跃子代理
+                subagent::cancel_children(&session_id);
                 observability::event(
                     EventType::State,
                     json!({ "kind": "headless.timeout", "session": session_id, "secs": timeout_secs }),
@@ -489,6 +526,7 @@ mod tests {
             },
             auto_approve: approve,
             session_id: "s1".into(),
+            parent_session: String::new(),
         };
         let deny = gate(false);
         // auto 档下高危操作（删文件类）才需要审批——判定尺子与 /api/chat 同一把
@@ -502,6 +540,10 @@ mod tests {
         // 档位语义仍走 ChatGate 同一把尺子（auto 档 shell 在沙箱内、文件可越界）
         assert!(deny.sandbox_enabled());
         assert!(deny.file_tools_unconfined());
+        // P22-C：父任务归属（子代理轮填、主任务空）
+        assert_eq!(deny.usage_parent_session(), None);
+        let with_parent = gate(false);
+        assert_eq!(with_parent.parent_session, "");
     }
 
     /// 请求反序列化：缺省值 = 安全侧（deny / 600s / purpose=headless 由 handler 补）。

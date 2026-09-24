@@ -24,6 +24,14 @@ max_rpm = 0
 # title = "配置 2"     # 会话标题生成专用渠道
 # embedding = "配置 2" # 向量嵌入专用渠道（须支持 OpenAI 兼容 /embeddings）
 # budget = "配置 2"    # P21 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+# subagent = "配置 2"  # P22-C 子代理专用渠道（未配 = 回落主渠道；主会话旗舰、子代理跑量用便宜模型）
+
+# P22-C 子代理并行度（docs/subagent-draft.md 第 1 节）
+[subagent]
+# 全局并发子代理上限（0 = 不允许派发子代理）
+max_concurrent = 3
+# 单个父任务的活跃子代理上限（满员进队列等，出队即跑，不丢不串）
+per_parent = 2
 
 [cost]
 # P21 成本台账红线：全局花费上限（美元，硬闸）。台账累计花费达到即拒绝新的模型请求

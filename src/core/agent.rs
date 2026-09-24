@@ -178,6 +178,9 @@ pub struct LoopChannels {
     /// P21：与 server 共享的「本任务已超预算」标志（budget_exceeded 触发时置位，
     /// 本任务剩余步骤改走 downgrade）。未配 downgrade 时只影响 Notice，不换渠道。
     pub budget_hit: Arc<std::sync::atomic::AtomicBool>,
+    /// P22-C 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
+    /// 工具调用 subagent_spawn 由核心循环拦截交给它——实现见 server/subagent.rs。
+    pub subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>>,
 }
 
 /// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
@@ -251,6 +254,12 @@ pub trait ApprovalGate: Send + Sync {
     fn session_id(&self) -> &str {
         ""
     }
+
+    /// P22-C：本会话的**父任务**会话 id（子代理会话专用）——台账按父任务聚合。
+    /// 默认 None = 本会话就是主任务（行为与旧版一致）。
+    fn usage_parent_session(&self) -> Option<&str> {
+        None
+    }
     /// 等待用户决定；true=允许。实现内部处理超时（视为拒绝）与取消。
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
     /// N1/025「立即发送（引导）」的运行中消息：核心循环每个决策点取一次并入本轮；
@@ -264,6 +273,24 @@ pub trait ApprovalGate: Send + Sync {
 pub enum LoopOutcome {
     Done,
     Cancelled,
+}
+
+/// P22-C：执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
+/// （子代理跑在独立会话，实现见 server/subagent.rs）；其余走工具注册表。
+async fn exec_tool_call(
+    cfg: &crate::tools::ExecConfig,
+    name: &str,
+    args: &str,
+    subagents: Option<&Arc<dyn crate::core::subagent::SubagentRunner>>,
+    parent_session: &str,
+) -> Result<String, String> {
+    if name == "subagent_spawn" {
+        return match subagents {
+            Some(runner) => Ok(runner.run(parent_session, args).await),
+            None => Err("子代理派发未启用（本任务没有派发器）".to_string()),
+        };
+    }
+    tools::execute(cfg, name, args).await
 }
 
 /// 工具参数压成一行短 reason（写文件等大参数只留头部）。
@@ -404,8 +431,12 @@ pub async fn run_task(
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
     // P21 用量台账归属：本任务的会话 id（辅助调用与主流程同一归属）
+    // P22-C：子代理会话填父任务 id——台账按父任务聚合（草案第 4 节，无数据迁移）
     let sid = gate.session_id().to_string();
-    let usage_ctx = UsageCtx::main(&sid);
+    let mut usage_ctx = UsageCtx::main(&sid);
+    if let Some(parent) = gate.usage_parent_session() {
+        usage_ctx.parent_session = Some(parent.to_string());
+    }
     // P21：任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
     let mut downgrade_noticed = false;
     // P10-A：任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
@@ -859,12 +890,15 @@ pub async fn run_task(
             }
         }
 
-        // 阶段二「执行」：Safe 只读组并行（无副作用无竞态），写/执行组串行独占
+        // 阶段二「执行」：Safe 只读组并行（无副作用无竞态），写/执行组串行独占。
+        // P22-C：subagent_spawn 也进并行组——子代理各自独立会话，天然无共享竞态，
+        // 一轮里发多个即真并行（受服务层并发度上限约束）。
         let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
         let parallel: Vec<usize> = (0..turn.tool_calls.len())
             .filter(|&i| {
                 let d = &decisions[i];
-                d.approved && d.plan_reason.is_none() && !d.skip_conflict && d.risk == 0
+                let is_subagent = turn.tool_calls[i].name == "subagent_spawn";
+                d.approved && d.plan_reason.is_none() && !d.skip_conflict && (d.risk == 0 || is_subagent)
             })
             .collect();
         if parallel.len() > 1 {
@@ -873,13 +907,22 @@ pub async fn run_task(
                 json!({ "kind": "tools.parallel", "step": step, "count": parallel.len() }),
             );
         }
+        let subagent_runner = channels.subagents.clone();
+        let parent_sid = gate.session_id().to_string();
         let mut futs = futures_util::stream::FuturesUnordered::new();
         for &i in &parallel {
             let call = &turn.tool_calls[i];
             let cfg = exec_cfg.clone();
             let name = call.name.clone();
             let args = call.arguments.clone();
-            futs.push(Box::pin(async move { (i, tools::execute(&cfg, &name, &args).await) }));
+            let runner = subagent_runner.clone();
+            let parent = parent_sid.clone();
+            futs.push(Box::pin(async move {
+                (
+                    i,
+                    exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent).await,
+                )
+            }));
         }
         // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
         while let Some((i, r)) = futs.next().await {
@@ -958,8 +1001,10 @@ pub async fn run_task(
             } else if !d.approved {
                 ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
             } else {
-                // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断
-                if rec_cfg.checkpoint_enabled && danger >= 1 {
+                // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断。
+                // P22-C：subagent_spawn 不拍——子代理会话对自己的改动拍自己的检查点
+                // （父任务这边拍只会把子代理的改动混进父任务的基线口径）。
+                if rec_cfg.checkpoint_enabled && danger >= 1 && call.name != "subagent_spawn" {
                     let reason = format!("{} {}", call.name, short_args(&call.arguments, 100));
                     let ws = tools::workspace_root().to_path_buf();
                     let sid = gate.session_id().to_string(); // 归属会话（改动条/撤销按会话对齐）
@@ -982,7 +1027,15 @@ pub async fn run_task(
                         ),
                     }
                 }
-                match tools::execute(&exec_cfg, &call.name, &call.arguments).await {
+                match exec_tool_call(
+                    &exec_cfg,
+                    &call.name,
+                    &call.arguments,
+                    channels.subagents.as_ref(),
+                    gate.session_id(),
+                )
+                .await
+                {
                     Ok(s) => (s, true),
                     Err(e) => (format!("工具执行失败: {e}"), false),
                 }

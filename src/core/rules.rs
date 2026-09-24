@@ -54,6 +54,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "edit_file", "shell", "git",
     // P21 浏览器内核：统一 browser 工具（method 判别；逐方法分级见 evaluate_risk）
     "browser",
+    // P22-C 子代理派发（核心循环拦截，实现见 server/subagent.rs）
+    "subagent_spawn",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -163,6 +165,10 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
 
         // 读技能：只读 SKILL.md，恒定 Safe
         "read_skill" => (RiskLevel::Safe, "读取技能文件（只读）".into()),
+
+        // P22-C 子代理派发：自身只发起一次独立会话（花销与隔离由服务层并发度/审批策略管），
+        // 按常规处理；子代理自己那轮的工具有它自己的审批门（无人值守默认拒绝高危）
+        "subagent_spawn" => (RiskLevel::Normal, "派发子代理任务".into()),
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
         "write_file" | "edit_file" => risk_write_file(args, workspace_root),

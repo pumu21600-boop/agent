@@ -3,16 +3,20 @@
 // 剧本（按最后一条 user 消息判断，且只在请求带 tools 时生效）：
 //   「读 <路径>」  → read_file 工具调用（不写路径则读 prompts/system.md）
 //   「编辑 <路径>」→ edit_file 工具调用（old=「状态：TODO」→ new=「状态：已完成」）
-//   「死循环」     → 每轮都返回工具调用（验证步数上限 / 取消）
+//   「派子代理」    → subagent_spawn 工具调用（P22-C：子代理独立会话跑 read_file 闭环）
+//   「派两个」      → 一轮两个 subagent_spawn（验证并行派发与并发度排队）
+//   「死循环」     → 每轮都返回工具调用（验证步数上限）
 //   「慢循环」     → 同死循环，但每步先等 1.5s（验证运行中插话 / steering）
 //   「慢流」       → 30 片 × 300ms 的长流（验证中途取消）
 //   其余          → 普通流式回复；已回填 tool 消息 → 返回最终回答
 // 注意：工具剧本必须**显式触发**（不能"带 tools 参数就吐工具调用"）——否则任何
 // 普通消息都会被卷进工具循环，慢流 / 纯流式冒烟全测不到（P16 真机踩过）。
+// 另：子代理剧本必须带 !hasToolMsg 守卫——子代理那轮的 user 消息里也含「子代理」字样，
+// 不加守卫会让子代理再派子代理（P22-C v1 禁嵌套，真机上就演变成递归刷额度）。
 import http from 'node:http';
 
 const PORT = 9399;
-let readCalls = 0; // 慢循环交替路径用（避免撞核心循环的重复工具调用检测）
+
 const CHUNKS = ['你好，', '这是', '模拟渠道', '的流式回复。', '（中文测试 OK）'];
 
 function sendSSE(res, obj) {
@@ -90,6 +94,9 @@ http
         // 「浏览 <url>」= browser navigate → click → snapshot → 最终回答（按 example.com 语义点链接）
         const browseUrl = (lastText.match(/浏览\s*(\S+)/) || [])[1];
         const cleaning = /清洗/.test(lastText);
+        // P22-C 子代理剧本（必须 !hasToolMsg：子代理那轮的 user 消息也含「子代理」字样）
+        const spawnTwo = hasToolsParam && !hasToolMsg && /派两个/.test(lastText);
+        const spawnOne = hasToolsParam && !hasToolMsg && /派子代理/.test(lastText);
         const toolMsgCount = msgs.filter((m) => m.role === 'tool').length;
         // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环/多步剧本除外
         const wantsTool =
@@ -114,7 +121,42 @@ http
           res.write('data: [DONE]\n\n');
           res.end();
         };
-        if (wantsTool) {
+        if (spawnTwo) {
+          // P22-C：一轮两个派发——验证并行组 + per_parent 上限排队（第二个等第一个完）。
+          // 注意 emitToolCall 内部会 end 响应，两个调用必须都用「不收尾」的裸帧写。
+          const calls = [
+            { id: 'call-1', args: { task: '读 prompts/system.md', label: '子代理甲' } },
+            // 乙用慢循环剧本：每步 1.5s，制造「父任务取消时子代理还在跑」的时间窗
+            { id: 'call-2', args: { task: '慢循环读 config.toml', label: '子代理乙' } },
+          ];
+          calls.forEach((c, idx) => {
+            sendSSE(res, {
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    tool_calls: [
+                      { index: idx, id: c.id, type: 'function', function: { name: 'subagent_spawn', arguments: '' } },
+                    ],
+                  },
+                },
+              ],
+            });
+            const text = JSON.stringify(c.args);
+            for (let i = 0; i < text.length; i += 8) {
+              sendSSE(res, {
+                choices: [
+                  { index: 0, delta: { tool_calls: [{ index: idx, function: { arguments: text.slice(i, i + 8) } }] } },
+                ],
+              });
+            }
+          });
+          sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } else if (spawnOne) {
+          emitToolCall(res, 'subagent_spawn', { task: '读 prompts/system.md', label: 'mock 子代理' });
+        } else if (wantsTool) {
           if (browseUrl) {
             if (toolMsgCount === 0) {
               emitToolCall(res, 'browser', { method: 'navigate', url: browseUrl });
@@ -156,10 +198,13 @@ http
             // read_file 剧本（含死循环/慢循环：每轮都读同一个文件）。
             // 慢循环额外做两件事：每步等 1.5s（留插话窗口）、交替两个路径——
             // 路径写死会让核心循环的「重复工具调用」检测提前终止，跑不满步数。
+            // 交替基准用**本请求内**的 tool 消息数（原来是全局计数器，父子多个请求
+            // 互相踩会错拍——P22-C 真机踩过，子代理被误判重复调用终止）。
             const pathMatch = lastText.match(/读\s*([^\s，。]+)/);
             const path = pathMatch ? pathMatch[1] : 'prompts/system.md';
-            readCalls += 1;
-            const alt = readCalls % 2 === 0 ? 'config.toml' : path;
+            // 交替目标必须与 path 不同：路径本身就是它时，连续两轮仍会撞重复调用检测
+            const other = path === 'prompts/system.md' ? 'config.toml' : 'prompts/system.md';
+            const alt = toolMsgCount % 2 === 0 ? path : other;
             const readCall = () => emitToolCall(res, 'read_file', { path: alt });
             if (slowLoop) setTimeout(readCall, 1500);
             else readCall();

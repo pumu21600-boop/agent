@@ -3,6 +3,7 @@
 use super::*;
 use super::gate::ChatGate;
 use super::memory::read_system_prompt;
+use super::subagent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaAttachment {
@@ -539,6 +540,15 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     let run_flag = run_flag.expect("占位或接管必得其一");
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
+    // P22-C 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。
+    // 在 spawn 前构建：dispatcher 持 AppState 克隆，任务里随 LoopChannels 带进核心循环。
+    let subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>> =
+        Some(Arc::new(subagent::SubagentDispatcher {
+            state: state.clone(),
+            limits: (*state.subagent_cfg).clone(),
+        }));
+    // P22-C：子代理 token 并入本任务预算的水印（只计自己没计过的增量）
+    let subagent_seen = std::sync::atomic::AtomicU64::new(subagent::subagent_tokens(&session_id));
     // 审批档位归一化（P19 四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就降级为 auto 并告知前端（档位与实际权限保持一致）。
     let allow_unsandboxed = cfg.allow_unsandboxed;
@@ -920,6 +930,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     // P21：预算降级渠道 + 共享超预算标志（见上方 budget_fired）
                     downgrade: ch.downgrade.clone(),
                     budget_hit: budget_fired.clone(),
+                    // P22-C：子代理派发（None 的任务不许派发）
+                    subagents: subagents.clone(),
                 },
                 // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
                 // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
@@ -973,9 +985,14 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                         // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
                         // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
+                        // P22-C：子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
+                        let sub_total = subagent::subagent_tokens(&session_id);
+                        let sub_fresh =
+                            sub_total.saturating_sub(subagent_seen.swap(sub_total, std::sync::atomic::Ordering::Relaxed));
                         let total = task_tokens
-                            .fetch_add(prompt_tokens, std::sync::atomic::Ordering::Relaxed)
-                            + prompt_tokens;
+                            .fetch_add(prompt_tokens + sub_fresh, std::sync::atomic::Ordering::Relaxed)
+                            + prompt_tokens
+                            + sub_fresh;
                         let budget = crate::hooks::budget_tokens();
                         if crate::hooks::budget_exceeded(total, budget)
                             && !budget_fired.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -1140,11 +1157,13 @@ pub(super) async fn cancel(State(state): State<AppState>, Query(q): Query<Cancel
         Json(json!({ "cancelled": true, "scope": "all", "count": count }))
     } else {
         let hit = state.cancel.cancel(session);
+        // P22-C：父任务被停 → 级联停它的全部活跃子代理（子代理跑在独立会话，标志互不相通）
+        let cascaded = subagent::cancel_children(session);
         observability::event(
             EventType::State,
-            json!({ "kind": "cancel", "scope": "session", "session": session, "active": hit }),
+            json!({ "kind": "cancel", "scope": "session", "session": session, "active": hit, "subagents_cancelled": cascaded }),
         );
-        Json(json!({ "cancelled": true, "scope": "session", "session": session, "active": hit }))
+        Json(json!({ "cancelled": true, "scope": "session", "session": session, "active": hit, "subagents_cancelled": cascaded }))
     }
 }
 

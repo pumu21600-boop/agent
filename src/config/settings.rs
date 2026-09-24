@@ -99,6 +99,10 @@ pub struct RolesSettings {
     /// （B3 解析链：settings.roles.budget > config.toml [roles].budget > 不降级）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
+    /// P22-C：子代理专用渠道（B3 解析链：settings.roles.subagent > config.toml [roles].subagent
+    /// > 回落主渠道；派发时的请求级 model 覆盖优先于此）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<String>,
     /// 降级备用配置名列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,

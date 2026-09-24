@@ -67,6 +67,9 @@ pub struct Config {
     /// P21 成本台账：全局花费上限（硬闸）等成本红线参数
     #[serde(default)]
     pub cost: CostConfig,
+    /// P22-C 子代理并行度上限
+    #[serde(default)]
+    pub subagent: SubagentConfig,
 }
 
 /// 成本红线参数（施工单 030，P21）。
@@ -95,6 +98,35 @@ pub struct RolesConfig {
     /// （未配置 = 维持主渠道 + Notice，行为与 P18 一致）
     #[serde(default)]
     pub budget: Option<String>,
+    /// P22-C 子代理专用渠道（未配置 = 回落主渠道，与 B3 一致）；
+    /// 典型用法：主会话用旗舰模型，子代理跑量用便宜模型
+    #[serde(default)]
+    pub subagent: Option<String>,
+}
+
+/// P22-C 子代理并行度（config.toml `[subagent]`；docs/subagent-draft.md 第 1 节）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    /// 全局并发子代理上限（0 = 不允许派发子代理）
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// 单个父任务的活跃子代理上限（满员进 FIFO 队列，出队即跑，不丢不串）
+    #[serde(default = "default_per_parent")]
+    pub per_parent: usize,
+}
+
+fn default_max_concurrent() -> usize {
+    3
+}
+
+fn default_per_parent() -> usize {
+    2
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self { max_concurrent: default_max_concurrent(), per_parent: default_per_parent() }
+    }
 }
 
 /// 记忆系统参数（施工单 009）。

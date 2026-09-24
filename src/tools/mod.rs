@@ -187,6 +187,23 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 2,
         },
         ToolSpec {
+            name: "subagent_spawn",
+            description: "P22-C 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理默认审批从紧——需要审批的操作按拒绝处理并回给它自己调整；要放行请在 on_approval 传 approve。子代理失败/超时会以错误文本返回，你可重派或换路。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "子任务描述：要它做什么、产出什么（说清楚边界，它看不到你的对话历史）" },
+                    "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 角色分工里的子代理席位，未配则跟主渠道）" },
+                    "approval_mode": { "type": "string", "enum": ["read-only", "sandbox", "auto", "full-access"], "description": "可选：子代理的审批档（缺省 auto）" },
+                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（缺省 deny 拒绝并回喂；approve 才放行高危）" },
+                    "timeout_secs": { "type": "integer", "description": "可选：整轮超时秒数（0 = 默认 1800）" },
+                    "label": { "type": "string", "description": "可选：一句话标签，方便你在结果里识别是哪个子代理" }
+                },
+                "required": ["task"]
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
             name: "browser",
             description: "内置浏览器（无头 Edge/Chrome，本进程直连控制）——一个工具按 method 覆盖全部动作：navigate/back/forward/reload/snapshot/click/fill/type/press/scroll/hover/select/check/drag/screenshot/get_state/element_info/evaluate/wait_for/get_dialog/handle_dialog/new_tab/close/close_browser/list/activate_tab/capabilities。定位优先级：ref（快照编号）→ text/label（语义）→ x/y（坐标）。工作流：navigate 后直接读返回的快照；点击/输入前先 snapshot 拿最新 ref；每个观察周期只做一个状态变更动作，做完再 snapshot 验证效果；ref 失效时用 text/label 或坐标兜底，别重试同一个 ref。用户可在右侧「网页」面板看到同一个浏览器（agent 页带徽章），list 查全部标签页，tab_id 可操作面板页。完整纪律：read_skill(\"browser-use\")。",
             parameters: json!({

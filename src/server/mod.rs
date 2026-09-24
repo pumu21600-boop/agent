@@ -53,6 +53,7 @@ mod memory;
 mod schedule;
 mod sessions;
 mod settings;
+mod subagent;
 mod system;
 mod usage;
 mod webpanel;
@@ -117,6 +118,8 @@ pub struct AppState {
     pub roles_cfg: Arc<crate::config::RolesConfig>,
     /// P8 网关级配置（config.toml [gateway]：max_rpm / fallback_configs）
     pub gateway_cfg: Arc<crate::config::GatewayConfig>,
+    /// P22-C 子代理并行度（config.toml [subagent]：max_concurrent / per_parent）
+    pub subagent_cfg: Arc<crate::config::SubagentConfig>,
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {

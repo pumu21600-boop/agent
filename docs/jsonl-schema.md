@@ -173,7 +173,7 @@
 > 台账本身**不是** JSONL 事件流：每次模型调用的完整计量（token 三路 / 状态 / 延迟 / 费用）
 > 落独立的 `<日志目录>/usage/ledger.jsonl`，字段见 README「用量台账与成本红线」。
 
-### 4.x P22 新增 kind（施工单 P22-A 无头会话 / P22-B 定时任务，只增）
+### 4.x P22 新增 kind（施工单 P22-A 无头会话 / P22-B 定时任务 / P22-C 子代理，只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -187,6 +187,11 @@
 | `schedule.done` | 定时任务这一轮结束（状态已写回任务） | `task`、`name`、`trigger` |
 | `schedule.saved` | 定时任务新建/修改已存 settings.json | `task`、`name`、`new` |
 | `schedule.deleted` | 定时任务已删除 | `task` |
+| `subagent.spawned` | 子代理已派发（独立会话起跑） | `parent`、`child`、`model`、`label`、`task_chars` |
+| `subagent.done` | 子代理这一轮结束（结果已回注父任务） | `parent`、`child`、`status`、`tokens`、`duration_ms` |
+| `subagent.queued` | 并发度满员，派发进等待（200ms 粒度重试） | `parent`、`running`、`per_parent` |
+| `subagent.rejected` | 派发被拒（嵌套派发 / 并行未启用 / 父任务已取消） | `parent`、`reason` |
+| `subagent.cascade_cancel` | 父任务被停 → 级联取消它的活跃子代理 | `parent`、`count` |
 
 ### 4.5 error —— 错误
 

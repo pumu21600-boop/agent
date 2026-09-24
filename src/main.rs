@@ -169,6 +169,8 @@ async fn main() -> anyhow::Result<()> {
         // P8 角色映射与网关级配置（降级链/限流参数）
         roles_cfg: Arc::new(config.roles.clone()),
         gateway_cfg: Arc::new(config.gateway.clone()),
+        // P22-C 子代理并行度（并发上限/单父任务上限）
+        subagent_cfg: Arc::new(config.subagent.clone()),
     };
     let app = server::router(state.clone(), manifest.join("web").join("dist"));
     // P22-B 定时任务：20s 心跳到点唤醒无头会话（没有任务时每跳只读一次设置，零开销）
