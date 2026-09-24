@@ -97,6 +97,14 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
 - 价格表是**内核配置**（settings.json 的 `cost` 节），插件只是编辑器：停用插件不影响计价与硬闸。
 - 金额一律**美元**规范存储；人民币是展示层（`cost.currency` + `usd_cny_rate` 折算），切币种不动账。
 
+> **宿主侧回传纪律（2026-09-24 补，所有桥方法通用）**：`agent:response` 的 `result` 必须是
+> **解析后的普通 JSON 对象**。`fetch` 的 `Response` 过不了 `postMessage` 的结构化克隆，
+> 原样回传会让插件侧只看到 `Failed to execute 'postMessage' on 'Window': Response object
+> could not be cloned.`（面板整个瘫掉）；当成数据用更阴——`r.path` / `r.extensions` 之类的
+> 字段在裸 Response 上恒 `undefined`，界面静默显示空值、一个报错都没有。只读桥统一走
+> `apiJson(path, opts, missingMsg)`（顺带把「旧版服务没这个接口」翻成人话），写完跑
+> `node scripts/check_fetch_json.mjs` 体检（判据与白名单见 ROADMAP 坑 20）。
+
 ## 六、钩子 v1
 
 config.toml `[hooks]`，四个挂点，承载形式 = 本地命令（stdin 收 JSON 事件、stdout 回 JSON）：

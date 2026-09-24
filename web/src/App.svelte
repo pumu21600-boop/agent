@@ -2451,7 +2451,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
-      });
+      }).then((r) => r.json());
       if (r.error) {
         settingsMsg = r.error;
         return;
@@ -2737,7 +2737,7 @@
   // 添加项目：server 弹 Win 原生选文件夹窗口 → 选中的目录注册为项目（=切换工作区）
   async function addProject() {
     try {
-      const r = await fetch('/api/workspace/picker', { method: 'POST' });
+      const r = await fetch('/api/workspace/picker', { method: 'POST' }).then((r) => r.json());
       if (r.canceled || !r.path) return;
       await applyWorkspace(r.path);
     } catch (e) {
@@ -2788,7 +2788,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
-      });
+      }).then((r) => r.json());
       await loadSessions();
       if (r.id) await loadSession(r.id);
     } catch (e) {
@@ -3037,7 +3037,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope: memTab, content: memText }),
-      });
+      }).then((r) => r.json());
       if (r.ok) {
         memDirty = false; // 先清脏标记再回读，框里保留的就是文件真实内容
         await loadMemory();
@@ -3104,7 +3104,7 @@
           description: skillEditor.description,
           content: skillEditor.content,
         }),
-      });
+      }).then((r) => r.json());
       if (r.error) {
         skillMsg = `保存失败: ${r.error}`;
         return;
@@ -3122,7 +3122,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'delete', name }),
-      });
+      }).then((r) => r.json());
       skillMsg = r.error ? `删除失败: ${r.error}` : `已删除 ${name}`;
       await loadSkills();
     } catch (e) {
@@ -3145,7 +3145,7 @@
   let appVersion = null;
   async function loadVersion() {
     try {
-      appVersion = await fetch('/api/version', { cache: 'no-store' });
+      appVersion = await fetch('/api/version', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       appVersion = null;
     }
@@ -3153,7 +3153,7 @@
   async function runSandboxProbe() {
     sbRunning = true;
     try {
-      sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' });
+      sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       sandboxProbe = { error: String(e.message || e) };
     }
@@ -3161,7 +3161,7 @@
   }
   async function loadGitRuntime() {
     try {
-      gitRuntime = await fetch('/api/git/info', { cache: 'no-store' });
+      gitRuntime = await fetch('/api/git/info', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       gitRuntime = null;
     }
@@ -3172,7 +3172,7 @@
   async function loadSandboxInfo(refresh) {
     sbInfoLoading = true;
     try {
-      sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' });
+      sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       sandboxInfo = null;
     }
@@ -3194,7 +3194,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, name, risk, server }),
-      });
+      }).then((r) => r.json());
       if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
       if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
     } catch (e) {
@@ -3343,7 +3343,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name, enabled: e.enabled === false }),
-      });
+      }).then((r) => r.json());
       if (r.extensions) extList = r.extensions;
       if (e.enabled !== false && extCurrent && extCurrent.name === e.name) extOpen = false; // 停用后关面板
     } catch (err) {
@@ -3358,7 +3358,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name }),
-      });
+      }).then((r) => r.json());
       if (r.error) extMsg = `转正失败: ${r.error}`;
       else extMsg = `已转正「${e.title || e.name}」（来源已改为 user，重启后仍在）`;
       if (r.extensions) extList = r.extensions;
@@ -3370,7 +3370,7 @@
   async function discardExt(e) {
     if (!confirm(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`)) return;
     try {
-      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' });
+      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
       if (r.error) extMsg = `丢弃失败: ${r.error}`;
       else extMsg = `已丢弃「${e.title || e.name}」`;
       if (r.extensions) extList = r.extensions;
@@ -3390,7 +3390,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, action }),
-      });
+      }).then((r) => r.json());
       if (r.error) extMsg = `${verb}失败: ${r.error}`;
       else extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
       if (r.extensions) extList = r.extensions;
@@ -3441,7 +3441,12 @@
     const id = d.id;
     const params = d.params || {};
     const reply = (ok, result) => postToName(from, { type: 'agent:response', id, ok, result });
-    const get = (url) => fetch(url, { cache: 'no-store' });
+    // 桥上的 GET 回传的必须是**解析后的 JSON**：fetch 的 Response 过不了 postMessage 的
+    // 结构化克隆——真机原话 "Response object could not be cloned"，插件侧只看到这句天书，
+    // 面板整个瘫掉（用量/价格/trace/工作区/git 六个只读方法全走这里）。
+    // 旧版服务没有这些接口时请求落进 SPA 兜底返回 HTML，统一翻成「请重启服务」的人话。
+    const get = (url) =>
+      apiJson(url, { cache: 'no-store' }, '服务端没有这个接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
     try {
       switch (d.method) {
         case 'app.info':
@@ -3522,7 +3527,8 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ path, content }),
           });
-          reply(!!r.ok, r.ok ? { ok: true, path: r.path, bytes: r.bytes } : r.error || '写入失败');
+          const j = await r.json().catch(() => ({}));
+          reply(!!r.ok, r.ok ? { ok: true, path: j.path, bytes: j.bytes } : j.error || '写入失败');
           break;
         }
         // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
@@ -3546,7 +3552,8 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ name: from, key, value: params.value ?? null }),
           });
-          reply(!!r.ok, r.ok ? { ok: true, bytes: r.bytes } : r.error || '写入失败');
+          const j = await r.json().catch(() => ({}));
+          reply(!!r.ok, r.ok ? { ok: true, bytes: j.bytes } : j.error || '写入失败');
           break;
         }
         case 'storage.delete': {
@@ -3554,7 +3561,8 @@
           const key = String(params.key || '');
           if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
           const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' });
-          reply(!!r.ok, r.ok ? { ok: true, found: r.found } : r.error || '删除失败');
+          const j = await r.json().catch(() => ({}));
+          reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
           break;
         }
         // —— P21 只读桥：「用量」插件（ui-ext/usage 试点）拉当前会话的用量统计 ——
