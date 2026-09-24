@@ -48,6 +48,7 @@ mod chat;
 mod ext;
 mod gate;
 mod git;
+mod headless;
 mod memory;
 mod sessions;
 mod settings;
@@ -60,6 +61,7 @@ use chat::*;
 use ext::*;
 use gate::*;
 use git::*;
+use headless::*;
 use memory::*;
 use sessions::*;
 use settings::*;
@@ -122,6 +124,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/approvals", post(decide_approval))
         .route("/api/approval-mode", post(set_approval_mode))
         .route("/api/chat", post(chat))
+        // P22-A 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
+        .route("/api/headless/run", post(run_headless))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/new", post(new_session))

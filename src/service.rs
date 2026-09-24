@@ -6,6 +6,8 @@
 //! - `agent.exe start`：后台启动服务（已跑则只开浏览器），与双击等价但不阻塞终端。
 //! - `agent.exe stop`：结束其他 agent.exe 服务进程（不杀自己）。
 //! - `agent.exe status`：打印 5173 监听状态与进程信息。
+//! - `agent.exe run <消息> [选项]`：P22-A 无头会话一次性唤醒——打本地服务跑完整轮，
+//!   把最终回答打印到终端（程序化唤醒的 CLI 入口；选项见 parse_run_args）。
 //! - `agent.exe --install`：写 HKCU Run 开机自启（最小化启动）；`--uninstall` 移除。
 //! - `agent.exe --minimized`：后台子进程入口（隐藏窗口跑服务）。
 
@@ -216,6 +218,15 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
             }
             false
         }
+        "run" => {
+            // P22-A 无头会话 CLI：在独立线程里跑阻塞 HTTP（reqwest 阻塞客户端不进
+            // tokio 运行时），run_cli 所有出口都直接退进程，join 只是兜底。
+            let rest: Vec<String> = argv[2..].to_vec();
+            let host = host.to_string();
+            let worker = std::thread::spawn(move || run_cli(&host, port, &rest));
+            let _ = worker.join();
+            true
+        }
         "" => {
             // 双击：已跑→开浏览器；未跑→后台起自己→开浏览器；自己退出（不占终端）
             if port_open(host, port) {
@@ -235,15 +246,210 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
             true
         }
         _ => {
-            eprintln!("[agent] unknown arg: {arg1} (usage: start / stop / status / --install / --uninstall)");
+            eprintln!("[agent] unknown arg: {arg1} (usage: start / stop / status / run <消息> / --install / --uninstall)");
             true
         }
     }
 }
 
+/// P22-A `run` 子命令的解析结果。
+pub(super) struct RunArgs {
+    pub message: String,
+    pub session_id: String,
+    pub model: String,
+    pub approval_mode: String,
+    pub timeout_secs: u64,
+    /// on_approval=approve：无人值守时对高危操作放行（缺省拒绝）
+    pub approve: bool,
+    /// 打印完整 JSON（含过程与用量）而不是只打印最终回答
+    pub json_out: bool,
+}
+
+/// 解析 `run` 子选项（纯函数，可单测）：
+/// `agent.exe run <消息...> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]`
+/// 消息可以是多个词（自动拼接），也可以只给一条完整字符串。
+pub(super) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut session_id = String::new();
+    let mut model = String::new();
+    let mut approval_mode = String::new();
+    let mut timeout_secs = 600u64;
+    let mut approve = false;
+    let mut json_out = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--session" => {
+                i += 1;
+                session_id = args.get(i).ok_or("--session 缺少值")?.clone();
+            }
+            "--model" => {
+                i += 1;
+                model = args.get(i).ok_or("--model 缺少值")?.clone();
+            }
+            "--mode" => {
+                i += 1;
+                approval_mode = args.get(i).ok_or("--mode 缺少值")?.clone();
+            }
+            "--timeout" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--timeout 缺少值")?;
+                timeout_secs = raw
+                    .parse()
+                    .map_err(|_| format!("--timeout 必须是秒数: {raw}"))?;
+            }
+            "--approve" => approve = true,
+            "--json" => json_out = true,
+            other if other.starts_with("--") => return Err(format!("未知参数: {other}")),
+            other => words.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let message = words.join(" ").trim().to_string();
+    if message.is_empty() {
+        return Err("缺少要唤醒的消息内容".into());
+    }
+    Ok(RunArgs { message, session_id, model, approval_mode, timeout_secs, approve, json_out })
+}
+
+/// 无头会话 CLI 主体：打本地服务 `/api/headless/run`，打印最终回答。
+/// 所有出口都退进程：done=0，其余（出错/超时/取消/连接失败）=1，参数错=2。
+fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
+    let ra = match parse_run_args(args) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[agent] {e}");
+            eprintln!(
+                "usage: agent.exe run <消息> [--session <id>] [--model <m>] [--mode read-only|sandbox|auto|full-access] [--timeout <秒>] [--approve] [--json]"
+            );
+            std::process::exit(2);
+        }
+    };
+    let url = format!("http://{host}:{port}/api/headless/run");
+    if !port_open(host, port) {
+        eprintln!("[agent] 服务未在 http://{host}:{port} 监听：先 agent.exe start（或双击 agent.exe）");
+        std::process::exit(1);
+    }
+    // 坑 17：reqwest 在 Windows 上会读系统代理注册表，环回请求被代理接走返 502——
+    // 打本机服务必须 no_proxy。
+    let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(ra.timeout_secs.max(60) + 30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[agent] 创建 HTTP 客户端失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let body = serde_json::json!({
+        "message": ra.message,
+        "session_id": ra.session_id,
+        "model": ra.model,
+        "approval_mode": ra.approval_mode,
+        "on_approval": if ra.approve { "approve" } else { "deny" },
+        "timeout_secs": ra.timeout_secs,
+        "purpose": "cli",
+    });
+    let resp = client.post(&url).json(&body).send();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[agent] 请求失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    let http_ok = resp.status().is_success();
+    let parsed: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[agent] 响应解析失败: {e}");
+            std::process::exit(1);
+        }
+    };
+    if ra.json_out {
+        println!("{}", serde_json::to_string_pretty(&parsed).unwrap_or_default());
+    } else {
+        for n in parsed
+            .get("notices")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(s) = n.as_str() {
+                eprintln!("[提示] {s}");
+            }
+        }
+        if let Some(ans) = parsed.get("answer").and_then(serde_json::Value::as_str)
+            && !ans.is_empty()
+        {
+            println!("{ans}");
+        }
+        if let Some(err) = parsed.get("error").and_then(serde_json::Value::as_str) {
+            eprintln!("[agent] {err}");
+        }
+    }
+    let status = parsed
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let has_error = parsed.get("error").is_some();
+    if http_ok && status == "done" && !has_error {
+        std::process::exit(0);
+    }
+    if !http_ok {
+        std::process::exit(1);
+    }
+    eprintln!("[agent] 无头会话状态: {status}");
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P22-A：`run` 子选项解析——消息多词拼接、各 flags、缺省值（安全侧）。
+    #[test]
+    fn parse_run_args_covers_words_flags_and_defaults() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 多词消息自动拼接；缺省 = 拒绝高危 / 600s 超时 / 不打印 JSON
+        let r = parse_run_args(&a(&["帮我看下", "构建为什么挂了"])).unwrap();
+        assert_eq!(r.message, "帮我看下 构建为什么挂了");
+        assert!(!r.approve, "缺省必须拒绝高危操作");
+        assert_eq!(r.timeout_secs, 600);
+        assert!(!r.json_out);
+        assert!(r.session_id.is_empty());
+        // 全套 flags
+        let r = parse_run_args(&a(&[
+            "跑一下",
+            "测试",
+            "--session",
+            "abc-123",
+            "--model",
+            "step-5-preview",
+            "--mode",
+            "read-only",
+            "--timeout",
+            "90",
+            "--approve",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(r.message, "跑一下 测试");
+        assert_eq!(r.session_id, "abc-123");
+        assert_eq!(r.model, "step-5-preview");
+        assert_eq!(r.approval_mode, "read-only");
+        assert_eq!(r.timeout_secs, 90);
+        assert!(r.approve);
+        assert!(r.json_out);
+        // 出错路径：空消息 / 缺值 / 未知 flag / 非数字超时
+        assert!(parse_run_args(&a(&[])).is_err());
+        assert!(parse_run_args(&a(&["--session"])).is_err());
+        assert!(parse_run_args(&a(&["hi", "--oops"])).is_err());
+        assert!(parse_run_args(&a(&["hi", "--timeout", "abc"])).is_err());
+    }
 
     #[test]
     fn parse_pids_reads_csv_and_skips_self() {

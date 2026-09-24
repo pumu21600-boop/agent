@@ -96,6 +96,15 @@ cargo run                            # 前台调试运行（关终端即停）
 
 **前端热更**：双击 `dev.bat`（vite 起在 5174，/api 与 /cancel 自动代理到 5173 主服务），改 `web/src` 即时生效，无需构建。
 
+**无头会话（P22-A，程序化唤醒）**：服务跑着时，一条命令让 agent 完整跑一轮并把最终回答打印到终端——子代理、定时任务、脚本集成都走这条路径：
+
+```powershell
+agent.exe run 帮我看下构建为什么挂了        # 新建会话跑一轮，打印最终回答（退出码 0=完成）
+agent.exe run 继续上一轮 --session <id>     # 唤醒指定会话（接着它的上下文）
+agent.exe run 巡检一遍 --mode read-only --timeout 300   # 只读档 + 5 分钟超时
+agent.exe run 批量清理 --approve --json     # 放行高危操作 + 输出完整 JSON（过程与用量）
+```
+
 ## 本机工具链（2026-09-14 装齐）
 
 - **Rust**：`rust-toolchain.toml` 钉死 `stable-x86_64-pc-windows-msvc`（本机 GNU 工具链的 dlltool 不可用，别改回）。
@@ -202,6 +211,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/api/chat` | 对话主入口，SSE 流式（content / reasoning / tool_call / tool_result / approval_request / plan_proposal / notice / **reset** / error / done；`reset` = 降级链换渠道重试，前端按给的长度丢掉本步已推的半截内容） |
 | POST | `/cancel?session=<id>` | 停止指定会话当前这一轮（不带 `session` = 停全部在跑任务） |
 | GET | `/api/cancel?session=<id>` | 查询取消状态：带 `session` 看该会话（`cancelled`/`running`），不带看全部（`cancelled`/`active`） |
+| POST | `/api/headless/run` | P22-A 无头会话：程序化唤醒一条会话跑完整轮，返回结构化结果（session_id/status/answer/tool_calls/用量/notices）；`status` = done·cancelled·timeout·error。无人值守时命中审批的动作按 `on_approval` 处理（缺省 deny 拒绝并回喂模型，`approve` 才放行）；会话在跑返回 409。CLI 等价入口：`agent.exe run <消息> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]` |
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/approvals` | 审批决定（允许/拒绝 + 本会话同类允许） |
 | POST | `/api/approval-mode` | 切换审批档（对进行中的请求即时生效） |

@@ -173,6 +173,17 @@
 > 台账本身**不是** JSONL 事件流：每次模型调用的完整计量（token 三路 / 状态 / 延迟 / 费用）
 > 落独立的 `<日志目录>/usage/ledger.jsonl`，字段见 README「用量台账与成本红线」。
 
+### 4.x P22 新增 kind（施工单 P22-A 无头会话，只增）
+
+| `kind` | 说明 | 关键字段 |
+| --- | --- | --- |
+| `headless.run` | 无头会话被程序化唤醒（/api/headless/run 或 agent.exe run） | `session`、`purpose`（cli/schedule/subagent…）、`mode`、`auto_approve`、`timeout_secs` |
+| `headless.done` | 无头会话整轮结束 | `session`、`status`（done/cancelled/timeout/error）、`purpose`、`duration_ms`、`requests`、`prompt_tokens` |
+| `headless.rejected` | 唤醒被拒（会话正在运行中，409） | `session`、`reason` |
+| `headless.timeout` | 整轮超时已取消（任务在后台收尾） | `session`、`secs` |
+| `headless.approval_auto` | 无人值守时命中审批，按 on_approval 策略自动决定 | `session`、`tool`、`approved` |
+| `headless.leftover` | 收尾时队列里还有没跑完的追加消息（超过 3 轮续跑上限） | `session`、`count` |
+
 ### 4.5 error —— 错误
 
 ```json

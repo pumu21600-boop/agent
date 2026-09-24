@@ -210,6 +210,162 @@ fn resolve_key(s: &Settings, c: &crate::config::settings::Config) -> String {
         .unwrap_or_default()
 }
 
+/// 审批档位归一化（P19 四档 + 旧档名映射）。返回（生效档, 降级提示）。
+/// /api/chat 与无头会话（P22-A）共用——档位语义只有这一处解释。
+pub(super) fn normalize_mode(cfg: &crate::config::AgentConfig, requested: &str) -> (String, Option<String>) {
+    let norm = |m: &str| -> String {
+        match m.trim() {
+            "suggest" => "read-only".into(),
+            "auto-edit" | "full-auto" => "auto".into(),
+            "local" | "full-access" => "full-access".into(),
+            other @ ("read-only" | "sandbox" | "auto") => other.to_string(),
+            _ => "auto".into(),
+        }
+    };
+    let mut mode = if requested.trim().is_empty() {
+        norm(&cfg.default_approval)
+    } else {
+        norm(requested)
+    };
+    // full-access 需 config 总开关，没开就降级为 auto 并提示（档位与实际权限保持一致）
+    if mode == "full-access" && !cfg.allow_unsandboxed {
+        mode = "auto".into();
+        return (
+            mode,
+            Some(
+                "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为自动档"
+                    .to_string(),
+            ),
+        );
+    }
+    (mode, None)
+}
+
+/// 一轮对话的系统提示：prompts/system.md（每轮实时读盘）+ 双层 AGENTS.md +
+/// 项目现状摘要（新会话开场：上一条同项目会话 + 工作区未提交改动）+ 技能索引。
+/// /api/chat 与无头会话共用同一套注入，行为对齐。
+pub(super) async fn turn_system_prompt(state: &AppState, session_id: &str) -> String {
+    let prompt = read_system_prompt(state);
+    let agents_md = state
+        .memory
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .agents_md();
+    let project_brief = {
+        let is_new = state
+            .session
+            .get(session_id)
+            .map(|f| f.messages.is_empty())
+            .unwrap_or(true);
+        if is_new {
+            let ws = crate::tools::workspace_root().to_path_buf();
+            let stats = tokio::task::spawn_blocking(move || {
+                let head = crate::recovery::head_id(&ws).ok().flatten()?;
+                crate::recovery::diff_stat(&ws, &head).ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            state.session.project_brief(session_id, stats).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+    format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt())
+}
+
+/// 一轮对话的渠道组装结果（主渠道 + 角色渠道 + 降级链 + 预算降级）。
+pub(super) struct TurnChannels {
+    pub(super) primary: gateway::Channel,
+    pub(super) summary: Option<gateway::Channel>,
+    pub(super) title: Option<gateway::Channel>,
+    pub(super) fallbacks: Vec<gateway::Channel>,
+    /// P21：预算降级渠道（[roles] budget；超 token 预算后剩余步骤改走它）
+    pub(super) downgrade: Option<gateway::Channel>,
+    /// 角色渠道解析失败等提示（转发给调用方展示，不静默）
+    pub(super) notices: Vec<String>,
+}
+
+/// 组装一轮对话的全部渠道。请求级覆盖优先（页面当前选择即时生效，不等保存）。
+/// /api/chat 与无头会话共用——角色解析顺序（B3）与 key 回落链（B2）只有这一处实现。
+pub(super) fn assemble_turn_channels(
+    state: &AppState,
+    s: &Settings,
+    active_cfg: &crate::config::settings::Config,
+    req_model: &str,
+    req_base_url: &str,
+    req_api_key: &str,
+) -> TurnChannels {
+    let base_url = if !req_base_url.is_empty() {
+        req_base_url.to_string()
+    } else {
+        active_cfg.effective_base_url()
+    };
+    let model = if !req_model.is_empty() {
+        req_model.to_string()
+    } else {
+        active_cfg.effective_model()
+    };
+    // B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量
+    let api_key = if !req_api_key.is_empty() {
+        req_api_key.to_string()
+    } else {
+        s.config_key(active_cfg)
+            .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+            .unwrap_or_default()
+    };
+    let mut params = build_chat_params(active_cfg, gateway::providers::find(&active_cfg.provider_id));
+    params.base_url = Some(base_url.clone());
+    let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
+    // P8/P8.5 角色映射：优先 settings.roles，未设回落 config.toml [roles]
+    let roles = s.roles.as_ref();
+    let summary_name = roles
+        .and_then(|r| r.summary.as_deref())
+        .or_else(|| state.roles_cfg.summary.as_deref());
+    let title_name = roles
+        .and_then(|r| r.title.as_deref())
+        .or_else(|| state.roles_cfg.title.as_deref());
+    let summary = summary_name.and_then(|n| find_channel(s, n));
+    let title = title_name.and_then(|n| find_channel(s, n));
+    let mut notices = Vec::new();
+    if let Some(n) = summary_name
+        && summary.is_none()
+    {
+        notices.push(format!(
+            "角色「会话摘要」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑"
+        ));
+    }
+    if let Some(n) = title_name
+        && title.is_none()
+    {
+        notices.push(format!(
+            "角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑"
+        ));
+    }
+    // P8/P8.5 降级链：优先 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
+    let fallback_names: Vec<String> = roles
+        .map(|r| r.fallbacks.clone())
+        .filter(|f| !f.is_empty())
+        .unwrap_or_else(|| state.gateway_cfg.fallback_configs.clone());
+    let fallbacks: Vec<gateway::Channel> = fallback_names
+        .iter()
+        .filter_map(|n| find_channel(s, n))
+        .collect();
+    // P21：预算降级渠道
+    let budget_name = roles
+        .and_then(|r| r.budget.as_deref())
+        .or_else(|| state.roles_cfg.budget.as_deref());
+    let downgrade = budget_name.and_then(|n| find_channel(s, n));
+    if let Some(n) = budget_name
+        && downgrade.is_none()
+    {
+        notices.push(format!(
+            "角色「预算降级」配置的渠道「{n}」解析失败（配置名不存在或地址为空），超预算后维持主渠道"
+        ));
+    }
+    TurnChannels { primary, summary, title, fallbacks, downgrade, notices }
+}
+
 /// 检查模型是否具备指定模态的输入能力（对齐 DSH acceptsMedia 门禁规范）
 fn accepts_modality(model: &str, kind: &str) -> bool {
     let caps = crate::config::settings::ModelCapabilities::infer_from_model_id(model);
@@ -287,10 +443,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         }
         c
     };
-    // 系统约定每轮实时读盘（面板保存 prompts/system.md 后无需重启即生效）
-    let prompt = read_system_prompt(&state);
     // P7 AGENTS.md 双层注入（全局在前、项目在后）；P8.2 记忆层随工作区热重开
-    let agents_md = state.memory.read().unwrap_or_else(|e| e.into_inner()).agents_md();
     let approvals = state.approvals.clone();
     let session = state.session.clone();
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -388,26 +541,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
     // 审批档位归一化（P19 四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就降级为 auto 并告知前端（档位与实际权限保持一致）。
-    let norm = |m: &str| -> String {
-        match m.trim() {
-            "suggest" => "read-only".into(),
-            "auto-edit" | "full-auto" => "auto".into(),
-            "local" | "full-access" => "full-access".into(),
-            other @ ("read-only" | "sandbox" | "auto") => other.to_string(),
-            _ => "auto".into(),
-        }
-    };
     let allow_unsandboxed = cfg.allow_unsandboxed;
-    let mut mode = if req.approval_mode.trim().is_empty() {
-        norm(&cfg.default_approval)
-    } else {
-        norm(&req.approval_mode)
-    };
-    if mode == "full-access" && !allow_unsandboxed {
-        mode = "auto".into();
-        let _ = tx.send(Ok(json_event(json!({
-            "notice": "完全访问（脱沙箱）未开启：在 config.toml [agent] allow_unsandboxed = true 后重启服务生效，本次已回退为自动档"
-        }))));
+    let (mode, mode_notice) = normalize_mode(&cfg, &req.approval_mode);
+    if let Some(n) = mode_notice {
+        let _ = tx.send(Ok(json_event(json!({ "notice": n }))));
     }
     // M1：档位写进**本会话**（不再写全局默认，否则并发多会话会互相覆盖——
     // 后到者生效可能让另一个会话以比预期更宽松的档位执行）
@@ -439,24 +576,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // P6.1：先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
 
-        // 新会话开场：注入「项目现状」摘要（上一条同项目会话 + 工作区未提交改动），
-        // 让同一工作区里新开的对话直接接手项目，而不是从零问起。
-        let project_brief = {
-            let is_new = session.get(&session_id).map(|f| f.messages.is_empty()).unwrap_or(true);
-            if is_new {
-                let ws = crate::tools::workspace_root().to_path_buf();
-                let stats = tokio::task::spawn_blocking(move || {
-                    let head = crate::recovery::head_id(&ws).ok().flatten()?;
-                    crate::recovery::diff_stat(&ws, &head).ok()
-                })
-                .await
-                .ok()
-                .flatten();
-                session.project_brief(&session_id, stats).unwrap_or_default()
-            } else {
-                String::new()
-            }
-        };
+        // 系统约定 + 双层 AGENTS.md + 项目现状摘要 + 技能索引（与无头会话同一组装路径）
+        let system_prompt = turn_system_prompt(&state, &session_id).await;
 
         // P8.5 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
@@ -778,56 +899,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     }
             }
         }
-        // 请求级覆盖优先：页面当前选择即时生效，不等保存
-        let base_url = if !req_base_url.is_empty() { req_base_url } else { active_cfg.effective_base_url() };
-        let model = if !req_model.is_empty() { req_model } else { active_cfg.effective_model() };
-        // B2 key 回落链（施工单 012 固化）：请求显式 key > 激活配置 DPAPI key > DEEPSEEK_API_KEY 环境变量。
-        let api_key = if !req_api_key.is_empty() {
-            req_api_key
-        } else {
-            s.config_key(&active_cfg).or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()).unwrap_or_default()
-        };
-        // P8/P8.5：主渠道 = 激活配置 + 供应商预设 → ChatParams
-        let mut params = build_chat_params(&active_cfg, gateway::providers::find(&active_cfg.provider_id));
-        params.base_url = Some(base_url.clone());
-        let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
-        // P8/P8.5 角色映射：优先使用 settings.roles，未设回落 config.toml [roles]
-        // （B3 角色解析顺序，施工单 012 固化：settings.roles > config.toml [roles] > 回落主渠道；
-        // 角色值按「配置名或配置 id」解析，解析失败回落主渠道并 Notice）
-        let roles = s.roles.as_ref();
-        let summary_name = roles.and_then(|r| r.summary.as_deref())
-            .or_else(|| state.roles_cfg.summary.as_deref());
-        let title_name = roles.and_then(|r| r.title.as_deref())
-            .or_else(|| state.roles_cfg.title.as_deref());
-        let summary = summary_name.and_then(|n| find_channel(&s, n));
-        let title = title_name.and_then(|n| find_channel(&s, n));
-        if let Some(n) = summary_name
-            && summary.is_none() {
-                send(json!({ "notice": format!("角色「会话摘要」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
-            }
-        if let Some(n) = title_name
-            && title.is_none() {
-                send(json!({ "notice": format!("角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑") }));
-            }
-        // P8/P8.5 降级链：优先使用 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
-        let fallback_names: Vec<String> = roles
-            .map(|r| r.fallbacks.clone())
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| state.gateway_cfg.fallback_configs.clone());
-        let fallbacks: Vec<gateway::Channel> = fallback_names
-            .iter()
-            .filter_map(|n| find_channel(&s, n))
-            .collect();
-        // P21：预算降级渠道（[roles] budget）——单任务累计 token 超 [hooks] budget_tokens 后，
-        // 本任务剩余步骤改走它（P18 遗留的「降级策略」在此收口）；未配置 = 维持主渠道 + Notice
-        let budget_name = roles
-            .and_then(|r| r.budget.as_deref())
-            .or_else(|| state.roles_cfg.budget.as_deref());
-        let downgrade = budget_name.and_then(|n| find_channel(&s, n));
-        if let Some(n) = budget_name
-            && downgrade.is_none() {
-                send(json!({ "notice": format!("角色「预算降级」配置的渠道「{n}」解析失败（配置名不存在或地址为空），超预算后维持主渠道") }));
-            }
+        // 请求级覆盖 + 角色/降级渠道组装（与无头会话同一路径；提示见 notices）
+        let ch = assemble_turn_channels(&state, &s, &active_cfg, &req_model, &req_base_url, &req_api_key);
+        for n in &ch.notices {
+            send(json!({ "notice": n }));
+        }
         // P18 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
         // P21：同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
         let task_tokens = std::sync::atomic::AtomicU64::new(0);
@@ -837,17 +913,17 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 &gateway,
                 // 续跑一轮时这些值复用（Channel 是克隆廉价的连接参数快照）
                 &agent::LoopChannels {
-                    primary: primary.clone(),
-                    summary: summary.clone(),
-                    title: title.clone(),
-                    fallbacks: fallbacks.clone(),
+                    primary: ch.primary.clone(),
+                    summary: ch.summary.clone(),
+                    title: ch.title.clone(),
+                    fallbacks: ch.fallbacks.clone(),
                     // P21：预算降级渠道 + 共享超预算标志（见上方 budget_fired）
-                    downgrade: downgrade.clone(),
+                    downgrade: ch.downgrade.clone(),
                     budget_hit: budget_fired.clone(),
                 },
                 // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
                 // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
-                &format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt()),
+                &system_prompt,
                 &history,
                 &cancel,
                 &cfg,
@@ -1023,7 +1099,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
 
 /// 本轮任务的取消标志守卫（D2）：登记即持标志，Drop 即注销。
 /// 任务正常结束、提前 return 或 panic 都会走到 Drop，注册表不留僵尸登记。
-struct CancelRun {
+/// 无头会话（P22-A）复用同一把守卫——「会话在跑」的登记随任务生命周期。
+pub(super) struct CancelRun {
     registry: Arc<CancelRegistry>,
     session: String,
     flag: Arc<CancelFlag>,
@@ -1032,7 +1109,7 @@ struct CancelRun {
 impl CancelRun {
     /// 接管一个**已登记**的标志（登记在 handler 入口由 `try_begin` 完成，
     /// 这样「拒并发」与「占位」是同一个原子动作）。
-    fn from_flag(registry: Arc<CancelRegistry>, session_id: &str, flag: Arc<CancelFlag>) -> Self {
+    pub(super) fn from_flag(registry: Arc<CancelRegistry>, session_id: &str, flag: Arc<CancelFlag>) -> Self {
         Self { registry, session: session_id.to_string(), flag }
     }
 }
