@@ -50,6 +50,7 @@ mod gate;
 mod git;
 mod headless;
 mod memory;
+mod schedule;
 mod sessions;
 mod settings;
 mod system;
@@ -63,12 +64,16 @@ use gate::*;
 use git::*;
 use headless::*;
 use memory::*;
+use schedule::*;
 use sessions::*;
 use settings::*;
 use system::*;
 use usage::*;
 use webpanel::*;
 use workspace::*;
+
+// P22-A 无头会话的进程内入口：定时任务（P22-B）不走 HTTP 直接唤醒
+pub(crate) use headless::{HeadlessRequest, run_headless_inner};
 
 
 #[derive(Clone)]
@@ -126,6 +131,12 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/chat", post(chat))
         // P22-A 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
         .route("/api/headless/run", post(run_headless))
+        // P22-B 定时任务：清单（含下次运行/通知）/ 新建改 / 删 / 立即运行
+        .route(
+            "/api/schedules",
+            get(list_schedules).post(save_schedule).delete(delete_schedule),
+        )
+        .route("/api/schedules/run", post(run_schedule_now))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/new", post(new_session))

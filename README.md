@@ -105,6 +105,8 @@ agent.exe run 巡检一遍 --mode read-only --timeout 300   # 只读档 + 5 分�
 agent.exe run 批量清理 --approve --json     # 放行高危操作 + 输出完整 JSON（过程与用量）
 ```
 
+**定时任务（P22-B）**：设置 → 定时 页签维护（5 段 cron，本地时区；`0 9 * * 1-5` = 工作日 9 点）。到点自动唤醒 agent 跑一轮：每轮新会话或固定会话两种模式，审批档与高危策略随任务设置（无人值守，高危默认拒绝）；停机期间过点的任务重启后补跑一次；完成结果进「完成记录」，会话落在侧栏可直接回看。
+
 ## 本机工具链（2026-09-14 装齐）
 
 - **Rust**：`rust-toolchain.toml` 钉死 `stable-x86_64-pc-windows-msvc`（本机 GNU 工具链的 dlltool 不可用，别改回）。
@@ -212,6 +214,8 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/cancel?session=<id>` | 停止指定会话当前这一轮（不带 `session` = 停全部在跑任务） |
 | GET | `/api/cancel?session=<id>` | 查询取消状态：带 `session` 看该会话（`cancelled`/`running`），不带看全部（`cancelled`/`active`） |
 | POST | `/api/headless/run` | P22-A 无头会话：程序化唤醒一条会话跑完整轮，返回结构化结果（session_id/status/answer/tool_calls/用量/notices）；`status` = done·cancelled·timeout·error。无人值守时命中审批的动作按 `on_approval` 处理（缺省 deny 拒绝并回喂模型，`approve` 才放行）；会话在跑返回 409。CLI 等价入口：`agent.exe run <消息> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]` |
+| GET / POST / DELETE | `/api/schedules` | P22-B 定时任务：清单（含下次运行时间/cron 人话/最近完成通知）/ 新建改（id 空=新建）/ 删除 |
+| POST | `/api/schedules/run?id=` | 立即运行一次（不打乱排期；结果进完成记录） |
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/approvals` | 审批决定（允许/拒绝 + 本会话同类允许） |
 | POST | `/api/approval-mode` | 切换审批档（对进行中的请求即时生效） |

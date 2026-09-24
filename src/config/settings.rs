@@ -330,6 +330,10 @@ pub struct Settings {
     #[serde(default)]
     pub cost: CostSettings,
 
+    /// P22-B 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedules: Vec<crate::schedule::ScheduleTask>,
+
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
     pub keys: BTreeMap<String, String>,

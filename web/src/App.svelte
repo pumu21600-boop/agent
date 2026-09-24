@@ -2979,7 +2979,7 @@
 
   // —— P10.5 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
-  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext'].includes(localStorage.getItem('settingsTab'))
+  let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'schedule'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
     : 'model';
   function pickSettingsTab(t) {
@@ -2987,6 +2987,7 @@
     localStorage.setItem('settingsTab', t);
     if (t === 'mcp' || t === 'plugins') loadMcp();
     if (t === 'skills') loadSkills();
+    if (t === 'schedule') loadSchedules();
     if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
   }
 
@@ -3057,9 +3058,123 @@
   // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
   $: if (settingsOpen && settingsTab === 'skills') loadSkills();
   $: if (settingsOpen && settingsTab === 'mcp') loadMcp();
+  $: if (settingsOpen && settingsTab === 'schedule') loadSchedules();
   $: if (settingsOpen && settingsTab === 'ext') {
     loadGitRuntime();
     loadSandboxInfo();
+  }
+
+  // —— P22-B 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
+  let schedulesData = [];
+  let scheduleNotices = [];
+  let schedMsg = '';
+  let schedLoading = false;
+  // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
+  let schedEditor = null;
+  const SCHED_MODES = [
+    { value: 'read-only', label: '只读（写/执行逐次询问）' },
+    { value: 'sandbox', label: '沙箱（只在沙箱执行）' },
+    { value: 'auto', label: '自动（可动工作区）' },
+    { value: 'full-access', label: '完全访问（需总开关）' },
+  ];
+  async function loadSchedules() {
+    schedLoading = true;
+    try {
+      const r = await fetch('/api/schedules').then((r) => r.json());
+      schedulesData = r.schedules || [];
+      scheduleNotices = r.notices || [];
+    } catch (e) {
+      schedMsg = `读取失败: ${e.message || e}`;
+    } finally {
+      schedLoading = false;
+    }
+    // 只清自己留下的读取失败：操作反馈（已保存/触发失败…）留到下一次操作，不被加载抹掉
+    if (schedMsg.startsWith('读取失败')) schedMsg = '';
+  }
+  function newSchedule() {
+    schedMsg = '';
+    schedEditor = {
+      id: '',
+      name: '',
+      cron: '0 9 * * *',
+      message: '',
+      session_mode: 'new',
+      session_id: '',
+      approval_mode: 'auto',
+      on_approval: 'deny',
+      enabled: true,
+      timeout_secs: 1800,
+      isNew: true,
+    };
+  }
+  function editSchedule(t) {
+    schedMsg = '';
+    schedEditor = { ...t, isNew: false };
+  }
+  async function saveSchedule() {
+    const e = schedEditor;
+    if (!e) return;
+    try {
+      const r = await fetch('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: e.id || '',
+          name: e.name,
+          cron: e.cron,
+          message: e.message,
+          session_mode: e.session_mode,
+          session_id: e.session_id,
+          approval_mode: e.approval_mode,
+          on_approval: e.on_approval,
+          enabled: e.enabled !== false,
+          timeout_secs: Number(e.timeout_secs) || 0,
+        }),
+      }).then((r) => r.json());
+      if (r.ok) {
+        schedEditor = null;
+        await loadSchedules();
+        schedMsg = '已保存'; // 放在加载之后：loadSchedules 会清提示，顺序反了就被抹掉
+      } else {
+        schedMsg = `保存失败: ${r.error}`;
+      }
+    } catch (err) {
+      schedMsg = `保存失败: ${err.message || err}`;
+    }
+  }
+  async function deleteSchedule(id) {
+    if (!confirm('删除这条定时任务？（已跑出的会话与记录保留）')) return;
+    try {
+      const r = await fetch(`/api/schedules?id=${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json());
+      if (r.ok) {
+        await loadSchedules();
+        schedMsg = '已删除';
+      } else {
+        schedMsg = `删除失败: ${r.error}`;
+      }
+    } catch (e) {
+      schedMsg = `删除失败: ${e.message || e}`;
+    }
+  }
+  async function runScheduleNow(id) {
+    try {
+      const r = await fetch(`/api/schedules/run?id=${encodeURIComponent(id)}`, { method: 'POST' }).then((r) => r.json());
+      schedMsg = r.ok ? '已触发，跑完会出现在下面的完成记录里' : `触发失败: ${r.error}`;
+      setTimeout(loadSchedules, 1500);
+    } catch (e) {
+      schedMsg = `触发失败: ${e.message || e}`;
+    }
+  }
+  function schedNextText(t) {
+    if (t.enabled === false) return '已停用';
+    return t.next_run_ts ? fmtTs(t.next_run_ts) : '无法计算';
+  }
+  // unix 秒 → 本地时间字符串（定时任务的运行时间展示）
+  function fmtTs(ts) {
+    if (!ts) return '—';
+    const d = new Date(ts * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
 
   // —— 技能（Skill / SKILL.md）分区 ——
@@ -4723,6 +4838,7 @@
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
           <button class:active={settingsTab === 'ext'} on:click={() => pickSettingsTab('ext')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.6"/><path d="M3.5 9.5h17"/><path d="M8 14h5" stroke-linecap="round"/></svg> 插件</button>
+          <button class:active={settingsTab === 'schedule'} on:click={() => pickSettingsTab('schedule')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg> 定时</button>
         </div>
         <div class="settings-content">
         {#if settingsTab === 'appearance'}
@@ -5402,6 +5518,102 @@
             <div class="mcp-cmd">{sandboxProbe.error}</div>
           {/if}
         </div>
+      {/if}
+
+      {#if settingsTab === 'schedule'}
+        <div class="sub-row">
+          <button class="btn primary" on:click={newSchedule}>新建任务</button>
+          <button class="btn" on:click={loadSchedules}>刷新</button>
+          <span class="hint">{schedMsg}</span>
+        </div>
+        {#if schedEditor}
+          <div class="field">
+            <label>{schedEditor.isNew ? '新建定时任务' : `编辑：${schedEditor.name}`}</label>
+            <div class="sub-row">
+              <input placeholder="名称" bind:value={schedEditor.name} style="max-width:220px" />
+              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} style="max-width:220px" />
+            </div>
+            <textarea
+              class="agents-editor"
+              rows="4"
+              spellcheck="false"
+              placeholder="到点时唤醒 agent 的消息"
+              bind:value={schedEditor.message}
+            ></textarea>
+            <div class="sub-row">
+              <Select
+                value={schedEditor.session_mode}
+                title="会话模式"
+                options={[
+                  { value: 'new', label: '每轮新会话' },
+                  { value: 'fixed', label: '固定会话' },
+                ]}
+                on:change={(e) => (schedEditor.session_mode = e.detail)}
+              />
+              {#if schedEditor.session_mode === 'fixed'}
+                <input placeholder="会话 id" bind:value={schedEditor.session_id} style="max-width:260px" />
+              {/if}
+            </div>
+            <div class="sub-row">
+              <Select
+                value={schedEditor.approval_mode}
+                title="审批档位"
+                options={SCHED_MODES}
+                on:change={(e) => (schedEditor.approval_mode = e.detail)}
+              />
+              <Select
+                value={schedEditor.on_approval}
+                title="高危操作"
+                options={[
+                  { value: 'deny', label: '高危：拒绝' },
+                  { value: 'approve', label: '高危：放行' },
+                ]}
+                on:change={(e) => (schedEditor.on_approval = e.detail)}
+              />
+              <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
+              <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
+            </div>
+            <div class="sub-row">
+              <button class="btn primary" on:click={saveSchedule}>保存</button>
+              <button class="btn" on:click={() => (schedEditor = null)}>取消</button>
+            </div>
+          </div>
+        {/if}
+        {#if schedLoading && !schedulesData.length}
+          <div class="trace-empty">加载中…</div>
+        {:else}
+          {#each schedulesData as t (t.id)}
+            <div class="mcp-card">
+              <div class="mcp-head">
+                <span class="dot" class:haskey={t.enabled !== false}></span>
+                <b>{t.name}</b>
+                <span class="mcp-status">{t.cron}</span>
+                <span class="mcp-risk">{t.cron_text}</span>
+                <span class="flex-sp"></span>
+                <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
+                <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
+                <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
+              </div>
+              <div class="mcp-cmd">{t.message}</div>
+              <div class="mcp-cmd">
+                下次运行 {schedNextText(t)}{t.last_status
+                  ? ` · 上次${t.last_status === 'done' ? '完成' : t.last_status === 'timeout' ? '超时' : t.last_status === 'cancelled' ? '取消' : '出错'}`
+                  : ''}{t.last_session_id ? ` · 会话 ${t.last_session_id.slice(0, 8)}` : ''}
+              </div>
+              {#if t.last_error}
+                <div class="mcp-cmd" style="color: var(--tint-orange-fg)">{t.last_error}</div>
+              {/if}
+            </div>
+          {:else}
+            <div class="menu-empty">还没有定时任务。到点会唤醒 agent 跑一轮，结果出现在下面的完成记录里。</div>
+          {/each}
+        {/if}
+        {#if scheduleNotices.length}
+          <div class="field"><label>完成记录</label></div>
+          {#each scheduleNotices as n (n.ts + n.task_id)}
+            <div class="mcp-cmd">{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</div>
+          {/each}
+        {/if}
       {/if}
 
         </div>

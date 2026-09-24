@@ -173,7 +173,7 @@
 > 台账本身**不是** JSONL 事件流：每次模型调用的完整计量（token 三路 / 状态 / 延迟 / 费用）
 > 落独立的 `<日志目录>/usage/ledger.jsonl`，字段见 README「用量台账与成本红线」。
 
-### 4.x P22 新增 kind（施工单 P22-A 无头会话，只增）
+### 4.x P22 新增 kind（施工单 P22-A 无头会话 / P22-B 定时任务，只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -183,6 +183,10 @@
 | `headless.timeout` | 整轮超时已取消（任务在后台收尾） | `session`、`secs` |
 | `headless.approval_auto` | 无人值守时命中审批，按 on_approval 策略自动决定 | `session`、`tool`、`approved` |
 | `headless.leftover` | 收尾时队列里还有没跑完的追加消息（超过 3 轮续跑上限） | `session`、`count` |
+| `schedule.fired` | 定时任务到点触发一次唤醒 | `task`、`name`、`trigger`（auto/manual） |
+| `schedule.done` | 定时任务这一轮结束（状态已写回任务） | `task`、`name`、`trigger` |
+| `schedule.saved` | 定时任务新建/修改已存 settings.json | `task`、`name`、`new` |
+| `schedule.deleted` | 定时任务已删除 | `task` |
 
 ### 4.5 error —— 错误
 

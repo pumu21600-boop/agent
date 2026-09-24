@@ -14,6 +14,7 @@ mod observability;
 mod plugin;
 mod recovery;
 mod sandbox;
+mod schedule;
 mod server;
 mod service;
 mod session;
@@ -169,7 +170,9 @@ async fn main() -> anyhow::Result<()> {
         roles_cfg: Arc::new(config.roles.clone()),
         gateway_cfg: Arc::new(config.gateway.clone()),
     };
-    let app = server::router(state, manifest.join("web").join("dist"));
+    let app = server::router(state.clone(), manifest.join("web").join("dist"));
+    // P22-B 定时任务：20s 心跳到点唤醒无头会话（没有任务时每跳只读一次设置，零开销）
+    schedule::start(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     observability::debug(&format!("listening on http://{addr}"));

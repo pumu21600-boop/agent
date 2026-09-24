@@ -15,7 +15,7 @@ use super::gate::ChatGate;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug, Deserialize)]
-pub(super) struct HeadlessRequest {
+pub(crate) struct HeadlessRequest {
     /// 要唤醒的消息（必填）
     #[serde(default)]
     pub message: String,
@@ -48,7 +48,7 @@ pub(super) struct HeadlessRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct HeadlessResult {
+pub(crate) struct HeadlessResult {
     pub session_id: String,
     /// done（正常跑完）/ cancelled（被停止）/ timeout（超时取消）/ error（出错）
     pub status: String,
@@ -134,9 +134,21 @@ pub(super) async fn run_headless(
     State(state): State<AppState>,
     Json(req): Json<HeadlessRequest>,
 ) -> Response {
+    match run_headless_inner(state, req).await {
+        Ok(r) => Json(r).into_response(),
+        Err((code, msg)) => (code, Json(json!({ "error": msg }))).into_response(),
+    }
+}
+
+/// 无头会话主体（进程内入口）：HTTP handler 与调度器（P22-B 定时任务）共用。
+/// Err = (HTTP 状态, 人话错误)。
+pub(crate) async fn run_headless_inner(
+    state: AppState,
+    req: HeadlessRequest,
+) -> Result<HeadlessResult, (StatusCode, String)> {
     let message = req.message.trim().to_string();
     if message.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "消息为空" }))).into_response();
+        return Err((StatusCode::BAD_REQUEST, "消息为空".to_string()));
     }
     // 会话 id：带合法 id 就复用（UI 里正聊着的会话也能被程序化唤醒），否则新建
     let session_id = {
@@ -151,10 +163,10 @@ pub(super) async fn run_headless(
             EventType::State,
             json!({ "kind": "headless.rejected", "reason": "session_busy", "session": session_id }),
         );
-        return (StatusCode::CONFLICT, Json(json!({
-            "error": format!("会话 {session_id} 正在运行中：等这一轮结束后再唤醒")
-        })))
-        .into_response();
+        return Err((
+            StatusCode::CONFLICT,
+            format!("会话 {session_id} 正在运行中：等这一轮结束后再唤醒"),
+        ));
     };
 
     let started = std::time::Instant::now();
@@ -436,7 +448,7 @@ pub(super) async fn run_headless(
             "prompt_tokens": prompt_tokens,
         }),
     );
-    Json(HeadlessResult {
+    Ok(HeadlessResult {
         session_id,
         status,
         answer,
@@ -449,7 +461,6 @@ pub(super) async fn run_headless(
         duration_ms,
         error,
     })
-    .into_response()
 }
 
 #[cfg(test)]
