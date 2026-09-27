@@ -3278,6 +3278,11 @@
       schedMsg = '还没选执行时间';
       return;
     }
+    // 单次时间已过：本地直接提示，不等服务端校验
+    if (body.once_ts && body.once_ts <= Math.floor(Date.now() / 1000)) {
+      schedMsg = '单次任务的时间要设在将来';
+      return;
+    }
     try {
       const r = await fetch('/api/schedules', {
         method: 'POST',
