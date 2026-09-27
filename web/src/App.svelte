@@ -343,6 +343,16 @@
       wsModalOpen = false;
       // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
       currentSessionId = null;
+      // 在跑的流一并断开登记（服务端那轮继续跑——SSE 断 ≠ 取消，坑 26）。不清的话
+      // 切回来 loadSession 走「本地缓冲」分支，拿到的是刚被清空的缓冲，历史全不见
+      // （2026-09-27 用户实锤「切界面丢对话内容」）；断开后对账轮询会把跑完的内容补回来。
+      const deadStreams = Object.values(streams);
+      streams = {};
+      streaming = false;
+      controller = null;
+      for (const st of deadStreams) {
+        try { st.controller.abort(); } catch {}
+      }
       sessionMsgs = {};
       outbox = {};
       usageBySession = {}; // 旧项目的会话账本一并清
@@ -898,6 +908,10 @@
     webAgentWatch = setInterval(async () => {
       try {
         const s = await webApi('/api/browser/state', { cache: 'no-store' });
+        // 这条轮询也刷新浏览器状态——就绪门在这里同样要放行：agent 自动唤起面板
+        // 走的就是这条路（不经过 loadWebState），不置标志的话视口同步被永远挡死，
+        // 拖面板宽度时壳里的 webview 纹丝不动（2026-09-27 用户实锤「宽度不同步」）。
+        // 注意放在标签清单更新**之后**：补发的那一发必须量到标签条挂出后的定型几何。
         // 宿主模式也随时同步：webMode 以前只在 loadWebState 时更新，而 agent 自动开面板
         // 走的是这条路——不同步的话面板按**无头模式**渲染（截图 img 分支），壳里的真
         // webview 随后才_pop_进来，用户看到的就是「先闪几下」（坏截图/暗区→真页面）。
@@ -920,6 +934,10 @@
           if (act && document.activeElement !== document.querySelector('.web-address')) {
             webAddress = act.url === 'about:blank' ? '' : act.url || '';
           }
+        }
+        if (!webStateReady) {
+          webStateReady = true;
+          webQueueViewport();
         }
         if (!s.agentTouched || Date.now() - s.agentTouched > 10000) return;
         if (s.agentTouched <= webAgentSeen) return; // 这次触碰已响应过
@@ -2173,9 +2191,13 @@
       { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
     ]);
     const ac = new AbortController();
-    streams = { ...streams, [key]: { asstId, controller: ac } };
+    // 引导（立即发送）不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
+    // 流条目，引导响应一结束 finally 又把它删掉，原轮还在跑本页却以为空闲了
+    // （再发消息走错分支、出队逻辑乱序）。引导的 SSE 只回执不产出，用不上这些。
+    const ownsTurn = opts.steer !== true;
+    if (ownsTurn) streams = { ...streams, [key]: { asstId, controller: ac } };
     syncCur();
-    const stream = streams[key];
+    const stream = { asstId, controller: ac };
     let skey = key; // 会话 id 到手后 key 会从 '@new' 变成真 id
     const patch = (fn) => patchAsst(skey, stream.asstId, fn);
     let ok = false;
@@ -2360,23 +2382,31 @@
       );
       patch((m) => ({ ...m, streaming: false }));
     } finally {
-      // 这条流结束（本会话可再次发送）；只清本会话的流登记，别的会话在跑不受影响
-      const nextStreams = { ...streams };
-      delete nextStreams[skey];
-      streams = nextStreams;
-      localSteers = [];
-      syncCur();
-      // 流死了没产出任何内容（网络断/服务重启等）：撤掉空回答气泡，别留一个空壳
-      updMsgs(skey, (a) =>
-        a.filter((m) => m.id !== stream.asstId || m.content || (m.tools && m.tools.length) || m.approval)
-      );
-      loadSessions(); // 刷新会话列表（新会话出现/标题更新）
-      // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
-      const q = outbox[skey] || [];
-      if (q.length > 0 && !streams[skey]) {
-        const [item, ...rest] = q;
-        outbox = { ...outbox, [skey]: rest };
-        deliver(skey, item.text, item.atts, { bubbleId: item.id });
+      if (ownsTurn) {
+        // 这条流结束（本会话可再次发送）；只清本会话的流登记，别的会话在跑不受影响。
+        // 引导请求（ownsTurn=false）绝不能走这段：它的流条目根本没登记，误删会把
+        // 还在跑的那一轮登记清掉（本页从此以为会话空闲，出队/重发全部乱套）。
+        const nextStreams = { ...streams };
+        delete nextStreams[skey];
+        streams = nextStreams;
+        localSteers = [];
+        syncCur();
+        // 流死了没产出任何内容（网络断/服务重启等）：撤掉空回答气泡，别留一个空壳。
+        // 缓冲已被清掉的会话（切工作区 abort）不复活条目——否则空数组是 truthy，
+        // 切回来会被当成「本地缓冲」用，历史照样全不见。
+        if (sessionMsgs[skey]) {
+          updMsgs(skey, (a) =>
+            a.filter((m) => m.id !== stream.asstId || m.content || (m.tools && m.tools.length) || m.approval)
+          );
+        }
+        loadSessions(); // 刷新会话列表（新会话出现/标题更新）
+        // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
+        const q = outbox[skey] || [];
+        if (q.length > 0 && !streams[skey]) {
+          const [item, ...rest] = q;
+          outbox = { ...outbox, [skey]: rest };
+          deliver(skey, item.text, item.atts, { bubbleId: item.id });
+        }
       }
     }
     return ok;
@@ -2521,6 +2551,16 @@
       if (!sessionMsgs[id]) {
         sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };
       }
+      // 对账（2026-09-27 用户实锤「切界面/开关程序丢对话内容」）：本页没有这条会话的流，
+      // 但服务端可能还有一轮在跑——切工作区回来/重开程序都会走到这里，拿到的是**旧文件**
+      // 快照，运行中那轮的产出从此没人补。挂上对账轮询：服务端空闲后从会话文件重载，
+      // 缺的尾巴自动回来。（本页有自己的流在跑时不进这个分支，用不到对账。）
+      fetch(`/api/cancel?session=${encodeURIComponent(id)}`)
+        .then((r) => r.json())
+        .then((c) => {
+          if (c.running && !streams[id]) reconcileServerQueued(id);
+        })
+        .catch(() => {});
       syncCur();
       restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
       dockCp = null;

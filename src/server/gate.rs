@@ -155,6 +155,8 @@ impl agent::ApprovalGate for ChatGate {
         let pending = self.pending.clone();
         let tx = self.tx.clone();
         let cancel = self.cancel.clone();
+        let steer = self.steer.clone();
+        let sid = self.session_id.clone();
         Box::pin(async move {
             async fn wait_cancelled(flag: Arc<CancelFlag>) {
                 loop {
@@ -164,10 +166,23 @@ impl agent::ApprovalGate for ChatGate {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
+            // 引导让位（2026-09-27 用户实锤：审批挂 120s，期间「立即发送」毫无反应）：
+            // 用户在审批等待期点了「立即发送」= 要改方向，挂着的操作按拒绝放行——
+            // 引导消息本身留在队列里，下一个决策点被核心循环取走，模型拿着
+            // 「操作已取消 + 新指令」马上重规划，引导秒级生效而不是等满超时。
+            async fn wait_steer(q: Arc<crate::core::steer::SteerQueue>, sid: String) {
+                loop {
+                    if q.has_immediate(&sid) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
             let decision = tokio::select! {
                 r = orx => r.unwrap_or(false),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
                 _ = wait_cancelled(cancel) => false,
+                _ = wait_steer(steer, sid) => false,
             };
             pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             observability::event(

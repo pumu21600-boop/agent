@@ -71,6 +71,17 @@ impl SteerQueue {
         now
     }
 
+    /// 是否有「立即发送」的消息在等（**不取走**）。审批等待期据此让位：用户引导 =
+    /// 要改方向，挂着的审批按拒绝处理，引导消息仍留在队列里给决策点取。
+    pub fn has_immediate(&self, session_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|v| v.iter().any(|s| s.immediate))
+            .unwrap_or(false)
+    }
+
     /// 取走本会话全部消息（服务层收尾：一轮结束后按先到先得顺序接着跑）。
     pub fn drain_all(&self, session_id: &str) -> Vec<String> {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -103,8 +114,15 @@ mod tests {
         q.push("s", "立即一".into(), true);
         q.push("s", "排队二".into(), false);
 
+        // 探针只看不动：有立即项 = true，且取不走队列
+        assert!(q.has_immediate("s"));
+        assert_eq!(q.pending("s"), 3, "has_immediate 不得消费消息");
+        assert!(!q.has_immediate("别的会话"));
+        q.drain_immediate("s");
+        assert!(!q.has_immediate("s"), "立即项取走后探针为 false");
+        assert_eq!(q.pending("s"), 2, "排队项不受影响");
+
         // 决策点只取「立即」的，且保持原有先后顺序；排队的留在队列里
-        assert_eq!(q.drain_immediate("s"), vec!["立即一".to_string()]);
         assert_eq!(q.drain_immediate("s"), Vec::<String>::new(), "取完立即项后为空");
         // 收尾把剩下的全取走（先到先得：排队一 → 排队二）
         assert_eq!(q.drain_all("s"), vec!["排队一".to_string(), "排队二".to_string()]);
