@@ -140,6 +140,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
             get(list_schedules).post(save_schedule).delete(delete_schedule),
         )
         .route("/api/schedules/run", post(run_schedule_now))
+        .route("/api/schedules/cron-text", get(cron_text))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/new", post(new_session))

@@ -3170,12 +3170,45 @@
   let schedLoading = false;
   // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
   let schedEditor = null;
+  // 高级选项（会话/审批/超时）默认折叠；编辑老任务时若与默认不同则自动展开，不藏已配置的东西
+  let schedAdvOpen = false;
+  const SCHED_ADV_DEFAULT = { session_mode: 'new', session_id: '', approval_mode: 'auto', on_approval: 'deny', timeout_secs: 1800 };
+  // cron 人话预览（输入即查，250ms 防抖；解析失败由界面提示）
+  let schedCronText = '';
+  let schedCronTimer = null;
+  let schedCronPending = false;
   const SCHED_MODES = [
     { value: 'read-only', label: '只读（写/执行逐次询问）' },
     { value: 'sandbox', label: '沙箱（只在沙箱执行）' },
     { value: 'auto', label: '自动（可动工作区）' },
     { value: 'full-access', label: '完全访问（需总开关）' },
   ];
+  function schedAdvNonDefault(t) {
+    const n = (v, d) => (v == null || v === '' ? d : v);
+    return (
+      n(t.session_mode, 'new') !== 'new' ||
+      !!(t.session_id && t.session_id.trim()) ||
+      n(t.approval_mode, 'auto') !== 'auto' ||
+      n(t.on_approval, 'deny') !== 'deny' ||
+      (Number(t.timeout_secs) || 1800) !== 1800
+    );
+  }
+  function previewCron() {
+    clearTimeout(schedCronTimer);
+    const cron = (schedEditor?.cron || '').trim();
+    schedCronTimer = setTimeout(async () => {
+      if (!schedEditor || !cron) { schedCronText = ''; schedCronPending = false; return; }
+      schedCronPending = true;
+      try {
+        const r = await fetch(`/api/schedules/cron-text?cron=${encodeURIComponent(cron)}`).then((r) => r.json());
+        schedCronText = r.ok ? r.text : '';
+      } catch {
+        schedCronText = '';
+      } finally {
+        schedCronPending = false;
+      }
+    }, 250);
+  }
   async function loadSchedules() {
     schedLoading = true;
     try {
@@ -3192,6 +3225,7 @@
   }
   function newSchedule() {
     schedMsg = '';
+    schedAdvOpen = false;
     schedEditor = {
       id: '',
       name: '',
@@ -3207,10 +3241,13 @@
       timeout_secs: 1800,
       isNew: true,
     };
+    previewCron();
   }
   function editSchedule(t) {
     schedMsg = '';
+    schedAdvOpen = schedAdvNonDefault(t);
     schedEditor = { ...t, isNew: false };
+    previewCron();
   }
   async function saveSchedule() {
     const e = schedEditor;
@@ -5645,11 +5682,17 @@
                 ]}
                 on:change={(e) => (schedEditor.kind = e.detail)}
               />
+              <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
             </div>
             <div class="sub-row">
-              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} style="max-width:220px" />
+              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} on:input={previewCron} style="max-width:220px" />
               {#if (schedEditor.kind || 'message') === 'memory'}
                 <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
+              {/if}
+              {#if schedCronText}
+                <span class="hint">{schedCronText}</span>
+              {:else if !schedCronPending && (schedEditor.cron || '').trim()}
+                <span class="hint" style="color: var(--tint-orange-fg)">没认出来，示例 0 9 * * * = 每天 09:00</span>
               {/if}
             </div>
             {#if (schedEditor.kind || 'message') === 'message'}
@@ -5664,38 +5707,42 @@
               <div class="mcp-cmd">到点先检索最近 {schedEditor.memory_days || 3} 天的对话，让 agent 找出要跟进的事项</div>
             {/if}
             <div class="sub-row">
-              <Select
-                value={schedEditor.session_mode}
-                title="会话模式"
-                options={[
-                  { value: 'new', label: '每轮新会话' },
-                  { value: 'fixed', label: '固定会话' },
-                ]}
-                on:change={(e) => (schedEditor.session_mode = e.detail)}
-              />
-              {#if schedEditor.session_mode === 'fixed'}
-                <input placeholder="会话 id" bind:value={schedEditor.session_id} style="max-width:260px" />
-              {/if}
+              <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
             </div>
-            <div class="sub-row">
-              <Select
-                value={schedEditor.approval_mode}
-                title="审批档位"
-                options={SCHED_MODES}
-                on:change={(e) => (schedEditor.approval_mode = e.detail)}
-              />
-              <Select
-                value={schedEditor.on_approval}
-                title="高危操作"
-                options={[
-                  { value: 'deny', label: '高危：拒绝' },
-                  { value: 'approve', label: '高危：放行' },
-                ]}
-                on:change={(e) => (schedEditor.on_approval = e.detail)}
-              />
-              <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
-              <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
-            </div>
+            {#if schedAdvOpen}
+              <div class="sub-row">
+                <Select
+                  value={schedEditor.session_mode}
+                  title="会话模式"
+                  options={[
+                    { value: 'new', label: '每轮新会话' },
+                    { value: 'fixed', label: '固定会话' },
+                  ]}
+                  on:change={(e) => (schedEditor.session_mode = e.detail)}
+                />
+                {#if schedEditor.session_mode === 'fixed'}
+                  <input placeholder="会话 id" bind:value={schedEditor.session_id} style="max-width:260px" />
+                {/if}
+              </div>
+              <div class="sub-row">
+                <Select
+                  value={schedEditor.approval_mode}
+                  title="审批档位"
+                  options={SCHED_MODES}
+                  on:change={(e) => (schedEditor.approval_mode = e.detail)}
+                />
+                <Select
+                  value={schedEditor.on_approval}
+                  title="高危操作"
+                  options={[
+                    { value: 'deny', label: '高危：拒绝' },
+                    { value: 'approve', label: '高危：放行' },
+                  ]}
+                  on:change={(e) => (schedEditor.on_approval = e.detail)}
+                />
+                <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
+              </div>
+            {/if}
             <div class="sub-row">
               <button class="btn primary" on:click={saveSchedule}>保存</button>
               <button class="btn" on:click={() => (schedEditor = null)}>取消</button>
@@ -5711,8 +5758,7 @@
                 <span class="dot" class:haskey={t.enabled !== false}></span>
                 <b>{t.name}</b>
                 {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
-                <span class="mcp-status">{t.cron}</span>
-                <span class="mcp-risk">{t.cron_text}</span>
+                <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
                 <span class="flex-sp"></span>
                 <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
@@ -5726,7 +5772,7 @@
               <div class="mcp-cmd">
                 下次运行 {schedNextText(t)}{t.last_status
                   ? ` · 上次${t.last_status === 'done' ? '完成' : t.last_status === 'timeout' ? '超时' : t.last_status === 'cancelled' ? '取消' : '出错'}`
-                  : ''}{t.last_session_id ? ` · 会话 ${t.last_session_id.slice(0, 8)}` : ''}
+                  : ''}
               </div>
               {#if t.last_error}
                 <div class="mcp-cmd" style="color: var(--tint-orange-fg)">{t.last_error}</div>

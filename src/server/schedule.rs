@@ -12,6 +12,11 @@ pub(super) struct ScheduleIdQuery {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct CronQuery {
+    pub cron: String,
+}
+
 /// GET /api/schedules —— 任务清单（带下次运行时间与人话描述）+ 最近完成通知。
 pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value> {
     let schedules: Vec<Value> = state
@@ -147,5 +152,13 @@ pub(super) async fn run_schedule_now(
     match schedule::run_now(&state, &id) {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "fired": true }))),
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))),
+    }
+}
+
+/// GET /api/schedules/cron-text?cron=... —— 编辑器的即时人话预览（解析失败 ok=false，落盘校验仍以 validate 为准）。
+pub(super) async fn cron_text(Query(q): Query<CronQuery>) -> Json<Value> {
+    match schedule::parse_cron(q.cron.trim()) {
+        Ok(c) => Json(json!({ "ok": true, "text": c.describe() })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
     }
 }
