@@ -5,6 +5,8 @@
 //   「编辑 <路径>」→ edit_file 工具调用（old=「状态：TODO」→ new=「状态：已完成」）
 //   「派子代理」    → subagent_spawn 工具调用（P22-C：子代理独立会话跑 read_file 闭环）
 //   「派两个」      → 一轮两个 subagent_spawn（验证并行派发与并发度排队）
+//   「重试失败」    → 连续两轮相同的 read_file（必失败：文件不存在），验证「失败后重试
+//                    不判死循环」——旧护栏会当场终止并弹天书横幅（P22 用户反馈）
 //   「死循环」     → 每轮都返回工具调用（验证步数上限）
 //   「慢循环」     → 同死循环，但每步先等 1.5s（验证运行中插话 / steering）
 //   「慢流」       → 30 片 × 300ms 的长流（验证中途取消）
@@ -97,6 +99,8 @@ http
         // P22-C 子代理剧本（必须 !hasToolMsg：子代理那轮的 user 消息也含「子代理」字样）
         const spawnTwo = hasToolsParam && !hasToolMsg && /派两个/.test(lastText);
         const spawnOne = hasToolsParam && !hasToolMsg && /派子代理/.test(lastText);
+        // 重试失败剧本：前两轮发同一个必失败的 read_file（文件不存在），验证失败重试放行
+        const retryFail = hasToolsParam && /重试失败/.test(lastText);
         const toolMsgCount = msgs.filter((m) => m.role === 'tool').length;
         // 工具结果回填后（hasToolMsg）不再吐工具调用，直接走最终回答；死循环/慢循环/多步剧本除外
         const wantsTool =
@@ -121,7 +125,14 @@ http
           res.write('data: [DONE]\n\n');
           res.end();
         };
-        if (spawnTwo) {
+        if (retryFail) {
+          // 前两轮同一个必失败调用（路径不存在）；第三轮起让模型收尾说话
+          if (toolMsgCount < 2) {
+            emitToolCall(res, 'read_file', { path: '绝不存在的文件.txt' });
+          } else {
+            emitFinal('两次读取都失败了：访问超时/文件不存在，建议稍后重试或换个别的方式。（mock 重试失败剧本闭环）');
+          }
+        } else if (spawnTwo) {
           // P22-C：一轮两个派发——验证并行组 + per_parent 上限排队（第二个等第一个完）。
           // 注意 emitToolCall 内部会 end 响应，两个调用必须都用「不收尾」的裸帧写。
           const calls = [

@@ -275,6 +275,14 @@ pub enum LoopOutcome {
     Cancelled,
 }
 
+/// 是否构成「重复调用死循环」（纯函数）：两步工具调用签名完全相同，且上一轮**不是**
+/// 全部失败。失败后重试是正当行为——超时/后端重置后状态可能已变，模型重试一次
+/// 理应放行（用户反馈：navigate 超时被当场判死循环，用户只看到天书横幅）；
+/// 真正要防的是对成功调用的重复请求，那种由步数上限兜底。
+fn is_repeat_loop(prev: &[String], cur: &[String], prev_all_failed: bool) -> bool {
+    !prev.is_empty() && prev == cur && !prev_all_failed
+}
+
 /// P22-C：执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
 /// （子代理跑在独立会话，实现见 server/subagent.rs）；其余走工具注册表。
 async fn exec_tool_call(
@@ -479,6 +487,9 @@ pub async fn run_task(
     // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
     let tools_def = tools_def_for(&primary.params);
     let mut prev_tool_sigs: Vec<String> = Vec::new();
+    // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
+    // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
+    let mut prev_all_failed = false;
 
     for step in 0..cfg.max_steps {
         // 每轮模型决策前查取消标志（核心循环刚性检查点）
@@ -764,10 +775,13 @@ pub async fn run_task(
             return Ok(LoopOutcome::Done);
         }
 
-        // 护栏：模型连续两步请求完全相同的工具调用 → 死循环，立即终止
+        // 护栏：模型连续两步请求完全相同的工具调用 → 死循环，立即终止。
+        // 例外：上一轮相同调用**全部失败**时重试是正当行为（用户反馈：navigate 超时被
+        // 当成死循环终止，用户看到的是天书错误横幅，而不是 AI 说「访问超时」）。
+        // 真正要防的是对成功调用的重复请求；失败重试由步数上限兜底。
         let sigs: Vec<String> =
             turn.tool_calls.iter().map(|c| format!("{}|{}", c.name, c.arguments)).collect();
-        if prev_tool_sigs == sigs {
+        if is_repeat_loop(&prev_tool_sigs, &sigs, prev_all_failed) {
             observability::event(
                 EventType::Error,
                 json!({ "message": "模型重复请求相同工具调用，已终止循环" }),
@@ -1059,6 +1073,8 @@ pub async fn run_task(
         }
         // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
         on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+        // 记录本轮成败：下一步的「相同调用」护栏要靠它区分死循环与失败重试
+        prev_all_failed = !results.is_empty() && results.iter().all(|(_, ok)| !ok);
     }
 
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
@@ -1080,10 +1096,23 @@ mod tests {
     }
 
     // —— P9 B3：plan 块解析 ——
+    /// 重复调用护栏：成功后的重复 = 死循环；失败后的重试 = 放行（步数上限兜底）。
+    #[test]
+    fn repeat_loop_allows_retry_after_failure() {
+        let a = vec!["browser|{\"method\":\"navigate\"}".to_string()];
+        // 上一轮相同调用成功了 → 重复即死循环
+        assert!(is_repeat_loop(&a, &a, false));
+        // 上一轮相同调用失败了（超时/后端重置）→ 重试放行
+        assert!(!is_repeat_loop(&a, &a, true));
+        // 不同调用 / 首轮（prev 空）→ 都不是循环
+        let b = vec!["browser|{\"method\":\"snapshot\"}".to_string()];
+        assert!(!is_repeat_loop(&a, &b, false));
+        assert!(!is_repeat_loop(&[], &a, false));
+    }
+
     // —— P12 018：写冲突检测 ——
     #[test]
-    fn write_conflict_detection() {
-        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
+    fn write_conflict_detection() {        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
         let calls = vec![
             mk("write_file", r#"{"path": "src/a.rs"}"#),
             mk("read_file", r#"{"path": "src/a.rs"}"#),

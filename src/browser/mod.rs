@@ -2016,7 +2016,7 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
     }
 
     // tab 级命令：解析目标页（缺省 = agent 专用页）
-    let session = ensure_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?;
+    let session = ensure_session().await.map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, friendly_backend_error(&e)))?;
     session.touch();
     let tab = match cmd.tab_id() {
         Some(id) => get_tab(&session, id).map_err(|e| BrowserError::new(ErrorCode::CapabilityUnsupported, e))?,
@@ -2026,12 +2026,12 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
                 check_url(url)?; // 先验地址，别为非法 URL 白开一页
                 agent_tab_for_navigate(&session, url)
                     .await
-                    .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?
+                    .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, friendly_backend_error(&e)))?
                     .0
             }
             _ => agent_tab(&session)
                 .await
-                .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, e))?,
+                .map_err(|e| BrowserError::new(ErrorCode::BackendUnavailable, friendly_backend_error(&e)))?,
         },
     };
     tab.touch();
@@ -2051,7 +2051,7 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
                     }
                     return Err(BrowserError::new(
                         ErrorCode::BackendUnavailable,
-                        format!("浏览器会话异常已重置（重试 navigate 即可）: {e}"),
+                        friendly_backend_error(&e),
                     ));
                 }
             };
@@ -2481,6 +2481,20 @@ fn exec_err(e: String) -> BrowserError {
         )
     } else {
         BrowserError::new(ErrorCode::ExecutionError, e)
+    }
+}
+
+/// 后端类错误的人话化（用户反馈：navigate 超时时满屏
+/// 「[backend_unavailable] 浏览器会话异常已重置：CDP 调用超时: Page.navigate」，
+/// 要的是 AI 能自然地说「访问超时」）。人话在前（模型转述给用户），
+/// 原始细节留在尾部（诊断用），错误码仍由 BrowserError Display 前置。
+fn friendly_backend_error(e: &str) -> String {
+    if e.contains("CDP 调用超时") {
+        format!("访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。可以重试一次；仍不行就 close_browser 后重新打开。（{e}）")
+    } else if e.contains("连接已断开") || e.contains("actor 已退出") {
+        format!("浏览器连接已断开：浏览器进程可能已被系统回收。重试 navigate 会自动重新拉起。（{e}）")
+    } else {
+        format!("浏览器暂时不可用：重试 navigate 即可，仍不行就 close_browser 后重新打开。（{e}）")
     }
 }
 
@@ -2992,6 +3006,20 @@ pub async fn panel_dialog(id: &str, accept: bool, prompt_text: Option<String>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 后端类错误人话化：超时要让模型能自然地说「访问超时」，技术细节留尾部诊断。
+    #[test]
+    fn friendly_backend_error_leads_with_human_words() {
+        let t = friendly_backend_error("CDP 调用超时: Page.navigate");
+        assert!(t.starts_with("访问超时："), "{t}");
+        assert!(t.contains("重试"), "要给出路：{t}");
+        assert!(t.contains("CDP 调用超时"), "原始细节保留供诊断：{t}");
+        let d = friendly_backend_error("连接已断开: pipe closed");
+        assert!(d.starts_with("浏览器连接已断开："), "{d}");
+        let o = friendly_backend_error("拉起失败: 没找到浏览器");
+        assert!(o.starts_with("浏览器暂时不可用："), "{o}");
+        assert!(o.contains("没找到浏览器"), "{o}");
+    }
 
     /// host_of / same_site：agent 跨站点导航是否开新标签的判据（纯函数）。
     #[test]
