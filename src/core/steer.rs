@@ -38,6 +38,16 @@ impl SteerQueue {
         v.len()
     }
 
+    /// 本会话当前积压条数（防线用：超过上限说明客户端在循环重发，拒收新消息）。
+    pub fn pending(&self, session_id: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
     /// 取走「立即发送」的（核心循环每个决策点一次）；排队的留下等本轮结束。
     pub fn drain_immediate(&self, session_id: &str) -> Vec<String> {
         let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());

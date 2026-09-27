@@ -83,6 +83,9 @@
   let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
   let streams = {}; // key → { asstId, controller } 正在跑的那条流
   let outbox = {}; // key → [{ id, text, atts }] 排队待发（本轮结束后自动按序发出）
+  // 服务端接管排队消息后的对账定时器（key → interval id）：本页流已死拿不到回答，
+  // 轮询到服务端空闲后从会话文件重载（2026-09-27 教训，见 d.queued 分支注释）
+  const reconcileTimers = {};
   let streaming = false; // 当前显示会话是否在跑（syncCur 维护）
   let controller = null; // 当前显示会话的 AbortController（停止按钮用）
   let input = '';
@@ -2210,9 +2213,15 @@
                 rekey(skey, d.session);
                 skey = d.session;
               } else if (d.queued) {
-                // 服务端判成「这个会话在跑」（别的窗口刚起了一轮）：本条转排队、撤掉空回答气泡
+                // 服务端判成「这个会话在跑」（流断了/别的窗口刚起了一轮）：本条转排队、撤掉空回答气泡。
+                // **服务端接管了这条的投递**（本轮收尾它自己排水跑掉）——必须把它从出队队列摘掉：
+                // 否则「排队→流结束→出队→再发→又排队」就是无限请求风暴
+                // （2026-09-27 真机踩到：SSE 断流后发一条消息，10 秒被重发 2000 次塞满队列）。
+                // 跑完的答案也拿不到（d.turn 走的是已死的原流）——由 reconcileServerQueued 对账。
                 updMsgs(skey, (a) => a.filter((m) => m.id !== stream.asstId));
-                markQueued(skey, effectiveMsg, atts);
+                const qid = markQueued(skey, effectiveMsg, atts);
+                outbox = { ...outbox, [skey]: (outbox[skey] || []).filter((x) => x.id !== qid) };
+                reconcileServerQueued(skey);
               } else if (d.steered) {
                 // 这条已被并进正在跑的一轮（引导）：本页不再给它单开回答气泡
                 updMsgs(skey, (a) => a.filter((m) => m.id !== stream.asstId));
@@ -2343,6 +2352,10 @@
       streams = nextStreams;
       localSteers = [];
       syncCur();
+      // 流死了没产出任何内容（网络断/服务重启等）：撤掉空回答气泡，别留一个空壳
+      updMsgs(skey, (a) =>
+        a.filter((m) => m.id !== stream.asstId || m.content || (m.tools && m.tools.length) || m.approval)
+      );
       loadSessions(); // 刷新会话列表（新会话出现/标题更新）
       // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
       const q = outbox[skey] || [];
@@ -2388,6 +2401,38 @@
     const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
     fetch('/cancel' + q, { method: 'POST' });
     if (controller) controller.abort();
+  }
+
+  // 服务端接管排队消息后的对账（2026-09-27）：本页的 SSE 流已死，服务端跑这条消息时
+  // 发的 d.turn / 回答流进的是那条死连接——轮询到服务端空闲后从会话文件重载，
+  // 把「排队中」气泡对成真消息 + 补上错过的一切。不重发任何东西（消息已在服务端队列里）。
+  function reconcileServerQueued(skey) {
+    if (reconcileTimers[skey]) return;
+    reconcileTimers[skey] = setInterval(async () => {
+      try {
+        if (streams[skey]) return; // 本页又起了流：对账交给正常流程
+        const c = await fetch(`/api/cancel?session=${encodeURIComponent(skey)}`).then((r) => r.json());
+        if (c.running) return; // 服务端还在跑：继续等
+        clearInterval(reconcileTimers[skey]);
+        delete reconcileTimers[skey];
+        if (currentSessionId !== skey) {
+          // 不在这个会话的页面：丢掉本地陈旧缓冲，下次打开时从服务端重建
+          const next = { ...sessionMsgs };
+          delete next[skey];
+          sessionMsgs = next;
+          return;
+        }
+        if (streams[skey]) return;
+        const r = await fetch(`/api/session?id=${encodeURIComponent(skey)}`).then((r) => r.json());
+        if ((r.messages || []).length > 0) {
+          sessionMsgs = { ...sessionMsgs, [skey]: rebuildFromSession(r.messages || []) };
+          syncCur();
+          loadSessions();
+        }
+      } catch (e) {
+        // 网络抖动：下一跳再试
+      }
+    }, 2000);
   }
 
   // —— P6 恢复与续命 ——

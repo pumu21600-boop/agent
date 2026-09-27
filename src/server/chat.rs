@@ -494,6 +494,22 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         if text.is_empty() {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": "消息为空" }))).into_response();
         }
+        // 防线（2026-09-27 前端重发风暴教训）：单会话排队上限。正常永远到不了——
+        // 每条消息客户端只发一次；堆到上限说明客户端在循环重发，拒收并给人话，
+        // 别让队列被灌到几千条后一次性排进模型上下文。
+        if state.steer.pending(&session_id) >= 32 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "chat.queue_full", "session": session_id, "pending": state.steer.pending(&session_id) }),
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": format!("会话 {session_id} 的排队消息已堆到上限（32 条）：客户端可能在循环重发。请点「停止」清空队列后再发。")
+                })),
+            )
+                .into_response();
+        }
         // 027：缺省 = 排队（这一轮跑完自动接着发）；steer=true = 立即（引导当前这一轮）
         let immediate = req.steer;
         let pending = state.steer.push(&session_id, text, immediate);
