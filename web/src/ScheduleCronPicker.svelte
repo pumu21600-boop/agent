@@ -35,7 +35,8 @@
     { v: 6, l: '六' },
     { v: 0, l: '日' },
   ];
-  const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  // 注意分钟必须有捕获组——buildCron 依赖 m[2]，丢了就是 NaN
+  const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
   function computeOnceEpoch(date, t) {
     if (!date || !TIME_RE.test(t || '')) return 0;
@@ -57,6 +58,8 @@
     if (!m) return '';
     const hh = Number(m[1]);
     const mm = Number(m[2]);
+    // 兜底：任何非数字都产出空串（客户端拦下），绝不让 NaN 溜进 cron
+    if (!Number.isFinite(hh) || !Number.isFinite(mm) || hh > 23 || mm > 59) return '';
     if (mode === 'interval') {
       const n = Number(intervalMin);
       return n >= 1 && n <= 59 ? `*/${n} * * * *` : '';
