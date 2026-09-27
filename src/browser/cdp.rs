@@ -166,6 +166,10 @@ impl Cdp {
 
     /// 发命令并等指定事件到达（等待器先同步注册、命令后入队——同一条 FIFO 通道，
     /// actor 处理顺序即注册顺序，无竞态）。事件超时视为失败（导航没完成）。
+    /// 命令本身失败（超时/actor 退出）时**立即**把错误返回——不再等事件
+    /// （旧版「调用 20s 超时 + 事件再干等 22s」= 一次注定失败的导航干耗 47s，
+    /// 2026-09-27 用户测试失败路径时实锤；且旧版即便事件来了也照样返回调用错误，
+    /// 那段等待纯属浪费）。
     pub async fn call_and_wait_event(
         &self,
         method: &str,
@@ -173,18 +177,16 @@ impl Cdp {
         event: &str,
         budget: std::time::Duration,
     ) -> Result<Value, String> {
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel::<Result<Value, String>>();
         self.tx
             .send(ToActor::WaitEvent { method: event.into(), reply: tx })
             .map_err(|_| "CDP actor 已退出".to_string())?;
-        let result = self.call_budgeted(method, params, budget).await;
-        let event_res = match tokio::time::timeout(budget + std::time::Duration::from_secs(2), rx).await {
+        self.call_budgeted(method, params, budget).await?;
+        match tokio::time::timeout(budget + std::time::Duration::from_secs(2), rx).await {
             Err(_) => Err(format!("等待事件超时: {event}")),
             Ok(Err(_)) => Err("CDP actor 已退出".to_string()),
             Ok(Ok(res)) => res,
-        };
-        result?;
-        event_res
+        }
     }
 
     /// 在页面的**隔离世界**里执行表达式（移植自 ZCode：worldName 隔离 + contextId 求值）。
