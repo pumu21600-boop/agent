@@ -1,6 +1,7 @@
 <script>
   import { onMount, afterUpdate, tick } from 'svelte';
   import Select from './Select.svelte';
+  import ScheduleCronPicker from './ScheduleCronPicker.svelte';
   import Galaxy from './Galaxy.svelte';
   import ImagePreview from './lib/ImagePreview.svelte';
   import RenameModal from './lib/RenameModal.svelte';
@@ -3195,9 +3196,10 @@
   }
   function previewCron() {
     clearTimeout(schedCronTimer);
-    const cron = (schedEditor?.cron || '').trim();
     schedCronTimer = setTimeout(async () => {
-      if (!schedEditor || !cron) { schedCronText = ''; schedCronPending = false; return; }
+      if (!schedEditor) { schedCronText = ''; schedCronPending = false; return; }
+      const cron = (schedEditor.cron || '').trim();
+      if (!cron) { schedCronText = ''; schedCronPending = false; return; }
       schedCronPending = true;
       try {
         const r = await fetch(`/api/schedules/cron-text?cron=${encodeURIComponent(cron)}`).then((r) => r.json());
@@ -5687,7 +5689,7 @@
               <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
             </div>
             <div class="sub-row">
-              <input placeholder="cron：分 时 日 月 周" bind:value={schedEditor.cron} on:input={previewCron} style="max-width:220px" />
+              <ScheduleCronPicker bind:cron={schedEditor.cron} on:change={previewCron} />
               {#if (schedEditor.kind || 'message') === 'memory'}
                 <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
               {/if}
