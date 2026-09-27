@@ -15,6 +15,18 @@ use super::gate::ChatGate;
 use super::subagent;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// 无头运行期间的工作区切换守卫：Drop 还原全局根。
+/// 放在跑整轮的任务里（随任务生命周期）——取消/超时后任务在后台收尾期间
+/// 工作区保持切换态，收尾完才还原，不会漏还原也不会提前还。
+struct WorkspaceGuard {
+    old: std::path::PathBuf,
+}
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        crate::tools::set_workspace_root(&self.old);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct HeadlessRequest {
     /// 要唤醒的消息（必填）
@@ -49,6 +61,11 @@ pub(crate) struct HeadlessRequest {
     /// P22-C：父任务会话 id（子代理派发时填）——台账按父任务聚合 + 取消级联
     #[serde(default)]
     pub parent_session: String,
+    /// 任务执行所在工作区（目录路径；空 = 跟随当前全局工作区）。
+    /// 非空时整轮切到该目录跑，跑完（含取消/超时后台收尾）还原全局根；
+    /// 完成会话也记在这个项目下，侧栏按项目可见。
+    #[serde(default)]
+    pub workspace: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,11 +315,25 @@ pub(crate) async fn run_headless_inner(
             None
         };
 
+    // 任务指定工作区：跑前切过去（会话也记到该项目下），跑完 Drop 还原全局根
+    let ws_override = req.workspace.trim().to_string();
+
     // 整轮（含排队追加消息的有界续跑）跑在独立任务里：取消守卫随任务生命周期，
     // 超时后任务仍在后台收尾也保持着「会话在跑」的登记——不会出现双写会话文件。
     let handle = tokio::spawn(async move {
         let cancel = run_flag.clone();
         let _run = CancelRun::from_flag(cancel_registry.clone(), &sid, run_flag);
+        // 守卫随任务生命周期：取消/超时后后台收尾期间工作区保持切换态，收尾完才还原
+        let _ws_guard = if ws_override.is_empty() {
+            None
+        } else {
+            let p = std::path::PathBuf::from(&ws_override);
+            if p.is_dir() {
+                Some(WorkspaceGuard { old: crate::tools::set_workspace_root(&p) })
+            } else {
+                None
+            }
+        };
         let mut status = "done".to_string();
         let mut error: Option<String> = None;
         let mut followups = 0u32;

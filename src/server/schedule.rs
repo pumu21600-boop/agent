@@ -46,6 +46,7 @@ pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value>
                 "memory_days": t.memory_days,
                 "session_mode": if t.session_mode.is_empty() { "new".to_string() } else { t.session_mode.clone() },
                 "session_id": t.session_id,
+                "workspace": t.workspace,
                 "approval_mode": t.approval_mode,
                 "on_approval": if t.on_approval.is_empty() { "deny".to_string() } else { t.on_approval.clone() },
                 "enabled": t.enabled,

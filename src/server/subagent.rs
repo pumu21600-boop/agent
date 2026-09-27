@@ -266,6 +266,7 @@ impl SubagentDispatcher {
                 timeout_secs: args.timeout_secs,
                 purpose: "subagent".into(),
                 parent_session: parent.to_string(),
+                workspace: String::new(),
             },
         )
         .await;

@@ -3194,6 +3194,21 @@
       (Number(t.timeout_secs) || 1800) !== 1800
     );
   }
+  // 工作区：默认跟随触发时的当前工作区；下拉里给最近项目（去重）
+  function wsLabel(w) {
+    return String(w).split(/[\\/]/).filter(Boolean).pop() || w;
+  }
+  function wsOptions() {
+    const seen = new Set();
+    const opts = [{ value: '', label: '跟随当前工作区' }];
+    for (const w of [workspace, ...recentWorkspaces]) {
+      if (w && !seen.has(w)) {
+        seen.add(w);
+        opts.push({ value: w, label: wsLabel(w) });
+      }
+    }
+    return opts;
+  }
   function previewCron() {
     clearTimeout(schedCronTimer);
     schedCronTimer = setTimeout(async () => {
@@ -3239,6 +3254,7 @@
       memory_days: '',
       session_mode: 'new',
       session_id: '',
+      workspace: '',
       approval_mode: 'auto',
       on_approval: 'deny',
       enabled: true,
@@ -3268,6 +3284,7 @@
       memory_days: Number(e.memory_days) || 3,
       session_mode: e.session_mode,
       session_id: e.session_id,
+      workspace: e.workspace || '',
       approval_mode: e.approval_mode,
       on_approval: e.on_approval,
       enabled: e.enabled !== false,
@@ -3278,8 +3295,8 @@
       schedMsg = '还没选执行时间';
       return;
     }
-    // 单次时间已过：本地直接提示，不等服务端校验
-    if (body.once_ts && body.once_ts <= Math.floor(Date.now() / 1000)) {
+    // 单次时间已过：本地直接提示，不等服务端校验（已跑完停用的任务编辑不受限，与服务端口径一致）
+    if (body.once_ts && body.enabled && body.once_ts <= Math.floor(Date.now() / 1000)) {
       schedMsg = '单次任务的时间要设在将来';
       return;
     }
@@ -3295,6 +3312,11 @@
         schedMsg = '已保存'; // 放在加载之后：loadSchedules 会清提示，顺序反了就被抹掉
       } else {
         schedMsg = `保存失败: ${r.error}`;
+        // 编辑器里挂着的任务已从列表消失（被删除/外部清掉）：关掉编辑器，说人话
+        if (String(r.error || '').includes('任务不存在')) {
+          schedEditor = null;
+          schedMsg = '这条任务已不在列表里（可能已被删除），请重新创建';
+        }
       }
     } catch (err) {
       schedMsg = `保存失败: ${err.message || err}`;
@@ -5723,6 +5745,15 @@
               <div class="mcp-cmd">到点先检索最近 {schedEditor.memory_days || 3} 天的对话，让 agent 找出要跟进的事项</div>
             {/if}
             <div class="sub-row">
+              <span class="hint">在哪儿完成</span>
+              <Select
+                value={schedEditor.workspace || ''}
+                title="工作区"
+                options={wsOptions()}
+                on:change={(e) => (schedEditor.workspace = e.detail)}
+              />
+            </div>
+            <div class="sub-row">
               <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
             </div>
             {#if schedAdvOpen}
@@ -5775,6 +5806,7 @@
                 <b>{t.name}</b>
                 {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
                 <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
+                {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>{/if}
                 <span class="flex-sp"></span>
                 <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>

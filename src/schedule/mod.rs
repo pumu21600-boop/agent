@@ -61,6 +61,10 @@ pub struct ScheduleTask {
     pub session_mode: String,
     #[serde(default)]
     pub session_id: String,
+    /// 任务执行所在工作区（目录绝对路径；空 = 跟随触发时的当前工作区）。
+    /// 非空时整轮切到该目录跑（完成会话也记在这个项目下），跑完还原全局根。
+    #[serde(default)]
+    pub workspace: String,
     /// 审批档位（透传无头会话；空 = 用 config 默认档）
     #[serde(default)]
     pub approval_mode: String,
@@ -128,6 +132,9 @@ impl ScheduleTask {
         }
         if self.session_mode == "fixed" && self.session_id.trim().is_empty() {
             return Err("固定会话模式要填会话 id".into());
+        }
+        if !self.workspace.trim().is_empty() && !std::path::Path::new(self.workspace.trim()).is_dir() {
+            return Err(format!("工作区目录不存在: {}", self.workspace.trim()));
         }
         Ok(())
     }
@@ -334,18 +341,20 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
                 },
                 purpose: "schedule".into(),
                 parent_session: String::new(),
+                workspace: task.workspace.clone(),
             };
         let result = crate::server::run_headless_inner(state.clone(), req).await;
-        let (status, detail, session_id, error, duration_ms) = match result {
+        let (status, session_id, error, duration_ms) = match result {
             Ok(r) => (
                 r.status.clone(),
-                preview(&r.answer),
                 r.session_id.clone(),
                 r.error.clone().unwrap_or_default(),
                 r.duration_ms,
             ),
-            Err((_code, msg)) => ("error".to_string(), String::new(), String::new(), msg, 0),
+            Err((_code, msg)) => ("error".to_string(), String::new(), msg, 0),
         };
+        // 通知不贴回答内容（去会话里看）；只有出错才带一句原因
+        let detail = if status == "done" { String::new() } else { error.clone() };
         // 回写任务状态（自动触发才动 last_run_ts——排期基准不能被手动跑打乱）
         write_back(
             &state,
@@ -387,12 +396,6 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             .unwrap_or_else(|e| e.into_inner())
             .remove(&task.id);
     });
-}
-
-/// 回答开头截断（通知详情用）。
-fn preview(s: &str) -> String {
-    let flat: String = s.chars().take(120).collect();
-    flat.trim().to_string()
 }
 
 /// 回写任务状态到 settings.json（自动触发才动 last_run_ts——排期基准不能被手动跑打乱）。
@@ -507,6 +510,7 @@ mod tests {
             memory_days: 0,
             session_mode: mode.into(),
             session_id: sid.into(),
+            workspace: String::new(),
             approval_mode: String::new(),
             on_approval: String::new(),
             enabled: true,
@@ -575,6 +579,16 @@ mod tests {
         t.last_run_ts = None;
         t.enabled = false;
         assert_eq!(next_run_ts(&t), None, "停用的单次任务没有下次");
+    }
+
+    /// 工作区：指定了就必须是存在的目录；空 = 跟随当前，不校验。
+    #[test]
+    fn workspace_must_exist_when_set() {
+        let mut t = task("0 9 * * *", "new", "");
+        t.workspace = "./definitely_missing_ws_dir_42".into();
+        assert!(t.validate().unwrap_err().contains("工作区目录不存在"));
+        t.workspace = String::new();
+        assert!(t.validate().is_ok());
     }
 
     /// P22-D：类型与回顾窗口的生效值（缺省 message / days 越界兜底 3）。
