@@ -5806,7 +5806,8 @@
                 <b>{t.name}</b>
                 {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
                 <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
-                {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>{/if}
+                {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
+                {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
                 <span class="flex-sp"></span>
                 <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
