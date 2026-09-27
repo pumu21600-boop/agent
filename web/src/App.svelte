@@ -3226,19 +3226,20 @@
   function newSchedule() {
     schedMsg = '';
     schedAdvOpen = false;
+    // 输入框一律留空不预填：cron/回顾天数/超时都有占位提示，留空走默认（天数缺省 3、超时缺省 1800 由服务端兜底）
     schedEditor = {
       id: '',
       name: '',
       kind: 'message',
-      cron: '0 9 * * *',
+      cron: '',
       message: '',
-      memory_days: 3,
+      memory_days: '',
       session_mode: 'new',
       session_id: '',
       approval_mode: 'auto',
       on_approval: 'deny',
       enabled: true,
-      timeout_secs: 1800,
+      timeout_secs: '',
       isNew: true,
     };
     previewCron();
@@ -3246,7 +3247,8 @@
   function editSchedule(t) {
     schedMsg = '';
     schedAdvOpen = schedAdvNonDefault(t);
-    schedEditor = { ...t, isNew: false };
+    // 0 = 走默认（超时服务端兜 1800）；回显为空 + 占位符，不显示突兀的 0
+    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '' };
     previewCron();
   }
   async function saveSchedule() {
@@ -3259,7 +3261,7 @@
       kind: e.kind || 'message',
       cron: e.cron,
       message: e.message,
-      memory_days: Number(e.memory_days) || 0,
+      memory_days: Number(e.memory_days) || 3,
       session_mode: e.session_mode,
       session_id: e.session_id,
       approval_mode: e.approval_mode,
