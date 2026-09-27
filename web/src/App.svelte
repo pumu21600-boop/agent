@@ -2227,9 +2227,10 @@
                 updMsgs(skey, (a) => a.filter((m) => m.id !== stream.asstId));
               } else if (d.turn) {
                 // 排队的消息开始跑了：气泡从「排队中」转正式 + 新开一个回答气泡
+                // （已引导过的也算命中——正常到不了这里，但收尾竞态下别让它再补一条重复气泡）
                 const adds = [];
                 for (const m of d.turn.messages || []) {
-                  const q = (sessionMsgs[skey] || []).find((x) => x.queued && x.role === 'user' && x.content === m.content);
+                  const q = (sessionMsgs[skey] || []).find((x) => (x.queued || x.steered) && x.role === 'user' && x.content === m.content);
                   if (q) updMsgs(skey, (a) => a.map((x) => (x.id === q.id ? { ...x, queued: false } : x)));
                   else adds.push({ id: nextId(), role: 'user', content: m.content });
                 }

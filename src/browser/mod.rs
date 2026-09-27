@@ -2519,17 +2519,29 @@ fn friendly_backend_error(e: &str) -> String {
         return e.to_string();
     }
     if e.contains("CDP 调用超时") {
-        // CDP 超时多半是网络等待（Chromium 连不上站点、响应迟迟不回）——
-        // 顺手带上系统代理诊断（开关关闭但客户端活着是本轮实锤的头号原因）
-        let proxy_hint = system_proxy_hint();
-        format!(
-            "访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。可以重试一次；仍不行就 close_browser 后重新打开。（{e}）{proxy_hint}"
-        )
+        timeout_error_text(e, &probe_system_proxy())
     } else if e.contains("连接已断开") || e.contains("actor 已退出") {
         format!("浏览器连接已断开：浏览器进程可能已被系统回收。重试 navigate 会自动重新拉起。（{e}）")
     } else {
         format!("浏览器暂时不可用：重试 navigate 即可，仍不行就 close_browser 后重新打开。（{e}）")
     }
+}
+
+/// CDP 超时的人话（纯函数可单测）。确诊「代理客户端活着、系统代理开关关闭」=
+/// 环境误配，重试/重开都救不了——文案必须终局（2026-09-27 用户实锤：旧文案
+/// 「可以重试一次；仍不行就 close_browser 后重新打开」在前、代理诊断缀在尾，
+/// 模型照前半句连试 close_browser + 导航又烧一分多钟）。
+fn timeout_error_text(e: &str, diag: &ProxyDiagnosis) -> String {
+    let retry_ok = !matches!(diag, ProxyDiagnosis::ClientAliveSwitchOff(_));
+    format!(
+        "访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。{}（{e}）{}",
+        if retry_ok {
+            "可以重试一次；仍不行就 close_browser 后重新打开。"
+        } else {
+            "原因已定位：本机代理客户端在运行但系统代理开关是关闭的（浏览器跟随系统代理=直连），重试和 close_browser 重开都救不了——不要再重试，直接结束本轮向用户说明：打开代理客户端的「系统代理」或 TUN 模式即可，改好后会让你重试。"
+        },
+        diagnosis_hint(diag),
+    )
 }
 
 /// 落点检查：导航结束后页面停在 chrome-error = 站点连不上（连接超时/被拒/被墙）。
@@ -2559,15 +2571,39 @@ async fn chrome_error_note_wait(tab: &WebTab, max_ms: u64) -> Option<String> {
     }
 }
 
+/// chrome-error 页的人话（纯函数可单测）。确诊代理误配时点名「重开也没用」，
+/// 别让模型照旧文案去 close_browser 折腾一轮。
 fn chrome_error_message(url: &str) -> String {
-    let hint = system_proxy_hint();
+    chrome_error_text(url, &probe_system_proxy())
+}
+
+fn chrome_error_text(url: &str, diag: &ProxyDiagnosis) -> String {
+    let diagnosed = matches!(diag, ProxyDiagnosis::ClientAliveSwitchOff(_));
+    let fix = if diagnosed {
+        "原因已定位：本机代理客户端在运行但系统代理开关是关闭的——重试和 close_browser 重开都救不了，直接结束本轮告诉用户：打开代理客户端的「系统代理」或 TUN 模式即可。"
+    } else {
+        "直接把「访问失败」告诉用户；若用户说网络已恢复，先 close_browser 重开浏览器实例再试一次。"
+    };
     format!(
-        "访问失败：页面落在浏览器错误页（{url}）——站点连不上（连接超时/被拒）。不要再重试导航，直接把「访问失败」告诉用户；若用户说网络已恢复，先 close_browser 重开浏览器实例再试一次。{hint}"
+        "访问失败：页面落在浏览器错误页（{url}）——站点连不上（连接超时/被拒）。不要再重试导航。{fix}{}",
+        diagnosis_hint(diag)
     )
 }
 
-/// 当前页 URL（导航历史取当前项；失败返回 None，不阻塞主流程）。
+/// 当前页 URL（优先 location.href——chrome 错误页的导航历史仍记原目标 URL，
+/// 只有页面自己报的 href 才是 chrome-error://，2026-09-27 实锤漏检；
+/// 求值不可用时退回导航历史）。失败返回 None，不阻塞主流程。
 async fn current_page_url(tab: &WebTab) -> Option<String> {
+    if tab.dialog.lock().await.is_none()
+        && let Ok(v) = tab
+            .cdp
+            .evaluate_in_isolated_world(ISOLATED_WORLD, "location.href")
+            .await
+        && let Some(s) = v.as_str()
+        && !s.is_empty()
+    {
+        return Some(s.to_string());
+    }
     let hist = tab
         .cdp
         .call("Page.getNavigationHistory", json!({}))
@@ -2578,26 +2614,47 @@ async fn current_page_url(tab: &WebTab) -> Option<String> {
     entries.get(idx)?.get("url")?.as_str().map(String::from)
 }
 
-/// 系统代理诊断（chrome-error 时附给模型）。真机实锤（2026-09-27）：代理客户端在跑
-/// 但「系统代理」开关关闭时，浏览器跟随系统=直连，被墙站点必超时（curl 显式走代理
-/// 却秒通）——这个组合值得点名，用户一拨开关就好。
-fn system_proxy_hint() -> String {
+/// 系统代理探测结果（chrome-error / CDP 超时的落点诊断用）。真机实锤（2026-09-27）：
+/// 代理客户端在跑但「系统代理」开关关闭时，浏览器跟随系统=直连，被墙站点必超时
+/// （curl 显式走代理却秒通）——这个组合值得点名，用户一拨开关就好。
+enum ProxyDiagnosis {
+    /// 探测不到可信结论（注册表读不到/开关关且无本地代理端口）：不带诊断
+    Silent,
+    /// 开关开着但仍不通：查分流规则
+    EnabledButBlocked,
+    /// 实锤误配：客户端活着、开关关闭——重试无解，必须用户拨开关
+    ClientAliveSwitchOff(String),
+}
+
+/// 读 HKCU 注册表 + 探本地代理端口，归入 [ProxyDiagnosis]。
+fn probe_system_proxy() -> ProxyDiagnosis {
     let Ok(out) = std::process::Command::new("reg")
         .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"])
         .creation_flags(0x0800_0000)
         .output()
     else {
-        return String::new();
+        return ProxyDiagnosis::Silent;
     };
     let (enabled, server) = parse_proxy_state(&String::from_utf8_lossy(&out.stdout));
     match (enabled, server) {
-        (true, _) => {
+        (true, _) => ProxyDiagnosis::EnabledButBlocked,
+        (false, Some(server)) if local_proxy_alive(&server) => {
+            ProxyDiagnosis::ClientAliveSwitchOff(server)
+        }
+        _ => ProxyDiagnosis::Silent,
+    }
+}
+
+/// 诊断 → 附给模型的人话（不确诊时返回空串）。
+fn diagnosis_hint(diag: &ProxyDiagnosis) -> String {
+    match diag {
+        ProxyDiagnosis::EnabledButBlocked => {
             "另外：系统代理当前已开启但仍不通——检查代理客户端的分流规则（该站点是否被分到了直连）。".to_string()
         }
-        (false, Some(server)) if local_proxy_alive(&server) => format!(
+        ProxyDiagnosis::ClientAliveSwitchOff(server) => format!(
             "另外：检测到本机代理客户端在运行（{server}）但系统代理开关是关闭的——浏览器跟随系统代理，所以直连不通的站点会超时；打开代理客户端的「系统代理」或 TUN 模式即可。"
         ),
-        _ => String::new(),
+        ProxyDiagnosis::Silent => String::new(),
     }
 }
 
@@ -3165,6 +3222,96 @@ mod tests {
         // chrome_error_note 生成的已是人话：原样透传不再二次包装
         let pass = "访问失败：页面停在浏览器错误页——不要再重试导航。";
         assert_eq!(friendly_backend_error(pass), pass);
+    }
+
+    /// 确诊「代理客户端活着、系统代理开关关闭」后文案必须终局：不许再邀请重试
+    /// （2026-09-27 用户实锤：模型照旧文案连试 close_browser + 导航，多烧一分多钟）。
+    #[test]
+    fn diagnosed_proxy_misconfig_forbids_retry() {
+        let diag = ProxyDiagnosis::ClientAliveSwitchOff("127.0.0.1:7897".into());
+        let t = timeout_error_text("CDP 调用超时: Page.navigate", &diag);
+        assert!(t.starts_with("访问超时："), "{t}");
+        assert!(t.contains("不要再重试"), "终局文案要点名不许重试：{t}");
+        assert!(t.contains("close_browser 重开都救不了"), "点名重开也没用：{t}");
+        assert!(!t.contains("可以重试一次"), "不得残留重试邀请：{t}");
+        assert!(t.contains("结束本轮"), "让模型直接结束并向用户解释：{t}");
+        // 未确诊（探测不到可信结论）时保留原来的「给出路」文案
+        let t2 = timeout_error_text("CDP 调用超时: Page.navigate", &ProxyDiagnosis::Silent);
+        assert!(t2.contains("可以重试一次"), "{t2}");
+        // chrome-error 落点同理：确诊 = 重试重开都点名救不了
+        let c = chrome_error_text("chrome-error://chromewebdata/", &diag);
+        assert!(c.contains("不要再重试导航"), "{c}");
+        assert!(c.contains("重开都救不了"), "{c}");
+        let c2 = chrome_error_text("chrome-error://chromewebdata/", &ProxyDiagnosis::Silent);
+        assert!(c2.contains("close_browser 重开浏览器实例再试一次"), "{c2}");
+    }
+
+    /// 进程内 CDP mock：按方法回固定响应（evaluate_ok=false 时 Runtime.evaluate 回
+    /// CDP 错误，触发客户端清缓存重试 + 回退导航历史——覆盖两条取源路径）。
+    async fn spawn_mock_cdp(evaluate_ok: bool) -> String {
+        use futures_util::StreamExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = l.accept().await else { break };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else { break };
+                loop {
+                    let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt))) = ws.next().await
+                    else { break };
+                    let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
+                    let Some(id) = v.get("id").and_then(Value::as_u64) else { continue };
+                    let method = v.get("method").and_then(Value::as_str).unwrap_or("");
+                    // (是否成功, 载荷)：失败按真实 CDP 语法走顶层 error（客户端的清缓存
+                    // 重试路径依赖真实错误形态，mock 不忠实就测不出回退路径）
+                    let (ok, payload): (bool, Value) = match method {
+                        "Page.getFrameTree" => (true, json!({ "frameTree": { "frame": { "id": "F1" } } })),
+                        "Page.createIsolatedWorld" => (true, json!({ "executionContextId": 7 })),
+                        "Runtime.evaluate" if evaluate_ok => {
+                            (true, json!({ "result": { "value": "chrome-error://chromewebdata/" } }))
+                        }
+                        "Page.getNavigationHistory" => (true, json!({
+                            "currentIndex": 0,
+                            "entries": [ { "url": "https://www.google.com/" } ]
+                        })),
+                        // Runtime.evaluate 失败形态（求值不可用场景）
+                        _ => (false, json!({ "message": "Execution context was destroyed", "data": "" })),
+                    };
+                    let body = if ok {
+                        json!({ "id": id, "result": payload })
+                    } else {
+                        json!({ "id": id, "error": payload })
+                    };
+                    let _ = futures_util::SinkExt::send(
+                        &mut ws,
+                        tokio_tungstenite::tungstenite::Message::Text(body.to_string()),
+                    )
+                    .await;
+                }
+            }
+        });
+        format!("ws://127.0.0.1:{port}/devtools/page/MOCK")
+    }
+
+    /// 错误页 URL 取源（2026-09-27 实锤漏检）：chrome 错误页的导航历史仍记**原目标 URL**，
+    /// 只有页面自己报的 location.href 才是 chrome-error://——旧实现只看导航历史，
+    /// `chrome_error_note` 永远探不到错误页，navigate 把错误页快照当成功（ok:true）返回。
+    #[tokio::test]
+    async fn current_page_url_prefers_location_href() {
+        // 场景一：求值可用 → location.href 胜出（导航历史给的是 google.com）
+        let ws = spawn_mock_cdp(true).await;
+        let cdp = cdp::Cdp::connect(&ws).await.unwrap();
+        let tab = WebTab::new("T1".into(), true, cdp, None);
+        let url = current_page_url(&tab).await.unwrap();
+        assert_eq!(url, "chrome-error://chromewebdata/", "必须取页面自报的 href");
+        let note = chrome_error_note(&tab).await;
+        assert!(note.is_some_and(|n| n.contains("不要再重试导航")), "错误页必须被识别成落点失败");
+        // 场景二：求值不可用（弹窗/页面楔死）→ 回退导航历史，与旧版行为一致
+        let ws2 = spawn_mock_cdp(false).await;
+        let cdp2 = cdp::Cdp::connect(&ws2).await.unwrap();
+        let tab2 = WebTab::new("T2".into(), true, cdp2, None);
+        let url2 = current_page_url(&tab2).await.unwrap();
+        assert_eq!(url2, "https://www.google.com/");
     }
 
     /// 系统代理解析：reg query 输出 → (开关, 地址)；分号形态的 ProxyServer 也能取。

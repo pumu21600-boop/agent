@@ -44,7 +44,8 @@ pub enum AgentEvent {
     /// P9 B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
     PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
     /// N1/025 运行中追加消息（steering）：这些用户消息已并入本轮对话（模型下一步可见），
-    /// server 收到即转前端补气泡 + 落盘。
+    /// server 收到即转前端补气泡 + 落盘。取走点有两个：每步决策前（take_steering）+
+    /// 最终回答落地后（补流式输出期间到达的，见主循环 027 补口）。
     Steer { messages: Vec<Value> },
 }
 
@@ -482,6 +483,8 @@ pub async fn run_task(
     };
     // P6 自动交接：本任务内只触发一次
     let mut handoff_done = false;
+    // 会话标题素材：本任务第一次最终回答（引导续跑后不从「好的已结束」生成标题）
+    let mut title_source: Option<String> = None;
 
     // A3 能力标记「工具调用」闭环（施工单 012）：capabilities.tools=false 时不携带 tools
     // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
@@ -756,6 +759,28 @@ pub async fn run_task(
             }
             msgs.push(final_msg);
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            // 标题素材取本任务**第一次**最终回答：引导续跑后的「好的，已结束」不该当会话标题
+            if title_source.is_none() {
+                title_source = Some(final_text.clone());
+            }
+            // 027 补口（2026-09-27 用户实锤）：决策点只在每步模型调用**之前**，「立即发送」
+            // 若在最终回答流式输出期间到达，会错过全部决策点——按旧逻辑直接收尾，这条引导
+            // 被服务层收尾 drain_all 捡去当 followup 另起一轮（用户看到自己没再说话却多出
+            // 一轮「好的，已结束」）。最终回答落地后再取一次：有引导就并进本轮继续（不丢
+            // 已流出的回答，模型下一步就看到），没有才是真的结束。
+            let steer = gate.take_steering();
+            if !steer.is_empty() {
+                let added: Vec<Value> =
+                    steer.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "steer", "phase": "post_answer", "count": added.len(), "step": step }),
+                );
+                msgs.extend(added.iter().cloned());
+                on_event(AgentEvent::Steer { messages: added });
+                on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                continue;
+            }
             emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             observability::event(
                 EventType::State,
@@ -765,7 +790,7 @@ pub async fn run_task(
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
             // P8 TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
             if let Some(tch) = &channels.title
-                && let Some(title) = generate_title(gateway, tch, &final_text, &sid).await {
+                && let Some(title) = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid).await {
                     observability::event(
                         EventType::State,
                         json!({ "kind": "session.titled", "title": title }),
