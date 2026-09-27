@@ -21,13 +21,14 @@ use serde_json::{Value, json};
 use crate::core::cancel::CancelFlag;
 use crate::observability::{self, EventType};
 
+pub mod anthropic;
 pub mod compat;
 pub mod effort;
 pub mod providers;
 pub mod replay;
 pub mod tags;
 
-use compat::{Compat, ThinkingFormat};
+use compat::{Compat, Protocol, ThinkingFormat};
 use providers::ProviderPreset;
 use tags::TagSplit;
 
@@ -38,6 +39,9 @@ pub struct Gateway {
     client: RwLock<reqwest::Client>,
     /// 本地限流（P8）：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
     throttle: Option<Throttle>,
+    /// P23 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
+    /// 这里记下「base_url|model」，后续请求直接不发思考字段（每轮渠道组装时出人话提示）。
+    thinking_degraded: RwLock<std::collections::HashSet<String>>,
 }
 
 /// 请求参数（P9）：全部可选，None=不发字段走渠道默认。
@@ -115,6 +119,11 @@ pub fn build_body_with_compat(
     tools: Option<&Value>,
     compat: &Compat,
 ) -> Value {
+    // Anthropic Messages 协议（P23）：请求体形状完全不同，交给专用适配器；
+    // 响应侧同样由适配器合成为 OpenAI 分片，下游零感知
+    if compat.protocol == Protocol::AnthropicMessages {
+        return anthropic::build_body(model, messages, stream, params, tools);
+    }
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -343,12 +352,17 @@ fn record_usage(ctx: &UsageCtx, base_url: &str, provider_id: Option<&str>, model
 }
 
 /// 从非流式响应里取 usage 三路（prompt / completion / cached；渠道不回 usage 时全 0）。
+/// 字段兼容：OpenAI 系 / DeepSeek 系 / Anthropic（input_tokens、output_tokens、cache_read_input_tokens）。
 fn usage_triple(data: &Value) -> (u64, u64, u64) {
     let u = match data.get("usage") {
         Some(u) => u,
         None => return (0, 0, 0),
     };
-    let p = u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let p = u
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("input_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
     let c = u
         .get("completion_tokens")
         .and_then(Value::as_u64)
@@ -358,6 +372,7 @@ fn usage_triple(data: &Value) -> (u64, u64, u64) {
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
         .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
     (p, c, k)
 }
@@ -376,7 +391,32 @@ pub enum ChatOutcome {
 
 impl Gateway {
     pub fn new() -> Self {
-        Self { client: RwLock::new(build_client()), throttle: None }
+        Self { client: RwLock::new(build_client()), throttle: None, thinking_degraded: RwLock::new(std::collections::HashSet::new()) }
+    }
+
+    /// 该渠道（base_url|model）是否已被登记为「端点拒收思考参数」。
+    pub fn thinking_is_degraded(&self, base_url: &str, model: &str) -> bool {
+        self.thinking_degraded
+            .read()
+            .map(|s| s.contains(&Self::degrade_key(base_url, model)))
+            .unwrap_or(false)
+    }
+
+    fn mark_thinking_degraded(&self, base_url: &str, model: &str) {
+        if let Ok(mut s) = self.thinking_degraded.write() {
+            s.insert(Self::degrade_key(base_url, model));
+        }
+    }
+
+    fn degrade_key(base_url: &str, model: &str) -> String {
+        format!("{}|{}", base_url.trim(), model.trim())
+    }
+
+    /// 请求体是否携带思考字段（两协议：thinking 对象 / enable_thinking / reasoning_effort / 聊天模板）。
+    fn body_has_thinking_params(body: &Value) -> bool {
+        ["thinking", "enable_thinking", "reasoning_effort", "chat_template_kwargs"]
+            .iter()
+            .any(|k| body.get(*k).is_some())
     }
 
     /// 打开本地限流（P8）：max_rpm>0 时生效。启动时由 main 配置一次（Arc 包装前）。
@@ -476,14 +516,41 @@ impl Gateway {
         }
     }
 
+    /// 按协议取对话端点 URL：OpenAI /chat/completions；Anthropic /v1/messages（P23）。
+    fn request_url(base_url: &str, protocol: Protocol) -> String {
+        match protocol {
+            Protocol::OpenAiCompletions => Self::chat_url(base_url),
+            Protocol::AnthropicMessages => anthropic::messages_url(base_url),
+        }
+    }
+
+    /// 按协议挂鉴权：OpenAI Authorization Bearer；Anthropic x-api-key + anthropic-version（P23）。
+    fn auth(rb: reqwest::RequestBuilder, api_key: &str, protocol: Protocol) -> reqwest::RequestBuilder {
+        match protocol {
+            Protocol::OpenAiCompletions => rb.bearer_auth(api_key),
+            Protocol::AnthropicMessages => rb
+                .header("x-api-key", api_key)
+                .header("anthropic-version", anthropic::ANTHROPIC_VERSION),
+        }
+    }
+
     /// GET {base}/models → 模型 id 列表（OpenAI 兼容）。
     pub async fn list_models(&self, base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
-        let url = Self::models_url(base_url);
+        // Anthropic /v1/models 的 data[].id 与 OpenAI 同形，仅 URL 与鉴权头不同（P23）
+        let protocol = if anthropic::is_anthropic_endpoint(None, Some(base_url)) {
+            Protocol::AnthropicMessages
+        } else {
+            Protocol::OpenAiCompletions
+        };
+        let url = match protocol {
+            Protocol::AnthropicMessages => anthropic::models_url(base_url),
+            Protocol::OpenAiCompletions => Self::models_url(base_url),
+        };
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": json!(null) }));
         observability::debug(&format!("[gateway] GET {url}"));
 
         let response = self
-            .send(|c| c.get(&url).bearer_auth(api_key))
+            .send(|c| Self::auth(c.get(&url), api_key, protocol))
             .await
             .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
 
@@ -527,16 +594,25 @@ impl Gateway {
         params: &ChatParams,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
-        let url = Self::chat_url(base_url);
         let compat = compat::resolve(
             params.provider_id.as_deref(),
             params.base_url.as_deref().or(Some(base_url.trim())),
             model,
             params.thinking_format,
         );
+        let url = Self::request_url(base_url, compat.protocol);
+        // P23 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        let degraded = self.thinking_is_degraded(base_url, model);
+        let eff_params = if degraded {
+            let mut p = params.clone();
+            p.thinking = None;
+            p
+        } else {
+            params.clone()
+        };
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
-        let body = build_body_with_compat(model, &outgoing, false, params, None, &compat);
+        let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat);
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "aux" }));
         // 红线1（P21）：花费上限硬闸——辅助调用与主流程同一道闸
         if let Some(msg) = crate::usage::cap_block() {
@@ -546,8 +622,8 @@ impl Gateway {
             );
             return Err(anyhow!(msg));
         }
-        let response = match self
-            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
+        let mut response = match self
+            .send(|c| Self::auth(c.post(&url), api_key, compat.protocol).json(&body))
             .await
         {
             Ok(r) => r,
@@ -556,6 +632,38 @@ impl Gateway {
                 return Err(anyhow!("请求渠道失败: {url}"));
             }
         };
+        // P23 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
+        if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.thinking_degrade_retry", "status": 400, "url": url, "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_params = {
+                let mut p = params.clone();
+                p.thinking = None;
+                p
+            };
+            let retry_body = build_body_with_compat(model, &outgoing, false, &retry_params, None, &compat);
+            response = match self
+                .send(|c| Self::auth(c.post(&url), api_key, compat.protocol).json(&retry_body))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!("请求渠道失败: {url}"));
+                }
+            };
+            if response.status().is_success() {
+                self.mark_thinking_degraded(base_url, model);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.thinking_degraded", "url": url, "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
+                );
+            }
+        }
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -571,11 +679,27 @@ impl Gateway {
         // 台账：usage 三路分计量（渠道不回 usage 时记 0，请求与延迟照记）
         let (p, c, k) = usage_triple(&data);
         record_usage(ctx, base_url, params.provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok((p, c, k)));
-        let raw = data
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // 取正文：Anthropic content[] 拼 text 块（思考走独立块不混正文）；OpenAI choices[0].message.content
+        let raw = match compat.protocol {
+            Protocol::AnthropicMessages => data
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                        .collect::<String>()
+                })
+                .unwrap_or_default(),
+            Protocol::OpenAiCompletions => data
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        };
+        if compat.protocol == Protocol::AnthropicMessages {
+            return Ok(raw);
+        }
         // 反代 <think> 当正文吐：剥离标签，摘要只要正文
         let mut ts = TagSplit::default();
         let (_, mut clean) = ts.feed(&raw);
@@ -690,21 +814,31 @@ impl Gateway {
             return Ok(ChatOutcome::Cancelled);
         }
 
-        let url = Self::chat_url(base_url);
         let compat = compat::resolve(
             channel.params.provider_id.as_deref(),
             Some(base_url.trim()),
             &channel.model,
             channel.params.thinking_format,
         );
+        let url = Self::request_url(base_url, compat.protocol);
+        // P23 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        let degraded = self.thinking_is_degraded(base_url, model);
+        let eff_params = if degraded {
+            let mut p = channel.params.clone();
+            p.thinking = None;
+            p
+        } else {
+            channel.params.clone()
+        };
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
-        let body = build_body_with_compat(model, &outgoing, true, &channel.params, tools, &compat);
+        let body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
         observability::event(
             EventType::State,
             json!({ "kind": "gateway.request", "url": url, "body": body, "reasoning": {
+                "protocol": compat.protocol.as_str(),
                 "thinking_format": compat.thinking_format.as_str(),
                 "thinking": channel.params.thinking,
             } }),
@@ -712,8 +846,8 @@ impl Gateway {
         observability::debug(&format!("[gateway] POST {url}"));
         observability::debug(&format!("[gateway] request body: {body}"));
 
-        let response = match self
-            .send(|c| c.post(&url).bearer_auth(&channel.api_key).json(&body))
+        let mut response = match self
+            .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body))
             .await
         {
             Ok(r) => r,
@@ -722,6 +856,39 @@ impl Gateway {
                 return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
             }
         };
+
+        // P23 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
+        if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.thinking_degrade_retry", "status": 400, "url": url, "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_params = {
+                let mut p = channel.params.clone();
+                p.thinking = None;
+                p
+            };
+            let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat);
+            response = match self
+                .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
+                }
+            };
+            if response.status().is_success() {
+                self.mark_thinking_degraded(base_url, model);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.thinking_degraded", "url": url, "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
+                );
+            }
+        }
 
         let status = response.status();
         observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
@@ -736,17 +903,16 @@ impl Gateway {
             return Err(anyhow!("渠道返回 {status}: {text}"));
         }
 
-        // —— SSE 解析：按行切，data: 前缀取 JSON，[DONE] 结束；聚合 content/reasoning/tool_calls ——
+        // —— SSE 解析：按行切，data: 前缀取 JSON；聚合 content/reasoning/tool_calls ——
         // 分片间 120s 无数据即报错（渠道/代理断流时不再干等总超时 600s）
         const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let mut stream = response.bytes_stream();
         let mut buf = String::new();
-        let mut chunk_count: u64 = 0;
         let mut done = false;
-        let mut turn = AssistantTurn::default();
-        let mut calls: Vec<ToolCall> = Vec::new();
-        // 反代把思考当正文吐（14 种标签，对齐 OpenClaw REASONING_TAG_NAMES）：剥离状态机
-        let mut think_split = TagSplit::default();
+        let mut agg = StreamAgg::new();
+        // Anthropic 协议（P23）：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
+        let mut translator = anthropic::SseTranslator::default();
+        let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
         loop {
             let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
                 Ok(item) => item,
@@ -761,92 +927,53 @@ impl Gateway {
                 if line.is_empty() {
                     continue;
                 }
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() {
+                // event: 行直接忽略——Anthropic data 自带 type，OpenAI 只认 data:
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if !is_anthropic && data == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let mut chunk: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("解析 SSE 分片失败: {e}"), "raw": data }),
+                        );
                         continue;
                     }
-                    if data == "[DONE]" {
-                        done = true;
-                        break;
-                    }
-                    let mut chunk: Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            observability::event(
-                                EventType::Error,
-                                json!({ "message": format!("解析 SSE 分片失败: {e}"), "raw": data }),
-                            );
-                            continue;
+                };
+                // 每个分片前查取消标志
+                if cancel.is_set() {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                    return Ok(ChatOutcome::Cancelled);
+                }
+                if is_anthropic {
+                    match translator.translate(&chunk) {
+                        Ok(anthropic::Translated::Chunk(mut synthetic)) => {
+                            agg.feed(&mut synthetic, data);
+                            on_chunk(&synthetic);
                         }
-                    };
-                    // 每个分片前查取消标志
-                    if cancel.is_set() {
-                        observability::event(
-                            EventType::State,
-                            json!({ "kind": "cancel", "phase": "streaming", "chunks": chunk_count }),
-                        );
-                        record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
-                        return Ok(ChatOutcome::Cancelled);
-                    }
-                    // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
-                    // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示 + P21 台账分计量）
-                    if let Some(u) = chunk.get("usage")
-                        && let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64) {
-                            turn.prompt_tokens = Some(p);
-                            turn.completion_tokens = u
-                                .get("completion_tokens")
-                                .and_then(Value::as_u64)
-                                .or_else(|| u.get("output_tokens").and_then(Value::as_u64));
-                            turn.cached_tokens = u
-                                .pointer("/prompt_tokens_details/cached_tokens")
-                                .and_then(Value::as_u64)
-                                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+                        Ok(anthropic::Translated::Done) => {
+                            done = true;
+                            break;
                         }
-                    let mut delta = extract_delta(&chunk);
-                    // 反代思考标签剥离：标签内文字改道思考通道；
-                    // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
-                    if !delta.content.is_empty() {
-                        let (think, clean) = think_split.feed(&delta.content);
-                        if !think.is_empty() || clean.len() != delta.content.len() {
-                            if !think.is_empty() {
-                                delta.reasoning = Some(match delta.reasoning.take() {
-                                    Some(r) => format!("{r}{think}"),
-                                    None => think,
-                                });
-                            }
-                            delta.content = clean.clone();
-                            if let Some(d) = chunk.pointer_mut("/choices/0/delta") {
-                                d["content"] = json!(clean);
-                                if let Some(r) = &delta.reasoning {
-                                    d["reasoning_content"] = json!(r);
-                                }
-                            }
+                        Ok(anthropic::Translated::Ignore) => {}
+                        Err(msg) => {
+                            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("渠道流式错误: {msg}")));
+                            anyhow::bail!("渠道流式错误: {msg}");
                         }
                     }
-                    let mut payload = json!({ "raw": data, "content": delta.content });
-                    if let Some(r) = &delta.reasoning {
-                        payload["reasoning_content"] = json!(r);
-                    }
-                    if let Some(f) = &delta.finish {
-                        payload["finish_reason"] = json!(f);
-                        turn.finish_reason = Some(f.clone());
-                    }
-                    let tc_arr = chunk
-                        .pointer("/choices/0/delta/tool_calls")
-                        .and_then(Value::as_array)
-                        .cloned();
-                    if let Some(arr) = &tc_arr {
-                        payload["tool_calls"] = json!(arr);
-                        accumulate_tool_calls(arr, &mut calls);
-                    }
-                    turn.content.push_str(&delta.content);
-                    if let Some(r) = &delta.reasoning {
-                        turn.reasoning.push_str(r);
-                    }
-                    observability::event(EventType::ModelChunk, payload);
-                    observability::debug(&format!("[gateway] sse: {data}"));
-                    chunk_count += 1;
+                } else {
+                    agg.feed(&mut chunk, data);
                     on_chunk(&chunk);
                 }
             }
@@ -854,11 +981,8 @@ impl Gateway {
                 break;
             }
         }
-        // 流结束：hold 里若剩半截标签（如截断在 "<thi"），按当前通道归位
-        let (tail_think, tail_content) = think_split.finish();
-        turn.reasoning.push_str(&tail_think);
-        turn.content.push_str(&tail_content);
-        turn.tool_calls = calls;
+        agg.finish();
+        let turn = agg.turn;
         // P21 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
         record_usage(
             ctx,
@@ -874,9 +998,96 @@ impl Gateway {
         );
         observability::event(
             EventType::State,
-            json!({ "kind": "gateway.stream_end", "chunks": chunk_count, "done": done, "tool_calls": turn.tool_calls.len() }),
+            json!({ "kind": "gateway.stream_end", "chunks": agg.chunk_count, "done": done, "tool_calls": turn.tool_calls.len() }),
         );
         Ok(ChatOutcome::Done(turn))
+    }
+}
+
+/// 流式分片聚合器（P23 从 stream_chat 抽出）：一个 OpenAI 形状分片进，
+/// usage/思考剥离/tool_calls 增量聚合、model_chunk 事件、干净分片出。
+/// Anthropic 协议的合成 OpenAI 分片走同一入口，下游零分叉。
+struct StreamAgg {
+    turn: AssistantTurn,
+    calls: Vec<ToolCall>,
+    think_split: TagSplit,
+    chunk_count: u64,
+}
+
+impl StreamAgg {
+    fn new() -> Self {
+        Self { turn: AssistantTurn::default(), calls: Vec::new(), think_split: TagSplit::default(), chunk_count: 0 }
+    }
+
+    /// 处理一个分片：raw/data 原文 + OpenAI 形状 chunk（可变，思考剥离会写回）。
+    fn feed(&mut self, chunk: &mut Value, data: &str) {
+        // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
+        // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示 + P21 台账分计量）
+        if let Some(u) = chunk.get("usage")
+            && let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64)
+        {
+            self.turn.prompt_tokens = Some(p);
+            self.turn.completion_tokens = u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("output_tokens").and_then(Value::as_u64));
+            self.turn.cached_tokens = u
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+        }
+        let mut delta = extract_delta(chunk);
+        // 反代思考标签剥离：标签内文字改道思考通道；
+        // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
+        if !delta.content.is_empty() {
+            let (think, clean) = self.think_split.feed(&delta.content);
+            if !think.is_empty() || clean.len() != delta.content.len() {
+                if !think.is_empty() {
+                    delta.reasoning = Some(match delta.reasoning.take() {
+                        Some(r) => format!("{r}{think}"),
+                        None => think,
+                    });
+                }
+                delta.content = clean.clone();
+                if let Some(d) = chunk.pointer_mut("/choices/0/delta") {
+                    d["content"] = json!(clean);
+                    if let Some(r) = &delta.reasoning {
+                        d["reasoning_content"] = json!(r);
+                    }
+                }
+            }
+        }
+        let mut payload = json!({ "raw": data, "content": delta.content });
+        if let Some(r) = &delta.reasoning {
+            payload["reasoning_content"] = json!(r);
+        }
+        if let Some(f) = &delta.finish {
+            payload["finish_reason"] = json!(f);
+            self.turn.finish_reason = Some(f.clone());
+        }
+        let tc_arr = chunk
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+            .cloned();
+        if let Some(arr) = &tc_arr {
+            payload["tool_calls"] = json!(arr);
+            accumulate_tool_calls(arr, &mut self.calls);
+        }
+        self.turn.content.push_str(&delta.content);
+        if let Some(r) = &delta.reasoning {
+            self.turn.reasoning.push_str(r);
+        }
+        observability::event(EventType::ModelChunk, payload);
+        observability::debug(&format!("[gateway] sse: {data}"));
+        self.chunk_count += 1;
+    }
+
+    /// 流结束：hold 里若剩半截标签（如截断在 "<thi"），按当前通道归位；tool_calls 落位。
+    fn finish(&mut self) {
+        let (tail_think, tail_content) = self.think_split.finish();
+        self.turn.reasoning.push_str(&tail_think);
+        self.turn.content.push_str(&tail_content);
+        self.turn.tool_calls = std::mem::take(&mut self.calls);
     }
 }
 
@@ -961,6 +1172,10 @@ mod tests {
     fn build_body_vendor_styles() {
         // REGISTRY 是进程级 OnceLock：测试进程里手动加载一次（幂等）
         let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
+        // P23 预设收敛后旧预设 id 已下架：契约知识保留在端点探测，手工构造探测线索验证
+        fn legacy(id: &str) -> ChatParams {
+            ChatParams { provider_id: Some(id.into()), ..Default::default() }
+        }
         let msgs = json!([{"role":"user","content":"hi"}]);
         // 智谱（zai 格式，端点探测出）：on/off 对象形态；档位无意义，非 off 一律 enabled
         let mut p = ChatParams::from_preset(crate::gateway::providers::find("zhipu").unwrap());
@@ -976,13 +1191,13 @@ mod tests {
         p.thinking = Some("high".into());
         let b = build_body("glm-4.6", &msgs, true, &p, None);
         assert_eq!(b["thinking"], json!({"type":"enabled"}), "档位对对象格式无意义");
-        // 豆包（预设 zai 覆盖）：ark 域名探测不出，靠 providers.json 兜底
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("doubao").unwrap());
+        // 豆包（旧预设 id，契约知识保留在端点探测）：provider_id 直判 Zai
+        let mut p = legacy("doubao");
         p.thinking = Some("on".into());
         let b = build_body("doubao-seed-1.6", &msgs, true, &p, None);
         assert_eq!(b["thinking"], json!({"type":"enabled"}));
-        // 混元（预设 qwen 覆盖）：顶层布尔
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("hunyuan").unwrap());
+        // 混元（旧预设 id）：provider_id 直判 qwen 形态，顶层布尔
+        let mut p = legacy("hunyuan");
         p.thinking = Some("off".into());
         let b = build_body("hunyuan-turbos-latest", &msgs, false, &p, None);
         assert_eq!(b["enable_thinking"], json!(false));
@@ -997,7 +1212,7 @@ mod tests {
         assert_eq!(b["thinking"], json!({"type":"enabled"}));
         assert!(b.get("reasoning_effort").is_none(), "deepseek 格式 supports_reasoning_effort=false");
         // OpenAI（openai 格式）：on→medium；low/medium/high 原样；off 不发（o 系无可靠关参数）
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap());
+        let mut p = legacy("openai");
         p.thinking = Some("on".into());
         let b = build_body("gpt-5", &msgs, true, &p, None);
         assert_eq!(b["reasoning_effort"], json!("medium"));
@@ -1013,25 +1228,32 @@ mod tests {
         let b = build_body("gpt-5", &msgs, true, &p, None);
         assert!(b.get("reasoning_effort").is_none(), "off 无参数可发时不发");
         // GPT-5 新系 max_tokens 字段切换
-        let p = ChatParams { max_tokens: Some(1024), ..ChatParams::from_preset(crate::gateway::providers::find("openai").unwrap()) };
+        let p = ChatParams { max_tokens: Some(1024), ..legacy("openai") };
         let b = build_body("gpt-5", &msgs, true, &p, None);
         assert!(b.get("max_tokens").is_none() && b["max_completion_tokens"] == json!(1024));
         let b = build_body("gpt-4o-mini", &msgs, true, &p, None);
         assert_eq!(b["max_tokens"], json!(1024));
         // 本地（qwen-chat-template）：chat_template_kwargs.enable_thinking
-        let mut p = ChatParams::from_preset(crate::gateway::providers::find("ollama").unwrap());
+        let mut p = legacy("ollama");
         p.thinking = Some("on".into());
         let b = build_body("qwen3:8b", &msgs, true, &p, None);
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(true));
         p.thinking = Some("off".into());
         let b = build_body("qwen3:8b", &msgs, true, &p, None);
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], json!(false));
-        // 自定义中转（端点认不出 → openai 格式）
-        let p = ChatParams::from_preset(crate::gateway::providers::find("custom").unwrap());
-        let mut p = p;
+        // OpenAI 兼容（自定义端点预设；端点认不出 → openai 格式）
+        let mut p = ChatParams::from_preset(crate::gateway::providers::find("openai_compat").unwrap());
         p.thinking = Some("high".into());
         let b = build_body("mystery-model", &msgs, true, &p, None);
         assert_eq!(b["reasoning_effort"], json!("high"));
+        // Anthropic 协议（P23）：build_body 入口直接产出 Messages 形状（system 顶层/max_tokens 必填/无 stream_options）
+        let mut p = legacy("anthropic");
+        p.thinking = Some("on".into());
+        p.max_tokens = Some(8192);
+        let b = build_body("claude-sonnet-4-5", &msgs, true, &p, None);
+        assert_eq!(b["max_tokens"], json!(8192));
+        assert!(b.get("stream_options").is_none(), "Anthropic 不带 OpenAI stream_options");
+        assert_eq!(b["thinking"]["type"], json!("enabled"), "思考开 → thinking 对象（预算见 anthropic 模块测试）");
         // 默认不发任何思考参数（无论 None、空串、全空格，全网关均不产生任何思考字段）
         for empty in [None, Some("".to_string()), Some("   ".to_string())] {
             let mut p = ChatParams::from_preset(crate::gateway::providers::find("deepseek").unwrap());
@@ -1039,7 +1261,7 @@ mod tests {
             let b = build_body("deepseek-v4-flash", &msgs, true, &p, None);
             assert!(b.get("thinking").is_none() && b.get("reasoning_effort").is_none(), "DeepSeek 默认不注入参数");
 
-            let mut p = ChatParams::from_preset(crate::gateway::providers::find("qwen").unwrap());
+            let mut p = legacy("qwen");
             p.thinking = empty.clone();
             let b = build_body("qwen3.8-flash", &msgs, true, &p, None);
             assert!(b.get("enable_thinking").is_none() && b.get("thinking").is_none(), "Qwen 默认不注入参数");

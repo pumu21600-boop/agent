@@ -68,28 +68,23 @@ mod tests {
     #[test]
     fn presets_parse_with_thinking_format() {
         let ps = load_test();
-        assert!(ps.len() >= 18, "官方网关 13 家 + 本地/自定义 5 家，实际 {}", ps.len());
-        for id in [
-            "deepseek", "qwen", "ernie", "spark", "moonshot", "zhipu", "minimax", "doubao",
-            "hunyuan", "openai", "anthropic", "gemini", "xai", "ollama", "lmstudio", "mnn",
-            "llamacpp", "custom",
-        ] {
+        // P23 预设收敛（用户拍板）：OpenAI 兼容 / Anthropic / DeepSeek / StepFun / GLM 五个。
+        // 被移除的旧预设 id 的契约知识保留在 compat 端点探测里，老渠道照常工作。
+        assert_eq!(ps.len(), 5, "预设收敛后应是五个，实际 {}", ps.len());
+        for id in ["openai_compat", "anthropic", "deepseek", "stepfun", "zhipu"] {
             assert!(ps.iter().any(|p| p.id == id), "缺预设 {id}");
         }
-        // 本地/自定义 key 可空
-        for local in ["ollama", "lmstudio", "mnn", "llamacpp", "custom"] {
+        // OpenAI 兼容（自定义端点）key 可空（覆盖本地推理服务等无 key 场景），其余四家必填
+        assert!(ps.iter().find(|p| p.id == "openai_compat").unwrap().key_optional);
+        for required in ["anthropic", "deepseek", "stepfun", "zhipu"] {
             assert!(
-                ps.iter().find(|p| p.id == local).unwrap().key_optional,
-                "{local} 应 key 可空"
+                !ps.iter().find(|p| p.id == required).unwrap().key_optional,
+                "{required} 应 key 必填"
             );
         }
-        // thinking_format 只给端点域名认不出的厂商兜底（豆包官方域名带 ark.* 看不出 GLM 式）
-        let doubao = ps.iter().find(|p| p.id == "doubao").unwrap();
-        assert_eq!(doubao.thinking_format, Some(ThinkingFormat::Zai), "豆包 Seed 思考=GLM 式 thinking 对象");
-        // 官方域名可探测的厂商不写覆盖（数据驱动交给探测）
-        for probeable in ["deepseek", "zhipu", "qwen", "openai"] {
-            let p = ps.iter().find(|p| p.id == probeable).unwrap();
-            assert_eq!(p.thinking_format, None, "{probeable} 官方域名可探测，不写覆盖");
+        // 全部不写 thinking_format 覆盖：思考形态交给端点探测/协议维度判定
+        for p in &ps {
+            assert_eq!(p.thinking_format, None, "{} 官方域名可探测，不写覆盖", p.id);
         }
     }
 

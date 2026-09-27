@@ -110,6 +110,25 @@ http
             browseUrl ||
             cleaning ||
             (!hasToolMsg && /读|编辑|插件搜索/.test(lastText)));
+        // P23 降级剧本：「降级」= 请求带思考字段（thinking/enable_thinking/reasoning_effort/
+        // chat_template_kwargs）就 400 拒收；剥参重试（不带思考字段）才 200——验证网关
+        // 「400 → 剥参重试 → 登记渠道 → 下一轮人话提示」全链路
+        if (/降级/.test(lastText)) {
+          const hasThinking = ['thinking', 'enable_thinking', 'reasoning_effort', 'chat_template_kwargs'].some(
+            (k) => Object.prototype.hasOwnProperty.call(parsed, k)
+          );
+          if (hasThinking) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'Unknown parameter: thinking is not supported by this endpoint' } }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+          sendSSE(res, { choices: [{ index: 0, delta: { content: '剥参重试成功：这轮没带思考字段。' } }] });
+          sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -250,6 +269,85 @@ http
             }
           }, 120);
         }
+      });
+    } else if (req.method === 'POST' && req.url.includes('/messages')) {
+      // P23 Anthropic Messages 协议 mock：请求按 Messages 形状解析（system 顶层 / content 块 /
+      // tool_use·tool_result / input_schema），响应按官方 SSE 事件流吐出
+      // （message_start → thinking/text/tool_use 块 → message_delta → message_stop）。
+      // 最终回答带「翻译回声」：收到的 tool_result 数量与内容、system 长度——
+      // 断言网关真的把 OpenAI 会话形状翻译成了 Messages 形状，而不是碰巧跑通。
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        console.log('[mock-anthropic] request body:', body);
+        const parsed = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        const ev = (name, obj) => res.write(`event: ${name}\ndata: ${JSON.stringify(obj)}\n\n`);
+        let blockIdx = -1;
+        const startBlock = (obj) => {
+          blockIdx += 1;
+          ev('content_block_start', { type: 'content_block_start', index: blockIdx, content_block: obj });
+          return blockIdx;
+        };
+        const stopBlock = () => ev('content_block_stop', { type: 'content_block_stop', index: blockIdx });
+        ev('message_start', {
+          type: 'message_start',
+          message: { usage: { input_tokens: 42, cache_read_input_tokens: 8 } },
+        });
+        const msgs = parsed.messages || [];
+        const blockText = (m) =>
+          Array.isArray(m.content)
+            ? m.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
+            : m.content || '';
+        const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
+        const lastText = blockText(lastUser || {});
+        // 网关翻译正确性回声：tool_result 块（挂在 user 消息上）与 system 顶层参数
+        const toolResults = [];
+        for (const m of msgs) {
+          if (m.role === 'user' && Array.isArray(m.content)) {
+            for (const b of m.content) if (b.type === 'tool_result') toolResults.push(b);
+          }
+        }
+        const hasToolsParam = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+        const wantsTool = hasToolsParam && toolResults.length === 0 && /读/.test(lastText);
+        // 思考块：无论如何都吐一段（验证 thinking_delta → reasoning_content 通道）
+        const ti = startBlock({ type: 'thinking', thinking: '' });
+        ev('content_block_delta', {
+          type: 'content_block_delta',
+          index: ti,
+          delta: { type: 'thinking_delta', thinking: '模拟思考：请求形状是 Messages 协议。' },
+        });
+        stopBlock();
+        if (wantsTool) {
+          const s = startBlock({ type: 'tool_use', id: 'toolu_mock_1', name: 'read_file', input: {} });
+          const args = JSON.stringify({ path: 'prompts/system.md' });
+          for (let i = 0; i < args.length; i += 8) {
+            ev('content_block_delta', {
+              type: 'content_block_delta',
+              index: s,
+              delta: { type: 'input_json_delta', partial_json: args.slice(i, i + 8) },
+            });
+          }
+          stopBlock();
+          ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 33 } });
+        } else {
+          const echo = toolResults.length
+            ? `收到 ${toolResults.length} 条工具结果，第一条开头：${String(toolResults[0]?.content || '').slice(0, 30)}；系统提示 ${String(parsed.system || '').length} 字。`
+            : '';
+          const text = echo || '你好，这是 Anthropic mock 渠道的流式回复。（中文 OK）';
+          const s = startBlock({ type: 'text', text: '' });
+          for (let i = 0; i < text.length; i += 6) {
+            ev('content_block_delta', {
+              type: 'content_block_delta',
+              index: s,
+              delta: { type: 'text_delta', text: text.slice(i, i + 6) },
+            });
+          }
+          stopBlock();
+          ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 55 } });
+        }
+        ev('message_stop', { type: 'message_stop' });
+        res.end();
       });
     } else {
       res.writeHead(404);

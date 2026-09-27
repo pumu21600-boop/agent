@@ -52,9 +52,31 @@ impl ThinkingFormat {
     }
 }
 
+/// 传输协议维度（P23）：同一渠道走 OpenAI Chat Completions 还是 Anthropic Messages。
+/// 与 ThinkingFormat 正交——Anthropic 协议的思考参数在 anthropic.rs 里按 Messages 规范组装。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Protocol {
+    /// OpenAI 兼容 /chat/completions（含全部国产官方网关、中转、本地推理服务）
+    #[default]
+    OpenAiCompletions,
+    /// Anthropic Messages（/v1/messages：system 顶层、tool_use/tool_result 块、x-api-key 鉴权）
+    AnthropicMessages,
+}
+
+impl Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Protocol::OpenAiCompletions => "openai-completions",
+            Protocol::AnthropicMessages => "anthropic-messages",
+        }
+    }
+}
+
 /// 端点兼容性档（请求组装与响应解析都按它走）。
 #[derive(Debug, Clone)]
 pub struct Compat {
+    /// 传输协议（P23）：Anthropic 端点走 Messages 适配器，其余走 OpenAI Completions
+    pub protocol: Protocol,
     pub thinking_format: ThinkingFormat,
     /// "max_tokens" 或 "max_completion_tokens"（OpenAI 新系模型要求后者）
     pub max_tokens_field: &'static str,
@@ -126,8 +148,8 @@ fn endpoint_class(provider_id: Option<&str>, base_url: Option<&str>) -> &'static
         }
     }
     if is_local {
-        // 本地端口：预设认得出用预设 id，认不出也算 local
-        if matches!(provider_id, Some("ollama" | "lmstudio" | "mnn" | "llamacpp"))
+        // 本地端口：预设认得出用预设 id，认不出也算 local（custom=旧「自定义端点」预设 id，保留兼容）
+        if matches!(provider_id, Some("ollama" | "lmstudio" | "mnn" | "llamacpp" | "openai_compat" | "custom"))
             || provider_id.is_none()
             || provider_id == Some("custom")
         {
@@ -147,10 +169,17 @@ pub fn resolve(
     format_override: Option<ThinkingFormat>,
 ) -> Compat {
     let class = endpoint_class(provider_id, base_url);
+    // 传输协议（P23）：provider_id=anthropic 或官方域 → Messages 协议，其余 OpenAI Completions
+    let protocol = if super::anthropic::is_anthropic_endpoint(provider_id, base_url) {
+        Protocol::AnthropicMessages
+    } else {
+        Protocol::OpenAiCompletions
+    };
 
     // 显式覆盖优先（providers.json 预设或渠道配置）
     if let Some(f) = format_override {
         return Compat {
+            protocol,
             thinking_format: f,
             max_tokens_field: max_tokens_field_for(model_id),
             supports_usage_in_streaming: true,
@@ -162,6 +191,7 @@ pub fn resolve(
     // 本地推理服务：聊天模板形态思考开关；宽收 stream_options
     if class == "local" {
         return Compat {
+            protocol,
             thinking_format: ThinkingFormat::QwenChatTemplate,
             max_tokens_field: "max_tokens",
             supports_usage_in_streaming: true,
@@ -188,6 +218,7 @@ pub fn resolve(
     };
 
     Compat {
+        protocol,
         thinking_format,
         max_tokens_field: max_tokens_field_for(model_id),
         supports_usage_in_streaming: true,
@@ -276,5 +307,22 @@ mod tests {
 
         let c = resolve(Some("qwen"), Some("https://relay.custom.io/v1"), "qwen-max", None);
         assert_eq!(c.thinking_format, ThinkingFormat::Qwen);
+    }
+
+    #[test]
+    fn anthropic_endpoints_get_messages_protocol() {
+        // 预设 id 与官方域都判 Anthropic Messages 协议；OpenAI 形状字段与之正交
+        let c = resolve(Some("anthropic"), Some("https://api.anthropic.com"), "claude-sonnet-4-5", None);
+        assert_eq!(c.protocol, Protocol::AnthropicMessages);
+        assert_eq!(c.max_tokens_field, "max_tokens");
+        // 域名判定：自定义渠道指到 anthropic.com 也是 Messages 协议
+        let c = resolve(Some("openai_compat"), Some("https://api.anthropic.com/v1"), "claude-3-5-haiku", None);
+        assert_eq!(c.protocol, Protocol::AnthropicMessages);
+        // 中转域名不带 anthropic 标识 → OpenAI 协议（要 Messages 就选 anthropic 预设）
+        let c = resolve(Some("openai_compat"), Some("https://relay.example.com/v1"), "claude-sonnet-4-5", None);
+        assert_eq!(c.protocol, Protocol::OpenAiCompletions);
+        // 国产官方域不受影响
+        let c = resolve(Some("zhipu"), Some("https://open.bigmodel.cn/api/paas/v4"), "glm-4.6", None);
+        assert_eq!(c.protocol, Protocol::OpenAiCompletions);
     }
 }

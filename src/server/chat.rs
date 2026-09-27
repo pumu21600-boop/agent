@@ -364,6 +364,11 @@ pub(super) fn assemble_turn_channels(
             "角色「预算降级」配置的渠道「{n}」解析失败（配置名不存在或地址为空），超预算后维持主渠道"
         ));
     }
+    // P23 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功），
+    // 本轮起明确告知用户，不静默
+    if state.gateway.thinking_is_degraded(&base_url, &model) {
+        notices.push("该端点此前拒绝了思考参数，已自动关闭思考下发（对话正常进行）".to_string());
+    }
     TurnChannels { primary, summary, title, fallbacks, downgrade, notices }
 }
 
@@ -721,7 +726,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     // 3) 能力预检：以专家配置里用户勾选的能力标记为准（勾了「图片解析」就放行，
                     //    不再看模型名里有没有 vision 等关键字）；找不到对应配置时才退回按名推导
                     let first_ch = &candidates[0];
-                    let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("custom");
+                    let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("openai_compat");
                     let first_model = &first_ch.model;
 
                     let gate_ok = match role_target
@@ -840,7 +845,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     let mut last_error_msg = String::new();
 
                     for vch in &candidates {
-                        let provider = vch.params.provider_id.as_deref().unwrap_or("custom");
+                        let provider = vch.params.provider_id.as_deref().unwrap_or("openai_compat");
                         last_route = (provider.to_string(), vch.model.clone());
 
                         let mut params = vch.params.clone();

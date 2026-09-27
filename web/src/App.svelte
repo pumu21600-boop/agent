@@ -409,7 +409,9 @@
         ? 'DeepSeek thinking 对象参数'
         : thinkingStyle === 'qwen'
           ? 'Qwen 系 enable_thinking 布尔'
-          : thinkingStyle === 'qwen-chat-template'
+          : thinkingStyle === 'anthropic'
+            ? 'Anthropic Messages thinking（开启后预算自动取输出上限一半；带工具结果的轮次自动关闭）'
+            : thinkingStyle === 'qwen-chat-template'
             ? '本地推理服务 chat_template_kwargs（Qwen3 系模板）'
             : thinkingStyle === 'openai'
               ? 'OpenAI 风格 reasoning_effort 档位'
@@ -5124,7 +5126,13 @@
         <Select
           value={providerId}
           title="供应商预设"
-          options={providers.map((p) => ({ value: p.id, label: p.name }))}
+          options={[
+            ...providers.map((p) => ({ value: p.id, label: p.name })),
+            // 老渠道可能还挂在已下架的预设 id 上：回显为「旧预设」，不主动改它
+            ...(providerId && !providers.some((p) => p.id === providerId)
+              ? [{ value: providerId, label: providerId + '（旧预设）' }]
+              : []),
+          ]}
           on:change={(e) => {
             providerId = e.detail;
             onProviderChange();

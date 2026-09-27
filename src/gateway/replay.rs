@@ -171,6 +171,7 @@ mod tests {
 
     fn openai_compat() -> Compat {
         Compat {
+            protocol: crate::gateway::compat::Protocol::OpenAiCompletions,
             thinking_format: ThinkingFormat::Openai,
             max_tokens_field: "max_tokens",
             supports_usage_in_streaming: true,

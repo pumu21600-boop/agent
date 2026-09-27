@@ -360,20 +360,27 @@ fn effective_thinking_style(
     use gateway::compat::ThinkingFormat as TF;
     match c.thinking_style.as_deref() {
         Some("none") => "none",
+        // P23：Anthropic Messages 协议专属形态（开/关 + 自动预算），显式指定或探测判定都归它
+        Some("anthropic") => "anthropic",
         // P8.3 旧词表别名 → 新词表
         Some("thinking_object") => TF::Zai.as_str(),
         Some("reasoning_effort") => TF::Openai.as_str(),
         Some("enable_thinking" | "enable_thinking_budget") => TF::Qwen.as_str(),
         Some(v) => TF::parse(v).map(|f| f.as_str()).unwrap_or("auto"),
         // auto：端点探测（预设 thinking_format 是探测认不出时的兜底）
-        _ => gateway::compat::resolve(
-            Some(c.provider_id.as_str()),
-            Some(&c.effective_base_url()),
-            &c.model,
-            preset.and_then(|p| p.thinking_format),
-        )
-        .thinking_format
-        .as_str(),
+        _ => {
+            let compat = gateway::compat::resolve(
+                Some(c.provider_id.as_str()),
+                Some(&c.effective_base_url()),
+                &c.model,
+                preset.and_then(|p| p.thinking_format),
+            );
+            if compat.protocol == gateway::compat::Protocol::AnthropicMessages {
+                "anthropic"
+            } else {
+                compat.thinking_format.as_str()
+            }
+        }
     }
 }
 
