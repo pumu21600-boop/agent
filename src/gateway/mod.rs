@@ -1160,13 +1160,43 @@ mod tests {
         init_logger();
         let g = Gateway::new();
 
+        // 本地 mock 渠道（曾直打 api.deepseek.com——2026-09-27 本机系统代理开关翻转后
+        // 该测试稳定失败：reqwest 的代理解析跟着注册表走，外网假设不再成立）。
+        // 回 401 即「网络层已通、渠道在拒假 key」；127.* 在 ProxyOverride 里天然绕代理。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::Write;
+            let resp = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        // 监听器是非阻塞的，Windows 上接受的 socket 会继承该标志——
+                        // 不恢复阻塞模式 write_all 会撞 WouldBlock（被 let _ 吞掉）
+                        let _ = s.set_nonblocking(false);
+                        // 先把请求读完再回响应：不读就关，未读的入站数据会让 Windows
+                        // 直接回 RST（os error 10054），客户端只会看到「连接被重置」
+                        let mut buf = [0u8; 4096];
+                        let _ = std::io::Read::read(&mut s, &mut buf);
+                        let _ = s.write_all(resp);
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}/v1");
+
         // 阶段1：代理指向死端口 → 必须失败（is_connect 分支）
         unsafe {
             std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
             std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
         }
         g.rebuild_client_for_test();
-        let r1 = g.list_models("https://api.deepseek.com/v1", "sk-dummy").await;
+        let r1 = g.list_models(&base, "sk-dummy").await;
         assert!(r1.is_err(), "死代理下应失败，实际 {:?}", r1.map(|v| v.len()));
 
         // 阶段2：清掉死代理 → rebuild → 同一 Gateway 实例应拿到渠道业务响应
@@ -1176,11 +1206,13 @@ mod tests {
             std::env::remove_var("HTTP_PROXY");
         }
         g.rebuild_client_for_test();
-        let r2 = g.list_models("https://api.deepseek.com/v1", "sk-dummy").await;
-        let msg = r2.err().map(|e| e.to_string()).unwrap_or_default();
+        let r2 = g.list_models(&base, "sk-dummy").await;
+        let msg = r2.err().map(|e| format!("{e:#}")).unwrap_or_default();
         assert!(
             msg.contains("401") && !msg.contains("请求渠道失败"),
             "重建后应拿到渠道 401（网络层恢复），实际: {msg}"
         );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
     }
 }

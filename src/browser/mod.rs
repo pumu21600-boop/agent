@@ -2055,6 +2055,12 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
                     ));
                 }
             };
+            // 落点检查（成功与超时都要查——错误页也会触发 load 事件）：
+            // 页面停在 chrome-error = 站点连不上，给模型「别再重试」的人话 + 代理诊断，
+            // 免得它在网络不通时反复烧 20-40 秒重试（2026-09-27 用户实锤）。
+            if let Some(msg) = chrome_error_note(&tab).await {
+                return Err(BrowserError::new(ErrorCode::BackendUnavailable, msg));
+            }
             let snap = take_snapshot(&tab, max_chars, None, false)
                 .await
                 .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
@@ -2489,6 +2495,10 @@ fn exec_err(e: String) -> BrowserError {
 /// 要的是 AI 能自然地说「访问超时」）。人话在前（模型转述给用户），
 /// 原始细节留在尾部（诊断用），错误码仍由 BrowserError Display 前置。
 fn friendly_backend_error(e: &str) -> String {
+    // chrome_error_note 生成的已是完整人话（含代理诊断），原样透传
+    if e.starts_with("访问失败：") {
+        return e.to_string();
+    }
     if e.contains("CDP 调用超时") {
         format!("访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。可以重试一次；仍不行就 close_browser 后重新打开。（{e}）")
     } else if e.contains("连接已断开") || e.contains("actor 已退出") {
@@ -2496,6 +2506,85 @@ fn friendly_backend_error(e: &str) -> String {
     } else {
         format!("浏览器暂时不可用：重试 navigate 即可，仍不行就 close_browser 后重新打开。（{e}）")
     }
+}
+
+/// 落点检查：导航结束后页面停在 chrome-error = 站点连不上（连接超时/被拒/被墙）。
+/// 返回给模型的人话（别再重试 + 代理诊断）；不在错误页返回 None。
+async fn chrome_error_note(tab: &WebTab) -> Option<String> {
+    let url = current_page_url(tab).await?;
+    if !url.starts_with("chrome-error://") {
+        return None;
+    }
+    let hint = system_proxy_hint();
+    Some(format!(
+        "访问失败：页面落在浏览器错误页（{url}）——站点连不上（连接超时/被拒）。不要再重试导航，直接把「访问失败」告诉用户；若用户说网络已恢复，先 close_browser 重开浏览器实例再试一次。{hint}"
+    ))
+}
+
+/// 当前页 URL（导航历史取当前项；失败返回 None，不阻塞主流程）。
+async fn current_page_url(tab: &WebTab) -> Option<String> {
+    let hist = tab
+        .cdp
+        .call("Page.getNavigationHistory", json!({}))
+        .await
+        .ok()?;
+    let entries = hist.get("entries")?.as_array()?;
+    let idx = hist.get("currentIndex")?.as_u64()? as usize;
+    entries.get(idx)?.get("url")?.as_str().map(String::from)
+}
+
+/// 系统代理诊断（chrome-error 时附给模型）。真机实锤（2026-09-27）：代理客户端在跑
+/// 但「系统代理」开关关闭时，浏览器跟随系统=直连，被墙站点必超时（curl 显式走代理
+/// 却秒通）——这个组合值得点名，用户一拨开关就好。
+fn system_proxy_hint() -> String {
+    let Ok(out) = std::process::Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"])
+        .creation_flags(0x0800_0000)
+        .output()
+    else {
+        return String::new();
+    };
+    let (enabled, server) = parse_proxy_state(&String::from_utf8_lossy(&out.stdout));
+    match (enabled, server) {
+        (true, _) => {
+            "另外：系统代理当前已开启但仍不通——检查代理客户端的分流规则（该站点是否被分到了直连）。".to_string()
+        }
+        (false, Some(server)) if local_proxy_alive(&server) => format!(
+            "另外：检测到本机代理客户端在运行（{server}）但系统代理开关是关闭的——浏览器跟随系统代理，所以直连不通的站点会超时；打开代理客户端的「系统代理」或 TUN 模式即可。"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// 解析 `reg query` 输出里的 ProxyEnable/ProxyServer。纯函数（可单测）。
+/// ProxyServer 可能是 `host:port` 或 `http=…;https=…` 分号形式。
+fn parse_proxy_state(text: &str) -> (bool, Option<String>) {
+    let mut enabled = true;
+    let mut server: Option<String> = None;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        match parts[0] {
+            "ProxyEnable" => enabled = parts[2] == "0x1",
+            "ProxyServer" => server = Some(parts[2..].join(" ")),
+            _ => {}
+        }
+    }
+    (enabled, server)
+}
+
+/// 代理地址（可能分号分隔多个 host:port）是否有任一端口活着。
+fn local_proxy_alive(server: &str) -> bool {
+    server.split(';').any(|s| {
+        let s = s.trim();
+        // http=host:port 形态取值部分；纯 host:port 直接用
+        let hp = s.split_once('=').map(|(_, v)| v).unwrap_or(s);
+        let Some((host, port)) = hp.rsplit_once(':') else { return false };
+        let Ok(addr) = format!("{host}:{port}").parse::<std::net::SocketAddr>() else { return false };
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
+    })
 }
 
 /// 输入：聚焦（真实点击）→ 全选清空 → 插文本 → 可选回车。
@@ -2661,6 +2750,10 @@ pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
     match navigate_tab(&tab, url).await {
         Ok(_) => {
             sweep_session(&session).await;
+            // 落点检查：面板用户手输的 URL 停在错误页时，红字给出人话 + 代理诊断
+            if let Some(msg) = chrome_error_note(&tab).await {
+                return Err(msg);
+            }
             Ok(json!({ "ok": true }))
         }
         Err(e) => {
@@ -3019,6 +3112,51 @@ mod tests {
         let o = friendly_backend_error("拉起失败: 没找到浏览器");
         assert!(o.starts_with("浏览器暂时不可用："), "{o}");
         assert!(o.contains("没找到浏览器"), "{o}");
+        // chrome_error_note 生成的已是人话：原样透传不再二次包装
+        let pass = "访问失败：页面停在浏览器错误页——不要再重试导航。";
+        assert_eq!(friendly_backend_error(pass), pass);
+    }
+
+    /// 系统代理解析：reg query 输出 → (开关, 地址)；分号形态的 ProxyServer 也能取。
+    #[test]
+    fn parse_proxy_state_reads_registry_shapes() {
+        // 开着
+        let (on, srv) = parse_proxy_state(
+            "\r\n    ProxyEnable    REG_DWORD    0x1\r\n    ProxyServer    REG_SZ    127.0.0.1:7897\r\n",
+        );
+        assert!(on);
+        assert_eq!(srv.as_deref(), Some("127.0.0.1:7897"));
+        // 关着（2026-09-27 现场就是它）
+        let (on, srv) = parse_proxy_state(
+            "\r\n    ProxyEnable    REG_DWORD    0x0\r\n    ProxyServer    REG_SZ    127.0.0.1:7897\r\n",
+        );
+        assert!(!on);
+        assert_eq!(srv.as_deref(), Some("127.0.0.1:7897"));
+        // 分号形态（http/https 分别配置）
+        let (on, srv) = parse_proxy_state(
+            "\r\n    ProxyEnable    REG_DWORD    0x1\r\n    ProxyServer    REG_SZ    http=127.0.0.1:7890;https=127.0.0.1:7897\r\n",
+        );
+        assert!(on);
+        assert_eq!(srv.as_deref(), Some("http=127.0.0.1:7890;https=127.0.0.1:7897"));
+        // 没有 ProxyServer 行
+        let (on, srv) = parse_proxy_state("\r\n    ProxyEnable    REG_DWORD    0x0\r\n");
+        assert!(!on);
+        assert!(srv.is_none());
+    }
+
+    /// 本机代理探活：分号形态逐个试，全死 = false。
+    #[test]
+    fn local_proxy_alive_checks_each_candidate() {
+        // 起一个真监听当代理端口
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(local_proxy_alive(&format!("127.0.0.1:{port}")));
+        // 分号形态：一个活一个死，任一活即活
+        assert!(local_proxy_alive(&format!("http=127.0.0.1:1;https=127.0.0.1:{port}")));
+        // 全死
+        assert!(!local_proxy_alive("127.0.0.1:1"));
+        // 非法形态不 panic
+        assert!(!local_proxy_alive("localhost"));
     }
 
     /// host_of / same_site：agent 跨站点导航是否开新标签的判据（纯函数）。
