@@ -488,7 +488,19 @@ async fn create_tab(session: &BrowserSession, url: &str, agent: bool) -> Result<
         .unwrap_or_else(|e| e.into_inner())
         .push(tab.clone());
     if url != "about:blank" && !url.is_empty() {
-        navigate_tab(&tab, url).await?;
+        if let Err(nav_err) = navigate_tab(&tab, url).await {
+            if nav_err.contains("连接已断开") {
+                return Err(friendly_backend_error(&nav_err));
+            }
+            // 导航失败（CDP 超时/事件超时）：等错误页落地，落点诊断比原始错误有用
+            return Err(chrome_error_note_wait(&tab, 12_000)
+                .await
+                .unwrap_or_else(|| friendly_backend_error(&nav_err)));
+        }
+        // 成功路径也查：错误页同样会触发 load 事件
+        if let Some(msg) = chrome_error_note(&tab).await {
+            return Err(msg);
+        }
     }
     log(
         "browser.tab.new",
@@ -2048,14 +2060,21 @@ async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<String, Brows
                 Err(e) => {
                     if e.contains("连接已断开") {
                         close_internal("dead").await;
+                        // 标签已死：落点无从查起，直接给 friendly 文案
+                        return Err(BrowserError::new(
+                            ErrorCode::BackendUnavailable,
+                            friendly_backend_error(&e),
+                        ));
                     }
-                    return Err(BrowserError::new(
-                        ErrorCode::BackendUnavailable,
-                        friendly_backend_error(&e),
-                    ));
+                    // 失败也先查落点：CDP 超时时 Chromium 往往还在连接，
+                    // 错误页几秒后才落地——等它，拿到「别再重试 + 代理诊断」
+                    let msg = chrome_error_note_wait(&tab, 12_000)
+                        .await
+                        .unwrap_or_else(|| friendly_backend_error(&e));
+                    return Err(BrowserError::new(ErrorCode::BackendUnavailable, msg));
                 }
             };
-            // 落点检查（成功与超时都要查——错误页也会触发 load 事件）：
+            // 落点检查（成功路径也要查——错误页同样会触发 load 事件）：
             // 页面停在 chrome-error = 站点连不上，给模型「别再重试」的人话 + 代理诊断，
             // 免得它在网络不通时反复烧 20-40 秒重试（2026-09-27 用户实锤）。
             if let Some(msg) = chrome_error_note(&tab).await {
@@ -2500,7 +2519,12 @@ fn friendly_backend_error(e: &str) -> String {
         return e.to_string();
     }
     if e.contains("CDP 调用超时") {
-        format!("访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。可以重试一次；仍不行就 close_browser 后重新打开。（{e}）")
+        // CDP 超时多半是网络等待（Chromium 连不上站点、响应迟迟不回）——
+        // 顺手带上系统代理诊断（开关关闭但客户端活着是本轮实锤的头号原因）
+        let proxy_hint = system_proxy_hint();
+        format!(
+            "访问超时：浏览器没有在预期时间内响应（页面打开太慢或网络不通都会这样）。可以重试一次；仍不行就 close_browser 后重新打开。（{e}）{proxy_hint}"
+        )
     } else if e.contains("连接已断开") || e.contains("actor 已退出") {
         format!("浏览器连接已断开：浏览器进程可能已被系统回收。重试 navigate 会自动重新拉起。（{e}）")
     } else {
@@ -2515,10 +2539,31 @@ async fn chrome_error_note(tab: &WebTab) -> Option<String> {
     if !url.starts_with("chrome-error://") {
         return None;
     }
+    Some(chrome_error_message(&url))
+}
+
+/// 失败路径专用：CDP 超时那一刻 Chromium 往往还在连接（错误页要再等约 10s 才落地），
+/// 轮询等错误页出现再给诊断——多花几秒换「别再瞎重试 + 怎么修」的 actionable 结论。
+async fn chrome_error_note_wait(tab: &WebTab, max_ms: u64) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+    loop {
+        if let Some(url) = current_page_url(tab).await
+            && url.starts_with("chrome-error://")
+        {
+            return Some(chrome_error_message(&url));
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn chrome_error_message(url: &str) -> String {
     let hint = system_proxy_hint();
-    Some(format!(
+    format!(
         "访问失败：页面落在浏览器错误页（{url}）——站点连不上（连接超时/被拒）。不要再重试导航，直接把「访问失败」告诉用户；若用户说网络已恢复，先 close_browser 重开浏览器实例再试一次。{hint}"
-    ))
+    )
 }
 
 /// 当前页 URL（导航历史取当前项；失败返回 None，不阻塞主流程）。
@@ -2759,8 +2804,13 @@ pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
         Err(e) => {
             if e.contains("连接已断开") {
                 close_internal("dead").await;
+                return Err(format!("导航失败: {}", friendly_backend_error(&e)));
             }
-            Err(format!("导航失败: {e}"))
+            // 失败也先查落点（CDP 超时时 Chromium 往往还在连接，错误页稍后才落地）
+            let msg = chrome_error_note_wait(&tab, 12_000)
+                .await
+                .unwrap_or_else(|| friendly_backend_error(&e));
+            Err(format!("导航失败: {msg}"))
         }
     }
 }
