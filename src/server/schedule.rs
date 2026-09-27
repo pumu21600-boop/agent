@@ -27,12 +27,21 @@ pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value>
         .iter()
         .map(|t| {
             let next = schedule::next_run_ts(t);
+            let cron_text = if t.once_ts > 0 {
+                chrono::DateTime::from_timestamp(t.once_ts, 0)
+                    .map(|d| d.with_timezone(&chrono::Local))
+                    .map(|d| format!("单次 · {}", d.format("%Y-%m-%d %H:%M")))
+                    .unwrap_or_default()
+            } else {
+                schedule::parse_cron(&t.cron).map(|c| c.describe()).unwrap_or_default()
+            };
             json!({
                 "id": t.id,
                 "name": t.name,
                 "kind": t.kind(),
                 "cron": t.cron,
-                "cron_text": schedule::parse_cron(&t.cron).map(|c| c.describe()).unwrap_or_default(),
+                "once_ts": t.once_ts,
+                "cron_text": cron_text,
                 "message": t.message,
                 "memory_days": t.memory_days,
                 "session_mode": if t.session_mode.is_empty() { "new".to_string() } else { t.session_mode.clone() },

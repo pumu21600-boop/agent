@@ -37,9 +37,15 @@ pub struct ScheduleTask {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// 5 段 cron（分 时 日 月 周，本地时区）；保存时校验可解析
+    /// 5 段 cron（分 时 日 月 周，本地时区）；保存时校验可解析。
+    /// once_ts > 0 时本字段不参与调度（单次任务没有周期表达式）。
     #[serde(default)]
     pub cron: String,
+    /// 单次任务的目标时间（unix 秒；0 = 周期任务，按 cron 调度）。
+    /// 语义：到点跑一次，跑完自动停用（enabled=false）；停机期间错过的，
+    /// 重启后第一次心跳补跑一次。
+    #[serde(default)]
+    pub once_ts: i64,
     /// 到点唤醒无头会话的消息内容（kind=memory 时忽略，内容由记忆检索生成）
     #[serde(default)]
     pub message: String,
@@ -98,7 +104,15 @@ impl ScheduleTask {
         if self.name.trim().is_empty() {
             return Err("任务名称不能为空".into());
         }
-        cron::parse(&self.cron).map_err(|e| format!("cron 表达式：{e}"))?;
+        if self.once_ts > 0 {
+            // 单次任务：cron 不参与调度；启用的任务时间必须在未来
+            // （已跑完自动停用的任务 enabled=false，改个名字再保存不受限）
+            if self.enabled && self.once_ts <= chrono::Local::now().timestamp() {
+                return Err("单次任务的时间要设在将来".into());
+            }
+        } else {
+            cron::parse(&self.cron).map_err(|e| format!("cron 表达式：{e}"))?;
+        }
         match self.kind.as_str() {
             "" | "message" => {
                 if self.message.trim().is_empty() {
@@ -209,17 +223,25 @@ fn tick_all(state: &AppState) {
         {
             continue; // 上一轮没跑完：跳过本轮，不并发双跑
         }
-        let Ok(spec) = cron::parse(&t.cron) else {
-            continue; // 保存时已校验；运行中改坏的旧任务不跑
+        // 到点判断：单次任务 = 设定时间已过且没跑过（停机错过的重启补跑一次）；
+        // 周期任务 = cron 的 next_after(last_run/created) ≤ now
+        let due = if t.once_ts > 0 {
+            t.last_run_ts.is_none() && now >= t.once_ts
+        } else {
+            let Ok(spec) = cron::parse(&t.cron) else {
+                continue; // 保存时已校验；运行中改坏的旧任务不跑
+            };
+            let base = t.last_run_ts.unwrap_or(t.created_ts);
+            let Some(from) = DateTime::from_timestamp(base, 0).map(|d| d.with_timezone(&Local))
+            else {
+                continue;
+            };
+            let Some(next) = spec.next_after(from) else {
+                continue;
+            };
+            now >= next.timestamp()
         };
-        let base = t.last_run_ts.unwrap_or(t.created_ts);
-        let Some(from) = DateTime::from_timestamp(base, 0).map(|d| d.with_timezone(&Local)) else {
-            continue;
-        };
-        let Some(next) = spec.next_after(from) else {
-            continue;
-        };
-        if now < next.timestamp() {
+        if !due {
             continue; // 没到点
         }
         crate::observability::event(
@@ -391,6 +413,12 @@ fn write_back(
         } else {
             t.last_manual_ts = Some(now);
         }
+        // 单次任务：跑过一次就到头——记 last_run_ts（防重复触发）+ 自动停用。
+        // 手动"立即运行"同样消耗掉这一次（单次语义不区分触发来源）。
+        if t.once_ts > 0 {
+            t.last_run_ts = Some(now);
+            t.enabled = false;
+        }
         t.last_status = Some(status.to_string());
         t.last_error = error.filter(|e| !e.is_empty()).map(|e| e.to_string());
         if let Some(sid) = session.filter(|s| !s.is_empty()) {
@@ -409,6 +437,14 @@ fn write_back(
 
 /// 计算某任务的下次触发时间（unix 秒；解析失败/无下一次返回 None）。
 pub fn next_run_ts(task: &ScheduleTask) -> Option<i64> {
+    if task.once_ts > 0 {
+        // 单次：没跑过且启用才有"下次"；跑完（last_run 已记/已停用）= 没有
+        return if task.enabled && task.last_run_ts.is_none() {
+            Some(task.once_ts)
+        } else {
+            None
+        };
+    }
     let spec = cron::parse(&task.cron).ok()?;
     let base = task.last_run_ts.unwrap_or(task.created_ts);
     let from = DateTime::from_timestamp(base, 0)?.with_timezone(&Local);
@@ -465,6 +501,7 @@ mod tests {
             id: "t1".into(),
             name: "巡检".into(),
             cron: cron.into(),
+            once_ts: 0,
             message: "跑一遍构建".into(),
             kind: String::new(),
             memory_days: 0,
@@ -511,6 +548,33 @@ mod tests {
         let mut t = task("0 9 * * *", "new", "");
         t.kind = "weird".into();
         assert!(t.validate().unwrap_err().contains("未知任务类型"));
+    }
+
+    /// 单次任务（once_ts）：不要求 cron；启用的必须设在未来；
+    /// 待跑有"下次"，跑过/停用即无。
+    #[test]
+    fn once_task_validate_and_next_run() {
+        let now = chrono::Local::now().timestamp();
+        let mut t = task("", "new", "");
+        t.once_ts = now + 3600;
+        assert!(t.validate().is_ok(), "单次任务不要求 cron，时间在未来即可");
+        t.once_ts = now - 60;
+        assert!(t.validate().is_err(), "启用的单次任务时间要在将来");
+        // 已跑完自动停用的（enabled=false、时间已过）：改名等编辑不受限
+        t.enabled = false;
+        assert!(t.validate().is_ok());
+        // 周期语义不受影响：cron 任务 once_ts=0 仍走 cron 校验
+        let t = task("bad cron", "new", "");
+        assert!(t.validate().unwrap_err().contains("cron"));
+        // 下次触发：待跑 = once_ts；跑过 / 停用 = 没有
+        let mut t = task("", "new", "");
+        t.once_ts = now + 3600;
+        assert_eq!(next_run_ts(&t), Some(t.once_ts));
+        t.last_run_ts = Some(now);
+        assert_eq!(next_run_ts(&t), None, "跑过的单次任务没有下次");
+        t.last_run_ts = None;
+        t.enabled = false;
+        assert_eq!(next_run_ts(&t), None, "停用的单次任务没有下次");
     }
 
     /// P22-D：类型与回顾窗口的生效值（缺省 message / days 越界兜底 3）。

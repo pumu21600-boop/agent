@@ -199,11 +199,13 @@ body {
 [data-theme='light'] select {
   color-scheme: light;
 }
-/* 时间输入的原生弹层（时钟选择器）同理：不在元素自身声明就会白底浅字 */
-[data-theme='dark'] input[type='time'] {
+/* 时间/日期输入的原生弹层（时钟/日历选择器）同理：不在元素自身声明就会白底浅字 */
+[data-theme='dark'] input[type='time'],
+[data-theme='dark'] input[type='date'] {
   color-scheme: dark;
 }
-[data-theme='light'] input[type='time'] {
+[data-theme='light'] input[type='time'],
+[data-theme='light'] input[type='date'] {
   color-scheme: light;
 }
 select {

@@ -3234,6 +3234,7 @@
       name: '',
       kind: 'message',
       cron: '',
+      once_ts: 0,
       message: '',
       memory_days: '',
       session_mode: 'new',
@@ -3262,6 +3263,7 @@
       name: e.name,
       kind: e.kind || 'message',
       cron: e.cron,
+      once_ts: Number(e.once_ts) || 0,
       message: e.message,
       memory_days: Number(e.memory_days) || 3,
       session_mode: e.session_mode,
@@ -3271,6 +3273,11 @@
       enabled: e.enabled !== false,
       timeout_secs: Number(e.timeout_secs) || 0,
     };
+    // 单次模式没选时间（或周期模式没产出 cron）：本地拦下，不发请求
+    if (!String(body.cron || '').trim() && !body.once_ts) {
+      schedMsg = '还没选执行时间';
+      return;
+    }
     try {
       const r = await fetch('/api/schedules', {
         method: 'POST',
@@ -5689,7 +5696,7 @@
               <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
             </div>
             <div class="sub-row">
-              <ScheduleCronPicker bind:cron={schedEditor.cron} on:change={previewCron} />
+              <ScheduleCronPicker bind:cron={schedEditor.cron} bind:onceTs={schedEditor.once_ts} on:change={previewCron} />
               {#if (schedEditor.kind || 'message') === 'memory'}
                 <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
               {/if}
