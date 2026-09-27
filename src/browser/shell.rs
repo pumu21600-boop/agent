@@ -74,6 +74,7 @@ pub fn start_listener() {
         loop {
             let Ok((sock, _)) = listener.accept().await else { continue };
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+            let ctl_tx = tx.clone();
             {
                 let mut g = slot().lock().unwrap_or_else(|e| e.into_inner());
                 if g.is_some() {
@@ -82,6 +83,14 @@ pub fn start_listener() {
                 *g = Some(Conn { tx });
             }
             crate::observability::debug("[shell] 壳已接入控制通道");
+            // 服务（重）启动后壳第一次接入：本进程还没有浏览器会话，壳里挂着的 child
+            // webview 全是上一任服务留下的孤儿（服务重启/停止不会关它们）——立即清掉。
+            // 不清的话一条旧页面会一直悬在面板/聊天列上，谁也不管它（2026-09-27 用户
+            // 截图实锤：重启后 chrome-error 页浮在错误位置）。会话活着时不清（只是
+            // 通道闪断重连，webview 还归当前会话管，清了反而闪没）。
+            if super::SESSION.lock().await.is_none() {
+                let _ = ctl_tx.send(format!("{}\n", json!({ "op": "reset" })));
+            }
             let (rd, mut wr) = tokio::io::split(sock);
             // 写任务：指令队列 → 套接字
             tokio::spawn(async move {

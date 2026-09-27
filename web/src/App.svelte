@@ -753,6 +753,7 @@
   let webBodyW = 0;
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
   let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
+  let webStateReady = false; // 浏览器状态已加载过一次（就绪前不量矩形：web-tabbar 行随标签增删整行出现/消失，未定型前量的都是瞬态矩形）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
   let webMenuOpen = false; // 「⋯」菜单（仅无头模式的 HTML 下拉；壳模式是壳里浮层，前端不记状态）
   // 壳模式：「⋯」菜单是壳里一个**透明置顶的 webview**，浮在网页之上——网页纹丝不动、
@@ -841,6 +842,13 @@
       webTabs = s.tabs || [];
       webMode = s.mode || 'headless';
       webDialog = s.dialog || null;
+      // 就绪门：状态到手后 web-tabbar 行才定型（有标签 = 多一行，无标签 = 整行消失），
+      // 之前量的矩形都是瞬态（webview 会跳一下再跳回）。就绪后补一发同步——若标签条
+      // 增删没引起 web-body 尺寸变化，ResizeObserver 不会开火，这一发是唯一机会。
+      if (!webStateReady) {
+        webStateReady = true;
+        webQueueViewport();
+      }
       if (!keepActive || !webTabs.some((t) => t.id === webActiveId)) {
         webActiveId = webTabs.length ? webTabs[webTabs.length - 1].id : '';
       }
@@ -1024,6 +1032,9 @@
   $: if (!(webNative && rpTab === 'web' && rightPanelOpen)) webWatchRect(false);
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
+    // 就绪门：浏览器状态没到手前，web-tabbar 行未定型（有标签=多一行 / 无标签=整行消失），
+    // 量的矩形是瞬态——发出去 webview 会先跳错位再跳回。等 loadWebState 就绪后补发。
+    if (!webStateReady) return;
     const el = webBodyEl;
     if (!el) return;
     const r = el.getBoundingClientRect();
@@ -1041,8 +1052,10 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: webActive.id, x, y, w, h }),
     })
-      .then(() => {
-        webShotT += 1;
+      .then((res) => {
+        // 服务端拒收（越界等）：清 key，等下一次观察器/节流开火重试，别把坏矩形当成已应用
+        if (res && res.skipped) webViewportKey = '';
+        else webShotT += 1;
       })
       .catch(() => {
         webViewportKey = ''; // 失败重试

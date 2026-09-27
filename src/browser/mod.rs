@@ -2950,12 +2950,13 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     if session.mode == HostMode::Shell
         && let Some(label) = tab.shell_label.as_deref()
     {
-        // 矩形合理性门槛：面板内容区永远在页签栏+工具栏下方（实测 y≈125——rp-tabs 44 +
-        // web-tabbar 44 + toolbar 39）。y<100 只可能是**量早了**：标签栏比内容区晚一帧
-        // 渲染时实测 y≈91。这种矩形发出去 webview 会跳到错位位置（盖住工具栏）再跳回，
-        // 用户看到的就是"闪一下"。直接丢弃等下一次同步——布局变化会触发 ResizeObserver
-        // 补发正确矩形，比错位闪一下好。
-        if !(y >= 100 && w >= 200 && h >= 200) {
+        // 合理范围门槛（只挡真垃圾，不挡合法布局）：旧版这里还有 y>=100——按「web 标签条
+        // 常在」的旧布局写死（rp-tabs 44 + web-tabbar 44 + toolbar 39 ≈ 125）。但标签条是
+        // {#if webTabs.length} 条件渲染：会话无标签页时整行消失，真实内容顶掉到 ~90——
+        // 正确矩形被当成「量早了」全部拒收，webview 冻结在旧矩形上（盖进聊天列、顶在
+        // 工具栏下 35px，2026-09-27 用户截图实锤）。「量早了」的瞬态改由前端就绪门挡
+        // （状态未加载前不上报），这里只挡越界。
+        if !(x >= 0 && y >= 0 && w >= 200 && h >= 200) {
             return Ok(json!({ "ok": true, "skipped": "rect-insane", "w": w, "h": h }));
         }
         *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
