@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
         subagent_cfg: Arc::new(config.subagent.clone()),
     };
     let app = server::router(state.clone(), manifest.join("web").join("dist"));
-    // P22-B 定时任务：20s 心跳到点唤醒无头会话（没有任务时每跳只读一次设置，零开销）
+    // P22-B 定时任务：2s 心跳到点唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
     schedule::start(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

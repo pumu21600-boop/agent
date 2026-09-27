@@ -1,6 +1,6 @@
 //! P22-B 定时任务：按 cron 唤醒无头会话跑任务，完成留痕可查
 //!
-//! 形态（最薄上层）：settings.json 里存任务清单（`schedules`），服务内一个 20s
+//! 形态（最薄上层）：settings.json 里存任务清单（`schedules`），服务内一个 2s
 //! 心跳的循环到点唤醒（走 P22-A 无头会话同一条路），结果写回任务状态 + 全局
 //! 通知列表（GET /api/schedules 一并带出，设置→定时 页签展示）。
 //!
@@ -196,8 +196,8 @@ fn running_slot() -> &'static Mutex<HashSet<String>> {
     RUNNING.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// 心跳间隔：20s（cron 最小粒度是分钟，20s 足够及时且开销可忽略）。
-const TICK_SECS: u64 = 20;
+/// 心跳间隔：到点触发最多延迟这么多秒（任务密集也就每 2s 读一次设置，开销可忽略）
+const TICK_SECS: u64 = 2;
 /// 整轮默认超时（秒）。
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
