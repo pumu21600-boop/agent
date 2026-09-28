@@ -415,7 +415,7 @@
         : thinkingStyle === 'qwen'
           ? 'Qwen 系 enable_thinking 布尔'
           : thinkingStyle === 'anthropic'
-            ? 'Anthropic Messages thinking：低/中/高=预算 20%/50%/80%（GLM Coding 端点按 ZCode 规范映射 effort 档）'
+            ? 'Anthropic Messages thinking：低/中/高=预算 20%/50%/80%'
             : thinkingStyle === 'qwen-chat-template'
             ? '本地推理服务 chat_template_kwargs（Qwen3 系模板）'
             : thinkingStyle === 'openai'
@@ -4628,7 +4628,7 @@
 
                   {#if thinkingStyle === 'deepseek' || thinkingStyle === 'openai' || thinkingStyle === 'anthropic'}
                     <!-- P23.2 三态机制：开启后菜单不收起，才展开该厂商预设映射的档位。
-                         anthropic：低/中/高=预算 20%/50%/80%（GLM Coding 端点归 effort 档）；
+                         anthropic：低/中/高=预算 20%/50%/80%；
                          deepseek：低/中/高/最大=reasoning_effort；openai：低/中/高=reasoning_effort -->
                     <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on', true)}>
                       开启

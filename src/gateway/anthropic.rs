@@ -23,45 +23,12 @@ const THINKING_BUDGET_MIN: u64 = 1024;
 /// 思考预算上限：预算取 max_tokens 一半，封顶 32k，防止大 max_tokens 时思考吃满一半。
 const THINKING_BUDGET_MAX: u64 = 32000;
 
-/// 是否 Anthropic 端点：provider_id=anthropic、base_url 含官方域、或路径是各家自建的
-/// /api/anthropic 兼容端点（如智谱 Coding Plan https://open.bigmodel.cn/api/anthropic）。
+/// 是否 Anthropic 端点：provider_id=anthropic 或 base_url 含官方域。
 pub fn is_anthropic_endpoint(provider_id: Option<&str>, base_url: Option<&str>) -> bool {
     if provider_id == Some("anthropic") {
         return true;
     }
-    let Some(b) = base_url else { return false };
-    let lower = b.to_lowercase();
-    lower.contains("anthropic.com") || lower.contains("/anthropic")
-}
-
-/// 是否 GLM 系 Anthropic 兼容端点（智谱 Coding Plan / Z.ai Coding Plan）。
-/// ZCode（智谱自家 agent）内置规范：GLM 在这类端点上的思考不是 Anthropic 原生
-/// budget_tokens 形态，而是 `thinking:{type:enabled}` + `output_config:{effort}`。
-pub fn is_glm_anthropic_endpoint(base_url: Option<&str>) -> bool {
-    let Some(b) = base_url else { return false };
-    let lower = b.to_lowercase();
-    if !lower.contains("/anthropic") {
-        return false;
-    }
-    lower.contains("bigmodel.cn") || lower.contains("z.ai")
-}
-
-/// GLM 系 Anthropic 端点的 effort 档映射（ZCode reasoningLevel 规格）：
-/// 我们的三档 low/medium/high 与 on 归一到 GLM 的 low/high/max。
-fn glm_effort(requested: &str) -> &'static str {
-    match requested {
-        "low" | "minimal" => "low",
-        "max" | "xhigh" => "max",
-        _ => "high",
-    }
-}
-
-/// 是否带 effort 分档的 GLM 型号（ZCode 规格：GLM-5.2 / GLM-5.3 系在 Anthropic 兼容端点上
-/// 思考恒开 + output_config.effort；更早的 5/5.1/4.x 只有 enabled/disabled 开关）。
-fn is_glm_effort_model(model: &str) -> bool {
-    let id = model.trim().to_lowercase();
-    let head = id.rsplit('/').next().unwrap_or(&id);
-    head.starts_with("glm-5.2") || head.starts_with("glm5.2") || head.starts_with("glm-5.3") || head.starts_with("glm5.3")
+    base_url.is_some_and(|b| b.to_lowercase().contains("anthropic.com"))
 }
 
 /// Messages 端点 URL：已含 /messages 原样（兼容端点给全路径）；以 /v1 结尾补 /messages；其余补 /v1/messages。
@@ -235,30 +202,16 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
             .unwrap_or_default();
         body["tools"] = json!(defs);
     }
-    // 思考参数按端点分两种形态（GLM 形态对齐 ZCode 内置规范——智谱自家 agent 的配置最准）：
-    // GLM 系 Anthropic 兼容端点（智谱/Z.ai Coding Plan）：不用 budget_tokens，用
-    // thinking:{type:enabled}（5.2/5.3 系加 output_config:{effort} 分档；其余型号纯开关）；
-    // off 显式发 disabled；ZCode 在 GLM 上工具循环与思考并存（无签名约束），带工具结果照常开。
-    // 真 Anthropic：thinking:{type:enabled, budget_tokens}（预算取 max_tokens 一半）；
-    // 带工具结果的请求不开思考（官方要求带签名 thinking 块回放，签名不可伪造——v1 确定性规避）。
-    // 默认档（None/空串）两种端点都不发任何思考字段，尊重渠道自身行为。
+    // 思考：开（非 off）且本请求不带工具结果才发 thinking 对象；默认档不发。
+    // 带工具结果不开思考：官方要求带签名 thinking 块回放，签名不可伪造——v1 确定性规避。
+    // 档位→预算比例见 thinking_budget（低/中/高=20%/50%/80%）。
     let requested = params.thinking.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if let Some(t) = requested {
-        if is_glm_anthropic_endpoint(params.base_url.as_deref()) {
-            if t == "off" {
-                body["thinking"] = json!({ "type": "disabled" });
-            } else {
-                body["thinking"] = json!({ "type": "enabled" });
-                if is_glm_effort_model(model) {
-                    body["output_config"] = json!({ "effort": glm_effort(t) });
-                }
-            }
-        } else if t != "off"
-            && !carries_tool_result(&arr)
-            && let Some(budget) = thinking_budget(params.max_tokens.unwrap_or(8192), t)
-        {
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-        }
+    if let Some(t) = requested
+        && t != "off"
+        && !carries_tool_result(&arr)
+        && let Some(budget) = thinking_budget(params.max_tokens.unwrap_or(8192), t)
+    {
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
     body
 }
@@ -418,57 +371,6 @@ mod tests {
         assert!(is_anthropic_endpoint(Some("custom"), Some("https://api.anthropic.com/v1")));
         assert!(!is_anthropic_endpoint(Some("zhipu"), Some("https://open.bigmodel.cn/api/paas/v4")));
         assert!(!is_anthropic_endpoint(None, None));
-        // 自建 Anthropic 兼容端点（路径含 /anthropic）：智谱 Coding Plan 等
-        assert!(is_anthropic_endpoint(Some("zhipu"), Some("https://open.bigmodel.cn/api/anthropic")));
-        assert!(is_anthropic_endpoint(None, Some("https://api.z.ai/api/anthropic")));
-        // GLM 系判定：只认智谱/Z.ai 域 + /anthropic 路径
-        assert!(is_glm_anthropic_endpoint(Some("https://open.bigmodel.cn/api/anthropic")));
-        assert!(is_glm_anthropic_endpoint(Some("https://api.z.ai/api/anthropic")));
-        assert!(!is_glm_anthropic_endpoint(Some("https://api.anthropic.com/v1")));
-        assert!(!is_glm_anthropic_endpoint(Some("https://open.bigmodel.cn/api/paas/v4")));
-    }
-
-    #[test]
-    fn glm_anthropic_thinking_shape() {
-        let msgs = json!([{"role":"user","content":"hi"}]);
-        let mut p = ChatParams {
-            provider_id: Some("zhipu".into()),
-            base_url: Some("https://open.bigmodel.cn/api/anthropic".into()),
-            ..Default::default()
-        };
-        // GLM-5.3 系（ZCode 规格）：思考恒开 + output_config.effort 分档；on 归 high
-        p.thinking = Some("on".into());
-        let b = build_body("GLM-5.3-Flash", &msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"enabled"}));
-        assert_eq!(b["output_config"], json!({"effort":"high"}));
-        p.thinking = Some("low".into());
-        let b = build_body("GLM-5.3-Flash", &msgs, true, &p, None);
-        assert_eq!(b["output_config"]["effort"], json!("low"));
-        p.thinking = Some("max".into());
-        let b = build_body("GLM-5.3-Flash", &msgs, true, &p, None);
-        assert_eq!(b["output_config"]["effort"], json!("max"));
-        // 带 tool_result 也照常开思考（GLM 无签名约束，ZCode 工具循环同款）
-        let tool_msgs = json!([
-            {"role":"user","content":"读"},
-            {"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},
-            {"role":"tool","tool_call_id":"t1","content":"内容"}
-        ]);
-        p.thinking = Some("on".into());
-        let b = build_body("GLM-5.3-Flash", &tool_msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"enabled"}), "GLM 带工具结果不关思考");
-        // off 显式发 disabled
-        p.thinking = Some("off".into());
-        let b = build_body("GLM-5.3-Flash", &msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"disabled"}));
-        // 默认档不发
-        p.thinking = None;
-        let b = build_body("GLM-5.3-Flash", &msgs, true, &p, None);
-        assert!(b.get("thinking").is_none());
-        // 非 effort 型号（4.7）：只有开关没有 effort
-        p.thinking = Some("on".into());
-        let b = build_body("GLM-4.7", &msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"enabled"}));
-        assert!(b.get("output_config").is_none(), "4.7 系规格无 effort 分档");
     }
 
     #[test]

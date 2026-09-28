@@ -318,9 +318,6 @@ mod tests {
         // 域名判定：自定义渠道指到 anthropic.com 也是 Messages 协议
         let c = resolve(Some("openai_compat"), Some("https://api.anthropic.com/v1"), "claude-3-5-haiku", None);
         assert_eq!(c.protocol, Protocol::AnthropicMessages);
-        // 自建 Anthropic 兼容端点（路径含 /anthropic）：智谱 GLM Coding Plan
-        let c = resolve(Some("zhipu"), Some("https://open.bigmodel.cn/api/anthropic"), "GLM-5.3", None);
-        assert_eq!(c.protocol, Protocol::AnthropicMessages);
         // 中转域名不带 anthropic 标识 → OpenAI 协议（要 Messages 就选 anthropic 预设）
         let c = resolve(Some("openai_compat"), Some("https://relay.example.com/v1"), "claude-sonnet-4-5", None);
         assert_eq!(c.protocol, Protocol::OpenAiCompletions);
