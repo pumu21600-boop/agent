@@ -33,15 +33,8 @@ export function configLabel(c) {
   return c.name || '未命名';
 }
 
-export function inferCapabilities(mId) {
-  const id = (mId || '').toLowerCase();
-  return {
-    tools: true,
-    vision: id.includes('vl') || id.includes('vision') || id.includes('gemini') || id.includes('gpt-4o') || id.includes('claude-3') || id.includes('omni') || id.includes('mimo'),
-    video: id.includes('video') || id.includes('gemini-2') || id.includes('omni') || id.includes('mimo'),
-    audio: id.includes('audio') || id.includes('realtime') || id.includes('whisper') || id.includes('omni') || id.includes('gemini') || id.includes('mimo'),
-  };
-}
+// P23.1：inferCapabilities（按模型名猜图片/视频/音频能力）已随智能预测机制一并删除——
+// 聚合渠道上名字与真实能力对不上；能力一律以设置里手动勾选为准。
 
 export function gitStatusLabel(s) {
   const c = String(s || '');

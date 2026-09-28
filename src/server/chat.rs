@@ -372,17 +372,9 @@ pub(super) fn assemble_turn_channels(
     TurnChannels { primary, summary, title, fallbacks, downgrade, notices }
 }
 
-/// 检查模型是否具备指定模态的输入能力（对齐 DSH acceptsMedia 门禁规范）
-fn accepts_modality(model: &str, kind: &str) -> bool {
-    let caps = crate::config::settings::ModelCapabilities::infer_from_model_id(model);
-    match kind {
-        "audio" => caps.audio,
-        "video" => caps.video,
-        "image" => caps.vision,
-        _ => false,
-    }
-}
-
+/// 检查模型是否具备指定模态的输入能力：P23.1 起只认用户手动勾选的能力标记，
+/// 不再按模型名智能推导（聚合渠道上名字与真实能力对不上）。
+/// 此前 accept_modality 的按名推导兜底已删：专家配置解析失败时按「未勾选」处理，
 /// A5（施工单 012）：媒体附件落在 <workspace>/.attachments/，若工作区是 git 仓库且
 /// .gitignore 未含该目录，自动追加一行 `.attachments/`（只追加，绝不重写用户文件），
 /// 防止用户 `git add .` 把二进制附件提交进历史。
@@ -723,8 +715,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         continue;
                     }
 
-                    // 3) 能力预检：以专家配置里用户勾选的能力标记为准（勾了「图片解析」就放行，
-                    //    不再看模型名里有没有 vision 等关键字）；找不到对应配置时才退回按名推导
+                    // 3) 能力预检：以专家配置里用户勾选的能力标记为准（勾了「图片解析」就放行）；
+                    //    专家配置解析失败（角色名指不到配置）按未勾选处理，不按名猜
                     let first_ch = &candidates[0];
                     let first_provider = first_ch.params.provider_id.as_deref().unwrap_or("openai_compat");
                     let first_model = &first_ch.model;
@@ -738,7 +730,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             "image" => expert.capabilities.vision,
                             _ => false,
                         },
-                        None => accepts_modality(first_model, kind),
+                        None => false,
                     };
                     if !gate_ok {
                         let text = format!(

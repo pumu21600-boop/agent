@@ -7,7 +7,7 @@
   import RenameModal from './lib/RenameModal.svelte';
   import WorkspaceModal from './lib/WorkspaceModal.svelte';
   import ModelPicker from './lib/ModelPicker.svelte';
-  import { fmtBytes, relTime, fmtTok, norm, configLabel, inferCapabilities, gitStatusLabel } from './lib/format.js';
+  import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel } from './lib/format.js';
 
   // —— 配置（改动即自动保存即时生效）——
   let providers = [];
@@ -410,7 +410,7 @@
         : thinkingStyle === 'qwen'
           ? 'Qwen 系 enable_thinking 布尔'
           : thinkingStyle === 'anthropic'
-            ? 'Anthropic Messages thinking（开启后预算自动取输出上限一半；带工具结果的轮次自动关闭）'
+            ? 'Anthropic Messages thinking（真 Anthropic 预算自动取输出上限一半；GLM Coding 端点按 ZCode 规范走 effort 分档）'
             : thinkingStyle === 'qwen-chat-template'
             ? '本地推理服务 chat_template_kwargs（Qwen3 系模板）'
             : thinkingStyle === 'openai'

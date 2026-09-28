@@ -50,29 +50,9 @@ impl Default for ModelCapabilities {
     }
 }
 
-impl ModelCapabilities {
-    /// 根据模型名称智能推导默认能力
-    pub fn infer_from_model_id(model_id: &str) -> Self {
-        let id = model_id.trim().to_lowercase();
-        let is_vision = id.contains("vl")
-            || id.contains("vision")
-            || id.contains("gemini")
-            || id.contains("gpt-4o")
-            || id.contains("gpt-5")
-            || id.contains("claude-3")
-            || id.contains("omni")
-            || id.contains("mimo")
-            || id.contains("sensenova");
-        let is_video = id.contains("video") || id.contains("gemini-2") || id.contains("omni") || id.contains("mimo");
-        let is_audio = id.contains("audio") || id.contains("realtime") || id.contains("whisper") || id.contains("omni") || id.contains("gemini") || id.contains("mimo");
-        Self {
-            tools: true,
-            vision: is_vision,
-            video: is_video,
-            audio: is_audio,
-        }
-    }
-}
+// P23.1（用户拍板）：按模型名「智能推导」能力的机制整体退役——聚合渠道上模型名与真实能力
+// 对不上（统计不过来），预测错的徽章/门控比没有更糟。能力一律以用户手动勾选为准：
+// 新建/迁移配置用 Default（tools 开、其余关，user_set=false），媒体门控只认勾选值。
 
 /// 角色路由配置（P8.5：支持主力、摘要、标题及多模态视觉/视频/音频路由，解决 config.toml 割裂）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -431,7 +411,7 @@ impl Settings {
                         let base_url = legacy.base_url.unwrap_or_default();
                         let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
                         let models = legacy.models.unwrap_or_default();
-                        let cap = ModelCapabilities::infer_from_model_id(&model);
+                        let cap = ModelCapabilities::default();
                         s.configs.push(Config {
                             id: new_config_id(),
                             name: "配置 1".to_string(),
@@ -475,7 +455,7 @@ impl Settings {
         } else {
             seed_model.to_string()
         };
-        let cap = ModelCapabilities::infer_from_model_id(&model);
+        let cap = ModelCapabilities::default();
         s.configs.push(Config {
             id: new_config_id(),
             name: "配置 1".to_string(),
@@ -795,25 +775,6 @@ fn new_config_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn capabilities_inference() {
-        let c_vision = ModelCapabilities::infer_from_model_id("qwen-vl-max");
-        assert!(c_vision.vision);
-        assert!(c_vision.tools);
-
-        let c_text = ModelCapabilities::infer_from_model_id("deepseek-chat");
-        assert!(!c_text.vision);
-        assert!(!c_text.video);
-        assert!(c_text.tools);
-
-        let c_v4 = ModelCapabilities::infer_from_model_id("deepseek-v4-flash");
-        assert!(!c_v4.vision);
-
-        let c_gemini = ModelCapabilities::infer_from_model_id("gemini-2.0-flash");
-        assert!(c_gemini.vision);
-        assert!(c_gemini.video);
-    }
 
     #[test]
     fn protocol_preset_inference() {
