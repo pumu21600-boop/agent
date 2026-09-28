@@ -401,6 +401,11 @@
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
   const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低档', medium: '中档', high: '高档', max: '最大' };
+  // P23.2 思考三态机制：默认('')/关闭('off')/开启('on'+档位)。
+  // 选「开启」后菜单不收起，才展开该厂商预设映射的档位（点档位才收尾）；
+  // 档位到线上参数的映射在网关：anthropic=预算比例（低20%/中50%/高80%，GLM 端点归 effort 档）
+  const THINKING_ON_VALUES = ['on', 'low', 'medium', 'high', 'max', 'xhigh', 'minimal'];
+  $: thinkingOn = THINKING_ON_VALUES.includes(thinking);
   // 提示按「生效形态」给（覆盖 > 端点探测），auto/无参数渠道给可操作指引
   $: thinkHint =
     thinkingStyle === 'zai'
@@ -410,7 +415,7 @@
         : thinkingStyle === 'qwen'
           ? 'Qwen 系 enable_thinking 布尔'
           : thinkingStyle === 'anthropic'
-            ? 'Anthropic Messages thinking（真 Anthropic 预算自动取输出上限一半；GLM Coding 端点按 ZCode 规范走 effort 分档）'
+            ? 'Anthropic Messages thinking：低/中/高=预算 20%/50%/80%（GLM Coding 端点按 ZCode 规范映射 effort 档）'
             : thinkingStyle === 'qwen-chat-template'
             ? '本地推理服务 chat_template_kwargs（Qwen3 系模板）'
             : thinkingStyle === 'openai'
@@ -418,9 +423,10 @@
               : thinkingStyle === 'none'
                 ? '形态=不发参数，思考由渠道决定'
                 : '该渠道无标准开关参数——关不掉到设置改「思考参数形态」';
-  function pickThinking(v) {
+  function pickThinking(v, keepOpen = false) {
     thinking = v;
-    thinkMenuOpen = false;
+    // 「开启」不收起菜单——档位要等开启后才出现（P23.2 三态机制）
+    if (!keepOpen) thinkMenuOpen = false;
     // 同步进设置（持久化到当前配置，刷新/切会话不丢）
     autoSave({ thinking: v }, 0);
   }
@@ -4604,7 +4610,7 @@
             <div class="bar-menu">
               <button
                 class="pill think-pill"
-                class:active={thinking === 'on' || thinking === 'low' || thinking === 'medium' || thinking === 'high'}
+                class:active={thinkingOn}
                 on:click={() => (thinkMenuOpen = !thinkMenuOpen)}
                 title={thinkHint}
               >
@@ -4616,50 +4622,38 @@
                   <button class="bar-item" class:active={thinking === ''} on:click={() => pickThinking('')}>
                     默认
                   </button>
+                  <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
+                    关闭
+                  </button>
 
-                  {#if thinkingStyle === 'deepseek'}
-                    <!-- DeepSeek-V4：默认 -> 低 -> 中 -> 高 -> 最大 -> 关闭 -->
-                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                      低
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'medium'} on:click={() => pickThinking('medium')}>
-                      中
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'on'} on:click={() => pickThinking('high')}>
-                      高
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
-                      最大
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
-                    </button>
-                  {:else if thinkingStyle === 'openai'}
-                    <!-- OpenAI (o1/o3/GPT-5)：默认 -> 低 -> 中 -> 高 -> 关闭 -->
-                    <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
-                      低
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'medium' || thinking === 'on'} on:click={() => pickThinking('medium')}>
-                      中
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'high' || thinking === 'max'} on:click={() => pickThinking('high')}>
-                      高
-                    </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
-                    </button>
-                  {:else if thinkingStyle === 'none'}
-                    <!-- 极简模式 / 不发思考参数 -->
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
-                    </button>
-                  {:else}
-                    <!-- 通义千问 (Qwen)、智谱 GLM、字节豆包、本地服务及通用渠道：官方原生开关 开启 / 关闭 -->
-                    <button class="bar-item" class:active={thinking === 'on' || thinking === 'high' || thinking === 'medium' || thinking === 'low' || thinking === 'max'} on:click={() => pickThinking('on')}>
+                  {#if thinkingStyle === 'deepseek' || thinkingStyle === 'openai' || thinkingStyle === 'anthropic'}
+                    <!-- P23.2 三态机制：开启后菜单不收起，才展开该厂商预设映射的档位。
+                         anthropic：低/中/高=预算 20%/50%/80%（GLM Coding 端点归 effort 档）；
+                         deepseek：低/中/高/最大=reasoning_effort；openai：低/中/高=reasoning_effort -->
+                    <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on', true)}>
                       开启
                     </button>
-                    <button class="bar-item" class:active={thinking === 'off'} on:click={() => pickThinking('off')}>
-                      关闭
+                    {#if thinkingOn}
+                      <button class="bar-item" class:active={thinking === 'low'} on:click={() => pickThinking('low')}>
+                        低
+                      </button>
+                      <button class="bar-item" class:active={thinking === 'medium'} on:click={() => pickThinking('medium')}>
+                        中
+                      </button>
+                      <button class="bar-item" class:active={thinking === 'high'} on:click={() => pickThinking('high')}>
+                        高
+                      </button>
+                      {#if thinkingStyle === 'deepseek'}
+                        <button class="bar-item" class:active={thinking === 'max'} on:click={() => pickThinking('max')}>
+                          最大
+                        </button>
+                      {/if}
+                    {/if}
+                  {:else if thinkingStyle !== 'none'}
+                    <!-- 通义千问 (Qwen)、智谱 GLM（标准端点）、字节豆包、本地服务及通用渠道：
+                         官方原生开关，无档位（默认/关闭在上方，开启即收尾） -->
+                    <button class="bar-item" class:active={thinkingOn} on:click={() => pickThinking('on')}>
+                      开启
                     </button>
                   {/if}
                 </div>

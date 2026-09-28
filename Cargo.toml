@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.25.1"
+version = "0.25.2"
 edition = "2024"
 description = "跑在 Windows 上的类 Codex 自主编码 Agent（Rust + Svelte，本地优先，SSE 流式）"
 

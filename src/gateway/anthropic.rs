@@ -113,9 +113,16 @@ fn carries_tool_result(messages: &[Value]) -> bool {
     messages.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
 }
 
-/// 思考预算：max_tokens 的一半，夹在 [1024, 32000]，且必须 < max_tokens；放不下就不开思考。
-pub fn thinking_budget(max_tokens: u64) -> Option<u64> {
-    let budget = (max_tokens / 2).clamp(THINKING_BUDGET_MIN, THINKING_BUDGET_MAX);
+/// 思考预算：按档位取 max_tokens 比例（P23.2 用户机制：Anthropic 档位 低/中/高），
+/// 夹在 [1024, 32000]，且必须 < max_tokens；放不下就不开思考。
+/// on/中=50%，低=20%，高=80%。
+pub fn thinking_budget(max_tokens: u64, requested: &str) -> Option<u64> {
+    let frac = match requested {
+        "low" | "minimal" => 0.20,
+        "high" | "max" | "xhigh" => 0.80,
+        _ => 0.50, // on / medium
+    };
+    let budget = ((max_tokens as f64 * frac) as u64).clamp(THINKING_BUDGET_MIN, THINKING_BUDGET_MAX);
     (budget < max_tokens).then_some(budget)
 }
 
@@ -248,7 +255,7 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
             }
         } else if t != "off"
             && !carries_tool_result(&arr)
-            && let Some(budget) = thinking_budget(params.max_tokens.unwrap_or(8192))
+            && let Some(budget) = thinking_budget(params.max_tokens.unwrap_or(8192), t)
         {
             body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
         }
@@ -529,8 +536,16 @@ mod tests {
         p.thinking = Some("on".into());
         p.max_tokens = Some(8192);
         let b = build_body("claude-sonnet", &msgs, true, &p, None);
-        assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":4096}), "预算取 max_tokens 一半");
+        assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":4096}), "on=预算取 max_tokens 一半");
+        // 档位比例（P23.2）：低=20%、高=80%
+        p.thinking = Some("low".into());
+        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        assert_eq!(b["thinking"]["budget_tokens"], json!(1638), "低=20%");
+        p.thinking = Some("high".into());
+        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        assert_eq!(b["thinking"]["budget_tokens"], json!(6553), "高=80%");
         // max_tokens 太小放不下预算：不开思考
+        p.thinking = Some("on".into());
         p.max_tokens = Some(1024);
         let b = build_body("claude-sonnet", &msgs, true, &p, None);
         assert!(b.get("thinking").is_none(), "budget 必须严格小于 max_tokens，放不下就不发");
