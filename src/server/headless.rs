@@ -366,7 +366,10 @@ pub(crate) async fn run_headless_inner(
                         col_task.answer.lock().unwrap_or_else(|e| e.into_inner()).push_str(&c)
                     }
                     agent::AgentEvent::Reasoning(r) => {
-                        col_task.reasoning.lock().unwrap_or_else(|e| e.into_inner()).push_str(&r)
+                        // P26：思考=关时不收 reasoning（渠道可能仍自行思考，用户关了就不显示）
+                        if ch.primary.params.thinking.as_deref() != Some("off") {
+                            col_task.reasoning.lock().unwrap_or_else(|e| e.into_inner()).push_str(&r)
+                        }
                     }
                     agent::AgentEvent::ToolResult { name, ok, preview } => {
                         col_task

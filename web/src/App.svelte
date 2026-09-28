@@ -764,6 +764,8 @@
   //      占位区并把矩形报给后端（壳里的 webview 摆到这块）；浏览器直开 5173 时
   //      仍是 screencast 帧流，两条路径由后端 state.mode + 是否在 Tauri 里共同决定。
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
+  // 思考过程展开态（按消息 id 记；流式 patch 换对象不丢开合——原生 details 在重渲染下会闪回，用户反馈展开不了）
+  let thinkingOpenMap = {};
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
@@ -873,10 +875,11 @@
       }
       // 地址栏跟随当前标签页。注意不能读 $: webActive（函数内拿到的是本帧旧值），
       // 就地重查；用户正在地址栏打字时（聚焦中）不覆盖。
+      // 无活动标签页（最后一个被关）时清空地址栏——否则还挂着已关标签的地址（用户反馈 bug）。
       const act = webTabs.find((t) => t.id === webActiveId) || null;
       const addrEl = document.querySelector('.web-address');
-      if (act && document.activeElement !== addrEl) {
-        webAddress = act.url === 'about:blank' ? '' : act.url || '';
+      if (document.activeElement !== addrEl) {
+        webAddress = act ? (act.url === 'about:blank' ? '' : act.url || '') : '';
       }
       // 上报可见页：后端据此只给这一页跑 screencast 帧流、挂起其余后台页
       if (webActiveId) webActivate(webActiveId);
@@ -898,6 +901,9 @@
   // 面板不看了（切走页签/关面板）：通知后端停帧流、放后台页去挂起；
   // P22 原生托管下空白页（about:blank）也通知隐藏——壳里那个 webview 要让位给空态引导
   function webNotifyHidden() {
+    // 清去重键：面板重新打开时即使矩形没变也要重发一遍——后端在面板收起时会作废
+    // 上次矩形（防旧矩形闪现），等新矩形才显示 webview；键不清就永远等不到
+    webViewportKey = '';
     webApi('/api/browser/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4288,10 +4294,20 @@
           <div class="msg assistant">
             <div class="bubble asst-bubble">
               {#if m.thinking}
-                <details class="thinking">
-                  <summary>思考过程</summary>
-                  <div class="thinking-body">{m.thinking}</div>
-                </details>
+                {@const thinkingOpen = thinkingOpenMap[m.id] || false}
+                <div class="thinking">
+                  <button
+                    class="thinking-summary"
+                    on:click={() => (thinkingOpenMap = { ...thinkingOpenMap, [m.id]: !thinkingOpen })}
+                    title={thinkingOpen ? '收起思考过程' : '展开思考过程'}
+                  >
+                    <span class="thinking-caret">{thinkingOpen ? '▼' : '▶'}</span>
+                    思考过程
+                  </button>
+                  {#if thinkingOpen}
+                    <div class="thinking-body">{m.thinking}</div>
+                  {/if}
+                </div>
               {/if}
               {#if m.approval}
                 <div class="approval-box" class:danger={m.approval.risk >= 2}>
@@ -7729,11 +7745,22 @@
   .thinking {
     margin-bottom: 8px;
   }
-  .thinking summary {
+  .thinking-summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0;
+    border: none;
+    background: none;
     cursor: pointer;
     font-size: 12px;
     color: var(--g6);
     user-select: none;
+    font-family: inherit;
+  }
+  .thinking-caret {
+    font-size: 10px;
+    line-height: 1;
   }
   .thinking-body {
     margin-top: 6px;

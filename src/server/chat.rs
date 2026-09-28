@@ -975,7 +975,13 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             },
                 |ev| match ev {
                     AgentEvent::Content(c) => send(json!({ "content": c })),
-                    AgentEvent::Reasoning(r) => send(json!({ "reasoning": r })),
+                    // P26：思考=关时不上报 reasoning——渠道（如 StepFun 推理模型）无视
+                    // 「不发思考参数」仍自行思考，用户明确关了就不要再显示思考过程
+                    AgentEvent::Reasoning(r) => {
+                        if ch.primary.params.thinking.as_deref() != Some("off") {
+                            send(json!({ "reasoning": r }))
+                        }
+                    }
                     AgentEvent::ToolCall { name, args } => {
                         send(json!({ "tool_call": { "name": name, "args": args } }))
                     }

@@ -260,6 +260,11 @@ impl BrowserSession {
     }
     fn set_showing(&self, v: bool) {
         *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner()) = v;
+        // P26：面板收起时作废上次矩形——否则重新打开时壳拿旧矩形立刻显示 webview
+        // （侧边栏展开动画还没完，页面先闪在旧位置再被新矩形套进去，用户反馈很突兀）
+        if !v {
+            *self.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
     /// 快照列表（面板展示与 agent list 用）。
     async fn tab_briefs(&self) -> Vec<TabBrief> {

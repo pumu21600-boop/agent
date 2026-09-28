@@ -832,7 +832,10 @@ pub async fn run_task(
             "content": if turn.content.is_empty() { Value::Null } else { json!(turn.content) },
             "tool_calls": calls_json,
         });
-        if !turn.reasoning.is_empty() {
+        if !turn.reasoning.is_empty()
+            && primary.params.thinking.as_deref() != Some("off")
+        {
+            // P26：思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
             asst_msg["reasoning_content"] = json!(turn.reasoning);
         }
         msgs.push(asst_msg);
