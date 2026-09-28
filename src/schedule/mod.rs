@@ -498,6 +498,7 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     fn task(cron: &str, mode: &str, sid: &str) -> ScheduleTask {
         ScheduleTask {
@@ -660,10 +661,21 @@ mod tests {
 
     #[test]
     fn next_run_uses_last_run_as_base() {
-        // 从没跑过：基准 = created_ts（0 = 1970-01-01 00:00 UTC = 本地 08:00）
-        // → 当天本地 09:00 = 1970-01-01 01:00 UTC = 3600 秒
+        // 从没跑过：基准 = created_ts（0 = 1970-01-01 00:00 UTC）。
+        // 不能写死期望的 epoch 秒数——实现按本地时区解析 cron，CI 机器是 UTC、
+        // 开发机东八区，写死偏移量在另一边必挂（CI 实锤：期望 3600、实算 32400）。
+        // 改为查性质：结果换算回本地必须是 09:00:00，且落在基准后一天内（第一个 09:00）。
         let t = task("0 9 * * *", "new", "");
-        assert_eq!(next_run_ts(&t), Some(3600));
+        let next = next_run_ts(&t).expect("应有下一次");
+        let local = DateTime::from_timestamp(next, 0)
+            .unwrap()
+            .with_timezone(&Local);
+        assert_eq!((local.hour(), local.minute(), local.second()), (9, 0, 0));
+        assert!(
+            (0..=86_400).contains(&(next - t.created_ts)),
+            "应是基准后第一个 09:00，实际隔了 {} 秒",
+            next - t.created_ts
+        );
         // 跑过：基准 = last_run_ts，下一次严格大于它
         let mut t = task("0 9 * * *", "new", "");
         let base = DateTime::from_timestamp(1_800_000_000, 0).unwrap(); // 2027-01-15 前后
