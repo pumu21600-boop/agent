@@ -18,21 +18,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
-pub struct CancelFlag(AtomicBool);
+pub struct CancelFlag {
+    flag: AtomicBool,
+    /// P26：异步等待用——工具执行（如卡在浏览器 CDP 调用里）只靠轮询 is_set
+    /// 要等工具自己超时（用户点「结束回答」后新消息会白等几十秒进队列）。
+    /// set() 时唤醒所有等待者，agent 循环用 select! 当场中断工具执行。
+    notify: tokio::sync::Notify,
+}
 
 impl CancelFlag {
     pub fn new() -> Self {
-        Self(AtomicBool::new(false))
+        Self { flag: AtomicBool::new(false), notify: tokio::sync::Notify::new() }
     }
 
     /// 置位（停止按钮 / 审批卡的取消路径）。
     pub fn set(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// 网关每个决策点、每个流式分片前检查。
     pub fn is_set(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// 异步等到取消置位（已置位则立即返回）。供 select! 中断阻塞中的工具执行。
+    pub async fn cancelled(&self) {
+        if self.is_set() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 

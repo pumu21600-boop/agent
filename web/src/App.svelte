@@ -855,7 +855,18 @@
   }
   // 空白页（about:blank）显示空态引导；有地址就渲染截图
   $: webShowShot = !!(webActive && webActive.url && webActive.url !== 'about:blank');
-  $: if (rpTab === 'web' && webBodyW && webActive) webQueueViewport();
+  // P26：面板「正在展示网页」的布尔态（只用原始值，避免对象标识每 2s 轮询都变导致重复触发）。
+  // 后端在面板隐藏时会作废上次矩形（防收起再弹时旧矩形闪现），所以这个态每次
+  // false→true（侧边栏重开/空白页加载出来/切回网页页签）都必须重发一次矩形，
+  // 去重键先清——不然壳永远等不到矩形，网页不显示（用户实测实锤）。
+  $: webShowing = rpTab === 'web' && rightPanelOpen && !!webActiveId && webShowShot;
+  $: if (webShowing && webBodyW) {
+    webViewportKey = '';
+    webQueueViewport();
+  }
+  // 常规同步路径（尺寸变化/切页；去重键挡重复）：无头模式没有 ResizeObserver，
+  // 靠 webActive 随轮询变标识兜底触发——保留它，别让上面那个跃迁响应式取代
+  $: if (rpTab === 'web' && rightPanelOpen && webBodyW && webActive) webQueueViewport();
 
   async function loadWebState(keepActive = true) {
     try {

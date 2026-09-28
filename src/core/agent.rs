@@ -960,9 +960,14 @@ pub async fn run_task(
             let runner = subagent_runner.clone();
             let parent = parent_sid.clone();
             futs.push(Box::pin(async move {
+                let exec = exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent);
+                // P26：并行组同样可被取消即时中断（串行组同款，见下方 select! 注释）
                 (
                     i,
-                    exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent).await,
+                    tokio::select! {
+                        r = exec => r,
+                        () = cancel.cancelled() => Err("已取消：用户点了结束回答".to_string()),
+                    },
                 )
             }));
         }
@@ -1069,15 +1074,23 @@ pub async fn run_task(
                         ),
                     }
                 }
-                match exec_tool_call(
+                let exec = exec_tool_call(
                     &exec_cfg,
                     &call.name,
                     &call.arguments,
                     channels.subagents.as_ref(),
                     gate.session_id(),
-                )
-                .await
-                {
+                );
+                // P26：取消即时中断——工具卡在浏览器 CDP 调用里时，select! 到取消当场丢 future
+                // （以前只靠下个决策点轮询 is_set，用户点了「结束回答」还要干等工具超时，
+                // 期间服务端仍显示在跑，新消息被排进队列——用户实测实锤）
+                let exec = async {
+                    tokio::select! {
+                        r = exec => r,
+                        () = cancel.cancelled() => Err("已取消：用户点了结束回答".to_string()),
+                    }
+                };
+                match exec.await {
                     Ok(s) => (s, true),
                     Err(e) => (format!("工具执行失败: {e}"), false),
                 }

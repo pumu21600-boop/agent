@@ -521,17 +521,20 @@ async fn shell_create_target(session: &BrowserSession) -> Result<(String, String
         return Err("桌面壳控制通道未连接（壳没跑或已断开）".into());
     }
     let label = format!("wv-{}", session.tabs.lock().unwrap_or_else(|e| e.into_inner()).len() + 1);
-    // 初始矩形：面板上次同步的矩形（没有就用个默认值；显示前 sweep 会补发正确矩形）
+    // 初始矩形：有面板同步过的矩形就用；没有（面板收起过/从未同步）建到**屏幕外**——
+    // 壳的 add_child 是先可见再按 visible=false 隐藏，建在 (0,0) 或失效矩形上会闪一个
+    // 莫名窗口（用户实测实锤）；屏幕外建、保持隐藏，等真正的 rect+visible 指令再归位。
     let (x, y, w, h) = session
         .last_rect
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .unwrap_or((0, 0, 1024, 768));
+        .map(|(x, y, w, h)| (x as f64, y as f64, w as f64, h as f64))
+        .unwrap_or((-4000.0, -4000.0, 1024.0, 768.0));
     // 发现基线：**发指令前**快照全部 page target id——壳里上一个会话残留的 webview
     // （服务重启后壳不重启时就有）target 还在列表里，只排除自己的 tab 会认领到将死的
     // 旧 target，连上就断
     let known = all_page_target_ids(session.port).await;
-    shell::create(&label, "about:blank", x as f64, y as f64, w as f64, h as f64, false);
+    shell::create(&label, "about:blank", x, y, w, h, false);
     match wait_new_page_target(session.port, &known, Duration::from_secs(8)).await {
         Ok((id, ws)) => Ok((id, ws, Some(label))),
         Err(e) => {
