@@ -3540,7 +3540,7 @@
     return out;
   }
   function addMcpServer() {
-    const isHttp = mcpForm.transport === 'http';
+    const isHttp = mcpForm.transport === 'http' || mcpForm.transport === 'sse';
     const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
     // P24：选了 OAuth 就带 oauth 配置（授权码可留空 client_id 走动态注册）
     const oauth =
@@ -3555,7 +3555,7 @@
     const srv = isHttp
       ? {
           name: mcpForm.name.trim(),
-          transport: 'http',
+          transport: mcpForm.transport,
           url: mcpForm.url.trim(),
           headers: parseHeaders(mcpForm.headers),
           ...(oauth ? { oauth } : {}),
@@ -5507,7 +5507,9 @@
               <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
             </div>
             <div class="mcp-cmd">
-              {sv.transport === 'http' ? `HTTP · ${sv.url}` : `${sv.command} ${(sv.args || []).join(' ')}`}
+              {sv.transport === 'stdio'
+                ? `${sv.command} ${(sv.args || []).join(' ')}`
+                : `${sv.transport.toUpperCase()} · ${sv.url}`}
             </div>
             {#if sv.oauth}
               <div class="sub-row">
@@ -5592,10 +5594,11 @@
               options={[
                 { value: 'stdio', label: 'stdio（本地子进程）' },
                 { value: 'http', label: 'http（远端 MCP）' },
+                { value: 'sse', label: 'sse（远端 MCP·SSE 长连接）' },
               ]}
               on:change={(e) => (mcpForm.transport = e.detail)}
             />
-            {#if mcpForm.transport === 'http'}
+            {#if mcpForm.transport === 'http' || mcpForm.transport === 'sse'}
               <input placeholder="https://host/mcp" bind:value={mcpForm.url} />
             {:else}
               <input placeholder="命令，如 node / npx" bind:value={mcpForm.command} />
@@ -5605,10 +5608,10 @@
               class="btn primary"
               on:click={addMcpServer}
               disabled={!mcpForm.name.trim() ||
-                (mcpForm.transport === 'http' ? !mcpForm.url.trim() : !mcpForm.command.trim())}>添加</button
+                (mcpForm.transport === 'stdio' ? !mcpForm.command.trim() : !mcpForm.url.trim())}>添加</button
             >
           </div>
-          {#if mcpForm.transport === 'http'}
+          {#if mcpForm.transport === 'http' || mcpForm.transport === 'sse'}
             <div class="sub-row">
               <textarea
                 placeholder={'自定义请求头，每行一条：\nAuthorization: Bearer xxx'}

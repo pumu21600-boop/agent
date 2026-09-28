@@ -123,11 +123,12 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_skill",
-            description: "读取一个技能（Skill）的完整 SKILL.md。系统提示的「可用技能」索引列出全部技能；用户消息中出现 $技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
+            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部技能；用户消息中出现 $技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "name": { "type": "string", "description": "技能名（见系统提示「可用技能」索引，如 deploy）" }
+                    "name": { "type": "string", "description": "技能名（见系统提示「可用技能」索引，如 deploy）" },
+                    "ref": { "type": "string", "description": "可选：references/ 下的参考文件名（见 SKILL.md 里的引用说明或索引篇数提示）" }
                 },
                 "required": ["name"]
             }),
@@ -301,7 +302,11 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
                 .get("name")
                 .and_then(|x| x.as_str())
                 .ok_or("缺少 name 参数")?;
-            crate::skills::read(name)
+            // P25：带 ref 读 references/ 单篇；不带读 SKILL.md 全文
+            match v.get("ref").and_then(|x| x.as_str()) {
+                Some(r) => crate::skills::read_ref(name, r),
+                None => crate::skills::read(name),
+            }
         }
         "write_file" => write_file(args, cfg.fs_unconfined),
         "edit_file" => edit_file(args, cfg.fs_unconfined),

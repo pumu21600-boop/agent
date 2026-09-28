@@ -39,12 +39,28 @@ fn is_http(cfg: &McpServerCfg) -> bool {
     cfg.transport.eq_ignore_ascii_case("http")
 }
 
+/// P25：SSE transport（MCP 2024-11-05 的 HTTP+SSE transport）。
+fn is_sse(cfg: &McpServerCfg) -> bool {
+    cfg.transport.eq_ignore_ascii_case("sse")
+}
+
 /// HTTP transport 运行态（stdio 不用）。
 #[derive(Debug, Clone)]
 struct HttpState {
     client: reqwest::blocking::Client,
     /// initialize 响应头 `Mcp-Session-Id`；有则后续请求回带
     session_id: Option<String>,
+}
+
+/// SSE transport 运行态（P25；MCP 2024-11-05 的 HTTP+SSE transport）：
+/// GET 一条长连接收 server→client 的 message 事件，client→server 走 endpoint 事件
+/// 给出的 POST URL。reader 线程把 message 帧推进 rx；主侧按 id 配对。
+#[derive(Debug)]
+struct SseState {
+    client: reqwest::blocking::Client,
+    /// endpoint 事件给出的 POST 地址（绝对化后的）
+    post_url: String,
+    rx: std::sync::mpsc::Receiver<Value>,
 }
 
 /// 单个 server 的运行态。
@@ -65,6 +81,8 @@ struct ServerState {
     reader: Option<BufReader<ChildStdout>>,
     /// HTTP transport 态（Some 即代表该 server 走 http）
     http: Option<HttpState>,
+    /// SSE transport 态（P25；Some 即代表该 server 走 sse）
+    sse: Option<SseState>,
     next_id: u64,
 }
 
@@ -78,6 +96,7 @@ impl ServerState {
         self.stdin = None;
         self.reader = None;
         self.http = None;
+        self.sse = None; // P25：丢 rx → reader 线程下一次 send 失败即自行退出
         self.online = false;
     }
 }
@@ -153,12 +172,14 @@ fn ensure_online(st: &mut ServerState) -> Result<(), String> {
         && matches!(child.try_wait(), Ok(Some(_))) {
             st.reset_proc();
         }
-    if st.online && (st.http.is_some() || (st.stdin.is_some() && st.reader.is_some())) {
+    if st.online && (st.http.is_some() || st.sse.is_some() || (st.stdin.is_some() && st.reader.is_some())) {
         return Ok(());
     }
     st.reset_proc();
     let cfg = st.cfg.clone().ok_or("无配置")?;
-    if is_http(&cfg) {
+    if is_sse(&cfg) {
+        spawn_sse(st, &cfg)?;
+    } else if is_http(&cfg) {
         let url = cfg.url.trim().to_string();
         if url.is_empty() {
             return Err("transport=http 但 url 为空".into());
@@ -318,6 +339,9 @@ fn rpc_round(
     expect_id: Option<u64>,
     timeout_ms: u64,
 ) -> Result<Value, String> {
+    if st.sse.is_some() {
+        return sse_round(st, req, expect_id, timeout_ms);
+    }
     if st.http.is_some() {
         return http_round(st, req, expect_id, timeout_ms);
     }
@@ -357,6 +381,169 @@ fn rpc_round(
     }
 }
 
+/// SSE transport（P25）：GET 长连接 + reader 线程。
+/// 首事件 `endpoint` 给出 client→server 的 POST URL（可能相对路径，按 base origin 补全）；
+/// 之后 `message` 事件的 data 即 JSON-RPC 帧，推进 rx 由 sse_round 按 id 配对。
+fn spawn_sse(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
+    let url = cfg.url.trim().to_string();
+    if url.is_empty() {
+        return Err("transport=sse 但 url 为空".into());
+    }
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(300));
+    if is_loopback_url(&url) {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().map_err(|e| format!("SSE 客户端创建失败: {e}"))?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .map_err(|e| format!("SSE 连接失败（{url}）: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("SSE 连接返回 HTTP {}", resp.status().as_u16()));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ep_tx, ep_rx) = std::sync::mpsc::channel();
+    let base = url.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(resp);
+        let mut event = String::new();
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if line.is_empty() {
+                event.clear();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("event:") {
+                event = rest.trim().to_string();
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            match event.as_str() {
+                "endpoint" => {
+                    let post_url = if data.starts_with("http://") || data.starts_with("https://") {
+                        data.to_string()
+                    } else {
+                        // 相对路径（/messages?sessionId=…）：按 base 的 origin 补全
+                        let after = base.split_once("://").map(|(_, r)| r).unwrap_or(&base);
+                        let host = after.split('/').next().unwrap_or("");
+                        let scheme = base.split_once("://").map(|(s, _)| s).unwrap_or("http");
+                        format!("{scheme}://{host}{data}")
+                    };
+                    let _ = ep_tx.send(post_url);
+                }
+                "message" => {
+                    if let Ok(v) = serde_json::from_str::<Value>(data)
+                        && tx.send(v).is_err()
+                    {
+                        break; // 主侧已丢弃（reset_proc/删配置）：收线程
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 流结束：drop tx/ep_tx → 主侧 recv 失败 → 离线重连
+    });
+    let post_url = ep_rx
+        .recv_timeout(Duration::from_secs(15))
+        .map_err(|_| "SSE 等 endpoint 事件超时（server 没给 POST 地址）".to_string())?;
+    st.sse = Some(SseState { client, post_url, rx });
+    Ok(())
+}
+
+/// OAuth Bearer 值（P24）：配置了 oauth 且有 token 返回 Some；无 token 返回人话 Err。
+/// http / sse 两种 transport 共用。
+fn oauth_bearer(cfg: &McpServerCfg, url: &str) -> Result<Option<String>, String> {
+    let Some(oauth) = &cfg.oauth else { return Ok(None) };
+    match crate::plugin::mcp_oauth::token_for(&cfg.name) {
+        Some(t) => {
+            let t = crate::plugin::mcp_oauth::refresh_if_needed(&cfg.name, url, oauth, &t)
+                .map_err(|e| format!("MCP 授权已过期且刷新失败：{e}"))?;
+            Ok(Some(t.access_token))
+        }
+        None => Err(format!(
+            "MCP 服务「{}」需要授权：设置 → 插件 → MCP → 点「授权」完成登录",
+            cfg.name
+        )),
+    }
+}
+
+/// SSE transport 的一轮：POST JSON-RPC 到 endpoint 事件给的地址（2xx 即受理），
+/// 响应经 SSE 长连接回流，按 id 配对（跳过通知/心跳帧）。
+fn sse_round(
+    st: &mut ServerState,
+    req: &Value,
+    expect_id: Option<u64>,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let cfg = st.cfg.clone().ok_or("无配置")?;
+    let (client, post_url) = {
+        let s = st.sse.as_ref().ok_or("SSE 会话未建立")?;
+        (s.client.clone(), s.post_url.clone())
+    };
+    let body_text = serde_json::to_string(req).map_err(|e| e.to_string())?;
+    let mut rb = client
+        .post(&post_url)
+        .timeout(Duration::from_millis(timeout_ms))
+        .header("Content-Type", "application/json")
+        .body(body_text);
+    for (k, v) in &cfg.headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    if let Some(token) = oauth_bearer(&cfg, &post_url)? {
+        rb = rb.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = rb.send().map_err(|e| offline(st, format!("SSE POST 失败（{post_url}）: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        let snip: String = body.chars().take(300).collect();
+        if matches!(status.as_u16(), 401 | 403) && cfg.oauth.is_some() {
+            return Err(offline(
+                st,
+                format!(
+                    "MCP 服务「{}」授权被拒绝（HTTP {}）：token 可能已过期或被撤销，请到设置 → 插件 → MCP 点「授权」重新登录",
+                    cfg.name,
+                    status.as_u16()
+                ),
+            ));
+        }
+        return Err(offline(st, format!("HTTP {}: {snip}", status.as_u16())));
+    }
+    let Some(expect_id) = expect_id else {
+        return Ok(Value::Null); // 通知：2xx 即视为已送达
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(offline(st, format!("SSE 等响应超时（{timeout_ms}ms）")));
+        }
+        // 每轮重借 rx：reset_proc 会换掉整个 SseState，不能跨调用持有借用
+        let got = {
+            let s = st.sse.as_ref().ok_or("SSE 会话已断开")?;
+            s.rx.recv_timeout(remaining)
+        };
+        match got {
+            Ok(v) => {
+                if v.get("id").and_then(Value::as_u64) != Some(expect_id) {
+                    continue; // 通知/心跳/别的响应帧
+                }
+                if let Some(err) = v.get("error") {
+                    return Err(format!("server 错误: {err}"));
+                }
+                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(offline(st, format!("SSE 等响应超时（{timeout_ms}ms）")));
+            }
+            Err(_) => return Err(offline(st, "SSE 连接已断开（server 关闭了长连接）".to_string())),
+        }
+    }
+}
+
 /// HTTP（MCP Streamable HTTP）：POST JSON-RPC。响应可以是 application/json 单包，
 /// 也可以是 text/event-stream（读 `data:` 帧、取 id 匹配的那一帧）。
 /// 会话头 `Mcp-Session-Id` 一旦从响应里拿到，同 server 后续请求回带。
@@ -387,20 +574,8 @@ fn http_round(
         rb = rb.header(k.as_str(), v.as_str());
     }
     // P24 OAuth：配置了 oauth 的远端服务，Bearer 从 token 存取取（近过期自动刷新）
-    if let Some(oauth) = &cfg.oauth {
-        match crate::plugin::mcp_oauth::token_for(&cfg.name) {
-            Some(t) => {
-                let t = crate::plugin::mcp_oauth::refresh_if_needed(&cfg.name, &url, oauth, &t)
-                    .map_err(|e| format!("MCP 授权已过期且刷新失败：{e}"))?;
-                rb = rb.header("Authorization", format!("Bearer {}", t.access_token));
-            }
-            None => {
-                return Err(format!(
-                    "MCP 服务「{}」需要授权：设置 → 插件 → MCP → 点「授权」完成登录",
-                    cfg.name
-                ));
-            }
-        }
+    if let Some(token) = oauth_bearer(&cfg, &url)? {
+        rb = rb.header("Authorization", format!("Bearer {token}"));
     }
     let resp = rb
         .send()
@@ -1155,6 +1330,82 @@ data: \"result\":{\"n\":7}}";
             .block_on(call_tool("mcp__mockres__get_prompt", r#"{"name":"review"}"#))
             .expect("get_prompt 应成功");
         assert!(prompt.contains("[user] 请评审：{{path}}"), "{prompt}");
+    }
+
+    /// P25：SSE transport 全握手——GET 长连接收 message 帧、POST 走 endpoint 事件给的地址。
+    /// mock：首连接 GET 回 endpoint 事件；随后每个 POST 202，并把对应响应帧写进 SSE 流。
+    #[test]
+    fn sse_transport_handshake_and_tools() {
+        let _guard = test_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sse_stream: std::sync::Arc<std::sync::Mutex<Option<std::net::TcpStream>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let writer = sse_stream.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { continue };
+                s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = [0u8; 16384];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if req.starts_with("GET") {
+                    s.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n",
+                    )
+                    .unwrap();
+                    s.write_all(b"event: endpoint\ndata: /messages?sessionId=t1\n\n").unwrap();
+                    *writer.lock().unwrap() = Some(s);
+                } else if req.starts_with("POST") {
+                    // 从 body 里解析 JSON-RPC 方法名，回对应响应帧（写进 SSE 流）
+                    let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+                    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+                    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+                    let frame = match method {
+                        "initialize" => json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": {
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "mocksse", "version": "1" }
+                            }
+                        }),
+                        "tools/list" => json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": { "tools": [{ "name": "echo", "description": "回声（mock）", "inputSchema": { "type": "object" } }] }
+                        }),
+                        _ => continue, // 通知等无需响应帧
+                    };
+                    if let Some(sw) = writer.lock().unwrap().as_mut() {
+                        sw.write_all(format!("event: message\ndata: {frame}\n\n").as_bytes()).unwrap();
+                    }
+                    s.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+                }
+            }
+        });
+        let cfg = McpServerCfg {
+            name: "mocksse".into(),
+            transport: "sse".into(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: format!("http://{addr}/sse"),
+            headers: BTreeMap::new(),
+            oauth: None,
+            enabled: true,
+            confirmed: true,
+            risk: "normal".into(),
+        };
+        sync_configs(std::slice::from_ref(&cfg));
+        let n = ensure_online_by_name("mocksse").expect("SSE 握手应成功");
+        assert_eq!(n, 1, "tools/list 应发现 1 个工具");
+        let defs = tool_definitions();
+        assert!(
+            defs.iter().any(|d| d.pointer("/function/name").and_then(Value::as_str) == Some("mcp__mocksse__echo")),
+            "SSE 工具应进入下发清单"
+        );
     }
 
     /// 没声明 resources/prompts 能力的 server 不该出现合成工具（避免给模型空能力）。

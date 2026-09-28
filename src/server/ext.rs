@@ -40,9 +40,9 @@ pub(super) async fn post_mcp(
             }
             // transport 合法性 + 该 transport 的必需字段（早失败好过调用时才报错）
             match cfg.transport.as_str() {
-                "http" | "HTTP" | "Http" => {
+                "http" | "HTTP" | "Http" | "sse" | "SSE" | "Sse" => {
                     if !cfg.url.trim().starts_with("http://") && !cfg.url.trim().starts_with("https://") {
-                        return err("http transport 需要 http(s):// 开头的 url".into());
+                        return err("http/sse transport 需要 http(s):// 开头的 url".into());
                     }
                 }
                 "stdio" | "STDIO" | "Stdio" => {
@@ -50,7 +50,7 @@ pub(super) async fn post_mcp(
                         return err("stdio transport 需要 command".into());
                     }
                 }
-                other => return err(format!("未知 transport: {other}（stdio | http）")),
+                other => return err(format!("未知 transport: {other}（stdio | http | sse）")),
             }
             s.mcp_servers.retain(|c| c.name != cfg.name);
             s.mcp_servers.push(cfg);

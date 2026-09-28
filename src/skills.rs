@@ -2,6 +2,9 @@
 //! 目录：`<workspace>/skills/`（项目级）与 `~/.agent/skills/`（全局），每个技能一个文件夹，内含 SKILL.md。
 //! SKILL.md 支持 `---` 围栏 frontmatter，字段 name / description；缺省 name 用文件夹名。
 //! 注入策略：system 提示只注入「名字 + 一句话描述」的索引，模型按需用 read_skill 工具拉全文。
+//! P25 加固（对齐 ZCode skills 扫描）：①符号链接三级拒绝（技能目录 / SKILL.md / references 内文件）——
+//! 链接是文件级逃逸面（SKILL.md → 外部任意文件），拒绝即无逃逸，不判定指向何处；
+//! ②references/ 渐进披露——大技能的参考文档不放全文，索引里报篇数，模型按需 read_skill(name, ref) 拉单篇。
 
 use serde::Serialize;
 use std::fs;
@@ -15,6 +18,8 @@ pub struct Skill {
     pub source: String,
     pub dir: String,
     pub content: String,
+    /// P25：references/ 下的参考文件名（渐进披露；read_skill 带 ref 参数按需拉全文）
+    pub refs: Vec<String>,
 }
 
 /// 技能根目录：(路径, 来源)。项目级在前，同名时项目覆盖全局。
@@ -49,12 +54,48 @@ fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>, String) 
     (name, desc, body)
 }
 
+/// 是否链接类入口（符号链接 / junction 都算）。三级拒绝策略见模块注释。
+/// Windows 上 junction 不带 symlink 语义但带 FILE_ATTRIBUTE_REPARSE_POINT(0x400)，
+/// 且普通用户权限就能建——只查 is_symlink 会漏掉它，必须按 reparse point 判。
+fn is_symlink(p: &Path) -> bool {
+    let Ok(m) = fs::symlink_metadata(p) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        m.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        m.file_type().is_symlink()
+    }
+}
+
+/// references/ 下的参考文件名（一层、仅文件、按名排序；链接一律跳过）。
+fn list_refs(dir: &Path) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(dir.join("references")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file() && !is_symlink(&e.path()))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    out
+}
+
 /// 单个 SKILL.md → Skill（name 缺省用文件夹名，正文去掉 frontmatter）。
+/// 符号链接三级拒绝：技能目录是链接、或 SKILL.md 是链接 → 整个技能不加载。
 fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
-    if !dir.is_dir() {
+    if !dir.is_dir() || is_symlink(dir) {
         return None;
     }
     let md_path = dir.join("SKILL.md");
+    if is_symlink(&md_path) {
+        return None;
+    }
     let content = fs::read_to_string(&md_path).ok()?;
     let folder = dir.file_name()?.to_string_lossy().to_string();
     // 正文不单独用：下面连 frontmatter 一起原样存（read_skill 给模型全文）
@@ -71,6 +112,7 @@ fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
         dir: dir.to_string_lossy().to_string(),
         content,
         name,
+        refs: list_refs(dir),
     })
 }
 
@@ -112,6 +154,37 @@ pub fn read(name: &str) -> Result<String, String> {
         }
     }
     Err(format!("未找到技能「{name}」：请在对应 skills 目录下创建 <name>/SKILL.md"))
+}
+
+/// P25：读技能的单篇参考资料（references/<ref>）。ref 名同样过 valid_name，
+/// 落点文件是链接一律拒（逃逸防护与 SKILL.md 同级）。
+pub fn read_ref(name: &str, ref_name: &str) -> Result<String, String> {
+    valid_name(name)?;
+    valid_name(ref_name)?;
+    let dir = find_dir(name).ok_or_else(|| format!("未找到技能「{name}」"))?;
+    let path = dir.join("references").join(ref_name);
+    if is_symlink(&path) {
+        return Err("参考资料是符号链接，已拒绝读取（防逃逸）".into());
+    }
+    fs::read_to_string(&path).map_err(|_| {
+        format!(
+            "技能「{name}」没有参考资料「{ref_name}」：可用的见索引里的篇数，或 read_skill(\"{name}\") 看 SKILL.md 里的引用说明"
+        )
+    })
+}
+
+/// 技能目录定位（frontmatter name 优先，文件夹名兜底）。
+fn find_dir(name: &str) -> Option<PathBuf> {
+    if let Some(s) = list().into_iter().find(|s| s.name == name) {
+        return Some(PathBuf::from(s.dir));
+    }
+    for (root, _) in roots() {
+        let dir = root.join(name);
+        if load_skill(&dir, "project").is_some() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 fn valid_name(name: &str) -> Result<(), String> {
@@ -182,12 +255,16 @@ pub fn delete(name: &str) -> Result<(), String> {
     valid_name(name)?;
     if let Some(s) = list().into_iter().find(|s| s.name == name) {
         let dir = PathBuf::from(&s.dir);
+        // 符号链接目录不删：remove_dir_all 对链接的行为平台相关，可能伤及链接目标
+        if is_symlink(&dir) {
+            return Err("技能目录是符号链接，已拒绝删除（防逃逸）".into());
+        }
         fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
         return Ok(());
     }
     for (root, _) in roots() {
         let dir = root.join(name);
-        if dir.is_dir() {
+        if dir.is_dir() && !is_symlink(&dir) {
             fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
             return Ok(());
         }
@@ -209,7 +286,13 @@ pub fn index_prompt() -> String {
         } else {
             &sk.description
         };
-        s.push_str(&format!("- ${}: {}\n", sk.name, desc));
+        // P25：references 渐进披露——索引只报篇数，模型按需 read_skill(name, ref) 拉单篇
+        let refs_hint = if sk.refs.is_empty() {
+            String::new()
+        } else {
+            format!("（含 {} 篇参考资料，按需 read_skill 带 ref 读）", sk.refs.len())
+        };
+        s.push_str(&format!("- ${}: {}{}\n", sk.name, desc, refs_hint));
     }
     s
 }
@@ -252,6 +335,61 @@ mod tests {
         assert!(valid_name("a\\b").is_err());
         assert!(valid_name("ok-name_1").is_ok());
         assert!(valid_name("部署流程").is_ok(), "中文技能名应允许");
+    }
+
+    /// P25：references 渐进披露——list 报篇数、read_ref 按名读单篇、穿越名被拒。
+    #[test]
+    fn refs_listing_and_read_ref() {
+        let name = "zz-test-skill-ref";
+        save(name, "带参考资料的技能", "步骤一").expect("save 失败");
+        let dir = crate::tools::workspace_root().join("skills").join(name);
+        fs::create_dir_all(dir.join("references")).unwrap();
+        fs::write(dir.join("references/r1.md"), "参考正文A").unwrap();
+        let listed = list().into_iter().find(|s| s.name == name).expect("应列出");
+        assert_eq!(listed.refs, vec!["r1.md".to_string()], "references 文件应进清单");
+        assert_eq!(read_ref(name, "r1.md").unwrap(), "参考正文A");
+        assert!(read_ref(name, "../SKILL.md").is_err(), "穿越名必须拒");
+        assert!(read_ref(name, "nope.md").is_err(), "不存在的参考资料给人话错");
+        let idx = index_prompt();
+        assert!(idx.contains("含 1 篇参考资料"), "索引应报篇数: {idx}");
+        delete(name).expect("清理失败");
+    }
+
+    /// P25：链接类入口逃逸防护——用 junction（普通权限可建）指向外部带 SKILL.md 的目录，
+    /// 必须整体拒载。顺带覆盖符号链接（无权限造时 junction 这条也够证明 reparse 判定生效）。
+    #[test]
+    fn linked_skill_dir_rejected() {
+        let outside = std::env::temp_dir().join(format!("agent-skill-out-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), "---\nname: evil\ndescription: 外部\n---\n外部内容").unwrap();
+        let link = crate::tools::workspace_root().join("skills").join("zz-link-skill");
+        let _ = fs::remove_dir_all(&link);
+        // junction：普通用户权限可建（symlink_dir 在这台机器上要特权，造不了）
+        let made = {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &outside.to_string_lossy(),
+                ])
+                .creation_flags(0x0800_0000)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if made {
+            assert!(is_symlink(&link), "junction 应按链接类入口识别");
+            assert!(load_skill(&link, "project").is_none(), "链接技能目录必须拒载");
+            assert!(!list().iter().any(|s| s.name == "zz-link-skill"), "链接技能不该进索引");
+            let _ = fs::remove_dir(&link); // 删 junction 本身（不伤目标）
+        } else {
+            eprintln!("跳过链接目录测试（mklink /J 失败）");
+        }
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
