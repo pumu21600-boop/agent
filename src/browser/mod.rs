@@ -211,9 +211,19 @@ struct BrowserSession {
     last_used_ms: AtomicU64,
     /// 面板当前可见的标签页（驱动 screencast 与驻留；None = 面板没在看）
     visible_tab: std::sync::Mutex<Option<String>>,
+    /// shell 模式：壳里该显示哪个标签页的 webview。**只有壳里那个客户端能写**（面板
+    /// 接口的 `native` 参数）。与 visible_tab 分开：visible_tab 是 screencast 目标，
+    /// 任何客户端（含浏览器直开 5173 的第二个）都能设——它的面板切页签只该换自己的
+    /// 截图；shell_tab 才是"壳里那块 HWND 显示谁"，被第二个客户端写的话，壳里的网页
+    /// 会跟着那个浏览器窗口的视图换页/消失（用户实锤「界面卡位」的另一副面孔）。
+    shell_tab: std::sync::Mutex<Option<String>>,
     /// **面板是否正在展示网页**（shell 模式壳里 webview 显隐的唯一依据）。
     /// 只有面板自己的动作（activate/new/viewport/frame/navigate）能置真；agent 工具的
     /// new_tab/activate_tab 不置——否则 agent 一开工就把 webview 弹到聊天区上空。
+    /// **且只有壳里那个客户端能置**（面板接口的 `native` 参数）：同一个服务上可能挂着
+    /// 第二个客户端（用户在普通浏览器里开 127.0.0.1:5173），它的「在看/不看」和它量的
+    /// x/y 都是那个浏览器窗口的坐标——拿来置壳的显隐/矩形，壳里网页就会浮到错误位置
+    /// （用户实锤「界面卡位」）。见各 panel_* 函数的 native 参数。
     panel_showing: std::sync::Mutex<bool>,
     /// shell 模式：当前在壳里显示中的 label（只发变化的显隐指令）
     shell_shown: std::sync::Mutex<Option<String>>,
@@ -246,6 +256,16 @@ impl BrowserSession {
     }
     fn clear_visible(&self) {
         *self.visible_tab.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// 壳里该显示的标签页（只有壳客户端写；见 `shell_tab` 字段注释）。
+    fn shell_tab(&self) -> Option<String> {
+        self.shell_tab.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn set_shell_tab(&self, id: &str) {
+        *self.shell_tab.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
+    }
+    fn clear_shell_tab(&self) {
+        *self.shell_tab.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     /// 记 agent 当前操作的页（面板据此跟随；agent 的切页不抢面板自己的视图）。
     fn set_agent_tab(&self, id: &str) {
@@ -840,6 +860,7 @@ async fn launch() -> Result<Arc<BrowserSession>, String> {
                     tabs: std::sync::Mutex::new(vec![first]),
                     last_used_ms: AtomicU64::new(now_ms()),
                     visible_tab: std::sync::Mutex::new(None),
+                    shell_tab: std::sync::Mutex::new(None),
                     panel_showing: std::sync::Mutex::new(false),
                     shell_shown: std::sync::Mutex::new(None),
                     last_rect: std::sync::Mutex::new(None),
@@ -882,6 +903,7 @@ async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         tabs: std::sync::Mutex::new(Vec::new()),
         last_used_ms: AtomicU64::new(now_ms()),
         visible_tab: std::sync::Mutex::new(None),
+        shell_tab: std::sync::Mutex::new(None),
         panel_showing: std::sync::Mutex::new(false),
         shell_shown: std::sync::Mutex::new(None),
         last_rect: std::sync::Mutex::new(None),
@@ -990,6 +1012,7 @@ fn ensure_reaper() {
 async fn sweep_session(session: &Arc<BrowserSession>) {
     let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let visible = session.visible();
+    let shell_tab = session.shell_tab();
     // screencast 同步：可见页 + 仍有客户端在轮询帧才开（壳里看的是真页面，不白编码；
     // 用户从普通浏览器开面板时轮询恢复，帧流自动跟上）
     let want_frames = now_ms().saturating_sub(session.last_frame_poll_ms.load(Ordering::Relaxed)) < 15_000;
@@ -997,8 +1020,9 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
         let on = visible.as_deref() == Some(t.id.as_str()) && !t.suspended.load(Ordering::Relaxed) && want_frames;
         ensure_screencast(t, on).await;
     }
-    // shell 显隐同步：只看变化的（壳没连时指令静默丢弃）
-    sync_shell_visibility(session, &tabs, &visible).await;
+    // shell 显隐同步：只看变化的（壳没连时指令静默丢弃）。显隐只认壳客户端选的页
+    // （shell_tab），screencast 才认任意客户端的可见页（visible）
+    sync_shell_visibility(session, &tabs, &shell_tab).await;
     // 驻留淘汰：非 agent、非可见、空闲超限、未挂起；活跃数超 LIVE_TAB_LIMIT 才动手
     let live: Vec<&Arc<WebTab>> = tabs.iter().filter(|t| !t.suspended.load(Ordering::Relaxed)).collect();
     if live.len() <= LIVE_TAB_LIMIT {
@@ -1026,14 +1050,16 @@ async fn sweep_session(session: &Arc<BrowserSession>) {
 }
 
 /// shell 模式同步壳里 webview 的显隐与矩形。**两道门控缺一不可**：
-/// ① `panel_showing`——只有面板自己在看时才显示。agent 工具的 new_tab/activate_tab
-///    也会写 visible_tab（无头时代那是驱动 screencast 用的），但那不是"人在看"——
-///    不门控的话 agent 一开工就把 webview 弹到聊天区上空（真机踩过）；
+/// ① `panel_showing` + `shell_tab`——只有壳里那个客户端自己在看时才显示，且只显示它
+///    选中的那一页。agent 工具的 new_tab/activate_tab 也会写 visible_tab（无头时代
+///    那是驱动 screencast 用的，浏览器直开 5173 的第二个客户端也写它），但那不是"壳里
+///    人在看"——不分开的话，那个客户端一开工就把壳的 webview 弹到聊天区上空/换页
+///    （真机踩过）；
 /// ② 矩形已知——面板还没同步过视口（首次打开/切页签的防抖窗口）时先藏着，
 ///    免得 webview 在错误位置闪一下。
 /// 「⋯」菜单不走这里的显隐——它是壳里一个**透明置顶的独立 webview**（见 `shell::menu`），
 /// 浮在下层内容 webview 之上，网页全程不动、不被遮也不被藏。
-async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab>], visible: &Option<String>) {
+async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab>], shell_tab: &Option<String>) {
     if session.mode != HostMode::Shell {
         return;
     }
@@ -1048,7 +1074,7 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
         .map(|(_, y, w, h)| y >= 100 && w >= 200 && h >= 200)
         .unwrap_or(false);
     let want_label: Option<String> = if session.showing() && rect_sane {
-        match visible.as_deref() {
+        match shell_tab.as_deref() {
             Some(vid) => tabs.iter().find(|t| t.id == vid).and_then(|t| t.shell_label.clone()),
             None => None,
         }
@@ -1074,18 +1100,21 @@ async fn sync_shell_visibility(session: &Arc<BrowserSession>, tabs: &[Arc<WebTab
     *session.shell_shown.lock().unwrap_or_else(|e| e.into_inner()) = want_label;
 }
 
-/// shell 模式下一个标签页该占的矩形：视口覆盖值（宽高，来自面板内容区）拼上面板
-/// 最近一次上报的左上角；都没有就用默认值。
+/// shell 模式下一个标签页该占的矩形：**以面板最近一次上报的矩形为准**（x/y/w/h 四元
+/// 一起来自同一次 panel_viewport，天然自洽）。以前 w/h 取 tab.viewport——那是按标签页
+/// 记的，面板在别的标签页上被拖宽/拖窄后，切回来的这个标签还留着旧尺寸，webview 会先
+/// 按旧宽高闪一帧再被新矩形套进去（用户截图里的"卡位/宽窄不对"）。last_rect 没有时
+/// （从未同步过）才回落 tab.viewport，再没有用默认值。
 async fn shell_rect_for(session: &Arc<BrowserSession>, tab: &WebTab) -> (f64, f64, f64, f64) {
     let last = *session.last_rect.lock().unwrap_or_else(|e| e.into_inner());
-    let (x, y) = last.map(|(x, y, _, _)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+    if let Some((x, y, w, h)) = last {
+        return (x as f64, y as f64, w as f64, h as f64);
+    }
     let (w, h) = match *tab.viewport.lock().await {
         Some((w, h)) => (w as f64, h as f64),
-        None => last
-            .map(|(_, _, w, h)| (w as f64, h as f64))
-            .unwrap_or((1024.0, 768.0)),
+        None => (1024.0, 768.0),
     };
-    (x, y, w, h)
+    (0.0, 0.0, w, h)
 }
 
 /// 挂起一个后台标签页：停 screencast → frozen（停 JS 定时器与渲染产出）。
@@ -2833,8 +2862,9 @@ fn mode_name(mode: HostMode) -> &'static str {
     }
 }
 
-/// 面板开新标签页（可选直接导航）。
-pub async fn panel_new(url: Option<String>) -> Result<Value, String> {
+/// 面板开新标签页（可选直接导航）。`native` = 调用方就是桌面壳里的那个客户端
+/// （见 BrowserSession::panel_showing 的注释）——只有它能置「面板在看」。
+pub async fn panel_new(url: Option<String>, native: bool) -> Result<Value, String> {
     let url = url.unwrap_or_else(|| "about:blank".into());
     if url != "about:blank" {
         check_panel_url(&url).map_err(|e| e.to_string())?;
@@ -2843,18 +2873,25 @@ pub async fn panel_new(url: Option<String>) -> Result<Value, String> {
     session.touch();
     let tab = create_tab(&session, &url, false).await?;
     session.set_visible(&tab.id);
-    session.set_showing(true); // 面板在建页 = 人在看
+    if native {
+        session.set_shell_tab(&tab.id);
+        session.set_showing(true); // 面板在建页 = 人在看
+    }
     sweep_session(&session).await;
     Ok(json!({ "id": tab.id }))
 }
 
-/// 面板导航（地址栏回车）。
-pub async fn panel_navigate(id: &str, url: &str) -> Result<Value, String> {
+/// 面板导航（地址栏回车）。`native` 见 `panel_viewport`：只有壳里那个客户端的导航
+/// 该把壳里的 webview 显示出来。
+pub async fn panel_navigate(id: &str, url: &str, native: bool) -> Result<Value, String> {
     check_panel_url(url).map_err(|e| e.to_string())?;
     let session = current_session().await?;
     session.touch();
     session.set_visible(id);
-    session.set_showing(true);
+    if native {
+        session.set_shell_tab(id);
+        session.set_showing(true);
+    }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     match navigate_tab(&tab, url).await {
@@ -2920,12 +2957,17 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
 /// 面板帧（P21）：screencast 最新 JPEG（内存直出，零 CDP 往返）；
 /// 没有帧（screencast 刚起步/失败）时回落 captureScreenshot（PNG）。
 /// P22：轮询即「有客户端要帧」的信号，驱动 screencast 门控（壳里看真页面不编码）。
-pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
+/// `native` = 调用方就是壳里那个客户端：轮询帧对它来说是"壳里看真页面"，本来就不该
+/// 因此把壳的 webview 显示出来（显示只归壳面板自己的 activate/viewport 管）。
+pub async fn panel_frame(id: &str, native: bool) -> Result<(Vec<u8>, &'static str), String> {
     let session = current_session().await?;
     session.touch();
     session.last_frame_poll_ms.store(now_ms(), Ordering::Relaxed);
     session.set_visible(id);
-    session.set_showing(true); // 轮询帧 = 有客户端在面板里看
+    if native {
+        session.set_shell_tab(id);
+        session.set_showing(true); // 轮询帧 = 有客户端在面板里看
+    }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     sweep_session(&session).await; // 可见页 screencast 拉起；首帧到达前走下面的回落
@@ -2938,11 +2980,18 @@ pub async fn panel_frame(id: &str) -> Result<(Vec<u8>, &'static str), String> {
 /// 面板设置标签页视口（截图尺寸跟随面板大小——固定 1280×900 会在窄面板里
 /// 显示得又小又留大黑边，ZCode 的面板浏览器就是视口=面板尺寸）。P22：x/y 是面板
 /// 内容区在壳窗口里的左上角（shell 模式据此把 child webview 摆到面板位置上）。
-pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<Value, String> {
+/// `native` = 调用方就是壳里那个客户端（见 BrowserSession::panel_showing 的注释）——
+/// **只有它的 x/y 是壳窗口坐标**。浏览器直开 5173 的第二个客户端也走这个接口（截图要跟
+/// 它自己的面板尺寸），但它的 x/y 是那个浏览器窗口的坐标：拿来挪壳里的 webview，页面就
+/// 整体漂到别的位置上去（用户实锤「界面卡位」：壳里网页浮在错误位置、盖住聊天列右侧）。
+pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64, native: bool) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     session.set_visible(id);
-    session.set_showing(true);
+    if native {
+        session.set_shell_tab(id);
+        session.set_showing(true);
+    }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     let w = w.clamp(320, 1600);
@@ -2954,8 +3003,10 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
     }
     *tab.viewport.lock().await = Some((w, h));
     // shell 模式：把壳里的 webview 挪到面板内容区（用户看到的就是 CDP 驱动的那个页面）。
-    // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片
+    // 矩形一到就立即同步显隐——不然要等最多 5s 的巡检，面板刚打开那会儿会白一片。
+    // 非壳客户端（浏览器直开 5173）的矩形只用于它自己的截图尺寸，**不碰壳的 webview**。
     if session.mode == HostMode::Shell
+        && native
         && let Some(label) = tab.shell_label.as_deref()
     {
         // 合理范围门槛（只挡真垃圾，不挡合法布局）：旧版这里还有 y>=100——按「web 标签条
@@ -2970,8 +3021,8 @@ pub async fn panel_viewport(id: &str, x: i64, y: i64, w: i64, h: i64) -> Result<
         *session.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y, w, h));
         shell::rect(label, x as f64, y as f64, w as f64, h as f64);
         let tabs = session.tabs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let visible = session.visible();
-        sync_shell_visibility(&session, &tabs, &visible).await;
+        let shell_tab = session.shell_tab();
+        sync_shell_visibility(&session, &tabs, &shell_tab).await;
     }
     Ok(json!({ "ok": true, "w": w, "h": h }))
 }
@@ -3166,15 +3217,17 @@ pub async fn panel_overlay(
     if session.mode != HostMode::Shell {
         return Ok(json!({ "ok": true, "open": true, "shell": false }));
     }
-    // 菜单项要操作的那一页：当前可见标签（没有就空——页面会禁用菜单项）
-    let tab = session.visible().unwrap_or_default();
+    // 菜单项要操作的那一页：壳里正显示的那一页（没有就空——页面会禁用菜单项）
+    let tab = session.shell_tab().unwrap_or_default();
     shell::menu(panel.0, panel.1, panel.2, panel.3, anchor, &tab);
     Ok(json!({ "ok": true, "open": true, "shell": true, "tab": tab }))
 }
 
 /// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。
 /// 空 id = 「面板不看了」——shell 模式下这是壳里 webview 隐藏的唯一信号。
-pub async fn panel_activate(id: &str) -> Result<Value, String> {
+/// `native` = 调用方就是壳里那个客户端：只有它的「在看/不看」能置壳里 webview 的显隐
+/// （浏览器直开 5173 的第二个客户端切走页签，不该把壳里的网页一起藏了）。
+pub async fn panel_activate(id: &str, native: bool) -> Result<Value, String> {
     let session = current_session().await?;
     session.touch();
     // 菜单开着时激活/切页签 = 浮层锚定的那一页失效了，顺手关掉壳里浮层（幂等）
@@ -3183,14 +3236,20 @@ pub async fn panel_activate(id: &str) -> Result<Value, String> {
     }
     if id.is_empty() {
         session.clear_visible();
-        session.set_showing(false);
+        if native {
+            session.clear_shell_tab();
+            session.set_showing(false);
+        }
         sweep_session(&session).await;
         return Ok(json!({ "ok": true }));
     }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;
     session.set_visible(id);
-    session.set_showing(true);
+    if native {
+        session.set_shell_tab(id);
+        session.set_showing(true);
+    }
     sweep_session(&session).await;
     Ok(json!({ "ok": true }))
 }

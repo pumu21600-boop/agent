@@ -12,12 +12,21 @@ pub(super) async fn browser_state() -> Json<Value> {
 }
 
 /// POST /api/browser/new —— 开新标签页（body 可带 url，缺省 about:blank）。
+/// `native`：调用方是不是桌面壳里那个客户端（缺省 true=旧版前端，行为不变）。壳外
+/// 浏览器直开 5173 时传 false——它的「人在看」不该显示壳里的 webview。
 pub(super) async fn browser_new(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let url = req.get("url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-    match crate::browser::panel_new(url.map(str::to_string)).await {
+    let native = panel_native(&req);
+    match crate::browser::panel_new(url.map(str::to_string), native).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(bad(e)),
     }
+}
+
+/// 面板接口的「调用方是不是壳」标记：body 里显式 false = 壳外浏览器客户端；
+/// 缺省（旧版前端没这个字段）按 true 处理，保持老行为不变。
+fn panel_native(req: &Value) -> bool {
+    req.get("native").and_then(Value::as_bool).unwrap_or(true)
 }
 
 fn bad(e: String) -> (StatusCode, Json<Value>) {
@@ -28,7 +37,8 @@ fn bad(e: String) -> (StatusCode, Json<Value>) {
 pub(super) async fn browser_navigate(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
     let Some(url) = req.get("url").and_then(Value::as_str) else { return Err(bad("缺少 url".into())) };
-    match crate::browser::panel_navigate(id, url).await {
+    let native = panel_native(&req);
+    match crate::browser::panel_navigate(id, url, native).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(bad(e)),
     }
@@ -49,12 +59,15 @@ pub(super) async fn browser_screenshot(Query(q): Query<ScreenshotQuery>) -> Resu
 #[derive(Debug, Deserialize)]
 pub struct ScreenshotQuery {
     pub id: String,
+    /// 调用方是不是壳里那个客户端（旧版前端不带 = true）。
+    pub native: Option<bool>,
 }
 
 /// GET /api/browser/frame?id= —— 面板帧（P21）：screencast 最新 JPEG，内存直出零 CDP
 /// 往返；无帧时后端回落 captureScreenshot（PNG）。前端 <img> 轮询源。
+/// `native=0`（壳外浏览器客户端）只拿帧，不因此显示壳里的 webview。
 pub(super) async fn browser_frame(Query(q): Query<ScreenshotQuery>) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    match crate::browser::panel_frame(&q.id).await {
+    match crate::browser::panel_frame(&q.id, q.native.unwrap_or(true)).await {
         Ok((bytes, mime)) => Ok((
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, mime)],
@@ -65,9 +78,11 @@ pub(super) async fn browser_frame(Query(q): Query<ScreenshotQuery>) -> Result<im
 }
 
 /// POST /api/browser/activate —— 面板上报可见标签页（驱动 screencast 与后台挂起）。
+/// `native`：只有壳里那个客户端的在看/不看能置壳里 webview 的显隐。
 pub(super) async fn browser_activate(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
-    crate::browser::panel_activate(id).await.map(Json).map_err(bad)
+    let native = panel_native(&req);
+    crate::browser::panel_activate(id, native).await.map(Json).map_err(bad)
 }
 
 /// POST /api/browser/dialog —— 面板处理页面 JS 弹窗（accept + 可选 promptText）。
@@ -144,13 +159,16 @@ pub(super) async fn browser_reload(Json(req): Json<Value>) -> Result<Json<Value>
 
 /// POST /api/browser/viewport —— 设置标签页视口（截图尺寸跟随面板大小）。
 /// x/y = 面板内容区在壳窗口里的左上角（P22 shell 模式把 child webview 摆过去）。
+/// `native`：只有壳里那个客户端量的 x/y 是壳窗口坐标，才能挪壳里的 webview；壳外
+/// 浏览器直开 5173 的第二个客户端传 false（它的矩形只用于自己的截图尺寸）。
 pub(super) async fn browser_viewport(Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
     let x = req.get("x").and_then(Value::as_i64).unwrap_or(0);
     let y = req.get("y").and_then(Value::as_i64).unwrap_or(0);
     let w = req.get("w").and_then(Value::as_i64).unwrap_or(1280);
     let h = req.get("h").and_then(Value::as_i64).unwrap_or(900);
-    crate::browser::panel_viewport(id, x, y, w, h).await.map(Json).map_err(bad)
+    let native = panel_native(&req);
+    crate::browser::panel_viewport(id, x, y, w, h, native).await.map(Json).map_err(bad)
 }
 
 /// POST /api/browser/overlay —— 「⋯」菜单开合。shell 模式开菜单时壳建一个透明置顶的

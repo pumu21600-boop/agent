@@ -316,6 +316,10 @@
     document.addEventListener('click', closeMenusOnOutside);
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
     stampMicroUids();
+    // 面板上次就是开着且停在「网页」时，补一次浏览器状态加载：openRightPanel 只在用户
+    // 点工具栏开关时跑，刷新页面这条路不走它——不补的话 webActiveId 一直是空的，面板
+    // 显示空态引导、壳里 webview 也不显示（用户刷新后看到的「网页没了」）
+    if (rightPanelOpen && rpTab === 'web') loadWebState();
   });
 
   function closeMenusOnOutside(e) {
@@ -905,7 +909,7 @@
     webApi('/api/browser/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id }),
+      body: JSON.stringify({ id, native: !!webNative }),
     }).catch(() => {});
   }
 
@@ -918,7 +922,9 @@
     webApi('/api/browser/activate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: '' }),
+      // native：只有壳里那个客户端的「不看了」能藏壳里的 webview（壳外浏览器客户端
+      // 切走页签不该把壳里的网页一起藏了）
+      body: JSON.stringify({ id: '', native: !!webNative }),
     }).catch(() => {});
   }
   $: if (rpTab !== 'web' || !rightPanelOpen || (webNative && !webShowShot)) webNotifyHidden();
@@ -956,6 +962,12 @@
           });
         if (stale) {
           webTabs = tabs;
+          // 活动页兜底：onMount 那条加载路径漏了时（面板开着但状态没加载过）、或服务重启后
+          // 老 tab id 已失效时，这里补上——不补的话 webActive 一直是 null，面板显示空态、
+          // 视口同步也永远不发（壳里 webview 跟着一直藏着）
+          if (!tabs.some((t) => t.id === webActiveId)) {
+            webActiveId = tabs.length ? tabs[tabs.length - 1].id : '';
+          }
           const act = tabs.find((t) => t.id === webActiveId);
           if (act && document.activeElement !== document.querySelector('.web-address')) {
             webAddress = act.url === 'about:blank' ? '' : act.url || '';
@@ -1057,14 +1069,22 @@
     }
   }
   function webWatchRect(on) {
+    // 根容器一并观察：内容区自身尺寸不变、只有 x 平移时（主滚动条出现/消失把弹性行
+    // 挤窄 16px、窗口拉伸后面板左缘横移）ResizeObserver 不会为内容区开火——不观察
+    // 根容器这种"只挪不变"的位移就漏一次同步，壳里 webview 卡在旧 x 上（用户实锤）
+    const rootEl = document.querySelector('.app');
     if (on) {
       if (!webRectObs && typeof ResizeObserver !== 'undefined') {
         webRectObs = new ResizeObserver(() => webQueueViewport());
       }
-      if (webRectObs && webBodyEl) webRectObs.observe(webBodyEl);
+      if (webRectObs) {
+        if (webBodyEl) webRectObs.observe(webBodyEl);
+        if (rootEl && rootEl !== webBodyEl) webRectObs.observe(rootEl);
+      }
       window.addEventListener('resize', webOnWindowResize);
-    } else if (webRectObs && webBodyEl) {
-      webRectObs.unobserve(webBodyEl);
+    } else if (webRectObs) {
+      if (webBodyEl) webRectObs.unobserve(webBodyEl);
+      if (rootEl) webRectObs.unobserve(rootEl);
       window.removeEventListener('resize', webOnWindowResize);
     }
   }
@@ -1074,6 +1094,18 @@
   // 面板在原生托管且停在「网页」时才需要跟（壳里 webview 的显隐与它联动）
   $: if (webNative && rpTab === 'web' && rightPanelOpen && webBodyEl) webWatchRect(true);
   $: if (!(webNative && rpTab === 'web' && rightPanelOpen)) webWatchRect(false);
+  // 自愈兜底（P27）：上面的同步全是**事件驱动**的，漏一个事件壳里 webview 就永久卡在
+  // 旧矩形上——用户看到的就是「网页浮在错误位置、盖住聊天列右侧」。漏事件的路径不止
+  // 一种：只挪不变的位移（观察根容器已补）、渲染竞态量到的瞬态矩形、面板切走期间发生
+  // 的布局变化（那时 webSyncViewport 直接 return）。所以再加一条 1s 心跳：重量一次
+  // 矩形，**变了才发**（去重键挡着，不变就是零请求），任何漏掉的变化最多 1s 内归位。
+  let webSyncHeartbeat = null;
+  $: if (rpTab === 'web' && rightPanelOpen && webActive && webStateReady && !webSyncHeartbeat) {
+    webSyncHeartbeat = setInterval(() => webQueueViewport(), 1000);
+  } else if (!(rpTab === 'web' && rightPanelOpen && webActive && webStateReady) && webSyncHeartbeat) {
+    clearInterval(webSyncHeartbeat);
+    webSyncHeartbeat = null;
+  }
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
     // 就绪门：浏览器状态没到手前，web-tabbar 行未定型（有标签=多一行 / 无标签=整行消失），
@@ -1094,7 +1126,11 @@
     webApi('/api/browser/viewport', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: webActive.id, x, y, w, h }),
+      // native：本客户端就是壳里那个（壳模式 + 跑在 Tauri 里）时，量的 x/y 才是壳窗口
+      // 坐标，服务端据此挪壳里的 child webview。浏览器直开 5173 的第二个客户端也走这个
+      // 接口（截图要跟它自己的面板尺寸），但它的矩形是属于那个浏览器窗口的——不标明白
+      // 就会被当成壳的矩形，壳里网页整体漂到错误位置（用户实锤「界面卡位」）。
+      body: JSON.stringify({ id: webActive.id, x, y, w, h, native: !!webNative }),
     })
       .then((res) => {
         // 服务端拒收（越界等）：清 key，等下一次观察器/节流开火重试，别把坏矩形当成已应用
@@ -1141,7 +1177,7 @@
       const r = await webApi('/api/browser/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: '{}',
+        body: JSON.stringify({ native: !!webNative }),
       });
       if (r.id) {
         webActiveId = r.id;
@@ -1179,7 +1215,7 @@
         const r = await webApi('/api/browser/new', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify({ url, native: !!webNative }),
         });
         if (r.id) webActiveId = r.id;
         else webError = r.error || '打开网页失败';
@@ -1187,7 +1223,7 @@
         const r = await webApi('/api/browser/navigate', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: webActive.id, url }),
+          body: JSON.stringify({ id: webActive.id, url, native: !!webNative }),
         });
         if (r.error) webError = r.error;
       }
@@ -4927,7 +4963,7 @@
                 <img
                   class="web-shot"
                   class:busy={webBusy}
-                  src={`/api/browser/frame?id=${encodeURIComponent(webActive.id)}&t=${webShotT}`}
+                  src={`/api/browser/frame?id=${encodeURIComponent(webActive.id)}&t=${webShotT}&native=0`}
                   alt="页面画面"
                   draggable="false"
                   on:click={webShotClick}
