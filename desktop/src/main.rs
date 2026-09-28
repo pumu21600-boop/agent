@@ -49,6 +49,42 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
+/// 主 webview 的身份标记（P27）：给本壳窗口里所有 `/api/browser/*` 请求打上
+/// `X-Agent-Client: shell`。服务端据此分辨「壳里那个客户端」和「用户在普通浏览器里
+/// 开的第二个客户端」——浏览器客户端量的 x/y 是它自己窗口的坐标，不认出来的话会被
+/// 当成壳窗口坐标去挪壳里的 child webview，页面整体漂到错误位置（用户实锤「界面卡位」）。
+/// **为什么走壳注入而不是前端字段**：前端可以只升级壳这一个页面，用户在浏览器里开着的
+/// 那个页面还是旧版、不带标记，靠它自觉申报是拦不住的；壳注入对任何版本的前端都生效。
+/// 幂等（页面刷新后重新 eval 一次即可，故按周期补打）。
+const SHELL_CLIENT_JS: &str = r#"(function () {
+  if (window.__agentShellClient) return;
+  window.__agentShellClient = true;
+  var hit = function (u) { try { return String(u).indexOf('/api/browser/') >= 0; } catch (e) { return false; } };
+  var of = window.fetch;
+  if (of) {
+    window.fetch = function (u, o) {
+      try {
+        if (hit(u)) {
+          o = o || {};
+          var h = o.headers;
+          if (h && typeof h.set === 'function') h.set('X-Agent-Client', 'shell');
+          else o.headers = Object.assign({}, h, { 'X-Agent-Client': 'shell' });
+        }
+      } catch (e) {}
+      return of.apply(this, arguments);
+    };
+  }
+  var oo = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, u) {
+    this.__agentApi = hit(u);
+    return oo.apply(this, arguments);
+  };
+  var os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function () {
+    try { if (this.__agentApi) this.setRequestHeader('X-Agent-Client', 'shell'); } catch (e) {}
+    return os.apply(this, arguments);
+  };
+})();"#;
 /// 「⋯」菜单浮层的 webview label（与 src/browser/shell.rs 的 MENU_LABEL 一致）
 const MENU_LABEL: &str = "wv-menu";
 
@@ -398,6 +434,14 @@ fn main() {
                         api.prevent_close();
                         let _ = w.hide();
                     }
+                });
+                // 身份标记补打（P27）：壳窗口里的前端页面是启动时加载的，用户可能在浏览器里
+                // 还开着一个旧版页面——两者都往服务端报面板矩形，服务端只认带壳标记的那个。
+                // 页面刷新会丢掉注入，故按周期重打（脚本幂等，重复执行零副作用）。
+                let marker = win.clone();
+                std::thread::spawn(move || loop {
+                    let _ = marker.eval(SHELL_CLIENT_JS);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                 });
             }
             use tauri::menu::{Menu, MenuItem};

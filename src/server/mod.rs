@@ -18,7 +18,7 @@ pub(crate) use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, Request, State},
     http::{
-        HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, CONTENT_TYPE, HOST, ORIGIN},
     },
     middleware::{self, Next},
