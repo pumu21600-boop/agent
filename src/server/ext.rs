@@ -84,6 +84,30 @@ pub(super) async fn post_mcp(
             }
             // 只重连+重新发现；配置不动（ensure_online 用管理器内已同步的 cfg）
         }
+        // P24 OAuth：发起授权（后台线程跑 discovery→授权→换 token，立即返回快照）
+        "oauth_authorize" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            let Some(c) = s.mcp_servers.iter().find(|c| &c.name == name) else {
+                return err(format!("未知 server: {name}"));
+            };
+            match crate::plugin::mcp_oauth::start_authorize(name, c) {
+                Ok(snap) => return (StatusCode::OK, Json(json!({ "ok": true, "tx": snap }))),
+                Err(e) => return err(e),
+            }
+        }
+        // P24 OAuth：撤销授权（删 token + 强制下线；下次调用回「未授权」人话）
+        "oauth_revoke" => {
+            let Some(name) = &req.name else { return err("缺少 name".into()) };
+            if !s.mcp_servers.iter().any(|c| &c.name == name) {
+                return err(format!("未知 server: {name}"));
+            }
+            crate::plugin::mcp_oauth::revoke(name);
+            crate::plugin::mcp::force_offline(name);
+            observability::event(
+                observability::EventType::State,
+                json!({ "kind": "mcp.oauth.revoked", "server": name }),
+            );
+        }
         other => return err(format!("未知操作: {other}")),
     }
 
@@ -151,6 +175,9 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
                 "resources": res,
                 "prompts": prompts,
+                // P24：OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）
+                "oauth": c.oauth,
+                "oauth_status": crate::plugin::mcp_oauth::tx_status(&c.name),
             })
         })
         .collect();

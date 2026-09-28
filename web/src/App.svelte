@@ -3444,7 +3444,19 @@
   // —— P11（施工单 016）：MCP 插件分区 ——
   let mcpServers = [];
   // 021：transport 二选一。stdio=本地子进程；http=远端 MCP（Streamable HTTP）
-  let mcpForm = { name: '', transport: 'stdio', command: '', args: '', url: '', headers: '' };
+  // P24：http 再加认证方式（无/自定义头、OAuth 授权码、OAuth 客户端凭据）
+  let mcpForm = {
+    name: '',
+    transport: 'stdio',
+    command: '',
+    args: '',
+    url: '',
+    headers: '',
+    oauth: 'none',
+    oauth_client_id: '',
+    oauth_client_secret: '',
+    oauth_scope: '',
+  };
   let mcpRiskChoice = 'normal';
   let wasmPlugins = [];
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
@@ -3508,6 +3520,9 @@
       }).then((r) => r.json());
       if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
       if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
+      // P24：授权发起后带回事务快照（pending 时卡片里会给可点的授权链接）
+      if (action === 'oauth_authorize' && r.tx) settingsMsg = r.tx.message || '授权已发起';
+      if (action === 'oauth_revoke') settingsMsg = '已撤销授权';
     } catch (e) {
       settingsMsg = `MCP ${action} 失败: ${e.message || e}`;
     }
@@ -3527,12 +3542,23 @@
   function addMcpServer() {
     const isHttp = mcpForm.transport === 'http';
     const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
+    // P24：选了 OAuth 就带 oauth 配置（授权码可留空 client_id 走动态注册）
+    const oauth =
+      isHttp && mcpForm.oauth !== 'none'
+        ? {
+            type: mcpForm.oauth,
+            client_id: mcpForm.oauth_client_id.trim(),
+            client_secret: mcpForm.oauth_client_secret.trim(),
+            scope: mcpForm.oauth_scope.trim(),
+          }
+        : undefined;
     const srv = isHttp
       ? {
           name: mcpForm.name.trim(),
           transport: 'http',
           url: mcpForm.url.trim(),
           headers: parseHeaders(mcpForm.headers),
+          ...(oauth ? { oauth } : {}),
         }
       : {
           name: mcpForm.name.trim(),
@@ -3541,7 +3567,18 @@
           args,
         };
     mcpAction('save', null, null, srv);
-    mcpForm = { name: '', transport: mcpForm.transport, command: '', args: '', url: '', headers: '' };
+    mcpForm = {
+      name: '',
+      transport: mcpForm.transport,
+      command: '',
+      args: '',
+      url: '',
+      headers: '',
+      oauth: 'none',
+      oauth_client_id: '',
+      oauth_client_secret: '',
+      oauth_scope: '',
+    };
   }
   // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
   function riskLabelFor(risk) {
@@ -5472,6 +5509,31 @@
             <div class="mcp-cmd">
               {sv.transport === 'http' ? `HTTP · ${sv.url}` : `${sv.command} ${(sv.args || []).join(' ')}`}
             </div>
+            {#if sv.oauth}
+              <div class="sub-row">
+                <span class="mcp-status">
+                  {#if sv.oauth_status?.status === 'pending'}授权中…
+                  {:else if sv.oauth_status?.status === 'error'}授权失败
+                  {:else if sv.oauth_status?.oauth?.state === 'authorized'}已授权
+                  {:else if sv.oauth_status?.oauth?.state === 'expiring'}即将过期（自动续）
+                  {:else}未授权{/if}
+                </span>
+                <button class="btn ghost" on:click={() => mcpAction('oauth_authorize', sv.name)}>
+                  {sv.oauth_status?.oauth?.state === 'none' || !sv.oauth_status?.oauth ? '授权' : '重新授权'}
+                </button>
+                {#if sv.oauth_status?.oauth && sv.oauth_status.oauth.state !== 'none'}
+                  <button class="btn ghost danger" on:click={() => mcpAction('oauth_revoke', sv.name)}>撤销</button>
+                {/if}
+              </div>
+              {#if sv.oauth_status?.status === 'pending' && sv.oauth_status?.authorization_url}
+                <div class="param-hint">
+                  浏览器没自动打开？<a href={sv.oauth_status.authorization_url} target="_blank" rel="noreferrer">点这里完成授权</a>
+                </div>
+              {/if}
+              {#if sv.oauth_status?.status === 'error'}
+                <div class="param-hint" style="color: var(--tint-red-fg, #e5484d)">{sv.oauth_status.message}</div>
+              {/if}
+            {/if}
             {#if !sv.confirmed}
               <div class="mcp-confirm">
                 {#if sv.tools.length}
@@ -5554,6 +5616,30 @@
                 rows="2"
               ></textarea>
             </div>
+            <div class="sub-row">
+              <Select
+                value={mcpForm.oauth}
+                title="认证方式"
+                options={[
+                  { value: 'none', label: '无 / 自定义请求头' },
+                  { value: 'authorization_code', label: 'OAuth 授权码（浏览器登录）' },
+                  { value: 'client_credentials', label: 'OAuth 客户端凭据' },
+                ]}
+                on:change={(e) => (mcpForm.oauth = e.detail)}
+              />
+            </div>
+            {#if mcpForm.oauth !== 'none'}
+              <div class="sub-row">
+                <input placeholder="client_id（留空=动态注册）" bind:value={mcpForm.oauth_client_id} style="max-width:220px" />
+                {#if mcpForm.oauth === 'client_credentials'}
+                  <input placeholder="client_secret" type="password" bind:value={mcpForm.oauth_client_secret} style="max-width:220px" />
+                {/if}
+                <input placeholder="scope（可选）" bind:value={mcpForm.oauth_scope} style="max-width:160px" />
+              </div>
+              <div class="param-hint">
+                授权码流程会打开浏览器登录（动态注册自动办 client_id）；token 自动续期，过期重授权即可。
+              </div>
+            {/if}
           {:else}
             <div class="param-hint">例：npx -y @modelcontextprotocol/server-filesystem &lt;目录&gt;</div>
           {/if}

@@ -326,6 +326,31 @@ pub struct Settings {
 }
 
 
+/// MCP OAuth 配置（P24，形状对齐 ZCode McpOAuthConfig）：
+/// authorization_code=浏览器授权码流程（远程托管 MCP 服务登录）；
+/// client_credentials=机器凭据直换 token（无浏览器）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpOAuthCfg {
+    /// "authorization_code" | "client_credentials"
+    #[serde(default = "default_oauth_type")]
+    pub r#type: String,
+    /// 预置 client_id；空=走 DCR 动态注册（授权码流程）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
+    /// client_credentials 必填；授权码流程仅个别授权服务器要求
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_secret: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    /// loopback 回调路径（默认 /callback）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redirect_path: String,
+}
+
+fn default_oauth_type() -> String {
+    "authorization_code".to_string()
+}
+
 /// P11：单个 MCP server 的连接与策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerCfg {
@@ -347,6 +372,9 @@ pub struct McpServerCfg {
     /// http：自定义请求头（鉴权等；值只在内存与 settings.json，绝不进日志）
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// http：OAuth 登录配置（P24；None=用手工 headers 或无需鉴权）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthCfg>,
     /// 启停（false 时工具不下发、不可调用）
     #[serde(default = "crate::config::settings::yes")]
     pub enabled: bool,

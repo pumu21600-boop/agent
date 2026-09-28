@@ -7,6 +7,7 @@
 pub mod contract;
 pub mod draft;
 pub mod mcp;
+pub mod mcp_oauth;
 pub mod trust;
 pub mod ui;
 pub mod wasm;

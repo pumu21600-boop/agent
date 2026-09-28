@@ -1,6 +1,6 @@
 [package]
 name = "agent"
-version = "0.25.3"
+version = "0.26.0"
 edition = "2024"
 description = "跑在 Windows 上的类 Codex 自主编码 Agent（Rust + Svelte，本地优先，SSE 流式）"
 
@@ -11,6 +11,8 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+# P24 MCP OAuth：PKCE verifier/state 随机源（lock 里本就经 reqwest 传递依赖存在，零新增下载面）
+rand = "0.8"
 # P21 成本台账 / 红线3 插件验签：sha256 canonical digest（纯 Rust，不引 openssl/ring；
 # lock 里本就经 wasmtime 传递依赖存在，不新增下载面）
 sha2 = "0.10"

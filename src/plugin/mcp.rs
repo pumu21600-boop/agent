@@ -98,6 +98,16 @@ pub fn split_full_name(full: &str) -> Option<(String, String)> {
     Some((srv.to_string(), tool.to_string()))
 }
 
+/// 强制某 server 下线（杀子进程/丢 HTTP 会话、清工具缓存）：撤销授权、配置大改后用。
+/// 下次工具调用/refresh 时按需重连（无 token 的 OAuth 服务会拿到「需要授权」人话）。
+pub fn force_offline(name: &str) {
+    let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = m.get_mut(name) {
+        st.reset_proc();
+        st.tools.clear();
+    }
+}
+
 /// settings 加载/保存后同步配置：新增的占位、删除的杀进程下线。
 /// 不在这里主动 spawn（首次工具调用/refresh 时按需启动）。
 pub fn sync_configs(cfgs: &[McpServerCfg]) {
@@ -120,6 +130,7 @@ pub fn sync_configs(cfgs: &[McpServerCfg]) {
                         || old.transport != c.transport
                         || old.url != c.url
                         || old.headers != c.headers
+                        || old.oauth != c.oauth
                 })
                 .unwrap_or(true);
             if changed {
@@ -375,6 +386,22 @@ fn http_round(
     for (k, v) in &cfg.headers {
         rb = rb.header(k.as_str(), v.as_str());
     }
+    // P24 OAuth：配置了 oauth 的远端服务，Bearer 从 token 存取取（近过期自动刷新）
+    if let Some(oauth) = &cfg.oauth {
+        match crate::plugin::mcp_oauth::token_for(&cfg.name) {
+            Some(t) => {
+                let t = crate::plugin::mcp_oauth::refresh_if_needed(&cfg.name, &url, oauth, &t)
+                    .map_err(|e| format!("MCP 授权已过期且刷新失败：{e}"))?;
+                rb = rb.header("Authorization", format!("Bearer {}", t.access_token));
+            }
+            None => {
+                return Err(format!(
+                    "MCP 服务「{}」需要授权：设置 → 插件 → MCP → 点「授权」完成登录",
+                    cfg.name
+                ));
+            }
+        }
+    }
     let resp = rb
         .send()
         .map_err(|e| offline(st, format!("HTTP 请求失败（{url}）: {e}")))?;
@@ -394,6 +421,17 @@ fn http_round(
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
         let snip: String = body.chars().take(300).collect();
+        // P24：OAuth 服务吃 401/403——token 过期/被撤销，人话指路重新授权
+        if matches!(status.as_u16(), 401 | 403) && cfg.oauth.is_some() {
+            return Err(offline(
+                st,
+                format!(
+                    "MCP 服务「{}」授权被拒绝（HTTP {}）：token 可能已过期或被撤销，请到设置 → 插件 → MCP 点「授权」重新登录",
+                    cfg.name,
+                    status.as_u16()
+                ),
+            ));
+        }
         return Err(offline(st, format!("HTTP {}: {snip}", status.as_u16())));
     }
     let Some(expect_id) = expect_id else {
@@ -987,6 +1025,7 @@ data: \"result\":{\"n\":7}}";
             env: BTreeMap::new(),
             url: url.clone(),
             headers: BTreeMap::from([("X-Test".to_string(), "1".to_string())]),
+            oauth: None,
             enabled: true,
             confirmed: true,
             risk: "normal".into(),
@@ -1074,6 +1113,7 @@ data: \"result\":{\"n\":7}}";
             env: BTreeMap::new(),
             url,
             headers: BTreeMap::new(),
+            oauth: None,
             enabled: true,
             confirmed: true,
             risk: "normal".into(),
@@ -1147,6 +1187,7 @@ data: \"result\":{\"n\":7}}";
             env: BTreeMap::new(),
             url,
             headers: BTreeMap::new(),
+            oauth: None,
             enabled: true,
             confirmed: true,
             risk: "normal".into(),
@@ -1176,6 +1217,7 @@ data: \"result\":{\"n\":7}}";
             env: BTreeMap::new(),
             url: "http://127.0.0.1:1/mcp".into(),
             headers: BTreeMap::new(),
+            oauth: None,
             enabled: true,
             confirmed: true,
             risk: "normal".into(),
