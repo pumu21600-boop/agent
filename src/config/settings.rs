@@ -300,12 +300,14 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
 
-    /// P17：停用的 UI 扩展名单（ui-ext 目录名；停用的不加载、不参与界面插槽与数据桥）
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub disabled_extensions: Vec<String>,
+    /// P28：停用的插件名单（plugins/ 目录名；停用的不加载、不参与面板插槽与数据桥）。
+    /// 旧字段名 `disabled_extensions` 读入自动兼容（serde alias），落盘写新名。
+    #[serde(default, alias = "disabled_extensions", skip_serializing_if = "Vec::is_empty")]
+    pub disabled_plugins: Vec<String>,
 
     /// P21 红线3（第三方插件验签）：已 pin 的内容指纹表。
-    /// 键 = `ui-ext:<name>` / `plugins:<name>`，值 = canonical digest（sha256）。
+    /// 键 = `plugins:<name>`（P28 目录合并后唯一 kind；旧 `ui-ext:<name>` 键读入时自动迁移），
+    /// 值 = canonical digest（sha256）。
     /// user 来源插件必须在这里有且 digest 一致才会加载；draft 转正时自动写入。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted_plugins: BTreeMap<String, String>,
@@ -469,6 +471,8 @@ impl Settings {
                 s.migrate_provider_keys_to_urls();
                 // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
                 s.migrate_url_keys_to_configs();
+                // P28 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
+                migrate_legacy_trust_keys(&mut s.trusted_plugins);
                 // 确保存在有效激活配置
                 s.ensure_active_config();
                 let _ = s.save();
@@ -800,6 +804,23 @@ fn new_config_id() -> String {
     format!("cfg-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// P28 目录合并迁移：信任表旧键 `ui-ext:<name>` → `plugins:<name>`（合并后唯一 kind）。
+/// 目标键已存在则保留新键、丢旧键；抽成纯函数让 load 与单测共用同一把尺子。
+fn migrate_legacy_trust_keys(map: &mut BTreeMap<String, String>) {
+    if !map.keys().any(|k| k.starts_with("ui-ext:")) {
+        return;
+    }
+    let legacy: Vec<(String, String)> = map
+        .iter()
+        .filter(|(k, _)| k.starts_with("ui-ext:"))
+        .map(|(k, v)| (k.trim_start_matches("ui-ext:").to_string(), v.clone()))
+        .collect();
+    for (name, digest) in legacy {
+        map.entry(format!("plugins:{name}")).or_insert(digest);
+    }
+    map.retain(|k, _| !k.starts_with("ui-ext:"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +929,25 @@ mod tests {
         let val: serde_json::Value = serde_json::from_str(&serialized).unwrap();
         assert!(val.get("provider_id").is_none(), "顶层镜像 provider_id 不再序列化");
         assert!(val.get("base_url").is_none(), "顶层镜像 base_url 不再序列化");
+    }
+
+    #[test]
+    fn backward_compat_plugins_rename_migration() {
+        // P28 目录合并迁移：旧字段 disabled_extensions → disabled_plugins（serde alias），
+        // 旧信任键 ui-ext:<name> → plugins:<name>（load 迁移）；落盘只写新名。
+        let legacy = r#"{
+            "disabled_extensions": ["usage"],
+            "trusted_plugins": { "ui-ext:board": "digest-a", "plugins:calc": "digest-b" }
+        }"#;
+        let mut s: Settings = serde_json::from_str(legacy).expect("旧字段名 alias 必须可反序列化");
+        assert_eq!(s.disabled_plugins, vec!["usage".to_string()], "alias 读入旧字段");
+        migrate_legacy_trust_keys(&mut s.trusted_plugins);
+        assert!(!s.trusted_plugins.contains_key("ui-ext:board"), "旧键必须删除");
+        assert_eq!(s.trusted_plugins.get("plugins:board").map(String::as_str), Some("digest-a"), "旧键迁移到新键");
+        assert_eq!(s.trusted_plugins.get("plugins:calc").map(String::as_str), Some("digest-b"), "已有新键不被迁移覆盖");
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(text.contains("\"disabled_plugins\""), "落盘写新字段名");
+        assert!(!text.contains("disabled_extensions"), "旧字段名不再写出");
+        assert!(!text.contains("ui-ext:"), "旧信任键不再写出");
     }
 }

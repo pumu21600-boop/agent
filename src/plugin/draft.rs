@@ -167,8 +167,9 @@ pub fn entry_file(name: &str) -> Option<String> {
     })
 }
 
-/// 一键转正：面板文件落 `ui-ext/<name>/`，工具文件落 plugins 目录（manifest.json + 工具文件），
-/// 来源改 `user`；随后重扫 WASM 注册表并移除 draft。返回落盘路径列表。
+/// 一键转正：全部文件落 `plugins/<name>/`（P28 目录合并：manifest.json + 面板页 +
+/// 工具文件同住一个目录，一次写盘），来源改 `user`；随后重扫 WASM 注册表并移除
+/// draft。返回落盘路径列表。
 pub fn promote(name: &str) -> Result<Vec<String>, String> {
     let d = get(name).ok_or_else(|| format!("没有名为 {name} 的 draft"))?;
     let app_root = crate::config::app_root();
@@ -177,28 +178,21 @@ pub fn promote(name: &str) -> Result<Vec<String>, String> {
     let mut mf = d.manifest.clone();
     mf["source"] = json!(crate::plugin::contract::ORIGIN_USER);
 
-    // 面板半边：有入口页就落 ui-ext/
-    let entry = mf.get("entry").and_then(Value::as_str).unwrap_or("index.html").to_string();
-    if d.files.contains_key(&entry) {
-        let dir = app_root.join(crate::plugin::ui::DIR).join(name);
-        write_all(&dir, &d.files, &mf, &entry, &mut written)
-            .map_err(|e| format!("写 ui-ext 失败: {e}"))?;
+    // P28 目录合并：一个插件一个目录，manifest + 面板页 + 工具文件一次写盘
+    let dir = crate::plugin::wasm::plugins_dir()
+        .unwrap_or_else(|| app_root.join(crate::plugin::ui::DIR))
+        .join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("建插件目录失败: {e}"))?;
+    let mf_path = dir.join("manifest.json");
+    crate::fsx::write_atomic_str(&mf_path, &serde_json::to_string_pretty(&mf).unwrap_or_default())
+        .map_err(|e| format!("写 manifest 失败: {e}"))?;
+    written.push(mf_path.display().to_string());
+    for (rel, bytes) in &d.files {
+        let p = dir.join(rel);
+        crate::fsx::write_atomic(&p, bytes).map_err(|e| format!("写 {rel} 失败: {e}"))?;
+        written.push(p.display().to_string());
     }
-
-    // 工具半边：有 tool_file 就落 plugins/<name>/
-    if let Some(tf) = &d.tool_file {
-        let bytes = d.files.get(tf).ok_or("tool_file 缺失")?;
-        let dir = crate::plugin::wasm::plugins_dir()
-            .unwrap_or_else(|| app_root.join("plugins"))
-            .join(name);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("建插件目录失败: {e}"))?;
-        let mf_path = dir.join("manifest.json");
-        crate::fsx::write_atomic_str(&mf_path, &serde_json::to_string_pretty(&mf).unwrap_or_default())
-            .map_err(|e| format!("写 manifest 失败: {e}"))?;
-        written.push(mf_path.display().to_string());
-        let bin_path = dir.join(tf);
-        crate::fsx::write_atomic(&bin_path, bytes).map_err(|e| format!("写工具文件失败: {e}"))?;
-        written.push(bin_path.display().to_string());
+    if d.tool_file.is_some() {
         crate::plugin::wasm::rescan();
     }
 
@@ -208,26 +202,6 @@ pub fn promote(name: &str) -> Result<Vec<String>, String> {
         json!({ "kind": "plugin.draft_promoted", "plugin": name, "paths": written.len() }),
     );
     Ok(written)
-}
-
-fn write_all(
-    dir: &std::path::Path,
-    files: &BTreeMap<String, Vec<u8>>,
-    manifest: &Value,
-    entry: &str,
-    written: &mut Vec<String>,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let mf_path = dir.join("manifest.json");
-    crate::fsx::write_atomic_str(&mf_path, &serde_json::to_string_pretty(manifest).unwrap_or_default())?;
-    written.push(mf_path.display().to_string());
-    for (rel, bytes) in files {
-        let p = dir.join(rel);
-        crate::fsx::write_atomic(&p, bytes)?;
-        written.push(p.display().to_string());
-    }
-    let _ = entry;
-    Ok(())
 }
 
 /// 丢弃一个 draft（用户不要了 / 换会话清理）。返回是否确有删除。

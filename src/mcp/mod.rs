@@ -15,6 +15,12 @@
 //! 线程模型：每个 server 串行 Mutex（工具调用本就串行）；两种 transport 都是阻塞
 //! IO，整体调用包 tokio timeout（超时放弃等待，残留响应由「id 不匹配即跳过」自愈）。
 //! 子进程 kill_on_drop，崩溃只标记离线，绝不拖垮主服务。
+//!
+//! 独立国（P28 分家）：MCP 自己的配置（settings.json `mcp_servers`）、自己的 OAuth
+//! （`oauth` 子模块 + `mcp_tokens.json`）、自己的 `mcp__` 工具前缀——与「插件」
+//! （`crate::plugin`）互不隶属，唯一过境点是共享的工具总线类型 `crate::plugin::ToolBrief`。
+
+pub mod oauth;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -457,9 +463,9 @@ fn spawn_sse(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
 /// http / sse 两种 transport 共用。
 fn oauth_bearer(cfg: &McpServerCfg, url: &str) -> Result<Option<String>, String> {
     let Some(oauth) = &cfg.oauth else { return Ok(None) };
-    match crate::plugin::mcp_oauth::token_for(&cfg.name) {
+    match crate::mcp::oauth::token_for(&cfg.name) {
         Some(t) => {
-            let t = crate::plugin::mcp_oauth::refresh_if_needed(&cfg.name, url, oauth, &t)
+            let t = crate::mcp::oauth::refresh_if_needed(&cfg.name, url, oauth, &t)
                 .map_err(|e| format!("MCP 授权已过期且刷新失败：{e}"))?;
             Ok(Some(t.access_token))
         }

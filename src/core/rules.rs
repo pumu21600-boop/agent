@@ -129,8 +129,8 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             None => (RiskLevel::Dangerous, format!("未知 WASM 插件工具: {tool_name}")),
         };
     }
-    if let Some(rest) = tool_name.strip_prefix(crate::plugin::mcp::PREFIX) {
-        return match crate::plugin::mcp::risk_for(tool_name) {
+    if let Some(rest) = tool_name.strip_prefix(crate::mcp::PREFIX) {
+        return match crate::mcp::risk_for(tool_name) {
             Some(2) => (
                 RiskLevel::Dangerous,
                 format!("MCP 工具（高危档或未确认接入）: {rest}"),

@@ -44,7 +44,7 @@ pub fn write_settings(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 插件名合法（与 ui-ext 同规：无分隔符、无穿越；额外放行 `- _ .` 组合但不接受 `.`/`..` 本身）。
+/// 插件名合法（与 plugins 同规：无分隔符、无穿越；额外放行 `- _ .` 组合但不接受 `.`/`..` 本身）。
 fn safe_plugin_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64

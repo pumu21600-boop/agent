@@ -99,7 +99,7 @@ static REGISTRY: OnceLock<RwLock<Vec<PluginEntry>>> = OnceLock::new();
 
 static PLUGINS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// P18：停用名单（settings.disabled_extensions 扩面到工具插件）。
+/// P18：停用名单（settings.disabled_plugins 扩面到工具插件）。
 /// 停用 = 不下发工具定义（拒新调用）；在跑调用等完（见模块头）。
 static DISABLED: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
@@ -268,10 +268,9 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     };
     bins.sort();
     match bins.len() {
-        0 => {
-            entry.load_error = Some("目录里没有 .wasm/.wat 工具文件".into());
-            entry
-        }
+        // P28 合并后一个插件一个目录：纯面板插件（manifest 只声明面板、没有工具
+        // 半边）合法——工具清单留空不算加载错误，「打开」半边由 ui 扫描负责。
+        0 => entry,
         1 => {
             let f = &bins[0];
             match compile_tools(&std::fs::read(f).unwrap_or_default()) {
@@ -557,7 +556,8 @@ pub fn status() -> Vec<(String, bool, Vec<ToolBrief>, Option<String>)> {
         .collect()
 }
 
-/// P18 二合一（027）：工具插件以 UiExt 同构形状进统一清单（/api/ext 一份列表看全部插件）。
+/// P28 目录合并：工具半边转成统一清单（与 ui::scan 同目录同形态，由 ui::scan_all
+/// 合成一份）。纯面板的目录在这里 tools 为空、**不报错**（P28 起合法形态）；
 /// 纯工具插件 `entry` 为空（前端不渲染「打开」），能力以 `tools` 清单呈现。
 pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
     let reg = registry().read().unwrap_or_else(|e| e.into_inner());

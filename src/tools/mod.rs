@@ -278,7 +278,7 @@ pub fn definitions() -> Vec<Value> {
             })
         })
         .collect();
-    out.extend(crate::plugin::mcp::tool_definitions());
+    out.extend(crate::mcp::tool_definitions());
     out.extend(crate::plugin::wasm::tool_definitions());
     out
 }
@@ -286,8 +286,8 @@ pub fn definitions() -> Vec<Value> {
 /// 执行工具，返回文本结果；Err 的内容会作为 tool 消息回填给模型（不中断循环）。
 pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String, String> {
     // P11：MCP 动态工具分发（进程隔离自带边界，不走本地沙箱/工作区约束）
-    if name.starts_with(crate::plugin::mcp::PREFIX) {
-        return crate::plugin::mcp::call_tool(name, args).await;
+    if name.starts_with(crate::mcp::PREFIX) {
+        return crate::mcp::call_tool(name, args).await;
     }
     // P11 017：WASM 插件工具分发（纯计算沙箱，自带边界）
     if name.starts_with(crate::plugin::wasm::PREFIX) {

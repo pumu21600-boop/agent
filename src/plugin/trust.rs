@@ -6,10 +6,10 @@
 //!
 //! - canonical digest = sha256(排序后的 `相对路径\n` + sha256(文件内容) + `\n` 序列)，
 //!   目录形态与裸文件形态各一把尺子（`digest_dir` / `digest_file`）；
-//! - `user` 来源插件（工作区/应用根自装的 ui-ext、plugins/ 目录与裸文件）**必须先被用户
+//! - `user` 来源插件（工作区/应用根自装的 plugins、plugins/ 目录与裸文件）**必须先被用户
 //!   pin 才能加载**：未 pin → 拒载 + 显式「未受信任」；内容被改 → digest 不符 → 拒载 +
 //!   「内容已变，需重新信任」；
-//! - pin 表落 settings.json `trusted_plugins{key: digest}`（key = `ui-ext:<name>` /
+//! - pin 表落 settings.json `trusted_plugins{key: digest}`（key = `plugins:<name>` /
 //!   `plugins:<name>`），内存态与落盘双向同步（install 在启动/设置变更时调）；
 //! - **豁免两类**：`built_in`（随包内置，位置即信任）、`model_generated`（draft 隔离区，
 //!   权限已清空 + 内存态）；draft **转正自动 pin**（转正是用户显式动作，即信任决定）。
@@ -28,7 +28,8 @@ const DOMAIN: &[u8] = b"zcode-plugin-digest-v1\n";
 /// 目录递归深度上限（防病态目录树；插件不该有深层嵌套）。
 const MAX_DEPTH: usize = 6;
 
-/// pin 键：`<kind>:<name>`（kind = ui-ext | plugins）。
+/// pin 键：`plugins:<name>`（P28 目录合并后唯一 kind；旧 `ui-ext:<name>` 键由
+/// settings 迁移改写，这里不再认第二种）。
 pub fn key_of(kind: &str, name: &str) -> String {
     format!("{kind}:{name}")
 }
@@ -144,37 +145,28 @@ pub fn reject_reason(state: &TrustState) -> String {
     }
 }
 
-/// pin 键 → 插件位置（工作区优先，与 ui::find_dir 同规；plugins 兼容裸文件旧形态）。
+/// pin 键 → 插件位置（P28 合并后单一 kind：目录形态工作区优先，裸 .wat/.wasm 旧形态兜底）。
 pub fn resolve(key: &str) -> Option<PathBuf> {
     let (kind, name) = key.split_once(':')?;
-    if name.is_empty() || name.contains(['/', '\\', ':']) {
+    if kind != crate::plugin::ui::DIR || name.is_empty() || name.contains(['/', '\\', ':']) {
         return None;
     }
-    match kind {
-        crate::plugin::ui::DIR => {
-            let ws = crate::tools::workspace_root().join(crate::plugin::ui::DIR).join(name);
-            if ws.is_dir() {
-                return Some(ws);
-            }
-            let app = crate::config::app_root().join(crate::plugin::ui::DIR).join(name);
-            app.is_dir().then_some(app)
-        }
-        "plugins" => {
-            let root = crate::plugin::wasm::plugins_dir()?;
-            let d = root.join(name);
-            if d.is_dir() {
-                return Some(d);
-            }
-            for ext in ["wat", "wasm"] {
-                let f = root.join(format!("{name}.{ext}"));
-                if f.is_file() {
-                    return Some(f);
-                }
-            }
-            None
-        }
-        _ => None,
+    let ws = crate::tools::workspace_root().join(crate::plugin::ui::DIR).join(name);
+    if ws.is_dir() {
+        return Some(ws);
     }
+    let app = crate::config::app_root().join(crate::plugin::ui::DIR).join(name);
+    if app.is_dir() {
+        return Some(app);
+    }
+    let root = crate::plugin::wasm::plugins_dir()?;
+    for ext in ["wat", "wasm"] {
+        let f = root.join(format!("{name}.{ext}"));
+        if f.is_file() {
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// 按位置算 digest（目录走目录尺，文件走文件尺）。
@@ -196,17 +188,10 @@ pub fn pin_from_manifest_paths(paths: &[String]) -> Vec<(String, String)> {
             continue;
         }
         let Some(dir) = path.parent() else { continue };
-        // ui-ext/<name>/manifest.json → kind=ui-ext；其余（plugins/<name>/…）→ kind=plugins
-        let kind = if dir.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str())
-            == Some(crate::plugin::ui::DIR)
-        {
-            crate::plugin::ui::DIR
-        } else {
-            "plugins"
-        };
+        // P28 目录合并：plugins/<name>/manifest.json → 唯一 kind=plugins
         let Some(name) = dir.file_name().and_then(|s| s.to_str()) else { continue };
         if let Ok(d) = digest_dir(dir) {
-            out.push((key_of(kind, name), d));
+            out.push((key_of("plugins", name), d));
         }
     }
     out
@@ -268,7 +253,7 @@ mod tests {
     #[test]
     fn state_matrix_pin_unpin_change() {
         install(&BTreeMap::new());
-        let key = "ui-ext:board";
+        let key = "plugins:board";
         // 未 pin → Untrusted
         assert_eq!(state(key, crate::plugin::contract::ORIGIN_USER, "abc"), TrustState::Untrusted { digest: "abc".into() });
         assert!(!state(key, crate::plugin::contract::ORIGIN_USER, "abc").trusted());
@@ -292,26 +277,20 @@ mod tests {
     }
 
     #[test]
-    fn pin_from_manifest_paths_derives_kinds() {
+    fn pin_from_manifest_paths_single_kind() {
         let root = tmp("promote");
-        let ui = root.join("ui-ext").join("calc");
-        let pl = root.join("plugins").join("calc");
-        std::fs::create_dir_all(&ui).unwrap();
-        std::fs::create_dir_all(&pl).unwrap();
-        std::fs::write(ui.join("manifest.json"), "{}").unwrap();
-        std::fs::write(pl.join("manifest.json"), "{}").unwrap();
-        std::fs::write(pl.join("calc.wat"), "(module)").unwrap();
-        let pins = pin_from_manifest_paths(&[
-            ui.join("manifest.json").display().to_string(),
-            pl.join("manifest.json").display().to_string(),
-        ]);
-        assert_eq!(pins.len(), 2);
-        assert!(pins.iter().any(|(k, d)| k == "ui-ext:calc" && !d.is_empty()));
-        assert!(pins.iter().any(|(k, d)| k == "plugins:calc" && !d.is_empty()));
-        // 两个 digest 不同（内容不同）
-        let a = pins.iter().find(|(k, _)| k == "ui-ext:calc").unwrap().1.clone();
-        let b = pins.iter().find(|(k, _)| k == "plugins:calc").unwrap().1.clone();
-        assert_ne!(a, b);
+        // P28 合并后一个形态：plugins/<name>/manifest.json → 唯一 kind=plugins
+        let dir = root.join("plugins").join("calc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(dir.join("calc.wat"), "(module)").unwrap();
+        let pins = pin_from_manifest_paths(&[dir.join("manifest.json").display().to_string()]);
+        assert_eq!(pins.len(), 1, "P28 起单一 kind，不再双表");
+        assert_eq!(pins[0].0, "plugins:calc");
+        assert!(!pins[0].1.is_empty(), "digest 必须非空（空 digest 无法验签）");
+        // 裸文件路径不产 pin（只认 manifest.json）
+        let bare = pin_from_manifest_paths(&[dir.join("calc.wat").display().to_string()]);
+        assert!(bare.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

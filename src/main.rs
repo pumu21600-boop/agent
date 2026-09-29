@@ -9,6 +9,7 @@ mod core;
 mod fsx;
 mod gateway;
 mod hooks;
+mod mcp;
 mod memory;
 mod observability;
 mod plugin;
@@ -66,10 +67,10 @@ async fn main() -> anyhow::Result<()> {
 
     // —— 设置：settings.json 持久化；首次用 config.toml 的 gateway 节作种子 ——
     let user_settings = config::settings::Settings::load(&config.gateway.base_url, &config.gateway.model);
-    crate::plugin::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
+    crate::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
     crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
-    crate::plugin::wasm::set_disabled(&user_settings.disabled_extensions); // P18 027：停用名单贯通工具插件
+    crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); // P18 027：停用名单贯通工具插件
     crate::plugin::trust::install(&user_settings.trusted_plugins); // P21 红线3：第三方插件验签（pin digest）
     crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
     // P21 成本台账：价格表来自 settings.json（由「用量」插件的价格设置页维护），

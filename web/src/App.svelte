@@ -3653,8 +3653,8 @@
 
   async function loadExt() {
     try {
-      const r = await fetch('/api/ext', { cache: 'no-store' }).then((r) => r.json());
-      extList = r.extensions || [];
+      const r = await fetch('/api/plugins', { cache: 'no-store' }).then((r) => r.json());
+      extList = r.plugins || [];
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
     } catch (e) {
       extList = [];
@@ -3682,7 +3682,7 @@
     if (ext) extCurrent = ext;
   }
   // 开机恢复 dock 页签：rpTab 存在 localStorage 里、extCurrent 不在。上次停在「用量」这类
-  // dock 页签时，插件清单（/api/ext）还没拉回来，右侧面板已经照着 ext:xxx 渲染 → extCurrent
+  // dock 页签时，插件清单（/api/plugins）还没拉回来，右侧面板已经照着 ext:xxx 渲染 → extCurrent
   // 还是 null → 显示「插件未加载」，必须切到别的页签再点回来才好（openDockPlugin 才补 extCurrent）。
   // 这里等清单一到就补上；插件被停用/删了则退回「产物」，别把用户留在死页签上。
   // 只在插件面板没占屏时同步——extOpen 时 extCurrent 归那个面板的 iframe 用，别抢。
@@ -3751,12 +3751,12 @@
   /// 扩展启用/停用（P17）：写设置 + 刷新清单
   async function toggleExt(e) {
     try {
-      const r = await fetch('/api/ext/toggle', {
+      const r = await fetch('/api/plugins/toggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name, enabled: e.enabled === false }),
       }).then((r) => r.json());
-      if (r.extensions) extList = r.extensions;
+      if (r.plugins) extList = r.plugins;
       if (e.enabled !== false && extCurrent && extCurrent.name === e.name) extOpen = false; // 停用后关面板
     } catch (err) {
       extMsg = `切换失败: ${err.message || err}`;
@@ -3766,14 +3766,14 @@
   // P18 契约 v1（027）：draft 转正（落盘持久化、来源改 user）/ 丢弃（内存即清）
   async function promoteExt(e) {
     try {
-      const r = await fetch('/api/ext/promote', {
+      const r = await fetch('/api/plugins/promote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: e.name }),
       }).then((r) => r.json());
       if (r.error) extMsg = `转正失败: ${r.error}`;
       else extMsg = `已转正「${e.title || e.name}」（来源已改为 user，重启后仍在）`;
-      if (r.extensions) extList = r.extensions;
+      if (r.plugins) extList = r.plugins;
     } catch (err) {
       extMsg = `转正失败: ${err.message || err}`;
     }
@@ -3782,10 +3782,10 @@
   async function discardExt(e) {
     if (!confirm(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`)) return;
     try {
-      const r = await fetch(`/api/ext/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
+      const r = await fetch(`/api/plugins/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
       if (r.error) extMsg = `丢弃失败: ${r.error}`;
       else extMsg = `已丢弃「${e.title || e.name}」`;
-      if (r.extensions) extList = r.extensions;
+      if (r.plugins) extList = r.plugins;
     } catch (err) {
       extMsg = `丢弃失败: ${err.message || err}`;
     }
@@ -3798,14 +3798,14 @@
     const verb = action === 'pin' ? '信任' : '取消信任';
     if (action === 'pin' && !confirm(`信任插件「${e.title || e.name}」？\n\n将记录它当前的内容指纹，之后每次加载都比对；文件被改动后会再次要求重新信任。`)) return;
     try {
-      const r = await fetch('/api/ext/trust', {
+      const r = await fetch('/api/plugins/trust', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, action }),
       }).then((r) => r.json());
       if (r.error) extMsg = `${verb}失败: ${r.error}`;
       else extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
-      if (r.extensions) extList = r.extensions;
+      if (r.plugins) extList = r.plugins;
     } catch (err) {
       extMsg = `${verb}失败: ${err.message || err}`;
     }
@@ -3977,7 +3977,7 @@
           reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
           break;
         }
-        // —— P21 只读桥：「用量」插件（ui-ext/usage 试点）拉当前会话的用量统计 ——
+        // —— P21 只读桥：「用量」插件（plugins/usage 试点）拉当前会话的用量统计 ——
         case 'usage.session': {
           const group = params.group === 'model' ? 'model' : 'provider';
           const range = ['today', '7d', '30d', 'all'].includes(params.range) ? params.range : 'all';
@@ -4019,7 +4019,7 @@
           reply(r.ok && j.ok !== false, r.ok ? j : j.error || '重算失败');
           break;
         }
-        // —— P19 只读桥：trace 时间线面板（ui-ext/trace 试点）拉最近任务事件流 ——
+        // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
         // 只读信息类方法与 workspace.info 同级，不占权限白名单。
         case 'trace.recent': {
           const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
@@ -4041,7 +4041,7 @@
     loadSession(e.detail);
   }
 
-  // P10-A trace 时间线已插件化（P19）：ui-ext/trace 面板 + 宿主只读桥 trace.recent，
+  // P10-A trace 时间线已插件化（P19）：plugins/trace 面板 + 宿主只读桥 trace.recent，
   // 原内置弹窗（状态/函数/标记/样式）整体撤下——顶栏的插件按钮即入口。
 
   function nextId() {
@@ -4856,7 +4856,7 @@
                 title={extCurrent.title}
                 sandbox="allow-scripts"
                 bind:this={dockExtFrame}
-                src={`/ui-ext/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
+                src={`/plugins/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
                 on:load={() => onExtFrameLoad(extCurrent.name)}
               ></iframe>
             {:else}
@@ -4997,7 +4997,7 @@
         bind:this={extFrame}
         title={extCurrent.title}
         sandbox="allow-scripts"
-        src={`/ui-ext/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
+        src={`/plugins/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
         on:load={() => onExtFrameLoad(extCurrent.name)}
       ></iframe>
     </aside>
@@ -5011,7 +5011,7 @@
         title={`插件后台：${e.title}`}
         sandbox="allow-scripts"
         bind:this={extFrameEls[e.name]}
-        src={`/ui-ext/${encodeURIComponent(e.name)}/${e.entry || 'index.html'}`}
+        src={`/plugins/${encodeURIComponent(e.name)}/${e.entry || 'index.html'}`}
         on:load={() => onExtFrameLoad(e.name)}
       ></iframe>
     {/if}

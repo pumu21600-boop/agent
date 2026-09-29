@@ -170,8 +170,8 @@ pub(super) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Resu
     s.save().map_err(|e| e.to_string())?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
-    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
@@ -257,8 +257,8 @@ pub(super) async fn remove_workspace(
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
-    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
 }
@@ -284,8 +284,8 @@ pub(super) async fn alias_workspace(
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
-    crate::plugin::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
     observability::event(
         EventType::State,
         json!({ "kind": "workspace.aliased", "path": path, "name": name }),

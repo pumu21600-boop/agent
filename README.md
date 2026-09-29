@@ -18,7 +18,7 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**第三方验签**：来源为 `user` 的插件（自装 / 工作区 / plugins 目录）要点「信任」固定内容指纹后才加载，文件被改动即停用；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
-- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量」插件**（`ui-ext/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
+- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量」插件**（`plugins/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
 - **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
@@ -50,7 +50,7 @@ agent/
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── ui-ext/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览、trace/ 时间线、usage/ 用量）
+├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览、trace/ 时间线、usage/ 用量）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
@@ -71,7 +71,7 @@ agent/
 - **开发形态**：`cargo run` 或直接跑 `target\release\agent.exe` —— exe 同级没有 `config.toml` / `web`，
   一律回落**编译期源码目录**（改动前的老行为，开发流程零变化）。
 - **打包形态**：exe 同级有 `config.toml` 或 `web/` —— 认定随包运行，`config.toml` /
-  `settings.json` / `providers.json` / `prompts/` / `web/dist/` / `plugins/` / `ui-ext/` / `logs/`
+  `settings.json` / `providers.json` / `prompts/` / `web/dist/` / `plugins/` / `plugins/` / `logs/`
   全落在 **exe 同级目录**。所以整个目录可以拷到任何地方（含没装 Rust/Node 的机器）直接双击 `start.bat`。
 
 侧栏底部的版本行（鼠标悬停显示「运行根」）就是用来一眼确认当前读的是哪一份资源。
@@ -148,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 
 ```
 agent.exe            服务二进制（start/stop/status 自管理内置）
-config.toml  providers.json  prompts\  plugins\  ui-ext\
+config.toml  providers.json  prompts\  plugins\  plugins\
 web\dist\            前端产物（由 exe 托管）
 tools\git-runtime.zip 内置 MinGit（未跑 bundle_git.ps1 时缺，缺了就要系统 git）
 start.bat  stop.bat  README.md  LICENSE
@@ -255,12 +255,12 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/api/memory/search` | 检索（`query` 或 `like=<会话id>`） |
 | GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
-| GET | `/api/ext` | 插件统一清单（面板 + 工具 + draft，一份列表）|
-| POST | `/api/ext/toggle` | 启用/停用插件（停用 = 拒新调用 + 等完）|
-| POST | `/api/ext/draft` / DELETE | 模型自产插件提交 draft 隔离区 / 丢弃 |
-| POST | `/api/ext/promote` | draft 一键转正（落盘持久化、来源改 user）|
+| GET | `/api/plugins` | 插件统一清单（面板 + 工具 + draft，一份列表）|
+| POST | `/api/plugins/toggle` | 启用/停用插件（停用 = 拒新调用 + 等完）|
+| POST | `/api/plugins/draft` / DELETE | 模型自产插件提交 draft 隔离区 / 丢弃 |
+| POST | `/api/plugins/promote` | draft 一键转正（落盘持久化、来源改 user）|
 | GET / PUT / DELETE | `/api/plugin/data` | 插件命名空间数据读写删（存储一门；键名白名单 ≤64 字符，值 ≤64KB）|
-| GET | `/ui-ext/{name}[/{path}]` | 插件面板静态资源（入口页由 manifest 指定；路径穿越一律 404） |
+| GET | `/plugins/{name}[/{path}]` | 插件面板静态资源（入口页由 manifest 指定；路径穿越一律 404） |
 | GET | `/api/version` | 版本与运行形态（`root` = 当前生效的应用根） |
 | GET | `/api/sandbox/selftest` | 沙箱探针套件（真实拉起受限进程） |
 | GET | `/api/sandbox/info` | 当前沙箱档位（配置档/生效档/回退原因/探测链明细；`?refresh=1` 强制重探） |
@@ -284,8 +284,8 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 一个插件 = 一个目录 + 一份 manifest.json，清单里**只声明「有什么」**（面板 / 工具 / 权限），不分类型。对外只留四个词：**Skill / MCP / 插件 / 沙箱**。契约全文见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)。
 
 ```
-<应用根>/ui-ext/<名字>/           # 面板（随包/内置）
-<当前工作区>/ui-ext/<名字>/       # 面板（项目自带；同名顶掉内置）
+<应用根>/plugins/<名字>/           # 面板（随包/内置）
+<当前工作区>/plugins/<名字>/       # 面板（项目自带；同名顶掉内置）
 <plugins 目录>/x.wat             # 工具（旧形态：裸文件）
 <plugins 目录>/x/manifest.json   # 工具（目录形态：manifest + 恰好一个 .wasm/.wat）
     manifest.json                # {"apiVersion":1,"source":"user","title":"…","entry":"index.html","ui":[],"permissions":[]}
@@ -322,8 +322,8 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
 - **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
-- **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 ui-ext、当前工作区 ui-ext、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
-- 参考实现：`ui-ext/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。
+- **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 plugins、当前工作区 plugins、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
+- 参考实现：`plugins/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。
 
 # 用量台账与成本红线（P21）
 
@@ -341,7 +341,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - **`parent_session`**：P22 子代理的父任务归属字段（v1 恒为 null，子代理落地后填值即可按父任务聚合）。
 - **报表**：`GET /api/usage?group=provider|model&range=today|7d|30d|all&session=<id>`；`session` 非空 = 只算该会话（「用量」插件的「当前对话」口径），缺省 = 全量。
 
-## 「用量」插件（随包内置试点，ui-ext/usage/）
+## 「用量」插件（随包内置试点，plugins/usage/）
 
 右侧面板在「产物 / 预览 / 网页」旁多一个**用量**页签（manifest 声明 `ui:[{slot:"dock"}]`；插件停用则页签与价格设置一起消失，**台账与硬闸照常跑**——内核不受插件停用影响）。插件经只读桥 `usage.session` 拉当前会话统计，显示输入 token（含缓存命中）/ 输出 token / 请求次数 / 本次对话费用，页脚一行累计花费与上限。
 

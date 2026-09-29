@@ -5,15 +5,15 @@
 //!
 //! ## 扩展形态
 //!
-//! `<root>/ui-ext/<name>/` 目录，内含 `manifest.json` + 静态资源（默认入口 `index.html`）：
+//! `<root>/plugins/<name>/` 目录，内含 `manifest.json` + 静态资源（默认入口 `index.html`）：
 //!
 //! ```json
 //! { "title": "记忆看板", "description": "把记忆库按标签排开", "version": "0.1.0", "entry": "index.html" }
 //! ```
 //!
 //! 两个来源，工作区同名覆盖内置：
-//! 1. 应用根 `ui-ext/`（随包携带的内置扩展）；
-//! 2. 当前工作区 `<workspace>/ui-ext/`（项目自带扩展）。
+//! 1. 应用根 `plugins/`（随包携带的内置扩展）；
+//! 2. 当前工作区 `<workspace>/plugins/`（项目自带扩展）。
 //!
 //! ## 隔离模型（本模块只负责发现与分发，隔离在前端）
 //!
@@ -35,9 +35,9 @@ use crate::plugin::{contract, ToolBrief};
 use crate::plugin::trust;
 
 /// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
-pub const DIR: &str = "ui-ext";
+pub const DIR: &str = "plugins";
 
-/// 一个插件的描述（GET /api/ext 直出；P18 契约 v1：面板与工具插件同构）。
+/// 一个插件的描述（GET /api/plugins 直出；P18 契约 v1：面板与工具插件同构）。
 #[derive(Debug, Clone, Serialize)]
 pub struct UiExt {
     pub name: String,
@@ -74,7 +74,7 @@ pub struct UiExt {
     /// P21：插件自带设置页（manifest settings_entry，如 prices.html）——
     /// 宿主在设置→插件卡片上渲染「设置」按钮，点了在插件面板里打开该页
     pub settings_entry: String,
-    /// P21 红线3：验签键（`ui-ext:<name>`；draft 为空串）
+    /// P21 红线3：验签键（`plugins:<name>`；draft 为空串）
     pub trust_key: String,
     /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
     pub digest: String,
@@ -139,6 +139,26 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
             digest: String::new(),
             trusted: true,
         });
+    }
+    out
+}
+
+/// 统一清单（P28 目录合并）：面板扫描 + 工具注册表合成一份。同目录名既声明面板又
+/// 带工具的合成一条（工具半边并入同一条目），不再像合并前那样一个插件出两行。
+pub fn scan_all(disabled: &[String]) -> Vec<UiExt> {
+    let mut out = scan(disabled);
+    for w in crate::plugin::wasm::scan_plugins(disabled) {
+        match out.iter_mut().find(|e| e.name == w.name) {
+            Some(e) => {
+                if e.tools.is_empty() {
+                    e.tools = w.tools;
+                }
+                if e.error.is_none() && w.error.is_some() {
+                    e.error = w.error;
+                }
+            }
+            None => out.push(w),
+        }
     }
     out
 }
@@ -277,11 +297,18 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             }
         }
     }
-    // 入口必须真实存在且不出目录
-    match resolve_in(dir, &e.entry) {
-        Ok(p) if p.is_file() => e.ok = true,
-        Ok(_) => e.error = Some(format!("入口 {} 不是文件", e.entry)),
-        Err(err) => e.error = Some(err),
+    // 入口必须真实存在且不出目录；P28 合并后纯工具插件（清单既无 entry 也无 ui）
+    // 不要求入口页——entry 留空、前端按空隐藏「打开」，工具半边由 wasm 注册表补齐。
+    let declares_panel = v.get("entry").is_some() || v.get("ui").is_some();
+    if declares_panel {
+        match resolve_in(dir, &e.entry) {
+            Ok(p) if p.is_file() => e.ok = true,
+            Ok(_) => e.error = Some(format!("入口 {} 不是文件", e.entry)),
+            Err(err) => e.error = Some(err),
+        }
+    } else {
+        e.entry = String::new();
+        e.ok = true;
     }
     e
 }
@@ -373,7 +400,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("agent-ui-ext-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("agent-plugins-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -165,13 +165,13 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/memory/search", post(search_memory))
         .route("/api/mcp", get(get_mcp).post(post_mcp))
         .route("/api/version", get(get_version))
-        .route("/api/ext", get(list_extensions))
-        .route("/api/ext/toggle", post(toggle_extension))
+        .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/toggle", post(toggle_plugin))
         // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
-        .route("/api/ext/draft", post(submit_draft).delete(discard_draft))
-        .route("/api/ext/promote", post(promote_draft))
+        .route("/api/plugins/draft", post(submit_draft).delete(discard_draft))
+        .route("/api/plugins/promote", post(promote_draft))
         // P21 红线3：第三方插件验签（pin/unpin 内容指纹）
-        .route("/api/ext/trust", post(trust_plugin))
+        .route("/api/plugins/trust", post(trust_plugin))
         // P21 成本台账：按供应商/模型的 token、次数、费用报表 + 价格表与重算
         .route("/api/usage", get(get_usage))
         .route("/api/usage/prices", get(get_usage_prices).put(put_usage_prices))
@@ -181,9 +181,9 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/file", post(write_workspace_file))
         // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
         // 尾斜杠那条约等于目录首页：不带它请求会掉进 SPA 兜底，把整个应用套进 iframe
-        .route("/ui-ext/{name}", get(ui_ext_entry))
-        .route("/ui-ext/{name}/", get(ui_ext_entry))
-        .route("/ui-ext/{name}/{*path}", get(ui_ext_asset))
+        .route("/plugins/{name}", get(plugin_entry))
+        .route("/plugins/{name}/", get(plugin_entry))
+        .route("/plugins/{name}/{*path}", get(plugin_asset))
         .route("/cancel", post(cancel))
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))

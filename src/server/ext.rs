@@ -35,7 +35,7 @@ pub(super) async fn post_mcp(
                 Ok(c) => c,
                 Err(e) => return err(format!("server 配置不合法: {e}")),
             };
-            if !crate::plugin::mcp::valid_name(&cfg.name) {
+            if !crate::mcp::valid_name(&cfg.name) {
                 return err("名称非法（非空、仅字母数字-_、禁止包含 __）".into());
             }
             // transport 合法性 + 该 transport 的必需字段（早失败好过调用时才报错）
@@ -90,7 +90,7 @@ pub(super) async fn post_mcp(
             let Some(c) = s.mcp_servers.iter().find(|c| &c.name == name) else {
                 return err(format!("未知 server: {name}"));
             };
-            match crate::plugin::mcp_oauth::start_authorize(name, c) {
+            match crate::mcp::oauth::start_authorize(name, c) {
                 Ok(snap) => return (StatusCode::OK, Json(json!({ "ok": true, "tx": snap }))),
                 Err(e) => return err(e),
             }
@@ -101,8 +101,8 @@ pub(super) async fn post_mcp(
             if !s.mcp_servers.iter().any(|c| &c.name == name) {
                 return err(format!("未知 server: {name}"));
             }
-            crate::plugin::mcp_oauth::revoke(name);
-            crate::plugin::mcp::force_offline(name);
+            crate::mcp::oauth::revoke(name);
+            crate::mcp::force_offline(name);
             observability::event(
                 observability::EventType::State,
                 json!({ "kind": "mcp.oauth.revoked", "server": name }),
@@ -116,14 +116,14 @@ pub(super) async fn post_mcp(
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
-    crate::plugin::mcp::sync_configs(&s.mcp_servers);
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
     crate::plugin::wasm::rescan(); // 017：顺带重扫 WASM 插件
     if req.action == "refresh" {
         let name = req.name.clone().unwrap_or_default();
-        let r = tokio::task::spawn_blocking(move || crate::plugin::mcp::ensure_online_by_name(&name)).await;
+        let r = tokio::task::spawn_blocking(move || crate::mcp::ensure_online_by_name(&name)).await;
         match r {
             Ok(Ok(n)) => {
                 return (StatusCode::OK, Json(json!({ "ok": true, "tools_found": n })));
@@ -152,12 +152,12 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
         .collect();
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let status: std::collections::HashMap<String, (bool, Vec<(String, String)>)> =
-        crate::plugin::mcp::status()
+        crate::mcp::status()
             .into_iter()
             .map(|(n, o, t)| (n, (o, t)))
             .collect();
     // P17：resources / prompts 清单（声明了能力的 server 才有内容）
-    let catalogs = crate::plugin::mcp::catalogs();
+    let catalogs = crate::mcp::catalogs();
     let servers: Vec<Value> = s
         .mcp_servers
         .iter()
@@ -177,34 +177,33 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 "prompts": prompts,
                 // P24：OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）
                 "oauth": c.oauth,
-                "oauth_status": crate::plugin::mcp_oauth::tx_status(&c.name),
+                "oauth_status": crate::mcp::oauth::tx_status(&c.name),
             })
         })
         .collect();
     Json(json!({ "servers": servers, "wasm": wasm_list }))
 }
 
-/// GET /api/ext —— 组件总线 v0：UI 扩展清单（应用根内置 + 当前工作区自带）。
-pub(super) async fn list_extensions(State(state): State<AppState>) -> Json<Value> {
+/// GET /api/plugins —— 组件总线 v0：UI 扩展清单（应用根内置 + 当前工作区自带）。
+pub(super) async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     let disabled = state
         .settings
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .disabled_extensions
+        .disabled_plugins
         .clone();
     // P18 二合一（027）：面板插件 + 工具插件（wasm 桥）+ 内存 draft，一份清单
-    let mut extensions = crate::plugin::ui::scan(&disabled);
-    extensions.extend(crate::plugin::wasm::scan_plugins(&disabled));
+    let extensions = crate::plugin::ui::scan_all(&disabled);
     Json(json!({
-        "extensions": extensions,
+        "plugins": extensions,
         "dir": crate::plugin::ui::DIR,
         "app_dir": crate::config::app_root().join(crate::plugin::ui::DIR).display().to_string(),
         "workspace_dir": crate::tools::workspace_root().join(crate::plugin::ui::DIR).display().to_string(),
     }))
 }
 
-/// POST /api/ext/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
-pub(super) async fn toggle_extension(
+/// POST /api/plugins/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
+pub(super) async fn toggle_plugin(
     State(state): State<AppState>,
     Json(req): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
@@ -214,27 +213,26 @@ pub(super) async fn toggle_extension(
     }
     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
-    s.disabled_extensions.retain(|d| d != &name);
+    s.disabled_plugins.retain(|d| d != &name);
     if !enabled {
-        s.disabled_extensions.push(name.clone());
+        s.disabled_plugins.push(name.clone());
     }
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_extensions);
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     observability::event(
         EventType::State,
-        json!({ "kind": "ext.toggle", "name": name, "enabled": enabled }),
+        json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled }),
     );
     // P18 二合一：回包清单含工具插件
-    let mut list = crate::plugin::ui::scan(&s.disabled_extensions);
-    list.extend(crate::plugin::wasm::scan_plugins(&s.disabled_extensions));
-    (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+    let list = crate::plugin::ui::scan_all(&s.disabled_plugins);
+    (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
 }
 
-/// POST /api/ext/draft —— 模型自产插件提交进 draft 隔离区（P18 027）。
+/// POST /api/plugins/draft —— 模型自产插件提交进 draft 隔离区（P18 027）。
 /// 规范化（source=model_generated、权限清空）在 draft::submit 里强制执行。
 pub(super) async fn submit_draft(
     State(state): State<AppState>,
@@ -256,17 +254,16 @@ pub(super) async fn submit_draft(
                 .settings
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .disabled_extensions
+                .disabled_plugins
                 .clone();
-            let mut list = crate::plugin::ui::scan(&disabled);
-            list.extend(crate::plugin::wasm::scan_plugins(&disabled));
-            (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+            let list = crate::plugin::ui::scan_all(&disabled);
+            (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
     }
 }
 
-/// POST /api/ext/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
+/// POST /api/plugins/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
 /// P21 红线3：转正是用户显式动作 = 信任决定，落盘后**自动 pin** 内容指纹（不 pin 就会被
 /// 自己的验签门拦下，转正等于白做）。
 pub(super) async fn promote_draft(
@@ -298,18 +295,17 @@ pub(super) async fn promote_draft(
                 .settings
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .disabled_extensions
+                .disabled_plugins
                 .clone();
-            let mut list = crate::plugin::ui::scan(&disabled);
-            list.extend(crate::plugin::wasm::scan_plugins(&disabled));
-            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "pinned": pins.len(), "extensions": list })))
+            let list = crate::plugin::ui::scan_all(&disabled);
+            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "pinned": pins.len(), "plugins": list })))
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
     }
 }
 
-/// POST /api/ext/trust {key, action} —— 第三方插件验签的 pin / unpin（P21 红线3）。
-/// key 形如 `ui-ext:<name>` / `plugins:<name>`；pin 时按当前位置重算 digest。
+/// POST /api/plugins/trust {key, action} —— 第三方插件验签的 pin / unpin（P21 红线3）。
+/// key 形如 `plugins:<name>` / `plugins:<name>`；pin 时按当前位置重算 digest。
 pub(super) async fn trust_plugin(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -317,7 +313,7 @@ pub(super) async fn trust_plugin(
     let key = req.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let action = req.get("action").and_then(Value::as_str).unwrap_or("pin").trim().to_string();
     if key.is_empty() || !key.contains(':') {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 ui-ext:<name>）" })));
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 plugins:<name>）" })));
     }
     let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -349,13 +345,12 @@ pub(super) async fn trust_plugin(
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // pin/unpin 会改变工具插件的可加载性 → 重扫注册表，清单与工具表同步
     crate::plugin::wasm::rescan();
-    let disabled = s.disabled_extensions.clone();
-    let mut list = crate::plugin::ui::scan(&disabled);
-    list.extend(crate::plugin::wasm::scan_plugins(&disabled));
-    (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+    let disabled = s.disabled_plugins.clone();
+    let list = crate::plugin::ui::scan_all(&disabled);
+    (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
 }
 
-/// DELETE /api/ext/draft?name= —— 丢弃 draft（内存即清，WASM 注册表同步回收）。
+/// DELETE /api/plugins/draft?name= —— 丢弃 draft（内存即清，WASM 注册表同步回收）。
 pub(super) async fn discard_draft(
     State(state): State<AppState>,
     Query(q): Query<PluginDataQueryName>,
@@ -365,11 +360,10 @@ pub(super) async fn discard_draft(
             .settings
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .disabled_extensions
+            .disabled_plugins
             .clone();
-        let mut list = crate::plugin::ui::scan(&disabled);
-        list.extend(crate::plugin::wasm::scan_plugins(&disabled));
-        (StatusCode::OK, Json(json!({ "ok": true, "extensions": list })))
+        let list = crate::plugin::ui::scan_all(&disabled);
+        (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
     } else {
         (StatusCode::NOT_FOUND, Json(json!({ "error": format!("没有名为 {} 的 draft", q.name) })))
     }
@@ -416,26 +410,26 @@ pub(super) async fn delete_plugin_data(Query(q): Query<PluginDataQuery>) -> (Sta
     }
 }
 
-/// GET /ui-ext/{name} —— 扩展入口页（entry 由 manifest 指定）。
-pub(super) async fn ui_ext_entry(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
-    serve_ext(&state, &name, "")
+/// GET /plugins/{name} —— 扩展入口页（entry 由 manifest 指定）。
+pub(super) async fn plugin_entry(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
+    serve_plugin(&state, &name, "")
 }
 
-/// GET /ui-ext/{name}/{*path} —— 扩展目录内的静态资源。
-pub(super) async fn ui_ext_asset(
+/// GET /plugins/{name}/{*path} —— 扩展目录内的静态资源。
+pub(super) async fn plugin_asset(
     State(state): State<AppState>,
     AxumPath((name, path)): AxumPath<(String, String)>,
 ) -> Response {
-    serve_ext(&state, &name, &path)
+    serve_plugin(&state, &name, &path)
 }
 
 /// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用、未通过验签的也 404。
-fn serve_ext(state: &AppState, name: &str, rel: &str) -> Response {
+fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
     let disabled = state
         .settings
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .disabled_extensions
+        .disabled_plugins
         .clone();
     if disabled.iter().any(|d| d == name) {
         return (StatusCode::NOT_FOUND, "插件已停用").into_response();
