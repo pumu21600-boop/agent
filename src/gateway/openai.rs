@@ -1,0 +1,277 @@
+use super::*;
+
+/// 组装 /chat/completions 请求体（纯函数，单测覆盖各端点样式）。
+/// 硬约束：不含 api_key；思考参数按端点 compat 适配而非按 provider id 分支。
+/// 生产路径走 build_body_with_compat（发送前先探测一次 compat 并复用）；本包装只给单测用。
+#[cfg(test)]
+pub fn build_body(
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    params: &ChatParams,
+    tools: Option<&Value>,
+) -> Value {
+    let compat = compat::resolve(
+        params.provider_id.as_deref(),
+        params.base_url.as_deref(),
+        model,
+        params.thinking_format,
+    );
+    build_body_with_compat(model, messages, stream, params, tools, &compat)
+}
+
+/// 带 compat 的组装（供网关在发送前先做历史净化时复用同一次探测）。
+pub fn build_body_with_compat(
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    params: &ChatParams,
+    tools: Option<&Value>,
+    compat: &Compat,
+) -> Value {
+    // Anthropic Messages 协议（P23）：请求体形状完全不同，交给专用适配器；
+    // 响应侧同样由适配器合成为 OpenAI 分片，下游零感知
+    if compat.protocol == Protocol::AnthropicMessages {
+        return anthropic::build_body(model, messages, stream, params, tools);
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+    if stream && compat.supports_usage_in_streaming {
+        // 流式末尾带回 usage（非标端点不收 stream_options，按 compat 跳过）
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    if let Some(t) = tools {
+        body["tools"] = t.clone();
+    }
+    if let Some(mt) = params.max_tokens {
+        body[compat.max_tokens_field] = json!(mt);
+    }
+    if let Some(t) = params.temperature
+        && compat.supports_temperature {
+            body["temperature"] = json!(t);
+        }
+    if let Some(t) = params.top_p {
+        body["top_p"] = json!(t);
+    }
+
+    // —— 思考参数：按 thinkingFormat 分支（对齐 OpenClaw buildOpenAICompletionsParams）——
+    // 关键保底：默认档位（None 或空串）绝不向任何网关发送任何思考字段，坚决尊重渠道自身行为
+    let requested = params
+        .thinking
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match compat.thinking_format {
+        // 极简模式：不向端点发送任何思考相关参数
+        ThinkingFormat::None => {}
+        // zai（智谱 GLM/豆包 Seed）：{type:enabled|disabled}
+        ThinkingFormat::Zai => {
+            if let Some(t) = requested {
+                body["thinking"] = json!({ "type": if t == "off" { "disabled" } else { "enabled" } });
+            }
+        }
+        // deepseek（V4 Pro/Flash/R1）：thinking 对象；V4 支持 reasoning_effort (low/high/max)
+        ThinkingFormat::Deepseek => {
+            if let Some(t) = requested {
+                if t == "off" {
+                    body["thinking"] = json!({ "type": "disabled" });
+                    body["reasoning_effort"] = json!("none");
+                } else {
+                    body["thinking"] = json!({ "type": "enabled" });
+                    let eff = match t {
+                        "low" => Some("low"),
+                        "medium" => Some("medium"),
+                        "high" => Some("high"),
+                        "max" | "xhigh" => Some("xhigh"),
+                        _ => None,
+                    };
+                    if let Some(e) = eff {
+                        body["reasoning_effort"] = json!(e);
+                    }
+                }
+            }
+        }
+        // qwen（百炼/混元）：顶层布尔 enable_thinking
+        ThinkingFormat::Qwen => {
+            if let Some(t) = requested {
+                body["enable_thinking"] = json!(t != "off");
+            }
+        }
+        // 本地推理服务聊天模板：chat_template_kwargs.enable_thinking（vLLM/llama.cpp Qwen3 系）
+        ThinkingFormat::QwenChatTemplate => {
+            if let Some(t) = requested {
+                let kwargs = body
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("chat_template_kwargs")
+                    .or_insert_with(|| json!({}));
+                kwargs["enable_thinking"] = json!(t != "off");
+            }
+        }
+        // openai：reasoning_effort 档位，经 effort::resolve 按模型降级；无法表达"关"时不发
+        ThinkingFormat::Openai => {
+            let level = match requested {
+                Some("on") => Some("medium".to_string()),
+                Some(v) => effort::resolve_effort(model, v, None),
+                None => None,
+            };
+            if let Some(level) = level {
+                body["reasoning_effort"] = json!(level);
+            }
+        }
+    }
+    body
+}
+
+/// 流式分片聚合器（P23 从 stream_chat 抽出）：一个 OpenAI 形状分片进，
+/// usage/思考剥离/tool_calls 增量聚合、model_chunk 事件、干净分片出。
+/// Anthropic 协议的合成 OpenAI 分片走同一入口，下游零分叉。
+pub(crate) struct StreamAgg {
+    pub(crate) turn: AssistantTurn,
+    pub(crate) calls: Vec<ToolCall>,
+    pub(crate) think_split: TagSplit,
+    pub(crate) chunk_count: u64,
+}
+
+impl StreamAgg {
+    pub(crate) fn new() -> Self {
+        Self { turn: AssistantTurn::default(), calls: Vec::new(), think_split: TagSplit::default(), chunk_count: 0 }
+    }
+
+    /// 处理一个分片：raw/data 原文 + OpenAI 形状 chunk（可变，思考剥离会写回）。
+    pub(crate) fn feed(&mut self, chunk: &mut Value, data: &str) {
+        // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
+        // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示 + P21 台账分计量）
+        if let Some(u) = chunk.get("usage")
+            && let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64)
+        {
+            self.turn.prompt_tokens = Some(p);
+            self.turn.completion_tokens = u
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("output_tokens").and_then(Value::as_u64));
+            self.turn.cached_tokens = u
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+        }
+        let mut delta = extract_delta(chunk);
+        // 反代思考标签剥离：标签内文字改道思考通道；
+        // 结果写回 chunk，让 on_chunk 转发路径（前端 SSE）也拿到干净值
+        if !delta.content.is_empty() {
+            let (think, clean) = self.think_split.feed(&delta.content);
+            if !think.is_empty() || clean.len() != delta.content.len() {
+                if !think.is_empty() {
+                    delta.reasoning = Some(match delta.reasoning.take() {
+                        Some(r) => format!("{r}{think}"),
+                        None => think,
+                    });
+                }
+                delta.content = clean.clone();
+                if let Some(d) = chunk.pointer_mut("/choices/0/delta") {
+                    d["content"] = json!(clean);
+                    if let Some(r) = &delta.reasoning {
+                        d["reasoning_content"] = json!(r);
+                    }
+                }
+            }
+        }
+        let mut payload = json!({ "raw": data, "content": delta.content });
+        if let Some(r) = &delta.reasoning {
+            payload["reasoning_content"] = json!(r);
+        }
+        if let Some(f) = &delta.finish {
+            payload["finish_reason"] = json!(f);
+            self.turn.finish_reason = Some(f.clone());
+        }
+        let tc_arr = chunk
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+            .cloned();
+        if let Some(arr) = &tc_arr {
+            payload["tool_calls"] = json!(arr);
+            accumulate_tool_calls(arr, &mut self.calls);
+        }
+        self.turn.content.push_str(&delta.content);
+        if let Some(r) = &delta.reasoning {
+            self.turn.reasoning.push_str(r);
+        }
+        observability::event(EventType::ModelChunk, payload);
+        observability::debug(&format!("[gateway] sse: {data}"));
+        self.chunk_count += 1;
+    }
+
+    /// 流结束：hold 里若剩半截标签（如截断在 "<thi"），按当前通道归位；tool_calls 落位。
+    pub(crate) fn finish(&mut self) {
+        let (tail_think, tail_content) = self.think_split.finish();
+        self.turn.reasoning.push_str(&tail_think);
+        self.turn.content.push_str(&tail_content);
+        self.turn.tool_calls = std::mem::take(&mut self.calls);
+    }
+}
+
+/// 按 index 合并流式 tool_calls 分片（OpenAI 兼容增量格式）。
+pub(crate) fn accumulate_tool_calls(arr: &[Value], calls: &mut Vec<ToolCall>) {
+    for entry in arr {
+        let index = entry.get("index").and_then(Value::as_i64).unwrap_or(0) as usize;
+        while calls.len() <= index {
+            calls.push(ToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+        }
+        let call = &mut calls[index];
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            call.id.push_str(id);
+        }
+        if let Some(name) = entry.pointer("/function/name").and_then(Value::as_str) {
+            call.name.push_str(name);
+        }
+        if let Some(args) = entry.pointer("/function/arguments").and_then(Value::as_str) {
+            call.arguments.push_str(args);
+        }
+    }
+}
+
+pub struct Delta {
+    pub content: String,
+    pub reasoning: Option<String>,
+    pub finish: Option<String>,
+}
+
+/// 从分片里提取增量内容与思考内容。
+/// 思考字段全量对齐 OpenClaw OPENAI_COMPLETIONS_REASONING_FIELDS +
+/// OpenRouter reasoning_details（type=reasoning.text）：四字段按序取第一个非空。
+pub fn extract_delta(chunk: &Value) -> Delta {
+    let choice = chunk.pointer("/choices/0").cloned().unwrap_or(Value::Null);
+    let delta = choice.pointer("/delta").cloned().unwrap_or(Value::Null);
+    Delta {
+        content: delta.pointer("/content").and_then(Value::as_str).unwrap_or("").to_string(),
+        reasoning: extract_reasoning(&delta),
+        finish: choice.pointer("/finish_reason").and_then(Value::as_str).map(String::from),
+    }
+}
+
+/// OpenAI Completions 系思考字段（上游 OPENAI_COMPLETIONS_REASONING_FIELDS 顺序）。
+pub(crate) fn extract_reasoning(delta: &Value) -> Option<String> {
+    for field in ["reasoning_content", "reasoning", "reasoning_text"] {
+        if let Some(s) = delta.get(field).and_then(Value::as_str)
+            && !s.is_empty() {
+                return Some(s.to_string());
+            }
+    }
+    // OpenRouter：delta.reasoning_details 数组里的 reasoning.text 块
+    if let Some(details) = delta.get("reasoning_details").and_then(Value::as_array) {
+        let mut buf = String::new();
+        for d in details {
+            if d.get("type").and_then(Value::as_str) == Some("reasoning.text")
+                && let Some(t) = d.get("text").and_then(Value::as_str) {
+                    buf.push_str(t);
+                }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+    None
+}
