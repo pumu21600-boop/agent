@@ -486,6 +486,31 @@ fn main() {
 
             // 控制通道客户端（连上服务端 9225；服务没起时每秒重试）
             spawn_ctl_client(app.handle().clone());
+
+            // 服务守护：服务进程没了（stop.bat / 强杀 / 崩溃）→ 壳优雅退出。
+            // 强杀壳会给 Windows 托盘留幽灵图标—— explorer 一直显示到鼠标划过才清
+            // （2026-09-29 用户实锤「每次重启服务托盘多出很多个 agent」）。优雅退出
+            // 让 Tauri 自己 NIM_DELETE 托盘图标，一个都不留。5s 宽限期：容纳快速
+            // stop→start 的重启（服务只是短暂不在）；真没了就退，start.bat 会带新的来。
+            {
+                let guard_app = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut dead_since: Option<std::time::Instant> = None;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if service_alive() {
+                            dead_since = None;
+                            continue;
+                        }
+                        let since = *dead_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= std::time::Duration::from_secs(5) {
+                            slog("服务已停止超过 5s，壳优雅退出（清理托盘图标）");
+                            guard_app.exit(0);
+                            return;
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
