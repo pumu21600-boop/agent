@@ -5,6 +5,19 @@
 //! 2. **Config 为一等实体**：包含渠道信息、模型选择、DPAPI 专属密钥、采样与思考参数、模型多模态能力标记。
 //! 3. **RolesSettings 角色路由**：支持主力模型、会话摘要、标题生成及多模态视觉/视频/音频解析路由。
 //! 4. **DPAPI 密钥隔离**：按配置独立加密保存（CryptProtectData），不入日志、不出内存。
+//!
+//! ## 配置面地图（P1 收敛：三类五面，写入口各一）
+//!
+//! | 面 | 性质 | 写入口（grep 实证唯一） |
+//! |----|------|------------------------|
+//! | `config.toml` | 静态种子（随包只读） | 无运行时写（启动一次性读入） |
+//! | `providers.json` | 预设目录（随包只读） | 无运行时写（`gateway::providers::init` 一次性读入） |
+//! | `settings.json` | **唯一运行时用户配置** | `crate::storage::write_settings`（P18 存储一门，原子写 + 审计） |
+//! | `mcp_tokens.json` | 运行时状态·机密（DPAPI 逐条加密） | `crate::mcp::oauth` 内部原子写（P28 独立国自持） |
+//! | `plugin_data/` | 运行时状态·插件命名空间 KV | `crate::storage::plugin_write_at` / `plugin_delete_at`（键名白名单） |
+//!
+//! 旧字段名兼容（P1 起）：serde alias 垫片退役，统一走 `parse_settings` →
+//! `migrate_legacy_field_names` 单一迁移入口（纯函数、带单测；未来改名只追加一行）。
 
 use std::collections::BTreeMap;
 
@@ -272,12 +285,12 @@ pub fn infer_protocol_preset(model_id: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct Settings {
-    /// 当前激活配置 ID（兼容旧 active_profile_id 字段）
-    #[serde(default, alias = "active_profile_id")]
+    /// 当前激活配置 ID（P1 起旧字段名 `active_profile_id` 由 parse_settings 迁移收口，垫片退役）
+    #[serde(default)]
     pub active_config_id: Option<String>,
 
-    /// 配置列表（按配置独立保存 provider/base_url/model/key/参数）
-    #[serde(default, alias = "profiles")]
+    /// 配置列表（按配置独立保存 provider/base_url/model/key/参数；旧名 `profiles` 走迁移入口）
+    #[serde(default)]
     pub configs: Vec<Config>,
 
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
@@ -301,8 +314,8 @@ pub struct Settings {
     pub mcp_servers: Vec<McpServerCfg>,
 
     /// P28：停用的插件名单（plugins/ 目录名；停用的不加载、不参与面板插槽与数据桥）。
-    /// 旧字段名 `disabled_extensions` 读入自动兼容（serde alias），落盘写新名。
-    #[serde(default, alias = "disabled_extensions", skip_serializing_if = "Vec::is_empty")]
+    /// P1 起旧字段名 `disabled_extensions` 由 parse_settings 迁移收口（垫片退役），落盘写新名。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_plugins: Vec<String>,
 
     /// P21 红线3（第三方插件验签）：已 pin 的内容指纹表。
@@ -433,7 +446,7 @@ impl Settings {
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {
         let path = Self::path();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
+            if let Ok(mut s) = parse_settings(&text) {
                 // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
                 if s.configs.is_empty()
                     && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text) {
@@ -804,6 +817,31 @@ fn new_config_id() -> String {
     format!("cfg-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// settings.json 解析唯一入口：先过一遍旧字段名迁移（纯函数），再按类型反序列化。
+/// P1 起 serde alias 垫片退役——旧字段名兼容只走这一条路（load 与单测共用）。
+fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
+    let mut v: serde_json::Value = serde_json::from_str(text)?;
+    migrate_legacy_field_names(&mut v);
+    serde_json::from_value(v)
+}
+
+/// P1 配置面收敛：settings.json 旧字段名一次迁净（新旧并存以新名为准，旧键删除）。
+/// 纯函数，load 与单测共用；未来改名只在此追加一行。
+fn migrate_legacy_field_names(v: &mut serde_json::Value) {
+    let Some(obj) = v.as_object_mut() else { return };
+    for (old, new) in [
+        ("active_profile_id", "active_config_id"),
+        ("profiles", "configs"),
+        ("disabled_extensions", "disabled_plugins"),
+    ] {
+        if let Some(val) = obj.remove(old)
+            && !obj.contains_key(new)
+        {
+            obj.insert(new.to_string(), val);
+        }
+    }
+}
+
 /// P28 目录合并迁移：信任表旧键 `ui-ext:<name>` → `plugins:<name>`（合并后唯一 kind）。
 /// 目标键已存在则保留新键、丢旧键；抽成纯函数让 load 与单测共用同一把尺子。
 fn migrate_legacy_trust_keys(map: &mut BTreeMap<String, String>) {
@@ -915,7 +953,7 @@ mod tests {
             "workspace": "D:\\test\\ws"
         }"#;
 
-        let mut s = serde_json::from_str::<Settings>(legacy_json).expect("旧格式反序列化必须成功");
+        let mut s = parse_settings(legacy_json).expect("旧格式反序列化必须成功");
         assert_eq!(s.configs.len(), 1);
         assert_eq!(s.active().unwrap().name, "商汤");
         // 验证 URL key 迁移至 config
@@ -939,7 +977,7 @@ mod tests {
             "disabled_extensions": ["usage"],
             "trusted_plugins": { "ui-ext:board": "digest-a", "plugins:calc": "digest-b" }
         }"#;
-        let mut s: Settings = serde_json::from_str(legacy).expect("旧字段名 alias 必须可反序列化");
+        let mut s: Settings = parse_settings(legacy).expect("旧字段名 alias 必须可反序列化");
         assert_eq!(s.disabled_plugins, vec!["usage".to_string()], "alias 读入旧字段");
         migrate_legacy_trust_keys(&mut s.trusted_plugins);
         assert!(!s.trusted_plugins.contains_key("ui-ext:board"), "旧键必须删除");
@@ -949,5 +987,37 @@ mod tests {
         assert!(text.contains("\"disabled_plugins\""), "落盘写新字段名");
         assert!(!text.contains("disabled_extensions"), "旧字段名不再写出");
         assert!(!text.contains("ui-ext:"), "旧信任键不再写出");
+    }
+
+    #[test]
+    fn backward_compat_field_name_migration() {
+        // P1 配置面收敛：serde alias 垫片退役，旧字段名兼容收拢到 parse_settings 单一入口。
+        // ① 三组旧名各自迁入；② 新旧并存以新名为准（旧键删除）；③ 落盘不再写旧名。
+        let legacy = r#"{
+            "active_profile_id": "cfg-legacy",
+            "profiles": [],
+            "disabled_extensions": ["usage"]
+        }"#;
+        let s = parse_settings(legacy).expect("旧字段名必须经迁移入口读入");
+        assert_eq!(s.active_config_id.as_deref(), Some("cfg-legacy"));
+        assert!(s.configs.is_empty());
+        assert_eq!(s.disabled_plugins, vec!["usage".to_string()]);
+
+        let both = r#"{
+            "active_config_id": "cfg-new",
+            "active_profile_id": "cfg-old",
+            "configs": [],
+            "profiles": [],
+            "disabled_plugins": ["calc"],
+            "disabled_extensions": ["usage"]
+        }"#;
+        let s2 = parse_settings(both).expect("新旧并存必须可解析");
+        assert_eq!(s2.active_config_id.as_deref(), Some("cfg-new"), "并存以新名为准");
+        assert_eq!(s2.disabled_plugins, vec!["calc".to_string()]);
+
+        let text = serde_json::to_string(&s2).unwrap();
+        assert!(!text.contains("active_profile_id"), "旧字段名不再写出");
+        assert!(!text.contains("\"profiles\""), "旧字段名不再写出");
+        assert!(!text.contains("disabled_extensions"), "旧字段名不再写出");
     }
 }

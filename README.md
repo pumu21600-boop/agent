@@ -63,6 +63,10 @@ agent/
 └── LICENSE               # MIT
 ```
 
+### 配置面地图（P1 收敛：三类五面，写入口各一）
+
+`config.toml`（静态种子，随包只读）与 `providers.json`（预设目录，随包只读）无运行时写；**`settings.json` 是唯一运行时用户配置**（写入口唯一：`storage::write_settings`，P18 存储一门）；`mcp_tokens.json`（DPAPI 逐条加密的运行时机密）与 `plugin_data/`（插件命名空间 KV）是**运行时状态不是配置**，写入口分别在 `mcp::oauth` 与 `storage::plugin_write_at`。字段名地图与迁移入口见 `src/config/settings.rs` 模块头。
+
 ## 运行形态（开发 / 打包两态）
 
 资源定位只有一条规则（`config::app_root()`）：
