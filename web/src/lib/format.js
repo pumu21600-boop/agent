@@ -46,3 +46,34 @@ export function gitStatusLabel(s) {
   if (c.includes('M')) return '修改';
   return c || '改动';
 }
+
+export function webNormalizeUrl(u) {
+  const s = (u || '').trim();
+  if (!s) return '';
+  if (s === 'about:blank' || /^(https?|file):\/\//.test(s)) return s;
+  return 'https://' + s;
+}
+// —— P6 恢复与续命 ——
+export function contentText(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.map((p) => p.text || '').join('');
+  return '';
+}
+export function normPath(p) {
+  return (p || '').replace(/[\\/]+$/, '');
+}
+// 时间用 DSH 短格式：4天 / 3小时 / 刚刚
+export function relShort(iso) {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return `${m}分钟`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}小时`;
+  return `${Math.floor(h / 24)}天`;
+}
+// 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
+export function riskLabelFor(risk) {
+  return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
+}

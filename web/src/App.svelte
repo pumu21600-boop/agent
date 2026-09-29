@@ -1,13 +1,17 @@
 <script>
   import { onMount, afterUpdate, tick } from 'svelte';
   import Select from './Select.svelte';
-  import ScheduleCronPicker from './ScheduleCronPicker.svelte';
   import Galaxy from './Galaxy.svelte';
   import ImagePreview from './lib/ImagePreview.svelte';
   import RenameModal from './lib/RenameModal.svelte';
   import WorkspaceModal from './lib/WorkspaceModal.svelte';
   import ModelPicker from './lib/ModelPicker.svelte';
-  import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel } from './lib/format.js';
+  import MemoryTab from './lib/MemoryTab.svelte';
+  import SkillsTab from './lib/SkillsTab.svelte';
+  import McpTab from './lib/McpTab.svelte';
+  import ScheduleTab from './lib/ScheduleTab.svelte';
+  import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
+  import { parseCssColor, rgbToHex, rgbAlpha, hexWithAlpha, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
 
   // —— 配置（改动即自动保存即时生效）——
   let providers = [];
@@ -1032,12 +1036,6 @@
   async function webApi(path, opts) {
     return apiJson(path, opts, '服务端没有浏览器接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
   }
-  function webNormalizeUrl(u) {
-    const s = (u || '').trim();
-    if (!s) return '';
-    if (s === 'about:blank' || /^(https?|file):\/\//.test(s)) return s;
-    return 'https://' + s;
-  }
 
   // 浏览器视口跟随面板内容区（16ms 节流≈每帧；截图铺满无黑边，网页按真实窗口宽度排版）。
   // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
@@ -1465,47 +1463,6 @@
 
   // —— CSS 注入器：用户自定义 CSS，实时生效并记住 ——
   let customCss = localStorage.getItem('customCss') || '';
-  // 给每条顶层规则的选择器加 #app 前缀：压过 Svelte scoped 样式（.composer.s-xxx 两级类名）；
-  // @media/@keyframes 等整块原样保留
-  function escalateCss(css) {
-    let out = '';
-    let i = 0;
-    const n = css.length;
-    while (i < n) {
-      const brace = css.indexOf('{', i);
-      if (brace === -1) {
-        out += css.slice(i);
-        break;
-      }
-      const selector = css.slice(i, brace);
-      if (selector.trim().startsWith('@')) {
-        let depth = 1;
-        let j = brace + 1;
-        while (j < n && depth > 0) {
-          if (css[j] === '{') depth++;
-          else if (css[j] === '}') depth--;
-          j++;
-        }
-        out += css.slice(i, j);
-        i = j;
-      } else {
-        const prefixed = selector
-          .split(',')
-          .map((s) => {
-            const t = s.trim();
-            return t ? `#app ${t}` : t;
-          })
-          .join(', ');
-        out += `${prefixed}{`;
-        // 跳过这条规则的声明块，直到它的关闭 '}'（声明不嵌套）
-        const close = css.indexOf('}', brace + 1);
-        const end = close === -1 ? n : close + 1;
-        out += css.slice(brace + 1, end);
-        i = end;
-      }
-    }
-    return out;
-  }
   function applyCustomCss() {
     let el = document.getElementById('user-custom-css');
     if (!el) {
@@ -1520,87 +1477,6 @@
   }
 
   // —— 界面微调模式：右击元素弹出属性面板，实时预览，生成微调规则 ——
-  // 元素别名表：语义名 → 稳定选择器（Svelte scoped 类名跨构建不稳定，禁止用原始类名当选择器）。
-  // 每个别名可带 pick：命中大容器时进一步收敛到具体控件，避免"一点按钮选中整条底板"。
-  //  - 'self'：只在点中容器自身（padding/空隙）时才算容器，点中子元素时继续往下落
-  //  - 选择器：命中容器后，在容器内按该选择器找离点击最近的祖先，找到就用它
-  const ELEMENT_ALIASES = [
-    { sel: '.composer', name: '输入框', pick: 'self' },
-    { sel: '.composer-input', name: '输入文本区' },
-    { sel: '.composer-bar', name: '输入框工具栏', pick: 'self' },
-    { sel: '.icon-btn', name: '图标按钮' },
-    { sel: '.pill', name: '工具栏胶囊按钮' },
-    { sel: '.send-btn', name: '发送按钮' },
-    { sel: '.ctx-ring', name: '上下文圆环' },
-    { sel: '.user-bubble', name: '用户消息气泡' },
-    { sel: '.asst-bubble', name: 'AI 消息气泡', pick: 'self' },
-    { sel: '.bubble', name: '消息气泡', pick: 'self' },
-    { sel: '.error-bubble', name: '错误消息气泡' },
-    { sel: '.tool-card', name: '工具卡' },
-    { sel: '.tool-preview', name: '工具输出（代码块）' },
-    { sel: '.tool-head', name: '工具卡头部' },
-    { sel: '.tool-badge', name: '工具状态徽章' },
-    { sel: '.tool-name', name: '工具名' },
-    { sel: '.tool-args', name: '工具参数' },
-    { sel: '.thinking', name: '思考折叠块', pick: 'self' },
-    { sel: '.thinking-body', name: '思考内容' },
-    { sel: '.approval-box', name: '审批框' },
-    { sel: '.term-panel', name: '终端面板', pick: 'self' },
-    { sel: '.term-head', name: '终端标题栏' },
-    { sel: '.term-title', name: '终端标题' },
-    { sel: '.term-hint', name: '终端提示文字' },
-    { sel: '.term-clear', name: '终端清空按钮' },
-    { sel: '.term-close', name: '终端关闭按钮' },
-    { sel: '.term-in', name: '终端输入栏' },
-    { sel: '.term-out', name: '终端输出区' },
-    { sel: '.term-line', name: '终端输出行' },
-    { sel: '.term-prompt', name: '终端命令提示符' },
-    { sel: '.term-text', name: '终端输出文本' },
-    { sel: '.cp-bar', name: '改动条', pick: 'self' },
-    { sel: '.cp-btn', name: '改动条按钮' },
-    { sel: '.new-chat', name: '新会话按钮' },
-    { sel: '.chat-head', name: '顶栏', pick: 'self' },
-    { sel: '.right-panel', name: '产物面板', pick: 'self' },
-    { sel: '.rp-tabs', name: '产物面板标签栏', pick: 'self' },
-    { sel: '.rp-tabs button', name: '产物面板标签' },
-    { sel: '.rp-body', name: '产物面板内容区' },
-    { sel: '.rp-empty', name: '产物面板空提示' },
-    { sel: '.rp-refresh', name: '产物刷新按钮' },
-    { sel: '.rp-file', name: '产物文件条目' },
-    { sel: '.rp-preview', name: '预览代码块' },
-    { sel: '.rp-preview-path', name: '预览文件路径' },
-    { sel: '.modal.settings-modal', name: '设置弹窗', pick: 'self' },
-    { sel: '.settings-nav button', name: '设置导航按钮' },
-    { sel: '.theme-opt', name: '主题选项按钮' },
-    { sel: '.agents-editor', name: 'CSS 注入框' },
-    { sel: '.field input', name: '设置输入框' },
-    { sel: '.field select', name: '设置下拉框' },
-    { sel: '.btn', name: '按钮' },
-    { sel: '.csel', name: '下拉框' },
-    { sel: '.csel-caret', name: '下拉箭头' },
-    { sel: '.csel-menu', name: '下拉菜单', pick: 'self' },
-    { sel: '.csel-item', name: '下拉选项' },
-    { sel: '.chip', name: '配置标签' },
-    { sel: '.sidebar', name: '侧栏', pick: 'self' },
-    { sel: '.side-head', name: '侧栏头部', pick: 'self' },
-    { sel: '.row-btn', name: '侧栏工具按钮' },
-    { sel: '.conv', name: '会话条目' },
-    { sel: '.conv-title', name: '会话标题' },
-    { sel: '.conv-time', name: '会话时间' },
-    { sel: '.conv-more', name: '会话更多按钮' },
-    { sel: '.proj', name: '项目行' },
-    { sel: '.proj-name', name: '项目名' },
-    { sel: '.foot-btn', name: '侧栏底部按钮' },
-    { sel: '.handoff-btn', name: '交接文档按钮' },
-    { sel: '.cp-dock', name: '改动条容器', pick: 'self' },
-    { sel: '.cp-undo', name: '撤销按钮' },
-    { sel: '.ctx-wrap', name: '上下文圆环容器', pick: 'self' },
-    { sel: '.ctx-card', name: '上下文明细卡' },
-    { sel: '.head-btn', name: '顶栏按钮' },
-    { sel: '.user-text', name: '用户消息文字' },
-    { sel: '.bar-dropdown', name: '下拉菜单', pick: 'self' },
-    { sel: '.bar-item', name: '下拉菜单项' },
-  ];
   let editMode = false;
   let microPanel = null; // { x, y, key, name, sel, el, color, bg, bgOpacity, radius, blur, fontSize, bgTransparent, *Dirty }
   let microTweaks = (() => {
@@ -1627,94 +1503,8 @@
     }
   })();
 
-  // 取色/透明度解析：同时支持 rgb()/rgba() 与 Chromium 解析 color-mix 后给出的
-  // color(srgb r g b / a)（分量是 0-1 小数）。取不出返回 null，由调用方决定不存该属性，
-  // 禁止再兜底成 #000000（那是黑底叠层的直接来源）
-  function parseCssColor(c) {
-    const s = String(c || '').trim();
-    let m = s.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)$/);
-    if (m) {
-      const a = m[4] == null ? 1 : m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4]);
-      return { r: +m[1], g: +m[2], b: +m[3], a };
-    }
-    m = s.match(/^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)$/);
-    if (m) {
-      return { r: Math.round(+m[1] * 255), g: Math.round(+m[2] * 255), b: Math.round(+m[3] * 255), a: m[4] == null ? 1 : +m[4] };
-    }
-    return null;
-  }
-  function rgbToHex(rgb) {
-    const c = parseCssColor(rgb);
-    if (!c) return null;
-    return '#' + [c.r, c.g, c.b].map((x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, '0')).join('');
-  }
-  // 解析不出的按不透明处理
-  function rgbAlpha(rgb) {
-    const c = parseCssColor(rgb);
-    return c ? Math.round(c.a * 100) : 100;
-  }
 
-  // 未登记元素：生成结构选择器。优先用稳定类名锚点（.icon-btn/.pill/.btn 等），
-  // 比纯 tag:nth-of-type 链更抗排序变化；实在没有类名才回落序号链（止于 #app）
-  function structuralSelector(el) {
-    const clsOf = (node) => {
-      const cls = typeof node.className === 'string' ? node.className : (node.getAttribute && node.getAttribute('class')) || '';
-      return cls.split(/\s+/).filter((c) => c && !/^s-[A-Za-z0-9_-]+$/.test(c));
-    };
-    // 自身或近祖先有稳定类名：直接用 ".类名" 锚定（多类取首个非 svelte 作用域类）
-    let cur = el;
-    for (let up = 0; up < 3 && cur && cur.id !== 'app'; up++) {
-      const stable = clsOf(cur).find((c) => /^(icon-btn|pill|btn|chip|bar-item|conv|proj|row-btn|foot-btn|theme-opt|agents-editor|ctx-ring|ctx-card|send-btn|new-chat|composer-input|tool-card|tool-preview|tool-head|thinking-body|approval-box|cp-bar|cp-undo|head-btn|user-text|proj-name|conv-title)$/.test(c));
-      if (stable) return `.${stable}`;
-      cur = cur.parentElement;
-    }
-    const parts = [];
-    cur = el;
-    while (cur && cur.id !== 'app') {
-      if (cur.id && cur !== el) {
-        parts.unshift(`#${CSS.escape(cur.id)}`);
-        return parts.join(' > ');
-      }
-      const parent = cur.parentElement;
-      if (!parent) break;
-      const sibs = [...parent.children].filter((c) => c.tagName === cur.tagName);
-      let seg = cur.tagName.toLowerCase();
-      if (sibs.length > 1) seg += `:nth-of-type(${sibs.indexOf(cur) + 1})`;
-      parts.unshift(seg);
-      cur = parent;
-    }
-    return parts.join(' > ');
-  }
 
-  // —— 单元素定位（修"改一处、同类全改"）：给具体元素盖一个 data-mt 唯一标记，
-  // 规则写成 #app [data-mt="mtXXXX"]，只作用这一个元素；Svelte 重渲染会重建节点丢标记，
-  // 所以存下"从 #app 起的孩子序号路径"，每次更新后按路径找回并补盖 ——
-  function pathOf(el) {
-    const parts = [];
-    let cur = el;
-    while (cur && cur.id !== 'app') {
-      const parent = cur.parentElement;
-      if (!parent) break;
-      parts.unshift(`${cur.tagName.toLowerCase()}:${[...parent.children].indexOf(cur)}`);
-      cur = parent;
-    }
-    return parts.join('/');
-  }
-  function findByPath(path) {
-    let cur = document.getElementById('app');
-    for (const seg of String(path || '').split('/').filter(Boolean)) {
-      const i = seg.lastIndexOf(':');
-      const tag = seg.slice(0, i);
-      const idx = Number(seg.slice(i + 1));
-      if (!cur || !cur.children[idx]) return null;
-      cur = cur.children[idx];
-      if (tag && cur.tagName.toLowerCase() !== tag) return null;
-    }
-    return cur;
-  }
-  function makeUid() {
-    return 'mt' + Math.random().toString(36).slice(2, 8);
-  }
   // 补盖标记：只在元素还匹配原选择器时才盖，避免路径漂移后错标到别的元素
   function stampMicroUids() {
     for (const t of Object.values(microTweaks || {})) {
@@ -1961,15 +1751,6 @@
     el.style[prop === 'radius' ? 'borderRadius' : 'fontSize'] = `${value}px`;
   }
 
-  function hexWithAlpha(hex, opacityPct) {
-    const m = /^#([0-9a-f]{6})$/i.exec(hex || '');
-    if (!m) return hex;
-    const a = Math.min(1, Math.max(0, (opacityPct ?? 100) / 100));
-    const r = parseInt(m[1].slice(0, 2), 16);
-    const g = parseInt(m[1].slice(2, 4), 16);
-    const b = parseInt(m[1].slice(4, 6), 16);
-    return `rgba(${r}, ${g}, ${b}, ${a})`;
-  }
 
   function clearMicroInline(el) {
     for (const k of ['color', 'backgroundColor', 'borderRadius', 'backdropFilter', 'fontSize', 'borderWidth', 'borderColor', 'borderStyle']) el.style[k] = '';
@@ -2166,28 +1947,6 @@
     reader.readAsText(file);
   }
 
-  // 微调规则 → CSS（拼在手动 CSS 之前，手写 CSS 永远有最终话语权）；
-  // 只输出当初亲手改过的属性（有键才输出），没动过的背景/颜色不会凭空出现。
-  // background 用 background-color 而非简写，避免盖掉原有的渐变/图片/transparent 语义
-  function microCss(tweaks) {
-    let out = '';
-    for (const t of Object.values(tweaks || {})) {
-      if (!t || !t.sel) continue;
-      const decls = [];
-      if (t.color) decls.push(`color: ${t.color}`);
-      if (t.bg) decls.push(`background-color: ${hexWithAlpha(t.bg, t.bgOpacity ?? 100)}`);
-      if (t.border) decls.push(`border-style: solid`, `border-width: ${t.border}`);
-      if (t.borderColor) decls.push(`border-color: ${t.borderColor}`);
-      if (t.blur != null && String(t.blur) !== '' && (parseInt(t.blur, 10) || 0) !== 0) decls.push(`backdrop-filter: blur(${parseInt(t.blur, 10) || 0}px)`);
-      if (t.radius) decls.push(`border-radius: ${t.radius}`);
-      if (t.fontSize) decls.push(`font-size: ${t.fontSize}`);
-      if (!decls.length) continue;
-      // 单个元素：用 data-mt 唯一标记；同类全部：用元素选择器
-      if (t.uid) out += `/* 微调:${t.name || t.sel} · 仅此元素 */\n#app [data-mt="${t.uid}"] { ${decls.join('; ')} }\n`;
-      else out += `/* 微调:${t.name || t.sel} · 同类全部 */\n#app ${t.sel} { ${decls.join('; ')} }\n`;
-    }
-    return out;
-  }
   // 启动时应用：微调规则 + 手动 CSS
   applyCustomCss();
   // (hmr-probe)
@@ -2541,12 +2300,6 @@
     }, 2000);
   }
 
-  // —— P6 恢复与续命 ——
-  function contentText(c) {
-    if (typeof c === 'string') return c;
-    if (Array.isArray(c)) return c.map((p) => p.text || '').join('');
-    return '';
-  }
 
   // —— 顶栏标题（仅对话标题；审批/备份状态在输入区与改动条上，不再重复展示）——
   // currentTitle：直接跟随当前会话（新会话首条消息即时上屏，不等标题生成）
@@ -2742,9 +2495,6 @@
     expandedFlags = { ...expandedFlags, [workspace]: true };
   }
 
-  function normPath(p) {
-    return (p || '').replace(/[\\/]+$/, '');
-  }
 
   // 项目列表 = 当前工作区 + 最近工作区（去重，按新→旧）
   $: projectList = (() => {
@@ -2837,17 +2587,6 @@
     await startNewSession();
   }
 
-  // 时间用 DSH 短格式：4天 / 3小时 / 刚刚
-  function relShort(iso) {
-    if (!iso) return '';
-    const ms = Date.now() - new Date(iso).getTime();
-    const m = Math.floor(ms / 60000);
-    if (m < 1) return '刚刚';
-    if (m < 60) return `${m}分钟`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}小时`;
-    return `${Math.floor(h / 24)}天`;
-  }
 
   // —— 工具栏四键：搜索 / 管理 / 视图 / 添加项目 ——
   function toggleSearch() {
@@ -3148,281 +2887,22 @@
     localStorage.setItem('settingsTab', t);
     if (t === 'mcp' || t === 'plugins') loadMcp();
     if (t === 'skills') loadSkills();
-    if (t === 'schedule') loadSchedules();
     if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
   }
 
-  // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
-  // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md。
-  // 文本框始终显示文件当前内容：进入分区/切 chips/保存后都回读一次盘。
-  let memData = null;
-  let memTab = 'system';
-  let memText = '';
-  let memSaving = false;
-  let memMsg = '';
-  // 有未保存的编辑：后台回读不得覆盖输入框（否则刚写的约定会被静默清空/回退成旧内容）
-  let memDirty = false;
-  const MEM_SCOPES = {
-    system: { text: 'system_prompt', path: 'system_path', label: '系统约定' },
-    global: { text: 'agents_global', path: 'global_agents_path', label: '全局约定' },
-    project: { text: 'agents_project', path: 'project_agents_path', label: '项目约定' },
-  };
-  function memTextOf(r, tab) {
-    const k = (MEM_SCOPES[tab] || MEM_SCOPES.project).text;
-    return (r && r[k]) || '';
-  }
-  // 当前约定文件路径。必须是响应式变量：模板里直接调用函数不会随 memTab 重算（Svelte 看不到函数体依赖）
-  $: memPath = (memData && MEM_SCOPES[memTab] ? memData[MEM_SCOPES[memTab].path] : '') || '';
-  async function loadMemory() {
-    try {
-      // 带时间戳绕开浏览器缓存：显示的一定是盘上当下的内容
-      const r = await fetch(`/api/memory?t=${Date.now()}`).then((r) => r.json());
-      memData = r;
-      if (!memDirty) memText = memTextOf(r, memTab);
-    } catch (e) {
-      if (!memData) memMsg = `读取失败: ${e.message || e}`;
-    }
-  }
-  function pickMemTab(t) {
-    if (!memData || memTab === t) return;
-    memTab = t;
-    memText = memTextOf(memData, t); // 先用上一份快照，随即回读盘上真容
-    memDirty = false; // 换 tab = 看那个文件的内容，放弃当前未保存编辑
-    memMsg = '';
-    loadMemory();
-  }
-  async function saveAgents() {
-    memSaving = true;
-    memMsg = '';
-    try {
-      const r = await fetch('/api/memory/agents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope: memTab, content: memText }),
-      }).then((r) => r.json());
-      if (r.ok) {
-        memDirty = false; // 先清脏标记再回读，框里保留的就是文件真实内容
-        await loadMemory();
-        memMsg = `已保存到 ${r.path}`;
-      } else {
-        memMsg = `保存失败: ${r.error}`;
-      }
-    } catch (e) {
-      memMsg = `保存失败: ${e.message || e}`;
-    } finally {
-      memSaving = false;
-    }
-  }
-  // 打开设置面板 / 切到记忆分区时都回读文件（含直接打开面板、持久化分区的情形）
-  $: if (settingsOpen && settingsTab === 'memory') loadMemory();
   // 同上：技能/MCP/插件分区的数据原先只在 pickSettingsTab 的点击里拉，页签从 localStorage
   // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
   $: if (settingsOpen && settingsTab === 'skills') loadSkills();
   $: if (settingsOpen && settingsTab === 'mcp') loadMcp();
-  $: if (settingsOpen && settingsTab === 'schedule') loadSchedules();
   $: if (settingsOpen && settingsTab === 'ext') {
     loadGitRuntime();
     loadSandboxInfo();
   }
 
-  // —— P22-B 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
-  let schedulesData = [];
-  let scheduleNotices = [];
-  let schedMsg = '';
-  let schedLoading = false;
-  // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
-  let schedEditor = null;
-  // 高级选项（会话/审批/超时）默认折叠；编辑老任务时若与默认不同则自动展开，不藏已配置的东西
-  let schedAdvOpen = false;
-  const SCHED_ADV_DEFAULT = { session_mode: 'new', session_id: '', approval_mode: 'auto', on_approval: 'deny', timeout_secs: 1800 };
-  // cron 人话预览（输入即查，250ms 防抖；解析失败由界面提示）
-  let schedCronText = '';
-  let schedCronTimer = null;
-  let schedCronPending = false;
-  const SCHED_MODES = [
-    { value: 'read-only', label: '只读（写/执行逐次询问）' },
-    { value: 'sandbox', label: '沙箱（只在沙箱执行）' },
-    { value: 'auto', label: '自动（可动工作区）' },
-    { value: 'full-access', label: '完全访问（需总开关）' },
-  ];
-  function schedAdvNonDefault(t) {
-    const n = (v, d) => (v == null || v === '' ? d : v);
-    return (
-      n(t.session_mode, 'new') !== 'new' ||
-      !!(t.session_id && t.session_id.trim()) ||
-      n(t.approval_mode, 'auto') !== 'auto' ||
-      n(t.on_approval, 'deny') !== 'deny' ||
-      (Number(t.timeout_secs) || 1800) !== 1800
-    );
-  }
-  // 工作区：默认跟随触发时的当前工作区；下拉里给最近项目（去重）
-  function wsLabel(w) {
-    return String(w).split(/[\\/]/).filter(Boolean).pop() || w;
-  }
-  function wsOptions() {
-    const seen = new Set();
-    const opts = [{ value: '', label: '跟随当前工作区' }];
-    for (const w of [workspace, ...recentWorkspaces]) {
-      if (w && !seen.has(w)) {
-        seen.add(w);
-        opts.push({ value: w, label: wsLabel(w) });
-      }
-    }
-    return opts;
-  }
-  function previewCron() {
-    clearTimeout(schedCronTimer);
-    schedCronTimer = setTimeout(async () => {
-      if (!schedEditor) { schedCronText = ''; schedCronPending = false; return; }
-      const cron = (schedEditor.cron || '').trim();
-      if (!cron) { schedCronText = ''; schedCronPending = false; return; }
-      schedCronPending = true;
-      try {
-        const r = await fetch(`/api/schedules/cron-text?cron=${encodeURIComponent(cron)}`).then((r) => r.json());
-        schedCronText = r.ok ? r.text : '';
-      } catch {
-        schedCronText = '';
-      } finally {
-        schedCronPending = false;
-      }
-    }, 250);
-  }
-  async function loadSchedules() {
-    schedLoading = true;
-    try {
-      const r = await fetch('/api/schedules').then((r) => r.json());
-      schedulesData = r.schedules || [];
-      scheduleNotices = r.notices || [];
-    } catch (e) {
-      schedMsg = `读取失败: ${e.message || e}`;
-    } finally {
-      schedLoading = false;
-    }
-    // 只清自己留下的读取失败：操作反馈（已保存/触发失败…）留到下一次操作，不被加载抹掉
-    if (schedMsg.startsWith('读取失败')) schedMsg = '';
-  }
-  function newSchedule() {
-    schedMsg = '';
-    schedAdvOpen = false;
-    // 输入框一律留空不预填：cron/回顾天数/超时都有占位提示，留空走默认（天数缺省 3、超时缺省 1800 由服务端兜底）
-    schedEditor = {
-      id: '',
-      name: '',
-      kind: 'message',
-      cron: '',
-      once_ts: 0,
-      message: '',
-      memory_days: '',
-      session_mode: 'new',
-      session_id: '',
-      workspace: '',
-      approval_mode: 'auto',
-      on_approval: 'deny',
-      enabled: true,
-      timeout_secs: '',
-      isNew: true,
-    };
-    previewCron();
-  }
-  function editSchedule(t) {
-    schedMsg = '';
-    schedAdvOpen = schedAdvNonDefault(t);
-    // 0 = 走默认（超时服务端兜 1800）；回显为空 + 占位符，不显示突兀的 0
-    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '' };
-    previewCron();
-  }
-  async function saveSchedule() {
-    const e = schedEditor;
-    if (!e) return;
-    // body 先组装：fetch 调用点往后 16 行内必须出现 .json()（scripts/check_fetch_json.mjs 硬体检）
-    const body = {
-      id: e.id || '',
-      name: e.name,
-      kind: e.kind || 'message',
-      cron: e.cron,
-      once_ts: Number(e.once_ts) || 0,
-      message: e.message,
-      memory_days: Number(e.memory_days) || 3,
-      session_mode: e.session_mode,
-      session_id: e.session_id,
-      workspace: e.workspace || '',
-      approval_mode: e.approval_mode,
-      on_approval: e.on_approval,
-      enabled: e.enabled !== false,
-      timeout_secs: Number(e.timeout_secs) || 0,
-    };
-    // 单次模式没选时间（或周期模式没产出 cron）：本地拦下，不发请求
-    if (!String(body.cron || '').trim() && !body.once_ts) {
-      schedMsg = '还没选执行时间';
-      return;
-    }
-    // 单次时间已过：本地直接提示，不等服务端校验（已跑完停用的任务编辑不受限，与服务端口径一致）
-    if (body.once_ts && body.enabled && body.once_ts <= Math.floor(Date.now() / 1000)) {
-      schedMsg = '单次任务的时间要设在将来';
-      return;
-    }
-    try {
-      const r = await fetch('/api/schedules', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-      if (r.ok) {
-        schedEditor = null;
-        await loadSchedules();
-        schedMsg = '已保存'; // 放在加载之后：loadSchedules 会清提示，顺序反了就被抹掉
-      } else {
-        schedMsg = `保存失败: ${r.error}`;
-        // 编辑器里挂着的任务已从列表消失（被删除/外部清掉）：关掉编辑器，说人话
-        if (String(r.error || '').includes('任务不存在')) {
-          schedEditor = null;
-          schedMsg = '这条任务已不在列表里（可能已被删除），请重新创建';
-        }
-      }
-    } catch (err) {
-      schedMsg = `保存失败: ${err.message || err}`;
-    }
-  }
-  async function deleteSchedule(id) {
-    if (!confirm('删除这条定时任务？（已跑出的会话与记录保留）')) return;
-    try {
-      const r = await fetch(`/api/schedules?id=${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json());
-      if (r.ok) {
-        await loadSchedules();
-        schedMsg = '已删除';
-      } else {
-        schedMsg = `删除失败: ${r.error}`;
-      }
-    } catch (e) {
-      schedMsg = `删除失败: ${e.message || e}`;
-    }
-  }
-  async function runScheduleNow(id) {
-    try {
-      const r = await fetch(`/api/schedules/run?id=${encodeURIComponent(id)}`, { method: 'POST' }).then((r) => r.json());
-      schedMsg = r.ok ? '已触发，跑完会出现在下面的完成记录里' : `触发失败: ${r.error}`;
-      setTimeout(loadSchedules, 1500);
-    } catch (e) {
-      schedMsg = `触发失败: ${e.message || e}`;
-    }
-  }
-  function schedNextText(t) {
-    if (t.enabled === false) return '已停用';
-    return t.next_run_ts ? fmtTs(t.next_run_ts) : '无法计算';
-  }
-  // unix 秒 → 本地时间字符串（定时任务的运行时间展示）
-  function fmtTs(ts) {
-    if (!ts) return '—';
-    const d = new Date(ts * 1000);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  }
 
   // —— 技能（Skill / SKILL.md）分区 ——
   let skillsData = [];
   let skillsLoading = false;
-  let skillMsg = '';
-  let skillEditor = null; // { isNew, name, description, content, source }
   async function loadSkills() {
     skillsLoading = true;
     try {
@@ -3433,85 +2913,9 @@
     }
     skillsLoading = false;
   }
-  function newSkill() {
-    skillEditor = {
-      isNew: true,
-      name: '',
-      description: '',
-      content: '---\nname: \ndescription: \n---\n\n1. 步骤一\n2. 步骤二\n',
-      source: 'project',
-    };
-  }
-  function editSkill(s) {
-    skillEditor = {
-      isNew: false,
-      name: s.name,
-      description: s.description || '',
-      content: s.content || '',
-      source: s.source || 'project',
-    };
-  }
-  async function saveSkill() {
-    if (!skillEditor) return;
-    const name = skillEditor.name.trim();
-    if (!name) {
-      skillMsg = '技能名不能为空';
-      return;
-    }
-    try {
-      const r = await fetch('/api/skills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'save',
-          name,
-          description: skillEditor.description,
-          content: skillEditor.content,
-        }),
-      }).then((r) => r.json());
-      if (r.error) {
-        skillMsg = `保存失败: ${r.error}`;
-        return;
-      }
-      skillMsg = `已保存到 ${r.dir}`;
-      skillEditor = null;
-      await loadSkills();
-    } catch (e) {
-      skillMsg = `保存失败: ${e.message || e}`;
-    }
-  }
-  async function deleteSkill(name) {
-    try {
-      const r = await fetch('/api/skills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'delete', name }),
-      }).then((r) => r.json());
-      skillMsg = r.error ? `删除失败: ${r.error}` : `已删除 ${name}`;
-      await loadSkills();
-    } catch (e) {
-      skillMsg = `删除失败: ${e.message || e}`;
-    }
-  }
 
   // —— P11（施工单 016）：MCP 插件分区 ——
   let mcpServers = [];
-  // 021：transport 二选一。stdio=本地子进程；http=远端 MCP（Streamable HTTP）
-  // P24：http 再加认证方式（无/自定义头、OAuth 授权码、OAuth 客户端凭据）
-  let mcpForm = {
-    name: '',
-    transport: 'stdio',
-    command: '',
-    args: '',
-    url: '',
-    headers: '',
-    oauth: 'none',
-    oauth_client_id: '',
-    oauth_client_secret: '',
-    oauth_scope: '',
-  };
-  let mcpRiskChoice = 'normal';
-  let wasmPlugins = [];
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
   // 021：沙箱自检（真拉起受限进程跑探针套件）
@@ -3580,62 +2984,6 @@
       settingsMsg = `MCP ${action} 失败: ${e.message || e}`;
     }
     await loadMcp();
-  }
-  // 表单里的 headers 写法：每行 `Key: Value`（值里可以有冒号，按第一个冒号切）
-  function parseHeaders(text) {
-    const out = {};
-    for (const line of (text || '').split('\n')) {
-      const t = line.trim();
-      if (!t) continue;
-      const i = t.indexOf(':');
-      if (i > 0) out[t.slice(0, i).trim()] = t.slice(i + 1).trim();
-    }
-    return out;
-  }
-  function addMcpServer() {
-    const isHttp = mcpForm.transport === 'http' || mcpForm.transport === 'sse';
-    const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
-    // P24：选了 OAuth 就带 oauth 配置（授权码可留空 client_id 走动态注册）
-    const oauth =
-      isHttp && mcpForm.oauth !== 'none'
-        ? {
-            type: mcpForm.oauth,
-            client_id: mcpForm.oauth_client_id.trim(),
-            client_secret: mcpForm.oauth_client_secret.trim(),
-            scope: mcpForm.oauth_scope.trim(),
-          }
-        : undefined;
-    const srv = isHttp
-      ? {
-          name: mcpForm.name.trim(),
-          transport: mcpForm.transport,
-          url: mcpForm.url.trim(),
-          headers: parseHeaders(mcpForm.headers),
-          ...(oauth ? { oauth } : {}),
-        }
-      : {
-          name: mcpForm.name.trim(),
-          transport: 'stdio',
-          command: mcpForm.command.trim(),
-          args,
-        };
-    mcpAction('save', null, null, srv);
-    mcpForm = {
-      name: '',
-      transport: mcpForm.transport,
-      command: '',
-      args: '',
-      url: '',
-      headers: '',
-      oauth: 'none',
-      oauth_client_id: '',
-      oauth_client_secret: '',
-      oauth_scope: '',
-    };
-  }
-  // 档位名兜底（与 core::rules::RiskLevel::label 对齐；正常情况 SSE 已带 risk_label）
-  function riskLabelFor(risk) {
-    return risk >= 2 ? '高危操作' : risk === 1 ? '常规改动' : '安全';
   }
 
   // —— 021 组件总线 v0：UI 扩展（iframe 插槽 + 白名单数据桥）——
@@ -5482,235 +4830,9 @@
         <div class="param-hint">留空 = 自动兜底</div>
       </div>
       {/if}
-      {#if settingsTab === 'memory'}
-        {#if memData}
-          <div class="field">
-            <label>记忆存储（自动记录）</label>
-            <div class="mem-stats">
-              <div>· 全局目录 <code>{memData.global_dir}</code> · {memData.projects_registered} 个项目</div>
-              <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
-            </div>
-          </div>
-          <div class="field">
-            <label>记忆库</label>
-            <div class="sub-row">
-              <button class="btn" on:click={() => { settingsOpen = false; galaxyOpen = true; }}>打开记忆库</button>
-            </div>
-          </div>
-          <div class="field">
-            <label>约定文件</label>
-            <div class="chips">
-              <button class="chip" class:active={memTab === 'system'} on:click={() => pickMemTab('system')}>系统约定</button>
-              <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定</button>
-              <button class="chip" class:active={memTab === 'project'} on:click={() => pickMemTab('project')}>项目约定</button>
-            </div>
-            <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText} on:input={() => (memDirty = true)}></textarea>
-            <div class="sub-row">
-              <button class="btn" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
-              <span class="hint">{memMsg}</span>
-            </div>
-            <div class="param-hint">文件：<code>{memPath}</code></div>
-          </div>
-        {:else}
-          <div class="trace-empty">{memMsg || '加载中…'}</div>
-        {/if}
-      {/if}
-      {#if settingsTab === 'skills'}
-        <div class="param-hint">消息里写 $技能名 指定</div>
-        <div class="sub-row">
-          <button class="btn primary" on:click={newSkill}>新建技能</button>
-          <button class="btn" on:click={loadSkills}>刷新</button>
-          <span class="hint">{skillMsg}</span>
-        </div>
-        {#if skillEditor}
-          <div class="field">
-            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}{skillEditor.source === 'global' ? '（全局技能）' : ''}</label>
-            <div class="sub-row">
-              <input placeholder="技能名" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
-              <input placeholder="一句话描述" bind:value={skillEditor.description} />
-            </div>
-            <textarea class="agents-editor" rows="14" spellcheck="false" bind:value={skillEditor.content}></textarea>
-            <div class="sub-row">
-              <button class="btn primary" on:click={saveSkill}>保存</button>
-              <button class="btn" on:click={() => (skillEditor = null)}>取消</button>
-            </div>
-          </div>
-        {/if}
-        {#if skillsLoading}
-          <div class="trace-empty">加载中…</div>
-        {:else}
-          {#each skillsData as s (s.name)}
-            <div class="mcp-card">
-              <div class="mcp-head">
-                <b>${s.name}</b>
-                <span class="mcp-status">{s.source === 'project' ? '项目级' : '全局'}</span>
-                <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
-                <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
-              </div>
-              <div class="mcp-cmd">{s.description || '（无描述）'}</div>
-            </div>
-          {:else}
-            <div class="menu-empty">还没有技能：点「新建技能」，或在 skills/ 目录放 &lt;名字&gt;/SKILL.md</div>
-          {/each}
-        {/if}
-      {/if}
-      {#if settingsTab === 'mcp'}
-        <div class="param-hint">工具调用名：mcp__服务__工具</div>
-        {#each mcpServers as sv}
-          <div class="field mcp-card">
-            <div class="mcp-head">
-              <span class="dot" class:haskey={sv.online}></span>
-              <b>{sv.name}</b>
-              <span class="mcp-status">{sv.online ? '在线' : '离线'}</span>
-              <span class="mcp-risk">{sv.risk === 'dangerous' ? '高危档' : '常规档'}{sv.confirmed ? '' : ' · 待确认'}</span>
-              <span class="flex-sp"></span>
-              <button class="btn ghost" on:click={() => mcpAction('toggle', sv.name)}>{sv.enabled ? '停用' : '启用'}</button>
-              <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
-              <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
-            </div>
-            <div class="mcp-cmd">
-              {sv.transport === 'stdio'
-                ? `${sv.command} ${(sv.args || []).join(' ')}`
-                : `${sv.transport.toUpperCase()} · ${sv.url}`}
-            </div>
-            {#if sv.oauth}
-              <div class="sub-row">
-                <span class="mcp-status">
-                  {#if sv.oauth_status?.status === 'pending'}授权中…
-                  {:else if sv.oauth_status?.status === 'error'}授权失败
-                  {:else if sv.oauth_status?.oauth?.state === 'authorized'}已授权
-                  {:else if sv.oauth_status?.oauth?.state === 'expiring'}即将过期（自动续）
-                  {:else}未授权{/if}
-                </span>
-                <button class="btn ghost" on:click={() => mcpAction('oauth_authorize', sv.name)}>
-                  {sv.oauth_status?.oauth?.state === 'none' || !sv.oauth_status?.oauth ? '授权' : '重新授权'}
-                </button>
-                {#if sv.oauth_status?.oauth && sv.oauth_status.oauth.state !== 'none'}
-                  <button class="btn ghost danger" on:click={() => mcpAction('oauth_revoke', sv.name)}>撤销</button>
-                {/if}
-              </div>
-              {#if sv.oauth_status?.status === 'pending' && sv.oauth_status?.authorization_url}
-                <div class="param-hint">
-                  浏览器没自动打开？<a href={sv.oauth_status.authorization_url} target="_blank" rel="noreferrer">点这里完成授权</a>
-                </div>
-              {/if}
-              {#if sv.oauth_status?.status === 'error'}
-                <div class="param-hint" style="color: var(--tint-red-fg, #e5484d)">{sv.oauth_status.message}</div>
-              {/if}
-            {/if}
-            {#if !sv.confirmed}
-              <div class="mcp-confirm">
-                {#if sv.tools.length}
-                  <div class="mcp-tools-list">
-                    <b>发现 {sv.tools.length} 个工具，请确认后启用：</b>
-                    {#each sv.tools as t}
-                      <div class="mcp-tool-item"><code>{t.name}</code> {t.desc}</div>
-                    {/each}
-                  </div>
-                  <div class="sub-row">
-                    <label class="mcp-risk-label">审批档：</label>
-                    <Select
-                      value={mcpRiskChoice}
-                      title="MCP 调用审批档"
-                      options={[
-                        { value: 'normal', label: '常规（auto 档自动放行）' },
-                        { value: 'dangerous', label: '高危（每次调用都弹窗）' },
-                      ]}
-                      on:change={(e) => (mcpRiskChoice = e.detail)}
-                    />
-                    <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
-                  </div>
-                {:else}
-                  <button class="btn primary" on:click={() => mcpAction('refresh', sv.name)}>连接并获取工具清单</button>
-                {/if}
-              </div>
-            {:else}
-              <div class="mcp-tools-list">
-                {#each sv.tools as t}
-                  <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
-                {/each}
-                {#if !sv.tools.length}<span class="hint">（未发现工具——点「重连」尝试）</span>{/if}
-                {#if sv.resources && sv.resources.length}
-                  <div class="mcp-tool-item"><b>资源 {sv.resources.length}</b>（模型可用 list_resources / read_resource 读取）</div>
-                  {#each sv.resources.slice(0, 8) as r}
-                    <div class="mcp-tool-item"><code>{r}</code></div>
-                  {/each}
-                {/if}
-                {#if sv.prompts && sv.prompts.length}
-                  <div class="mcp-tool-item"><b>提示词模板 {sv.prompts.length}</b>（模型可用 list_prompts / get_prompt 取用）</div>
-                  {#each sv.prompts.slice(0, 8) as p}
-                    <div class="mcp-tool-item"><code>{p}</code></div>
-                  {/each}
-                {/if}
-              </div>
-            {/if}
-          </div>
-        {/each}
-        <div class="field">
-          <label>添加 MCP server</label>
-          <div class="sub-row">
-            <input placeholder="名称（字母数字-_）" bind:value={mcpForm.name} style="max-width:160px" />
-            <Select
-              value={mcpForm.transport}
-              title="transport"
-              options={[
-                { value: 'stdio', label: 'stdio（本地子进程）' },
-                { value: 'http', label: 'http（远端 MCP）' },
-                { value: 'sse', label: 'sse（远端 MCP·SSE 长连接）' },
-              ]}
-              on:change={(e) => (mcpForm.transport = e.detail)}
-            />
-            {#if mcpForm.transport === 'http' || mcpForm.transport === 'sse'}
-              <input placeholder="https://host/mcp" bind:value={mcpForm.url} />
-            {:else}
-              <input placeholder="命令，如 node / npx" bind:value={mcpForm.command} />
-              <input placeholder="参数（空格分隔）" bind:value={mcpForm.args} />
-            {/if}
-            <button
-              class="btn primary"
-              on:click={addMcpServer}
-              disabled={!mcpForm.name.trim() ||
-                (mcpForm.transport === 'stdio' ? !mcpForm.command.trim() : !mcpForm.url.trim())}>添加</button
-            >
-          </div>
-          {#if mcpForm.transport === 'http' || mcpForm.transport === 'sse'}
-            <div class="sub-row">
-              <textarea
-                placeholder={'自定义请求头，每行一条：\nAuthorization: Bearer xxx'}
-                bind:value={mcpForm.headers}
-                rows="2"
-              ></textarea>
-            </div>
-            <div class="sub-row">
-              <Select
-                value={mcpForm.oauth}
-                title="认证方式"
-                options={[
-                  { value: 'none', label: '无 / 自定义请求头' },
-                  { value: 'authorization_code', label: 'OAuth 授权码（浏览器登录）' },
-                  { value: 'client_credentials', label: 'OAuth 客户端凭据' },
-                ]}
-                on:change={(e) => (mcpForm.oauth = e.detail)}
-              />
-            </div>
-            {#if mcpForm.oauth !== 'none'}
-              <div class="sub-row">
-                <input placeholder="client_id（留空=动态注册）" bind:value={mcpForm.oauth_client_id} style="max-width:220px" />
-                {#if mcpForm.oauth === 'client_credentials'}
-                  <input placeholder="client_secret" type="password" bind:value={mcpForm.oauth_client_secret} style="max-width:220px" />
-                {/if}
-                <input placeholder="scope（可选）" bind:value={mcpForm.oauth_scope} style="max-width:160px" />
-              </div>
-              <div class="param-hint">
-                授权码流程会打开浏览器登录（动态注册自动办 client_id）；token 自动续期，过期重授权即可。
-              </div>
-            {/if}
-          {:else}
-            <div class="param-hint">例：npx -y @modelcontextprotocol/server-filesystem &lt;目录&gt;</div>
-          {/if}
-        </div>
-      {/if}
+      <MemoryTab tab={settingsTab} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
+      <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} on:reload={loadSkills} />
+      <McpTab servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.risk, e.detail.server)} />
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
@@ -5854,144 +4976,7 @@
         </div>
       {/if}
 
-      {#if settingsTab === 'schedule'}
-        <div class="sub-row">
-          <button class="btn primary" on:click={newSchedule}>新建任务</button>
-          <button class="btn" on:click={loadSchedules}>刷新</button>
-          <span class="hint">{schedMsg}</span>
-        </div>
-        {#if schedEditor}
-          <div class="field">
-            <label>{schedEditor.isNew ? '新建定时任务' : `编辑：${schedEditor.name}`}</label>
-            <div class="sub-row">
-              <input placeholder="名称" bind:value={schedEditor.name} style="max-width:220px" />
-              <Select
-                value={schedEditor.kind || 'message'}
-                title="任务类型"
-                options={[
-                  { value: 'message', label: '固定消息' },
-                  { value: 'memory', label: '记忆提醒（回顾最近对话）' },
-                ]}
-                on:change={(e) => (schedEditor.kind = e.detail)}
-              />
-              <label class="mcp-risk-label"><input type="checkbox" bind:checked={schedEditor.enabled} /> 启用</label>
-            </div>
-            <div class="sub-row">
-              <ScheduleCronPicker bind:cron={schedEditor.cron} bind:onceTs={schedEditor.once_ts} on:change={previewCron} />
-              {#if (schedEditor.kind || 'message') === 'memory'}
-                <input placeholder="回顾天数" type="number" bind:value={schedEditor.memory_days} style="max-width:110px" />
-              {/if}
-              {#if schedCronText}
-                <span class="hint">{schedCronText}</span>
-              {:else if !schedCronPending && (schedEditor.cron || '').trim()}
-                <span class="hint" style="color: var(--tint-orange-fg)">没认出来，示例 0 9 * * * = 每天 09:00</span>
-              {/if}
-            </div>
-            {#if (schedEditor.kind || 'message') === 'message'}
-              <textarea
-                class="agents-editor"
-                rows="4"
-                spellcheck="false"
-                placeholder="到点时唤醒 agent 的消息"
-                bind:value={schedEditor.message}
-              ></textarea>
-            {:else}
-              <div class="mcp-cmd">到点先检索最近 {schedEditor.memory_days || 3} 天的对话，让 agent 找出要跟进的事项</div>
-            {/if}
-            <div class="sub-row">
-              <span class="hint">在哪儿完成</span>
-              <Select
-                value={schedEditor.workspace || ''}
-                title="工作区"
-                options={wsOptions()}
-                on:change={(e) => (schedEditor.workspace = e.detail)}
-              />
-            </div>
-            <div class="sub-row">
-              <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
-            </div>
-            {#if schedAdvOpen}
-              <div class="sub-row">
-                <Select
-                  value={schedEditor.session_mode}
-                  title="会话模式"
-                  options={[
-                    { value: 'new', label: '每轮新会话' },
-                    { value: 'fixed', label: '固定会话' },
-                  ]}
-                  on:change={(e) => (schedEditor.session_mode = e.detail)}
-                />
-                {#if schedEditor.session_mode === 'fixed'}
-                  <input placeholder="会话 id" bind:value={schedEditor.session_id} style="max-width:260px" />
-                {/if}
-              </div>
-              <div class="sub-row">
-                <Select
-                  value={schedEditor.approval_mode}
-                  title="审批档位"
-                  options={SCHED_MODES}
-                  on:change={(e) => (schedEditor.approval_mode = e.detail)}
-                />
-                <Select
-                  value={schedEditor.on_approval}
-                  title="高危操作"
-                  options={[
-                    { value: 'deny', label: '高危：拒绝' },
-                    { value: 'approve', label: '高危：放行' },
-                  ]}
-                  on:change={(e) => (schedEditor.on_approval = e.detail)}
-                />
-                <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
-              </div>
-            {/if}
-            <div class="sub-row">
-              <button class="btn primary" on:click={saveSchedule}>保存</button>
-              <button class="btn" on:click={() => (schedEditor = null)}>取消</button>
-            </div>
-          </div>
-        {/if}
-        {#if schedLoading && !schedulesData.length}
-          <div class="trace-empty">加载中…</div>
-        {:else}
-          {#each schedulesData as t (t.id)}
-            <div class="mcp-card">
-              <div class="mcp-head">
-                <span class="dot" class:haskey={t.enabled !== false}></span>
-                <b>{t.name}</b>
-                {#if t.kind === 'memory'}<span class="mcp-risk">记忆 · {t.memory_days || 3} 天</span>{/if}
-                <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
-                {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
-                {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
-                <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
-                <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
-                <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
-              </div>
-              {#if t.kind === 'memory'}
-                <div class="mcp-cmd">到点回顾最近 {t.memory_days || 3} 天的对话，找出要跟进的事项</div>
-              {:else}
-                <div class="mcp-cmd">{t.message}</div>
-              {/if}
-              <div class="mcp-cmd">
-                下次运行 {schedNextText(t)}{t.last_status
-                  ? ` · 上次${t.last_status === 'done' ? '完成' : t.last_status === 'timeout' ? '超时' : t.last_status === 'cancelled' ? '取消' : '出错'}`
-                  : ''}
-              </div>
-              {#if t.last_error}
-                <div class="mcp-cmd" style="color: var(--tint-orange-fg)">{t.last_error}</div>
-              {/if}
-            </div>
-          {:else}
-            <div class="menu-empty">还没有定时任务。到点会唤醒 agent 跑一轮，结果出现在下面的完成记录里。</div>
-          {/each}
-        {/if}
-        {#if scheduleNotices.length}
-          <div class="field"><label>完成记录</label></div>
-          {#each scheduleNotices as n (n.ts + n.task_id)}
-            <div class="mcp-cmd">{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</div>
-          {/each}
-        {/if}
-      {/if}
+      <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} />
 
         </div>
       </div>
@@ -8711,10 +7696,6 @@
     flex-direction: column;
     gap: 7px;
   }
-  .mem-stats code {
-    font-size: 11px;
-    color: var(--g5);
-  }
   .agents-editor {
     width: 100%;
     box-sizing: border-box;
@@ -8775,14 +7756,6 @@
     flex-direction: column;
     gap: 3px;
     margin: 6px 0;
-  }
-  .mcp-tool-item code {
-    background: var(--g2);
-    border: 1px solid var(--g3);
-    border-radius: 4px;
-    padding: 0 4px;
-    margin-right: 6px;
-    font-size: 11px;
   }
   .mcp-confirm {
     margin-top: 6px;
@@ -8916,3 +7889,5 @@
     padding: 6px 8px;
   }
 </style>
+
+
