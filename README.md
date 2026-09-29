@@ -44,9 +44,9 @@ agent/
 │   ├── session/          # 会话落盘与恢复
 │   ├── tools/            # 工具系统（内置 + 并行调度 + git 发现链）
 │   ├── memory/           # 记忆 v1（events.log/AGENTS.md/摘要）+ library.rs 记忆库索引
-│   ├── plugin/           # contract.rs（契约 v1）+ mcp.rs + wasm.rs（工具引擎）+ ui.rs（面板）+ draft.rs（隔离区）+ trust.rs（第三方验签）
+│   ├── plugin/           # 插件核心（P28 后 6 文件）：contract.rs（契约 v1）+ draft.rs（草稿隔离区）+ trust.rs（pin 验签）+ ui.rs（面板扫描）+ wasm.rs（WASM 工具桥）+ mod.rs（工具总线 ToolBrief）
+│   ├── mcp/              # MCP 独立国（P28）：stdio + Streamable HTTP 双 transport + OAuth（mod.rs + oauth.rs）
 │   ├── usage/            # P21 用量台账：ledger.jsonl 记账（费用冻结）+ prices.rs 价格匹配 + 按会话/分组报表 + 花费硬闸 + 重算
-│   ├── usage/            # P21 用量台账：ledger.jsonl 记账 + prices.rs 价格表 + 聚合报表 + 花费硬闸
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
@@ -54,7 +54,6 @@ agent/
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
-├── plugins/              # 插件工具目录（*.wat / 目录+manifest；仓库内示例已清空，放自己的插件即可）
 ├── prompts/system.md     # 系统约定（每轮任务实时读盘）
 ├── providers.json        # 供应商预设（数据驱动）
 ├── docs/                 # ROADMAP / jsonl-schema / workorders/ / 交接文档
@@ -71,7 +70,7 @@ agent/
 - **开发形态**：`cargo run` 或直接跑 `target\release\agent.exe` —— exe 同级没有 `config.toml` / `web`，
   一律回落**编译期源码目录**（改动前的老行为，开发流程零变化）。
 - **打包形态**：exe 同级有 `config.toml` 或 `web/` —— 认定随包运行，`config.toml` /
-  `settings.json` / `providers.json` / `prompts/` / `web/dist/` / `plugins/` / `plugins/` / `logs/`
+  `settings.json` / `providers.json` / `prompts/` / `web/dist/` / `plugins/` / `logs/`
   全落在 **exe 同级目录**。所以整个目录可以拷到任何地方（含没装 Rust/Node 的机器）直接双击 `start.bat`。
 
 侧栏底部的版本行（鼠标悬停显示「运行根」）就是用来一眼确认当前读的是哪一份资源。
