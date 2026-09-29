@@ -1,0 +1,18 @@
+# 行尾纪律(P2 件 2 前置):仓库统一 LF,检出不再随 autocrlf 翻转
+* text=auto
+*.rs text eol=lf
+*.svelte text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.mjs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.wat text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
