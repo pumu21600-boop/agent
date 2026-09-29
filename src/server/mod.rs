@@ -45,7 +45,7 @@ pub(crate) use crate::config::AgentConfig;
 pub(crate) use crate::core::agent::{self, AgentEvent, LoopOutcome};
 
 mod chat;
-mod ext;
+mod plugins;
 mod gate;
 mod git;
 mod headless;
@@ -60,7 +60,7 @@ mod webpanel;
 mod workspace;
 
 use chat::*;
-use ext::*;
+use plugins::*;
 use gate::*;
 use git::*;
 use headless::*;
