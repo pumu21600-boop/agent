@@ -11,6 +11,28 @@
     }
 
     #[test]
+    fn thinking_inflates_max_tokens_budget() {
+        // P27.3：思考开启时上游把 reasoning+正文算进同一个 max_tokens，用户配的
+        // 「最大输出长度」会被思考吃掉——发送值 = 配置值 + max(配置值, 8192)。
+        // 思考关闭/未配 → 原值（此时上限本就只约束正文）。
+        let mut p = ChatParams::default();
+        p.max_tokens = Some(4096);
+        p.thinking = Some("high".into());
+        assert_eq!(effective_max_tokens(&p), Some(12288));
+        p.thinking = Some("on".into());
+        assert_eq!(effective_max_tokens(&p), Some(12288));
+        p.thinking = Some("off".into());
+        assert_eq!(effective_max_tokens(&p), Some(4096), "思考关闭不扩容");
+        p.thinking = None;
+        assert_eq!(effective_max_tokens(&p), Some(4096), "未配思考档位不扩容");
+        p.max_tokens = Some(12600);
+        p.thinking = Some("high".into());
+        assert_eq!(effective_max_tokens(&p), Some(25200), "配置值大于 8192 时按配置值翻倍");
+        p.max_tokens = None;
+        assert_eq!(effective_max_tokens(&p), None);
+    }
+
+    #[test]
     fn build_body_vendor_styles() {
         // REGISTRY 是进程级 OnceLock：测试进程里手动加载一次（幂等）
         let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));

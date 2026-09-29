@@ -623,7 +623,22 @@ impl Gateway {
         };
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
-        let body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat);
+        // P27.3 思考预算扩容：思考开启时上游把思考+正文算进同一个 max_tokens，用户配的
+        // 「最大输出长度」会被思考吃掉导致正文莫名截断——发送值加思考余量（端点硬上限
+        // 拒收时下方回退原值重试）。思考关闭/未配 max_tokens 时等价原值。
+        let mut send_params = eff_params.clone();
+        let inflated = match (eff_params.max_tokens, effective_max_tokens(&eff_params)) {
+            (Some(orig), Some(eff)) if eff != orig => {
+                send_params.max_tokens = Some(eff);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.max_tokens_inflated", "url": url, "model": model, "configured": orig, "sent": eff }),
+                );
+                true
+            }
+            _ => false,
+        };
+        let body = build_body_with_compat(model, &outgoing, true, &send_params, tools, &compat);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
         observability::event(
@@ -650,7 +665,9 @@ impl Gateway {
 
         // P23 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
         // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
+        let mut degrade_retried = false;
         if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
+            degrade_retried = true;
             let text = response.text().await.unwrap_or_default();
             observability::event(
                 EventType::State,
@@ -677,6 +694,33 @@ impl Gateway {
                 observability::event(
                     EventType::State,
                     json!({ "kind": "gateway.thinking_degraded", "url": url, "model": model, "note": "端点拒收思考参数，剥参重试成功；该渠道后续请求不再发送思考字段" }),
+                );
+            }
+        }
+
+        // P27.3 扩容回退：扩容后的 max_tokens 超出该模型硬上限被 400 拒收 → 用配置原值
+        // 重试一次（思考参数不动；剥参重试已跑过则不重复——它本来就用的原值）
+        if response.status().as_u16() == 400 && inflated && !degrade_retried {
+            let text = response.text().await.unwrap_or_default();
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": url, "model": model, "error_body": text.chars().take(300).collect::<String>() }),
+            );
+            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat);
+            response = match self
+                .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
+                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
+                }
+            };
+            if response.status().is_success() {
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "gateway.max_tokens_inflate_fallback", "url": url, "model": model, "note": "扩容值超出模型硬上限，已回退配置原值" }),
                 );
             }
         }

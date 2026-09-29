@@ -4665,7 +4665,7 @@
             type="number"
             min="0"
             bind:value={maxOut}
-            title="最大输出长度：随请求作为 max_tokens 发给渠道"
+            title="最大输出长度：随请求作为 max_tokens 发给渠道。思考开启时自动加思考余量（配置值+max(配置值,8192)）——上游把思考和正文算进同一个额度，不加余量正文会被思考挤断；端点拒收会自动回退原值"
             on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
           />
         </div>

@@ -20,6 +20,27 @@ pub fn build_body(
     build_body_with_compat(model, messages, stream, params, tools, &compat)
 }
 
+/// P27.3 思考预算扩容：思考开启时上游把 reasoning+正文一起算进同一个 max_tokens
+/// （StepFun 官方文档：max_tokens 默认 INF、推理深度只有 reasoning_effort 三档、
+/// 没有单独思考预算参数；GLM/DeepSeek/Qwen 同构——共用一个输出上限）。
+/// 用户配的「最大输出长度」本意是正文额度，被思考吃掉半截正文就莫名截断
+/// （2026-09-29 用户实锤：step-5-preview + high 档思考，SVG 写到一半被切）。
+/// 发送值 = 配置值 + max(配置值, 8192)，给思考留出与正文同量级的余量；
+/// 端点硬上限拒收（400）时由 stream_chat 回退配置原值重试，不影响可用性。
+/// 思考关闭 / 未配 max_tokens → 原样返回（此时上限本就只约束正文，语义正确）。
+pub fn effective_max_tokens(params: &ChatParams) -> Option<u64> {
+    let mt = params.max_tokens?;
+    let thinking_on = params
+        .thinking
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|t| !t.is_empty() && t != "off");
+    if !thinking_on {
+        return Some(mt);
+    }
+    Some(mt + mt.max(8192))
+}
+
 /// 带 compat 的组装（供网关在发送前先做历史净化时复用同一次探测）。
 pub fn build_body_with_compat(
     model: &str,

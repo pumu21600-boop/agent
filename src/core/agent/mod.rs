@@ -85,10 +85,6 @@ pub const PLAN_PROMPT: &str = "\
 ```\n\
 用户批准该计划后才会开始实际执行。";
 
-/// P27 截断自动续写时临时注入的用户消息：只进续写请求的上下文（cont_ctx），
-/// 不进 canonical msgs——不落盘、不产生气泡，模型对外表现为「一条完整的回答」。
-const CONTINUE_PROMPT: &str = "（系统提示：上一条回答因达到最大输出长度被截断。请从截断处直接继续输出剩余内容，不要重复已有内容，也不要重新开始。）";
-
 /// P8 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
 pub struct LoopChannels {
     /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
@@ -493,7 +489,7 @@ pub async fn run_task(
         }
         let outcome = outcome?;
 
-        let mut turn = match outcome {
+        let turn = match outcome {
             ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
             ChatOutcome::Done(t) => t,
         };
@@ -503,91 +499,22 @@ pub async fn run_task(
             on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
         }
 
-        // P7.6 输出截断处理（P27 升级，2026-09-29 用户实锤）：finish_reason=length 时
-        // 思考内容也被上游计入「最大输出长度」额度（reasoning+正文一起算 completion），
-        // 正文常比预期短就被截断。无工具调用 → 携半截上下文自动续写（最多 MAX_CONTINUE 段），
-        // 把额度内的正文接完；仍不够才提示调大。续写上下文只在临时数组拼接：canonical msgs
-        // 最终只落一条完整回答，前端同气泡无缝续流；工具调用参数被截断没法拼回 JSON，不续写。
+        // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
+        // P27.3 起思考预算已在网关侧扩容（effective_max_tokens：思考开启时发送
+        // 配置值+思考余量），思考不再吃掉「最大输出长度」额度——此处截断即正文
+        // 本身超限，提示口径回归真实。P27 的自动续写方案已撤（治标不治本且拖慢
+        // 响应：续写要重传全量上下文，用户实锤「还会卡」）。
         if turn.finish_reason.as_deref() == Some("length") {
             observability::event(
                 EventType::State,
                 json!({ "kind": "model.truncated", "step": step, "max_output_tokens": max_output_tokens }),
             );
-            if turn.tool_calls.is_empty() {
-                const MAX_CONTINUE: usize = 2;
-                let mut cont_ctx: Vec<Value> = msgs.clone();
-                let mut continued = 0usize;
-                while turn.finish_reason.as_deref() == Some("length")
-                    && turn.tool_calls.is_empty()
-                    && continued < MAX_CONTINUE
-                    && !cancel.is_set()
-                {
-                    continued += 1;
-                    emit_notice(
-                        &mut msgs,
-                        &on_event,
-                        if continued == 1 {
-                            "回答达到最大输出长度被截断（思考内容也计入该额度），正在自动续写…".to_string()
-                        } else {
-                            format!("续写未完（第 {continued} 段），继续…")
-                        },
-                    );
-                    if !turn.content.trim().is_empty() {
-                        let mut partial = json!({ "role": "assistant", "content": turn.content });
-                        if !turn.reasoning.is_empty() {
-                            partial["reasoning_content"] = json!(turn.reasoning);
-                        }
-                        cont_ctx.push(partial);
-                    }
-                    cont_ctx.push(json!({ "role": "user", "content": CONTINUE_PROMPT }));
-                    let (res, chain_notices) = run_chain(
-                        gateway,
-                        &chain,
-                        &cont_ctx,
-                        tools_def.as_ref(),
-                        cancel,
-                        &usage_ctx,
-                        step,
-                        &on_event,
-                    )
-                    .await;
-                    for n in chain_notices {
-                        persist_notice(&mut msgs, &on_event, &n);
-                    }
-                    match res {
-                        Ok(ChatOutcome::Cancelled) => return Ok(LoopOutcome::Cancelled),
-                        Ok(ChatOutcome::Done(seg)) => {
-                            turn.content.push_str(&seg.content);
-                            turn.reasoning.push_str(&seg.reasoning);
-                            turn.finish_reason = seg.finish_reason;
-                            turn.tool_calls = seg.tool_calls;
-                            turn.prompt_tokens = seg.prompt_tokens;
-                            turn.cached_tokens = seg.cached_tokens;
-                            turn.completion_tokens = seg.completion_tokens;
-                        }
-                        Err(e) => {
-                            emit_notice(&mut msgs, &on_event, format!("自动续写失败：{e}"));
-                            break;
-                        }
-                    }
-                }
-                if turn.finish_reason.as_deref() == Some("length") && turn.tool_calls.is_empty() {
-                    emit_notice(
-                        &mut msgs,
-                        &on_event,
-                        format!(
-                            "已自动续写 {continued} 段仍未完整。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
-                        ),
-                    );
-                }
-            } else {
-                emit_notice(
-                    &mut msgs,
-                    &on_event,
-                    "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
-                        .to_string(),
-                );
-            }
+            emit_notice(
+                &mut msgs,
+                &on_event,
+                "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
+                    .to_string(),
+            );
         }
 
         // 思考完整段落落 thought（分片级已记 model_chunk）
@@ -1090,12 +1017,13 @@ mod tests {
         assert!(p.files.is_empty());
     }
 
-    // —— P27 截断自动续写（2026-09-29 用户实锤「思考内容算进输出长度把正文截断」）——
-    // mock SSE：第一段 finish_reason=length 只给半截正文，第二段 stop 补全。
-    // 期望：同气泡续流（最终回答=两段拼接）、续写提示落盘成 display_only 气泡、
-    // 第二次请求确实带了半截上下文 + CONTINUE_PROMPT。
+    // —— P27.3 思考预算扩容 + 截断提示（2026-09-29 用户实锤「思考内容算进输出长度
+    // 把正文截断」；P27 的自动续写方案已撤——治标不治本且拖慢响应）——
+    // mock SSE：一次请求即 finish_reason=length 半截正文。
+    // 期望：① 请求体 max_tokens = 配置值+思考余量（4096 → 12288，思考不再吃正文额度）；
+    //       ② 不自动续写（只有一次请求，正文就是半截）；③ 截断提示落盘成 display_only 气泡。
     #[tokio::test]
-    async fn truncated_text_answer_auto_continues() {
+    async fn thinking_max_tokens_inflated_and_no_auto_continue() {
         // 日志落临时目录（与 gateway/memory 测试同款，不写仓库 logs/）
         fn init_logger() {
             static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -1126,16 +1054,10 @@ mod tests {
                         let mut buf = [0u8; 65536];
                         let n = Read::read(&mut s, &mut buf).unwrap_or(0);
                         bodies_c.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
-                        let i = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let body = if i == 0 {
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"半截正文\"}}]}\n\n\
+                        hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"半截正文\"}}]}\n\n\
                              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
-                             data: [DONE]\n\n"
-                        } else {
-                            "data: {\"choices\":[{\"delta\":{\"content\":\"+补全的尾巴\"}}]}\n\n\
-                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
-                             data: [DONE]\n\n"
-                        };
+                             data: [DONE]\n\n";
                         let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
                         let _ = s.write_all(resp.as_bytes());
                         let _ = s.flush();
@@ -1146,12 +1068,9 @@ mod tests {
         });
 
         let gateway = Arc::new(Gateway::new());
-        let ch = Channel::new(
-            &format!("http://127.0.0.1:{port}/v1"),
-            "mock-model",
-            "sk-dummy",
-            ChatParams::default(),
-        );
+        // 复刻用户实锤配置：step-5-preview + thinking=high + 最大输出长度 4096
+        let params = ChatParams { max_tokens: Some(4096), thinking: Some("high".to_string()), ..Default::default() };
+        let ch = Channel::new(&format!("http://127.0.0.1:{port}/v1"), "mock-model", "sk-dummy", params);
         let channels = LoopChannels {
             primary: ch,
             summary: None,
@@ -1211,16 +1130,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
 
         assert_eq!(outcome.unwrap(), LoopOutcome::Done);
-        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 2, "截断后应自动续写一次");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1, "不再自动续写：只有一次请求");
         let reqs = bodies.lock().unwrap();
-        assert!(
-            reqs[1].contains("半截正文") && reqs[1].contains(CONTINUE_PROMPT),
-            "续写请求应带半截上下文与续写指令"
-        );
+        let body_json = reqs[0]
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or_default();
+        let sent: Value = serde_json::from_str(body_json).expect("请求体应为 JSON");
+        assert_eq!(sent.get("max_tokens").and_then(Value::as_u64), Some(12288), "思考开启时 max_tokens 应扩容到 4096+8192");
         let notes = notices.lock().unwrap();
         assert!(
-            notes.iter().any(|n| n.contains("正在自动续写")),
-            "应推送续写提示，实际 {:?}",
+            notes.iter().any(|n| n.contains("模型输出被截断")),
+            "应推送截断提示，实际 {:?}",
             *notes
         );
         let snaps = snaps.lock().unwrap();
@@ -1230,10 +1151,10 @@ mod tests {
             .rev()
             .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
             .expect("快照应有最终回答");
-        assert_eq!(final_msg.get("content").and_then(Value::as_str), Some("半截正文+补全的尾巴"));
+        assert_eq!(final_msg.get("content").and_then(Value::as_str), Some("半截正文"), "不续写：正文就是半截");
         assert!(
             last.iter().any(|m| m.get("display_only").and_then(Value::as_bool) == Some(true)),
-            "续写提示应以 display_only 消息落盘（重启后气泡还在）"
+            "截断提示应以 display_only 消息落盘（重启后气泡还在）"
         );
     }
 }
