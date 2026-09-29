@@ -16,6 +16,16 @@ use crate::observability::{self, EventType};
 use crate::recovery;
 use crate::tools::{self, ExecConfig};
 
+
+mod checkpoint;
+mod exec;
+mod plan;
+mod summary;
+
+pub(crate) use checkpoint::*;
+pub(crate) use exec::*;
+pub use plan::*;
+pub(crate) use summary::*;
 /// 循环向外发的结构化事件（SSE 转发用）。
 pub enum AgentEvent {
     Content(String),
@@ -75,95 +85,6 @@ pub const PLAN_PROMPT: &str = "\
 ```\n\
 用户批准该计划后才会开始实际执行。";
 
-fn is_summary_msg(m: &Value) -> bool {
-    m.get("content").and_then(Value::as_str).map(|c| c.starts_with(SUMMARY_PREFIX)).unwrap_or(false)
-}
-
-/// 快照用：去掉 system 头与摘要消息（摘要由会话文件 summary 字段单独持久化）。
-fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
-    msgs.iter().skip(1).filter(|m| !is_summary_msg(m)).cloned().collect()
-}
-
-/// P7 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
-/// P8 角色映射：优先走 [roles] summary 专用渠道，失败回落主渠道再降级占位符。
-/// P21：辅助调用记用量台账（purpose=summary），归属会话由 sid 带入。
-async fn summarize_folded(
-    gateway: &Arc<Gateway>,
-    primary: &Channel,
-    summary_role: Option<&Channel>,
-    prior: &Option<String>,
-    folded: &[Value],
-    sid: &str,
-) -> Option<String> {
-    let mut text = String::new();
-    if let Some(p) = prior {
-        text.push_str(&format!("已有摘要：{p}\n\n"));
-    }
-    text.push_str("新增对话：\n");
-    for m in folded {
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("?");
-        let body: String = match m.get("content") {
-            Some(Value::String(s)) => s.chars().take(500).collect(),
-            Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string().chars().take(500).collect(),
-        };
-        let calls = m
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c.pointer("/function/name").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .unwrap_or_default();
-        text.push_str(&format!("{role}: {body}{}\n", if calls.is_empty() { String::new() } else { format!(" [调用工具: {calls}]") }));
-        if text.chars().count() > 8000 {
-            break;
-        }
-    }
-    let req = json!([
-        {"role": "system", "content": "你是对话历史压缩器。把给定对话压成不超过300字中文要点，必须保留：任务目标、关键决定、改过哪些文件、未完成事项。只输出要点正文，不要开场白。"},
-        {"role": "user", "content": text},
-    ]);
-    // 辅助调用固定小输出，压 max_tokens=400；其余参数跟渠道走
-    let params = ChatParams { max_tokens: Some(400), ..primary.params.clone() };
-    let mut out = None;
-    // 角色渠道优先（参数用角色的；无角色渠道则直接主渠道）
-    if let Some(role) = summary_role {
-        let rp = ChatParams { max_tokens: Some(400), ..role.params.clone() };
-        let ch = Channel { params: rp, ..role.clone() };
-        let ctx = UsageCtx::aux(sid, "summary");
-        out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
-    }
-    // 回落主渠道
-    if out.is_none() {
-        let ch = Channel { params, ..primary.clone() };
-        let ctx = UsageCtx::aux(sid, "summary");
-        out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &ch.params).await.ok();
-    }
-    let out = out?;
-    let out = out.trim().to_string();
-    (!out.is_empty()).then_some(out)
-}
-
-/// P8 TITLE 角色：用最终回答生成 ≤20 字会话标题。失败返回 None（保留机械截断标题）。
-/// P21：辅助调用记用量台账（purpose=title）。
-async fn generate_title(gateway: &Arc<Gateway>, ch: &Channel, answer: &str, sid: &str) -> Option<String> {
-    let text: String = answer.chars().take(1200).collect();
-    let req = json!([
-        {"role": "system", "content": "根据对话内容生成一个不超过20字的中文会话标题。只输出标题本身，不要引号、句号或任何解释。"},
-        {"role": "user", "content": text},
-    ]);
-    let params = ChatParams { max_tokens: Some(50), ..ch.params.clone() };
-    let ctx = UsageCtx::aux(sid, "title");
-    let out = gateway.complete(&ctx, &ch.base_url, &ch.model, &ch.api_key, &req, &params).await.ok()?;
-    let mut t = out.trim().trim_matches(|c| c == '"' || c == '“' || c == '”' || c == '「' || c == '」').to_string();
-    // 防跑偏：截到 30 字符以内（标题超长说明模型没听话，硬截断）
-    t = t.chars().take(30).collect();
-    (!t.is_empty()).then_some(t)
-}
-
 /// P8 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
 pub struct LoopChannels {
     /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
@@ -182,44 +103,6 @@ pub struct LoopChannels {
     /// P22-C 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
     /// 工具调用 subagent_spawn 由核心循环拦截交给它——实现见 server/subagent.rs。
     pub subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>>,
-}
-
-/// 任务结束时的改动统计条：先补一次「结束快照」提交（让任务内新建文件也进影子仓库），
-/// 再算相对基线的 numstat；无改动不发。撤销 = 影子仓库 reset --hard 回基线。
-async fn emit_checkpoint_bar(
-    baseline: Option<String>,
-    session_id: &str,
-    on_event: &(dyn Fn(AgentEvent) + Send + Sync),
-) {
-    let Some(base) = baseline else { return };
-    let ws = tools::workspace_root().to_path_buf();
-    let sid = session_id.to_string();
-    let res = tokio::task::spawn_blocking({
-        let base = base.clone();
-        move || -> anyhow::Result<(usize, u64, u64)> {
-            recovery::checkpoint(&ws, "任务结束快照", &sid)?;
-            recovery::diff_stat(&ws, &base)
-        }
-    })
-    .await;
-    match res {
-        Ok(Ok((files, adds, dels))) if files > 0 => {
-            observability::event(
-                EventType::State,
-                json!({ "kind": "checkpoint.summary", "baseline": base, "files": files, "additions": adds, "deletions": dels }),
-            );
-            on_event(AgentEvent::Checkpoint { id: base, files_changed: files, additions: adds, deletions: dels });
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => observability::event(
-            EventType::State,
-            json!({ "kind": "checkpoint.skipped", "reason": e.to_string() }),
-        ),
-        Err(e) => observability::event(
-            EventType::State,
-            json!({ "kind": "checkpoint.skipped", "reason": format!("任务失败: {e}") }),
-        ),
-    }
 }
 
 /// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
@@ -274,138 +157,6 @@ pub trait ApprovalGate: Send + Sync {
 pub enum LoopOutcome {
     Done,
     Cancelled,
-}
-
-/// 是否构成「重复调用死循环」（纯函数）：两步工具调用签名完全相同，且上一轮**不是**
-/// 全部失败。失败后重试是正当行为——超时/后端重置后状态可能已变，模型重试一次
-/// 理应放行（用户反馈：navigate 超时被当场判死循环，用户只看到天书横幅）；
-/// 真正要防的是对成功调用的重复请求，那种由步数上限兜底。
-fn is_repeat_loop(prev: &[String], cur: &[String], prev_all_failed: bool) -> bool {
-    !prev.is_empty() && prev == cur && !prev_all_failed
-}
-
-/// P22-C：执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
-/// （子代理跑在独立会话，实现见 server/subagent.rs）；其余走工具注册表。
-async fn exec_tool_call(
-    cfg: &crate::tools::ExecConfig,
-    name: &str,
-    args: &str,
-    subagents: Option<&Arc<dyn crate::core::subagent::SubagentRunner>>,
-    parent_session: &str,
-) -> Result<String, String> {
-    if name == "subagent_spawn" {
-        return match subagents {
-            Some(runner) => Ok(runner.run(parent_session, args).await),
-            None => Err("子代理派发未启用（本任务没有派发器）".to_string()),
-        };
-    }
-    tools::execute(cfg, name, args).await
-}
-
-/// 工具参数压成一行短 reason（写文件等大参数只留头部）。
-fn short_args(args: &str, max_chars: usize) -> String {
-    let flat: String = args.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-    flat.chars().take(max_chars).collect()
-}
-
-/// A3（施工单 012）：能力标记「工具调用」闭环的核心判定——tools_enabled=false 时不带
-/// tools 参数。独立成纯函数便于单测。
-fn tools_def_for(params: &ChatParams) -> Option<Value> {
-    if params.tools_enabled {
-        Some(Value::Array(tools::definitions()))
-    } else {
-        None
-    }
-}
-
-/// P9 B3：从模型回复解析 ```plan 围栏块（施工单 013 B3：计划产物结构化）。
-/// 行前缀容错匹配（中英文冒号、markdown 加粗/列表符都剥），小节顺序 目标→步骤→文件。
-/// 解析结果全空（无任何有效字段）返回 None。
-pub fn parse_plan(text: &str) -> Option<Plan> {
-    let fence = text.find("```plan")?;
-    let body_start = fence + text[fence..].find('\n')? + 1;
-    let body_end = text[body_start..]
-        .find("```")
-        .map(|i| body_start + i)
-        .unwrap_or(text.len());
-    let body = text[body_start..body_end].trim();
-    if body.is_empty() {
-        return None;
-    }
-
-    let mut goal = String::new();
-    let mut steps: Vec<String> = Vec::new();
-    let mut files: Vec<String> = Vec::new();
-    let mut in_steps = false;
-
-    for line in body.lines() {
-        let t = line.trim().trim_start_matches(['*', '#']).trim();
-        if t.is_empty() {
-            continue;
-        }
-        if t.starts_with("目标") {
-            goal = after_colon(t);
-        } else if t.starts_with("步骤") {
-            in_steps = true;
-        } else if t.starts_with("文件") {
-            in_steps = false;
-            files = after_colon(t)
-                .split([',', '，', '、', ';', '；', ' '])
-                .map(|s| s.trim().trim_matches('`').to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        } else if in_steps {
-            // 步骤项：剥序号 "1. " / "1、" / "1)" / "- "
-            let core = t
-                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '、' || c == ')' || c == '-')
-                .trim()
-                .to_string();
-            if !core.is_empty() {
-                steps.push(core);
-            }
-        }
-        // 小节外的散行忽略
-    }
-
-    if goal.is_empty() && steps.is_empty() && files.is_empty() {
-        None
-    } else {
-        Some(Plan { goal, steps, files })
-    }
-}
-
-/// P12 018：同轮 write_file 同路径写冲突检测——返回应跳过的索引集合。
-/// 输入 (工具名, arguments JSON)；仅认 write_file；路径小写 + 反斜杠归一后判重。
-fn write_conflict_skips(calls: &[(String, String)]) -> std::collections::HashSet<usize> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, (name, args_json)) in calls.iter().enumerate() {
-        if name != "write_file" {
-            continue;
-        }
-        let path = serde_json::from_str::<Value>(args_json)
-            .ok()
-            .and_then(|v| v.get("path").and_then(Value::as_str).map(|p| p.to_lowercase().replace('\\', "/")))
-            .unwrap_or_default();
-        if path.is_empty() {
-            continue;
-        }
-        if !seen.insert(path) {
-            skip.insert(i);
-        }
-    }
-    skip
-}
-
-/// 取行内第一个中/英文冒号后的内容（剥 markdown 加粗星号）。
-/// 用 char_indices 定位，避免全角冒号（3 字节）切出非字符边界。
-fn after_colon(line: &str) -> String {
-    for (i, c) in line.char_indices() {
-        if c == ':' || c == '：' {
-            return line[i + c.len_utf8()..].trim().trim_matches('*').trim().to_string();
-        }
-    }
-    String::new()
 }
 
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
