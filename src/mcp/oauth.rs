@@ -112,7 +112,13 @@ pub fn store_tokens(name: &str, tokens: McpTokens) {
         c.insert(name.to_string(), tokens);
         c.clone()
     };
-    let _ = save_all(&snapshot);
+    // N4：落盘失败不许静默吞——token 只在内存里，重启后「已授权」凭空消失且无迹可查
+    if let Err(e) = save_all(&snapshot) {
+        observability::event(
+            observability::EventType::Error,
+            json!({ "kind": "mcp.token_persist_failed", "server": name, "error": format!("{e:#}") }),
+        );
+    }
 }
 
 /// 撤销授权（删 token；下次调用回到「未授权」人话错误）。
@@ -122,7 +128,13 @@ pub fn revoke(name: &str) {
         c.remove(name);
         c.clone()
     };
-    let _ = save_all(&snapshot);
+    // N4：落盘失败不许静默吞——token 只在内存里，重启后「已授权」凭空消失且无迹可查
+    if let Err(e) = save_all(&snapshot) {
+        observability::event(
+            observability::EventType::Error,
+            json!({ "kind": "mcp.token_persist_failed", "server": name, "error": format!("{e:#}") }),
+        );
+    }
 }
 
 /// 授权状态（GET /api/mcp 展示 + 前端徽章）。

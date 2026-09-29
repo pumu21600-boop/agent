@@ -743,7 +743,12 @@ fn synth_def(srv: &str, name: &str) -> Value {
                 "arguments":{"type":"object","description":"模板参数（可选，键值均为字符串）"}
             },"required":["name"]}),
         ),
-        _ => unreachable!("未知合成工具"),
+        _ => {
+            // F11：兜底定义而不是 unreachable!——新增合成工具忘加分支时，
+            // panic 会拖垮整个 agent 进程；debug_assert 只在测试构建里喊
+            debug_assert!(false, "未知合成工具: {name}");
+            ("MCP 合成工具（未知类型）。", json!({"type":"object","properties":{}}))
+        }
     };
     json!({
         "type": "function",

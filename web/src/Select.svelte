@@ -91,9 +91,11 @@
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       hlIndex = Math.max(0, hlIndex - 1);
-    } else if (e.key === 'Enter' && options[hlIndex]) {
+    } else if (e.key === 'Enter') {
       e.preventDefault();
-      pick(options[hlIndex]);
+      // 没高亮项时 Enter 关菜单——原来无反馈不关，键盘只剩 Esc 可用（F15）
+      if (options[hlIndex]) pick(options[hlIndex]);
+      else open = false;
     } else if (e.key === 'Tab') {
       open = false;
     }

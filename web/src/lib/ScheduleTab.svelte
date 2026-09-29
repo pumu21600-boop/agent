@@ -92,7 +92,7 @@
   function newSchedule() {
     schedMsg = '';
     schedAdvOpen = false;
-    // 输入框一律留空不预填：cron/回顾天数/超时都有占位提示，留空走默认（天数缺省 3、超时缺省 1800 由服务端兜底）
+    // 输入框一律留空不预填：cron/回顾天数/超时都有占位提示，留空走默认（天数缺省 3、超时缺省 1800）
     schedEditor = {
       id: '',
       name: '',
@@ -115,7 +115,7 @@
   function editSchedule(t) {
     schedMsg = '';
     schedAdvOpen = schedAdvNonDefault(t);
-    // 0 = 走默认（超时服务端兜 1800）；回显为空 + 占位符，不显示突兀的 0
+    // 超时回显为空 + 占位符，不显示突兀的 0；保存时留空按 1800 发（见 saveSchedule）
     schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '' };
     previewCron();
   }
@@ -137,7 +137,8 @@
       approval_mode: e.approval_mode,
       on_approval: e.on_approval,
       enabled: e.enabled !== false,
-      timeout_secs: Number(e.timeout_secs) || 0,
+      // 留空 = 1800（与服务端 DEFAULT_TIMEOUT_SECS 对齐，显式发值不靠「0 走默认」隐式契约，F10）
+      timeout_secs: Number(e.timeout_secs) || 1800,
     };
     // 单次模式没选时间（或周期模式没产出 cron）：本地拦下，不发请求
     if (!String(body.cron || '').trim() && !body.once_ts) {
@@ -185,13 +186,19 @@
       schedMsg = `删除失败: ${e.message || e}`;
     }
   }
+  // 「立即运行」防连点（F6）：跑着的任务按钮置灰，响应回来才恢复
+  let runningIds = {};
   async function runScheduleNow(id) {
+    if (runningIds[id]) return;
+    runningIds = { ...runningIds, [id]: true };
     try {
       const r = await fetch(`/api/schedules/run?id=${encodeURIComponent(id)}`, { method: 'POST' }).then((r) => r.json());
       schedMsg = r.ok ? '已触发，跑完会出现在下面的完成记录里' : `触发失败: ${r.error}`;
       setTimeout(loadSchedules, 1500);
     } catch (e) {
       schedMsg = `触发失败: ${e.message || e}`;
+    } finally {
+      runningIds = { ...runningIds, [id]: false };
     }
   }
   function schedNextText(t) {
@@ -317,7 +324,7 @@
                 {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
                 {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
                 <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => runScheduleNow(t.id)}>立即运行</button>
+                <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
                 <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
               </div>

@@ -24,7 +24,11 @@
           class="rename-input"
           bind:value={modal.value}
           placeholder={modal.kind === 'project' ? '留空恢复为文件夹名' : '会话标题'}
-          on:keydown={(e) => e.key === 'Enter' && submit()}
+          on:keydown={(e) => {
+            // 中文输入法组词中的 Enter 只确认候选词，不触发提交（与主输入框 handleKey 一致，F2）
+            if (e.isComposing || e.keyCode === 229) return;
+            if (e.key === 'Enter') submit();
+          }}
         />
       </div>
       <div class="rename-actions">

@@ -189,7 +189,19 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             return Sse::new(UnboundedReceiverStream::new(srx)).into_response();
         }
     }
-    let run_flag = run_flag.expect("占位或接管必得其一");
+    // 构造上不可达（占位/接管必得其一）；显式 500 而不是 expect——新增分支忘接
+    // run_flag 时，panic 拖垮的是整个 agent 进程（F12）
+    let Some(run_flag) = run_flag else {
+        observability::event(
+            EventType::Error,
+            json!({ "kind": "chat.run_flag_missing", "session": session_id }),
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "服务内部状态异常：会话占位缺失，请重发这条消息" })),
+        )
+            .into_response();
+    };
     // P7 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
     // P22-C 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。

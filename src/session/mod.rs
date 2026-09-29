@@ -233,10 +233,10 @@ impl SessionManager {
     }
 
     /// 改会话标题（P8 TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
+    /// 不动 updated_at：list 与「上次做到哪」都按它排序，改名不该把老会话顶到最前（与 set_flags 口径一致，F7）。
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
         let Some(mut f) = self.get(id) else { return Ok(()) };
         f.title = title.chars().take(60).collect();
-        f.updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         self.write(&f)
     }
 
@@ -538,5 +538,36 @@ mod tests {
         // 别的项目不算同项目
         assert!(m.previous_in_workspace("C:\\somewhere\\else", &fresh).is_none());
         assert!(m.project_brief(&fresh, None).is_some(), "换基线仍有上一条会话可写");
+    }
+
+    #[test]
+    fn rename_keeps_updated_at() {
+        // F7：改名不许动 updated_at——list 与「上次做到哪」都按它排序，
+        // 动了老会话会跳到侧栏最前，且「上次做到哪」可能选错会话
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("rename");
+        let a = m.new_id();
+        m.save(&a, &[json!({"role":"user","content":"旧标题的开头"})], None).unwrap();
+        // 人为把 updated_at 压老，模拟一个很久前的会话
+        let mut f = m.get(&a).unwrap();
+        f.updated_at = "2020-01-01T00:00:00.000Z".to_string();
+        m.write(&f).unwrap();
+
+        m.rename(&a, "新标题").unwrap();
+
+        let after = m.get(&a).unwrap();
+        assert_eq!(after.title, "新标题", "标题应改");
+        assert_eq!(after.updated_at, "2020-01-01T00:00:00.000Z", "updated_at 不该被动");
+        // 排序佐证：另建一个新会话，改名的老会话仍排在它后面
+        let b = m.new_id();
+        m.save(&b, &[json!({"role":"user","content":"更新的会话"})], None).unwrap();
+        let order: Vec<String> = m.list().into_iter().map(|x| x.id).collect();
+        let pos_b = order.iter().position(|id| id == &b).unwrap();
+        let pos_a = order.iter().position(|id| id == &a).unwrap();
+        assert!(pos_a > pos_b, "改名后的老会话不该被顶到前面: {order:?}");
     }
 }

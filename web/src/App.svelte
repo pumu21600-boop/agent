@@ -1,5 +1,5 @@
 <script>
-  import { onMount, afterUpdate, tick } from 'svelte';
+  import { onMount, afterUpdate, onDestroy, tick } from 'svelte';
   import Select from './Select.svelte';
   import Galaxy from './Galaxy.svelte';
   import ImagePreview from './lib/ImagePreview.svelte';
@@ -448,6 +448,8 @@
   // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
   // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
   const APPROVAL_LABELS = { 'read-only': '只读', sandbox: '沙箱', auto: '自动', 'full-access': '完全访问' };
+  // 审批档切换的请求序号：并发乱序时以「最后一次点击」为准，过期响应丢弃（F14）
+  let approvalPickSeq = 0;
   function pickApproval(m) {
     const key = currentSessionId || '@new';
     approvalMode = m;
@@ -455,6 +457,7 @@
     approvalMenuOpen = false;
     localStorage.setItem('approvalMode', m);
     // M1：带当前会话 id——多会话并发时只切本会话的档（不带 session 才改全局默认）
+    const seq = ++approvalPickSeq;
     fetch('/api/approval-mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -462,6 +465,7 @@
     })
       .then((r) => r.json())
       .then((r) => {
+        if (seq !== approvalPickSeq) return; // 过期响应：之后又有新点击，不许覆盖本地档位
         // 服务端可能把「完全访问」降级为「自动」（config 未开脱沙箱）：以服务端裁决为准
         if (r && r.mode && r.mode !== m) {
           approvalMode = r.mode;
@@ -469,7 +473,7 @@
           localStorage.setItem('approvalMode', r.mode);
         }
       })
-      .catch(() => {});
+      .catch((e) => console.warn('审批档位切换失败', e)); // 原来空吞错，失败至少留痕（F13）
   }
 
   function handleKey(e) {
@@ -482,6 +486,14 @@
   }
   function autoRows(e) {
     const el = e.target;
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+  }
+
+  // 程序化改动 input 后手动回收高度（不触发 input 事件，autoRows 不会跑）
+  function resetComposerHeight() {
+    const el = composerInputEl;
+    if (!el) return;
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 160) + 'px';
   }
@@ -570,13 +582,15 @@
       const d = await r.json();
       if (d.error) {
         settingsMsg = `保存失败: ${d.error}`;
-        return;
+        return false;
       }
       apiKey = '';
       applyState(d);
       flashSaved();
+      return true;
     } catch (e) {
       settingsMsg = `保存失败: ${e}`;
+      return false;
     }
   }
 
@@ -651,6 +665,8 @@
   }
 
   async function toggleModel(m) {
+    const prevModels = savedModels;
+    const prevModel = model;
     const list = savedModels.includes(m)
       ? savedModels.filter((x) => x !== m)
       : [...savedModels, m].sort();
@@ -662,10 +678,15 @@
     }
     // A2（施工单 012）：能力标记归用户所有，切换/勾选模型不再改写 capabilities；
     // 后端仅在该配置无用户标记历史时按新模型名推导初值
-    await sendSettings({ models: list, model: newModel, api_key: apiKey.trim() || undefined });
+    if (!(await sendSettings({ models: list, model: newModel, api_key: apiKey.trim() || undefined }))) {
+      savedModels = prevModels; // F3：保存失败回滚，勾选态不许与后端脱节
+      model = prevModel;
+    }
   }
 
   async function selectAllModels() {
+    const prevModels = savedModels;
+    const prevModel = model;
     const list = [...fetchedModels].sort();
     savedModels = list;
     let newModel = model;
@@ -674,21 +695,32 @@
       model = newModel;
     }
     // A2：同上，不随选择改写能力标记
-    await sendSettings({ models: list, model: newModel });
+    if (!(await sendSettings({ models: list, model: newModel }))) {
+      savedModels = prevModels;
+      model = prevModel;
+    }
   }
 
   async function selectNoModels() {
+    const prevModels = savedModels;
+    const prevModel = model;
     savedModels = [];
     model = '';
-    await sendSettings({ models: [], model: '' });
+    if (!(await sendSettings({ models: [], model: '' }))) {
+      savedModels = prevModels;
+      model = prevModel;
+    }
   }
 
   // —— 模型快选 ——
   async function pickModel(m) {
+    const prevModel = model;
     model = m;
     modelMenuOpen = false;
     // 能力标记完全由用户手动勾选，切换模型不改写
-    await sendSettings({ model: m });
+    if (!(await sendSettings({ model: m }))) {
+      model = prevModel;
+    }
   }
 
   // 快选菜单里跨配置选模型：先切激活配置，再把该配置的模型设为目标
@@ -716,8 +748,7 @@
     el.focus();
     const caret = s + text.length;
     el.setSelectionRange(caret, caret);
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    resetComposerHeight();
   }
 
   async function openCtxPicker() {
@@ -999,6 +1030,9 @@
     }, 2000);
   }
   webStartAgentWatch();
+  onDestroy(() => {
+    if (webAgentWatch) clearInterval(webAgentWatch); // N2：常开轮询随组件销毁收掉
+  });
 
 
   // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
@@ -1962,6 +1996,7 @@
     if (!msg && atts.length === 0) return;
     const key = curKey();
     input = '';
+    resetComposerHeight(); // F4：发送后清空是程序化赋值，不触发 input 事件，高度得手动回收
     pendingAttachments = [];
     if (streams[key]) {
       queueOut(key, msg, atts);
@@ -2718,12 +2753,18 @@
     const modal = renameModal;
     renameModal = null;
     if (modal.kind === 'session') {
-      if (v && v !== modal.value) {
+      // orig = 打开弹窗时的原标题。输入框 bind 直接改 modal.value，拿它比较
+      // 恒为假——请求永远发不出（F1），必须拿原值比
+      if (v && v !== modal.orig) {
         fetch('/api/sessions/meta', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id: modal.target, title: v }),
-        }).then(() => loadSessions());
+        }).then(() => {
+          // F5：改的就是当前会话时同步顶栏（否则侧栏变了顶栏仍旧名）
+          if (modal.target === currentSessionId) currentTitle = v.slice(0, 60); // 与后端 60 字截断对齐
+          loadSessions();
+        });
       }
     } else {
       fetch('/api/workspace/alias', {
@@ -2810,11 +2851,20 @@
   // remember=true → 本会话内「同类操作」不再询问（P9 A3）；后端拒绝记忆 Dangerous 档。
   async function decideApproval(id, approved, remember = false) {
     patchMessageApproval(id, approved);
-    await fetch('/api/approvals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, approved, remember }),
-    });
+    try {
+      const r = await fetch('/api/approvals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, approved, remember }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    } catch (e) {
+      // F13：失败回滚本地标记（后端没收到决定，UI 不能显示已决定）+ 人话提示
+      updMsgs(curKey(), (a) =>
+        a.map((m) => (m.approval && m.approval.id === id ? { ...m, approval: { ...m.approval, decided: null } } : m))
+      );
+      pushMsg(curKey(), { id: nextId(), role: 'error', content: `[审批决定提交失败，已恢复待决定] ${e}` });
+    }
   }
   function patchMessageApproval(id, approved) {
     updMsgs(curKey(), (a) =>
@@ -3570,7 +3620,7 @@
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.2 19.8 9.5a1 1 0 0 1-.94 1.68l-2.6-.52-3.62 3.62.55 2.87a1 1 0 0 1-1.7.89L9.9 16.4l-4.6 4.6-1.3-1.3 4.6-4.6-1.64-1.64a1 1 0 0 1 .89-1.7l2.87.55 3.62-3.62-.52-2.6a1 1 0 0 1 1.68-.94Z"/></svg>
                   {s.pinned ? '取消置顶' : '置顶'}
                 </button>
-                <button on:click|stopPropagation={() => { sessMenuId = null; renameModal = { kind: 'session', target: s.id, value: s.title }; }}>
+                <button on:click|stopPropagation={() => { sessMenuId = null; renameModal = { kind: 'session', target: s.id, value: s.title, orig: s.title }; }}>
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16.8 3.7a2.1 2.1 0 0 1 3 3L7.3 19.2 3 20.3l1.1-4.3Z"/><path d="M13.5 20h7"/></svg>
                   重命名
                 </button>

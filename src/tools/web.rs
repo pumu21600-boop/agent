@@ -78,8 +78,102 @@ pub(crate) fn web_client() -> Result<reqwest::Client, String> {
         // 搜索引擎按 TLS/协议指纹分流：HTTP/2 客户端会被当成爬虫，回一张「查询对得上、结果
         // 全是别的东西」的页面（真机踩过：查「rust 语言」返回西班牙股票、德国天气）。HTTP/1.1 正常。
         .http1_only()
+        // 重定向也要过 SSRF 闸（N3）：公网页 302 跳 169.254.169.254（云元数据）/
+        // localhost（本机管理口）是经典打法。IP 字面量内段直接掐掉；域名放行——
+        // 域名解析发生在代理侧，预检覆盖不到（直连场景预检已拦）。
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let host_ok = match attempt.url().host_str() {
+                Some(h) => match h.parse::<std::net::IpAddr>() {
+                    Ok(ip) => !is_private_ip(ip),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            if !host_ok || attempt.previous().len() >= 5 {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
+}
+
+/// 响应体字节上限：流式读到这就断，后续分片丢弃，再走字符截断（N3）。
+/// 旧写法 `resp.text()` 整体读——超大/无尽头响应先撑爆内存，max_chars 字符截断拦不住。
+const WEB_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 流式读响应体（带上限）。utf8 按整体 lossy 解码：截断处可能切在汉字中间，
+/// 末字符变 U+FFFD 无所谓——紧接着还有 max_chars 截断，且这是抓取不是流式正文。
+async fn read_body_capped(resp: reqwest::Response) -> Result<String, String> {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读响应失败: {e}"))?;
+        if body.len() >= WEB_BODY_MAX_BYTES {
+            break;
+        }
+        let take = chunk.len().min(WEB_BODY_MAX_BYTES - body.len());
+        body.extend_from_slice(&chunk[..take]);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// 内网/环回/链路本地段判定（SSRF 黑名单，N3）。
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local() // fc00::/7
+                // IPv6 链路本地 fe80::/10（std 无稳定判定，按首段掩码手算）
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped / IPv4-compatible（::ffff:127.0.0.1 这类）按内段判
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_private_ip(std::net::IpAddr::V4(v4)))
+                || v6.to_ipv4().is_some_and(|v4| is_private_ip(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// SSRF 预检（N3）：拒绝指向环回/内网/链路本地的抓取目标。IP 字面量直接判段；
+/// 域名解析后逐个 IP 判段。DNS 解析失败不拦——代理场景下 DNS 在代理侧完成，
+/// 本机可能查不到（误拦比漏拦更伤：搜索/抓取是常用路径）。
+/// 本地 dev 要抓 127.0.0.1 得显式开 AGENT_WEB_ALLOW_PRIVATE=1
+/// （与 AGENT_WEB_DEBUG_DIR / AGENT_BROWSER_PATH 同款环境变量开关）。
+async fn ensure_public_target(url: &str) -> Result<(), String> {
+    if std::env::var("AGENT_WEB_ALLOW_PRIVATE").is_ok() {
+        return Ok(());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("url 解析失败: {e}"))?;
+    let host = parsed.host_str().ok_or("url 缺少主机名")?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::IpAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => match tokio::net::lookup_host((host, port)).await {
+            Ok(it) => it.map(|s| s.ip()).collect(),
+            Err(_) => return Ok(()),
+        },
+    };
+    for ip in addrs {
+        if is_private_ip(ip) {
+            return Err(format!(
+                "拒绝抓取内网地址 {host}（{ip}）：web_fetch 不抓环回/内网/链路本地目标（SSRF 防护）。\
+                 本地调试可设 AGENT_WEB_ALLOW_PRIVATE=1 放开"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, String> {
@@ -88,6 +182,7 @@ pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, St
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("url 必须以 http:// 或 https:// 开头".to_string());
     }
+    ensure_public_target(url).await?;
     let client = web_client()?;
     let resp = client
         .get(url)
@@ -98,7 +193,7 @@ pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, St
     if !status.is_success() {
         return Err(format!("渠道返回 {status}"));
     }
-    let body = resp.text().await.map_err(|e| format!("读响应失败: {e}"))?;
+    let body = read_body_capped(resp).await?;
     let is_html = body.trim_start().starts_with('<') || body.contains("<html");
     let text = if is_html { html_to_text(&body) } else { body };
     if text.trim().is_empty() {
@@ -138,7 +233,7 @@ pub(crate) async fn web_search(args: &str, max_chars: usize) -> Result<String, S
                 // 关键：只认落在「搜索结果页」上的响应。Bing 会把请求重定向到首页（/?q=…），
                 // 首页上的推荐链接也带同类 CSS 类名，照解析就会把推荐位当搜索结果（真机踩过）。
                 let effective = r.url().clone();
-                let html = r.text().await.unwrap_or_default();
+                let html = read_body_capped(r).await.unwrap_or_default();
                 let got = match kind {
                     "rss" => parse_bing_rss(&html, count),
                     "bing" => parse_bing(&html, count),
@@ -456,4 +551,36 @@ pub(crate) fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_private_ip_covers_ssrf_targets() {
+        // N3：环回/私网/链路本地（云元数据 169.254.169.254）/未指定/组播一律算内网
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1", // IPv4-mapped 环回
+            "::ffff:169.254.169.254",
+            "fc00::1",  // 唯一本地地址
+            "fe80::1",  // 链路本地
+            "::",       // 未指定
+        ] {
+            let a: std::net::IpAddr = ip.parse().unwrap();
+            assert!(is_private_ip(a), "{ip} 应判为内网");
+        }
+        for ip in ["8.8.8.8", "1.1.1.1", "104.16.0.1", "2606:4700::1111", "2001:4860:4860::8888"] {
+            let a: std::net::IpAddr = ip.parse().unwrap();
+            assert!(!is_private_ip(a), "{ip} 是公网地址，不该误拦");
+        }
+    }
 }

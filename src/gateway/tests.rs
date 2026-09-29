@@ -301,3 +301,24 @@
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         mock.join().unwrap();
     }
+    #[test]
+    fn take_line_survives_utf8_split_across_chunks() {
+        // N1：网络分片边界不保证 UTF-8 字符完整。「你」= E4 BD A0、「好」= E5 A5 BD，
+        // 从「你」第三个字节处切开——旧写法（逐分片 from_utf8_lossy）会把两个半截
+        // 汉字碎成 U+FFFD 永久进正文。take_line 按字节攒完整行再解码，不该出替换符。
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice("data: {\"content\":\"\u{4f60}".as_bytes());
+        buf.truncate(buf.len() - 1); // 砍掉「你」的最后一个字节，模拟分片切在字符中间
+        assert_eq!(take_line(&mut buf), None, "半个汉字 + 半行不该出行");
+        buf.extend_from_slice(b"\xA0"); // 补齐「你」被砍掉的尾字节（裸字节，不是 U+00A0 字符）
+        buf.extend_from_slice("好".as_bytes());
+        buf.extend_from_slice("\"}\n".as_bytes());
+        let line = take_line(&mut buf).expect("补齐后应出完整行");
+        assert_eq!(line, "data: {\"content\":\"你好\"}");
+        assert!(!line.contains('\u{FFFD}'), "不该出现 U+FFFD 替换符: {line:?}");
+        assert_eq!(take_line(&mut buf), None, "行已取完");
+        // 回归：\r\n 行尾与空行照旧处理
+        buf.extend_from_slice(b"data: x\r\n\r\n");
+        assert_eq!(take_line(&mut buf).as_deref(), Some("data: x"));
+        assert_eq!(take_line(&mut buf).as_deref(), Some(""));
+    }

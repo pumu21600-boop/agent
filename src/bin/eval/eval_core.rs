@@ -261,7 +261,7 @@ pub async fn drive_turn(
 
     let mut out = DriveResult::default();
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
@@ -276,11 +276,13 @@ pub async fn drive_turn(
             Some(Ok(b)) => b,
             Some(Err(_)) | None => break, // 连接结束/中断
         };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(pos) = buf.find("\n\n") {
-            let raw = buf[..pos].to_string();
-            buf.drain(..pos + 2);
-            for line in raw.split('\n') {
+        buf.extend_from_slice(&bytes);
+        // 同 gateway（N1）：字节缓冲、按事件界（\n\n）切再解码——逐分片 lossy
+        // 会把跨片的汉字碎成 U+FFFD，评测正文与 sse_events 都会失真
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let raw: Vec<u8> = buf.drain(..pos + 2).collect();
+            let event = String::from_utf8_lossy(&raw[..pos]);
+            for line in event.split('\n') {
                 let Some(data) = line.strip_prefix("data: ") else { continue };
                 let Ok(ev) = serde_json::from_str::<Value>(data) else { continue };
                 if let Some(obj) = ev.as_object()

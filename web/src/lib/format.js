@@ -1,7 +1,8 @@
 // 纯格式化/判定助手（P19 App.svelte 拆分）：无组件状态依赖，App 与各视图组件共用。
 
 export function fmtBytes(b) {
-  if (!b) return '0B';
+  // NaN/负数/非数字一律按 0 显示（!b 会吞 NaN 显示 "0B" 但放过 -5 显示 "-5B"，F9）
+  if (!Number.isFinite(b) || b < 0) return '0B';
   if (b < 1024) return `${b}B`;
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)}KB`;
   return `${(b / (1024 * 1024)).toFixed(1)}MB`;
@@ -9,7 +10,10 @@ export function fmtBytes(b) {
 
 export function relTime(iso) {
   if (!iso) return '';
-  const ms = Date.now() - new Date(iso).getTime();
+  const t = new Date(iso).getTime();
+  // 非法日期：NaN 会让后续比较全 false 落兜底，输出 "Invalid Date"（F8）
+  if (!Number.isFinite(t)) return '';
+  const ms = Date.now() - t;
   const m = Math.floor(ms / 60000);
   if (m < 1) return '刚刚';
   if (m < 60) return `${m}分钟前`;
@@ -65,7 +69,10 @@ export function normPath(p) {
 // 时间用 DSH 短格式：4天 / 3小时 / 刚刚
 export function relShort(iso) {
   if (!iso) return '';
-  const ms = Date.now() - new Date(iso).getTime();
+  const t = new Date(iso).getTime();
+  // 同 relTime：非法日期直接空串，别输出 "NaN天"（F8）
+  if (!Number.isFinite(t)) return '';
+  const ms = Date.now() - t;
   const m = Math.floor(ms / 60000);
   if (m < 1) return '刚刚';
   if (m < 60) return `${m}分钟`;

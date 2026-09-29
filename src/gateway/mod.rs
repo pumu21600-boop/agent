@@ -40,6 +40,16 @@ use compat::{Compat, Protocol, ThinkingFormat};
 use providers::ProviderPreset;
 use tags::TagSplit;
 
+/// 从字节缓冲头部切出第一行（含 '\n'）并解码为 String；没有完整行则返回 None。
+/// 跨分片的 UTF-8 字符（汉字 3 字节被网络分片切开）不完整时留在 buf 里等后续
+/// 字节——逐分片 `from_utf8_lossy` 会把它们碎成 U+FFFD 永久进正文（N1）。
+pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let pos = buf.iter().position(|&b| b == b'\n')?;
+    let raw: Vec<u8> = buf.drain(..=pos).collect();
+    let decoded = String::from_utf8_lossy(&raw[..raw.len() - 1]); // 末字节是 '\n'
+    Some(decoded.trim_end_matches('\r').to_string())
+}
+
 pub struct Gateway {
     /// 热可重建的 HTTP 客户端：reqwest 在构建时固化系统代理设置，
     /// 之后 Clash 开/关/换节点不会自动跟进。网络层失败时 rebuild_client()
@@ -742,7 +752,7 @@ impl Gateway {
         // 分片间 120s 无数据即报错（渠道/代理断流时不再干等总超时 600s）
         const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let mut stream = response.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut done = false;
         let mut agg = StreamAgg::new();
         // Anthropic 协议（P23）：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
@@ -755,10 +765,10 @@ impl Gateway {
             };
             let Some(item) = item else { break };
             let bytes = item.context("读流失败")?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf.drain(..=pos);
+            buf.extend_from_slice(&bytes);
+            // 按字节缓冲、按行解码（take_line）：分片边界不保证 UTF-8 字符完整，
+            // 逐分片 from_utf8_lossy 会把跨片的汉字碎成 U+FFFD 永久进正文（N1）
+            while let Some(line) = take_line(&mut buf) {
                 if line.is_empty() {
                     continue;
                 }
