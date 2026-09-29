@@ -340,7 +340,6 @@
 
   // —— P8.2 工作区切换 ——
   async function applyWorkspace(path) {
-    wsMsg = '切换中…';
     try {
       const r = await fetch('/api/workspace', {
         method: 'POST',
@@ -349,7 +348,6 @@
       });
       const d = await r.json();
       if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
-      wsMsg = '';
       wsModalOpen = false;
       // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
       currentSessionId = null;
@@ -371,7 +369,9 @@
       await loadSettings();
       await loadSessions(true);
     } catch (e) {
-      wsMsg = `切换失败: ${e.message}`;
+      // wsMsg 只渲染在 WorkspaceModal 里，而那个弹窗没有任何置 true 的入口（死代码）——
+      // 切换失败一直是静默的。改应用内提示弹窗，壳内外都可见。
+      await confirmAsk(`切换项目失败：${e.message}`, true);
     }
   }
 
@@ -2360,7 +2360,8 @@
         body: JSON.stringify({ id }),
       }).then((r) => r.json());
       if (r.error) {
-        settingsMsg = r.error;
+        // 侧栏点会话打不开：settingsMsg 只在设置弹窗里渲染，这里必须可见反馈
+        await confirmAsk(`打开会话失败：${r.error}`, true);
         return;
       }
       currentSessionId = id;
@@ -2382,7 +2383,7 @@
       syncCur();
       restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
       dockCp = null;
-      if (r.warning) settingsMsg = r.warning;
+      if (r.warning) await confirmAsk(r.warning, true);
       if (r.switched) {
         // 项目换了：配置（工作区路径/AGENTS.md）与会话分组都要跟着刷新
         await loadSettings();
@@ -2416,10 +2417,10 @@
         }
         await loadSessions();
       } else if (r.error) {
-        settingsMsg = `新建会话失败: ${r.error}`;
+        await confirmAsk(`新建会话失败：${r.error}`, true);
       }
     } catch (e) {
-      settingsMsg = `新建会话失败: ${e.message || e}`;
+      await confirmAsk(`新建会话失败：${e.message || e}`, true);
     }
   }
 
@@ -2582,8 +2583,8 @@
   async function switchProject(path) {
     if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) return;
     if (Object.keys(streams).length > 0) {
-      // 切项目会重置所有会话缓冲，等所有会话跑完再切
-      settingsMsg = '有会话正在运行，稍后再切换项目';
+      // 切项目会重置所有会话缓冲。同上：拒绝可以，但要让人看见原因
+      await confirmAsk('有会话正在运行，等它跑完再切换项目。', true);
       return;
     }
     await applyWorkspace(path);
@@ -2652,13 +2653,17 @@
       if (r.canceled || !r.path) return;
       await applyWorkspace(r.path);
     } catch (e) {
-      settingsMsg = `选择文件夹失败: ${e.message || e}`;
+      // settingsMsg 只在设置弹窗里渲染——侧栏操作时不可见，改应用内提示弹窗
+      await confirmAsk(`选择文件夹失败：${e.message || e}`, true);
     }
   }
 
   async function removeProject(path, name) {
     if (normPath(path).toLowerCase() === normPath(workspace).toLowerCase()) {
-      settingsMsg = '当前项目不能移除，先切换到其他项目';
+      // 列表最上面那条就是当前项目（projectList 把它固定放首位）。拦下来可以，但理由
+      // 必须可见：settingsMsg 只在设置弹窗里渲染，侧栏操作时写了等于没写（用户实锤
+      // 「最上面的删除项目无效」）——应用内提示弹窗说清楚。
+      await confirmAsk(`「${name}」是当前正在使用的项目，不能移除。\n先切换到其他项目，再来移除它。`, true);
       return;
     }
     if (!(await confirmAsk(`从侧边栏移除项目「${name}」？\n只移出列表，不删除磁盘上的文件夹与会话。`))) return;
@@ -2703,7 +2708,7 @@
       await loadSessions();
       if (r.id) await loadSession(r.id);
     } catch (e) {
-      settingsMsg = `分叉失败: ${e.message || e}`;
+      await confirmAsk(`分叉失败：${e.message || e}`, true);
     }
   }
 
