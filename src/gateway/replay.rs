@@ -76,12 +76,15 @@ fn should_preserve_replay(model_id: &str, compat: &Compat) -> bool {
 /// 1) assistant 消息的思考回放字段——保留（DeepSeek/zai 契约或白名单模型）或剥离（其余）；
 /// 2) OpenRouter 形态 reasoning_details → reasoning 字符串合并后再按契约去留；
 /// 3) developer 角色改写（上游 supportsDeveloperRole：OpenAI 新系）；
-/// 4) 空消息过滤（上游 requiresNonEmptyUserOrAssistantMessage：ModelStudio/Qwen）。
+/// 4) 空消息过滤（上游 requiresNonEmptyUserOrAssistantMessage：ModelStudio/Qwen）；
+/// 5) display_only 消息剔除（P27）：通知/错误等前端气泡随会话落盘只为重启后界面还在，
+///    这里统一剥离——两条协议的请求体组装都在本净化之后，一处过滤即全渠道生效。
 pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &Compat) {
     let arr = match messages.as_array_mut() {
         Some(a) => a,
         None => return,
     };
+    arr.retain(|m| m.get("display_only").and_then(Value::as_bool) != Some(true));
     let preserve = should_preserve_replay(model_id, compat);
 
     for msg in arr.iter_mut() {
@@ -191,6 +194,20 @@ mod tests {
         let a = msgs.as_array().unwrap();
         assert!(a[1].get("reasoning_content").is_none(), "非契约端点应剥离 reasoning_content");
         assert_eq!(a[1]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn drops_display_only_notices() {
+        // P27：通知/错误气泡（display_only）只随会话落盘给界面回放，绝不进模型上下文
+        let mut msgs = json!([
+            {"role":"system","content":"sys prompt"},
+            {"role":"user","content":"hi"},
+            {"role":"system","content":"[通知] 回答达到最大输出长度被截断","display_only":true},
+            {"role":"system","content":"[错误] 渠道超时","display_only":true}
+        ]);
+        apply_outgoing_transforms(&mut msgs, "mystery-model", &openai_compat());
+        let roles: Vec<&str> = msgs.as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "user"], "display_only 消息应被剥离");
     }
 
     #[test]

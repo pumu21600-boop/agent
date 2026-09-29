@@ -723,6 +723,19 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 // 失败被悄悄吞掉（若下一轮同样失败，会再报一次错，语义仍然清楚）
                 observability::event(EventType::Error, json!({ "message": e.to_string() }));
                 send(json!({ "error": e.to_string() }));
+                // P27：错误随会话落盘（重启/切回会话后报错气泡还在）。display_only 消息，
+                // 发送侧 replay 剥离，不进模型上下文。
+                {
+                    let mut snap = last_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                    snap.push(json!({ "role": "system", "content": format!("[错误] {e}"), "display_only": true }));
+                    let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Err(se) = session.save(&session_id, &snap, cur_summary.as_deref()) {
+                        observability::event(
+                            EventType::Error,
+                            json!({ "message": format!("会话落盘失败: {se}") }),
+                        );
+                    }
+                }
             }
         }
         // M2 收尾顺序：**先注销占位、再取队列**。顺序反过来的话，「入队后没人取」的窗口

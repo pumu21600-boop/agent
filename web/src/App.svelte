@@ -2317,10 +2317,12 @@
       projectName = r.project || '';
       sessions = r.sessions || [];
       // 启动/切项目时恢复最近一条会话：只认当前工作区里的会话。
-      // 不筛会打开别的项目的会话，而 /api/sessions/open 会把工作区切回那个项目（侧栏项目来回弹）
+      // 不筛会打开别的项目的会话，而 /api/sessions/open 会把工作区切回那个项目（侧栏项目来回弹）。
+      // 无 workspace 标记的遗留会话不许自动弹：新建工作区会翻出最老的一批测试会话
+      // （2026-09-29 用户实锤「只回复两个字：收到」轮）；侧栏「未分组」里仍可手动打开。
       if (autoPick && currentSessionId === null) {
         const mine = sessions.filter(
-          (s) => !s.workspace || normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase(),
+          (s) => s.workspace && normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase(),
         );
         if (mine.length) await loadSession(mine[0].id);
       }
@@ -2762,6 +2764,9 @@
           streaming: false,
         };
         out.push(asst);
+      } else if (m.role === 'system') {
+        // P27：通知/错误随会话落盘（display_only），重启/切回会话后气泡还在
+        out.push({ id: nextId(), role: 'system', content: contentText(m.content) });
       } else if (m.role === 'tool') {
         const asst = [...out].reverse().find(
           (x) => x.role === 'assistant' && (x.tools || []).some((t) => t.id === m.tool_call_id)

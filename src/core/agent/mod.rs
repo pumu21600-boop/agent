@@ -85,6 +85,10 @@ pub const PLAN_PROMPT: &str = "\
 ```\n\
 用户批准该计划后才会开始实际执行。";
 
+/// P27 截断自动续写时临时注入的用户消息：只进续写请求的上下文（cont_ctx），
+/// 不进 canonical msgs——不落盘、不产生气泡，模型对外表现为「一条完整的回答」。
+const CONTINUE_PROMPT: &str = "（系统提示：上一条回答因达到最大输出长度被截断。请从截断处直接继续输出剩余内容，不要重复已有内容，也不要重新开始。）";
+
 /// P8 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
 pub struct LoopChannels {
     /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
@@ -157,6 +161,85 @@ pub trait ApprovalGate: Send + Sync {
 pub enum LoopOutcome {
     Done,
     Cancelled,
+}
+
+/// 渠道链调用（P27 从 run_task 抽出，续写复用同一套）：主渠道当轮失败按序换 fallback
+/// 重试同一步；取消置位立即停（不降级）。流式增量原样转发 on_event；换渠道时先发
+/// StepReset（前端丢半截内容）+ 人话提示。返回 (结果, 提示文本)——提示已实时转发过，
+/// 调用方负责 persist_notice 补进上下文落盘（重启后气泡还在）。
+#[allow(clippy::too_many_arguments)]
+async fn run_chain(
+    gateway: &Arc<Gateway>,
+    chain: &[&Channel],
+    ctx: &[Value],
+    tools_def: Option<&Value>,
+    cancel: &CancelFlag,
+    usage_ctx: &UsageCtx,
+    step: u32,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) -> (anyhow::Result<ChatOutcome>, Vec<String>) {
+    let mut notices = Vec::new();
+    let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
+    // 本步当前这次尝试已经推给前端的字符数（UTF-16 码元，与 JS String.length 同口径）。
+    // 换渠道重试时前端要按这个数把半截内容丢掉——否则界面会出现「半截 + 完整」叠着显示。
+    let streamed_content = std::sync::atomic::AtomicUsize::new(0);
+    let streamed_reasoning = std::sync::atomic::AtomicUsize::new(0);
+    for (i, ch) in chain.iter().enumerate() {
+        if i > 0 {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "gateway.fallback", "step": step, "from": chain[0].model, "to": ch.model, "base_url": ch.base_url }),
+            );
+            let last_err = outcome.err().map(|e| e.to_string()).unwrap_or_default();
+            on_event(AgentEvent::StepReset {
+                content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
+                reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
+            });
+            let note = format!("主渠道调用失败（{last_err}），已切换到降级渠道「{}」", ch.model);
+            on_event(AgentEvent::Notice(note.clone()));
+            notices.push(note);
+        }
+        outcome = gateway
+            .stream_chat(usage_ctx, ch, &Value::Array(ctx.to_vec()), tools_def, cancel, |chunk| {
+                let delta = extract_delta(chunk);
+                if !delta.content.is_empty() {
+                    streamed_content.fetch_add(
+                        delta.content.encode_utf16().count(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    on_event(AgentEvent::Content(delta.content));
+                }
+                if let Some(r) = delta.reasoning
+                    && !r.is_empty() {
+                        streamed_reasoning.fetch_add(
+                            r.encode_utf16().count(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        on_event(AgentEvent::Reasoning(r));
+                    }
+            })
+            .await;
+        match &outcome {
+            Ok(ChatOutcome::Done(_)) => break,
+            Ok(ChatOutcome::Cancelled) => return (outcome, notices),
+            Err(_) => continue, // 换下一个渠道
+        }
+    }
+    (outcome, notices)
+}
+
+/// 通知持久化（P27）：通知以 display_only 消息进上下文——随 Snapshot 落盘，重启/切回
+/// 会话后气泡还在；发送侧由 gateway replay 净化剥离（模型永远看不到）。
+/// 提示已实时转发过 Notice 事件的调用方用这个（如渠道链降级提示）。
+fn persist_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: &str) {
+    msgs.push(json!({ "role": "system", "content": format!("[通知] {text}"), "display_only": true }));
+    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(msgs) });
+}
+
+/// 实时转发 + 持久化（绝大多数通知走这个）。
+fn emit_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: String) {
+    on_event(AgentEvent::Notice(text.clone()));
+    persist_notice(msgs, on_event, &text);
 }
 
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
@@ -346,10 +429,11 @@ pub async fn run_task(
                             json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "auto", "context_pct": pct }),
                         );
                         mem.record("handoff.written", json!({ "trigger": "auto", "context_pct": pct }));
-                        on_event(AgentEvent::Notice(format!(
-                            "上下文占用 {pct}%，已自动生成交接文档 {}",
-                            path.display()
-                        )));
+                        emit_notice(
+                            &mut msgs,
+                            &on_event,
+                            format!("上下文占用 {pct}%，已自动生成交接文档 {}", path.display()),
+                        );
                     }
                     Ok(Err(e)) => {
                         observability::event(EventType::Error, json!({ "message": format!("自动 HANDOFF 生成失败: {e}") }))
@@ -375,73 +459,41 @@ pub async fn run_task(
                     EventType::State,
                     json!({ "kind": "cost.downgraded", "step": step, "from": primary.model, "to": cheap.model }),
                 );
-                on_event(AgentEvent::Notice(format!(
-                    "本任务累计 token 已超预算（[hooks] budget_tokens），后续步骤改走降级渠道「{}」以节省花费",
-                    cheap.model
-                )));
+                emit_notice(
+                    &mut msgs,
+                    &on_event,
+                    format!(
+                        "本任务累计 token 已超预算（[hooks] budget_tokens），后续步骤改走降级渠道「{}」以节省花费",
+                        cheap.model
+                    ),
+                );
             }
             chain.push(cheap);
         } else {
             chain.push(primary);
         }
         chain.extend(channels.fallbacks.iter());
-        let mut outcome = Err(anyhow::anyhow!("渠道链为空"));
-        // 本步当前这次尝试已经推给前端的字符数（UTF-16 码元，与 JS String.length 同口径）。
-        // 换渠道重试时前端要按这个数把半截内容丢掉——否则界面会出现「半截 + 完整」叠着显示。
-        let streamed_content = std::sync::atomic::AtomicUsize::new(0);
-        let streamed_reasoning = std::sync::atomic::AtomicUsize::new(0);
-        for (i, ch) in chain.iter().enumerate() {
-            if i > 0 {
-                observability::event(
-                    EventType::State,
-                    json!({ "kind": "gateway.fallback", "step": step, "from": primary.model, "to": ch.model, "base_url": ch.base_url }),
-                );
-                let last_err = outcome.err().map(|e| e.to_string()).unwrap_or_default();
-                on_event(AgentEvent::StepReset {
-                    content: streamed_content.swap(0, std::sync::atomic::Ordering::Relaxed),
-                    reasoning: streamed_reasoning.swap(0, std::sync::atomic::Ordering::Relaxed),
-                });
-                on_event(AgentEvent::Notice(format!(
-                    "主渠道调用失败（{last_err}），已切换到降级渠道「{}」",
-                    ch.model
-                )));
-            }
-            outcome = gateway
-                .stream_chat(
-                    &usage_ctx,
-                    ch,
-                    &Value::Array(msgs.clone()),
-                    tools_def.as_ref(),
-                    cancel,
-                    |chunk| {
-                        let delta = extract_delta(chunk);
-                        if !delta.content.is_empty() {
-                            streamed_content.fetch_add(
-                                delta.content.encode_utf16().count(),
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            on_event(AgentEvent::Content(delta.content));
-                        }
-                        if let Some(r) = delta.reasoning
-                            && !r.is_empty() {
-                                streamed_reasoning.fetch_add(
-                                    r.encode_utf16().count(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                on_event(AgentEvent::Reasoning(r));
-                            }
-                    },
-                )
-                .await;
-            match &outcome {
-                Ok(ChatOutcome::Done(_)) => break,
-                Ok(ChatOutcome::Cancelled) => return Ok(LoopOutcome::Cancelled),
-                Err(_) => continue, // 换下一个渠道
-            }
+        let (outcome, chain_notices) = run_chain(
+            gateway,
+            &chain,
+            &msgs,
+            tools_def.as_ref(),
+            cancel,
+            &usage_ctx,
+            step,
+            &on_event,
+        )
+        .await;
+        if matches!(&outcome, Ok(ChatOutcome::Cancelled)) {
+            return Ok(LoopOutcome::Cancelled);
+        }
+        // 换渠道的提示实时已推给前端，这里补进上下文随快照落盘（重启后气泡还在）
+        for n in chain_notices {
+            persist_notice(&mut msgs, &on_event, &n);
         }
         let outcome = outcome?;
 
-        let turn = match outcome {
+        let mut turn = match outcome {
             ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
             ChatOutcome::Done(t) => t,
         };
@@ -451,15 +503,91 @@ pub async fn run_task(
             on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
         }
 
-        // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入
+        // P7.6 输出截断处理（P27 升级，2026-09-29 用户实锤）：finish_reason=length 时
+        // 思考内容也被上游计入「最大输出长度」额度（reasoning+正文一起算 completion），
+        // 正文常比预期短就被截断。无工具调用 → 携半截上下文自动续写（最多 MAX_CONTINUE 段），
+        // 把额度内的正文接完；仍不够才提示调大。续写上下文只在临时数组拼接：canonical msgs
+        // 最终只落一条完整回答，前端同气泡无缝续流；工具调用参数被截断没法拼回 JSON，不续写。
         if turn.finish_reason.as_deref() == Some("length") {
             observability::event(
                 EventType::State,
                 json!({ "kind": "model.truncated", "step": step, "max_output_tokens": max_output_tokens }),
             );
-            on_event(AgentEvent::Notice(
-                "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。".to_string(),
-            ));
+            if turn.tool_calls.is_empty() {
+                const MAX_CONTINUE: usize = 2;
+                let mut cont_ctx: Vec<Value> = msgs.clone();
+                let mut continued = 0usize;
+                while turn.finish_reason.as_deref() == Some("length")
+                    && turn.tool_calls.is_empty()
+                    && continued < MAX_CONTINUE
+                    && !cancel.is_set()
+                {
+                    continued += 1;
+                    emit_notice(
+                        &mut msgs,
+                        &on_event,
+                        if continued == 1 {
+                            "回答达到最大输出长度被截断（思考内容也计入该额度），正在自动续写…".to_string()
+                        } else {
+                            format!("续写未完（第 {continued} 段），继续…")
+                        },
+                    );
+                    if !turn.content.trim().is_empty() {
+                        let mut partial = json!({ "role": "assistant", "content": turn.content });
+                        if !turn.reasoning.is_empty() {
+                            partial["reasoning_content"] = json!(turn.reasoning);
+                        }
+                        cont_ctx.push(partial);
+                    }
+                    cont_ctx.push(json!({ "role": "user", "content": CONTINUE_PROMPT }));
+                    let (res, chain_notices) = run_chain(
+                        gateway,
+                        &chain,
+                        &cont_ctx,
+                        tools_def.as_ref(),
+                        cancel,
+                        &usage_ctx,
+                        step,
+                        &on_event,
+                    )
+                    .await;
+                    for n in chain_notices {
+                        persist_notice(&mut msgs, &on_event, &n);
+                    }
+                    match res {
+                        Ok(ChatOutcome::Cancelled) => return Ok(LoopOutcome::Cancelled),
+                        Ok(ChatOutcome::Done(seg)) => {
+                            turn.content.push_str(&seg.content);
+                            turn.reasoning.push_str(&seg.reasoning);
+                            turn.finish_reason = seg.finish_reason;
+                            turn.tool_calls = seg.tool_calls;
+                            turn.prompt_tokens = seg.prompt_tokens;
+                            turn.cached_tokens = seg.cached_tokens;
+                            turn.completion_tokens = seg.completion_tokens;
+                        }
+                        Err(e) => {
+                            emit_notice(&mut msgs, &on_event, format!("自动续写失败：{e}"));
+                            break;
+                        }
+                    }
+                }
+                if turn.finish_reason.as_deref() == Some("length") && turn.tool_calls.is_empty() {
+                    emit_notice(
+                        &mut msgs,
+                        &on_event,
+                        format!(
+                            "已自动续写 {continued} 段仍未完整。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
+                        ),
+                    );
+                }
+            } else {
+                emit_notice(
+                    &mut msgs,
+                    &on_event,
+                    "模型输出被截断（达到最大输出长度）。建议在设置里调大该模型的「最大输出长度」，或让它分多次写入。"
+                        .to_string(),
+                );
+            }
         }
 
         // 思考完整段落落 thought（分片级已记 model_chunk）
@@ -497,9 +625,11 @@ pub async fn run_task(
                             files: plan.files,
                         });
                     }
-                    None => on_event(AgentEvent::Notice(
+                    None => emit_notice(
+                        &mut msgs,
+                        &on_event,
                         "Plan 档：模型未按 ```plan 围栏格式输出计划，可直接对话要求它补一份格式化计划。".to_string(),
-                    )),
+                    ),
                 }
             }
             // P6：最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
@@ -758,7 +888,7 @@ pub async fn run_task(
                     EventType::State,
                     json!({ "kind": "plan.blocked", "step": step, "tool": call.name, "reason": reason }),
                 );
-                on_event(AgentEvent::Notice(format!("Plan 档已拦截 {}：{}", call.name, reason)));
+                emit_notice(&mut msgs, &on_event, format!("Plan 档已拦截 {}：{}", call.name, reason));
                 (
                     format!(
                         "Plan 模式拦截（未执行）：{reason}。请勿执行写/改类操作——继续只读调研，并在最终回答中用 ```plan 围栏输出执行计划，等待用户批准。"
@@ -771,7 +901,7 @@ pub async fn run_task(
                     EventType::State,
                     json!({ "kind": "tier.blocked", "step": step, "tool": call.name, "reason": reason }),
                 );
-                on_event(AgentEvent::Notice(format!("审批档位已拦截 {}：{}", call.name, reason)));
+                emit_notice(&mut msgs, &on_event, format!("审批档位已拦截 {}：{}", call.name, reason));
                 (
                     format!("审批档位拦截（未执行）：{reason}。当前档位下这类操作不可用，请改用只读方式继续，或建议用户切换审批档位。"),
                     true,
@@ -782,16 +912,17 @@ pub async fn run_task(
                     EventType::State,
                     json!({ "kind": "hook.blocked", "step": step, "tool": call.name, "reason": reason }),
                 );
-                on_event(AgentEvent::Notice(format!("钩子已拦截 {}：{}", call.name, reason)));
+                emit_notice(&mut msgs, &on_event, format!("钩子已拦截 {}：{}", call.name, reason));
                 (
                     format!("自定义钩子拦截（未执行）：{reason}。请换别的做法或直接回答用户。"),
                     true,
                 )
             } else if d.skip_conflict {
-                on_event(AgentEvent::Notice(format!(
-                    "写冲突已跳过 {}：本轮已有对同一文件的写操作",
-                    call.name
-                )));
+                emit_notice(
+                    &mut msgs,
+                    &on_event,
+                    format!("写冲突已跳过 {}：本轮已有对同一文件的写操作", call.name),
+                );
                 (
                     "写冲突：本轮已有对同一文件的写操作，本次已跳过。请把对同一文件的多次写入拆分到不同轮次。".to_string(),
                     true,
@@ -957,5 +1088,152 @@ mod tests {
         assert!(p.goal.is_empty());
         assert_eq!(p.steps, vec!["先做 A", "再做 B"]);
         assert!(p.files.is_empty());
+    }
+
+    // —— P27 截断自动续写（2026-09-29 用户实锤「思考内容算进输出长度把正文截断」）——
+    // mock SSE：第一段 finish_reason=length 只给半截正文，第二段 stop 补全。
+    // 期望：同气泡续流（最终回答=两段拼接）、续写提示落盘成 display_only 气泡、
+    // 第二次请求确实带了半截上下文 + CONTINUE_PROMPT。
+    #[tokio::test]
+    async fn truncated_text_answer_auto_continues() {
+        // 日志落临时目录（与 gateway/memory 测试同款，不写仓库 logs/）
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hits_c = hits.clone();
+        let bodies_c = bodies.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let n = Read::read(&mut s, &mut buf).unwrap_or(0);
+                        bodies_c.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        let i = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = if i == 0 {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"半截正文\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"+补全的尾巴\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        };
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}");
+                        let _ = s.write_all(resp.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let ch = Channel::new(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "mock-model",
+            "sk-dummy",
+            ChatParams::default(),
+        );
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-trunc-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false },
+            ws.join("global"),
+        );
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
+        let notices_c = notices.clone();
+        let snaps_c = snaps.clone();
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = CancelFlag::new();
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "写点东西" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &mem,
+            None,
+            false,
+            &G,
+            move |ev: AgentEvent| match ev {
+                AgentEvent::Notice(t) => notices_c.lock().unwrap().push(t),
+                AgentEvent::Snapshot { messages } => snaps_c.lock().unwrap().push(messages),
+                _ => {}
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(outcome.unwrap(), LoopOutcome::Done);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 2, "截断后应自动续写一次");
+        let reqs = bodies.lock().unwrap();
+        assert!(
+            reqs[1].contains("半截正文") && reqs[1].contains(CONTINUE_PROMPT),
+            "续写请求应带半截上下文与续写指令"
+        );
+        let notes = notices.lock().unwrap();
+        assert!(
+            notes.iter().any(|n| n.contains("正在自动续写")),
+            "应推送续写提示，实际 {:?}",
+            *notes
+        );
+        let snaps = snaps.lock().unwrap();
+        let last = snaps.last().expect("至少落一次快照");
+        let final_msg = last
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("快照应有最终回答");
+        assert_eq!(final_msg.get("content").and_then(Value::as_str), Some("半截正文+补全的尾巴"));
+        assert!(
+            last.iter().any(|m| m.get("display_only").and_then(Value::as_bool) == Some(true)),
+            "续写提示应以 display_only 消息落盘（重启后气泡还在）"
+        );
     }
 }
