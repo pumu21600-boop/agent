@@ -4,6 +4,7 @@
   import Galaxy from './Galaxy.svelte';
   import ImagePreview from './lib/ImagePreview.svelte';
   import RenameModal from './lib/RenameModal.svelte';
+  import ConfirmModal from './lib/ConfirmModal.svelte';
   import WorkspaceModal from './lib/WorkspaceModal.svelte';
   import ModelPicker from './lib/ModelPicker.svelte';
   import MemoryTab from './lib/MemoryTab.svelte';
@@ -179,9 +180,9 @@
     e.target.value = '';
   }
 
-  function addAttachmentFile(file) {
+  async function addAttachmentFile(file) {
     if (file.size > 25 * 1024 * 1024) {
-      alert(`文件「${file.name}」超过 25MB 上限`);
+      await confirmAsk(`文件「${file.name}」超过 25MB 上限`, true);
       return;
     }
     // 对图片附件进行前端等比缩放与优质压缩（最长边 1536px，符合各大视觉模型规范且规避反代请求体体积限制）
@@ -1898,7 +1899,7 @@
     if (!file) return;
     const reader = new FileReader();
     reader.onerror = () => (settingsMsg = '导入失败：文件读取错误');
-    reader.onload = (ev) => {
+    reader.onload = async (ev) => {
       const text = String(ev.target.result || '');
       let css = '';
       let tweaks = null; // null 表示"这次不动微调规则"（导入纯 CSS 文本时）
@@ -1932,7 +1933,7 @@
       const existing = Object.keys(microTweaks || {}).length;
       const overwriteMicro = tweaks != null;
       const scope = overwriteMicro ? `当前的 ${existing} 条微调规则和手写 CSS` : '当前的手写 CSS';
-      if ((existing || customCss.trim()) && !confirm(`导入将覆盖${scope}，继续？`)) return;
+      if ((existing || customCss.trim()) && !(await confirmAsk(`导入将覆盖${scope}，继续？`))) return;
       customCss = css;
       if (overwriteMicro) {
         microTweaks = tweaks;
@@ -2423,7 +2424,7 @@
   }
 
   async function deleteSession(id) {
-    if (!confirm('删除这条会话？其余会话不受影响')) return;
+    if (!(await confirmAsk('删除这条会话？其余会话不受影响'))) return;
     await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
     if (id === currentSessionId) {
       await startNewSession();
@@ -2491,6 +2492,14 @@
   let projMenuPath = null; // 打开了操作菜单的项目 path
   let viewMenuOpen = false;
   let renameModal = null; // { kind: 'session'|'project', target, value }
+  // P27 通用确认弹窗：桌面壳（Tauri WebView2）不实现 window.confirm/alert（静默无操作），
+  // 全部确认/提示走应用内弹窗。{ text, okOnly, resolve }。
+  let confirmModal = null;
+  function confirmAsk(text, okOnly = false) {
+    return new Promise((resolve) => {
+      confirmModal = { text, okOnly, resolve };
+    });
+  }
   const CONV_PREVIEW = 5; // 项目收起态先显 5 条，其余走「展开其余 N 个会话」
 
   $: if (workspace && !(workspace in expandedFlags)) {
@@ -2621,7 +2630,7 @@
   }
 
   async function batchDelete() {
-    if (!checkedIds.length || !confirm(`删除选中的 ${checkedIds.length} 条会话？不可恢复`)) return;
+    if (!checkedIds.length || !(await confirmAsk(`删除选中的 ${checkedIds.length} 条会话？不可恢复`))) return;
     for (const id of checkedIds) {
       await fetch(`/api/session?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
     }
@@ -2652,7 +2661,7 @@
       settingsMsg = '当前项目不能移除，先切换到其他项目';
       return;
     }
-    if (!confirm(`从侧边栏移除项目「${name}」？\n只移出列表，不删除磁盘上的文件夹与会话。`)) return;
+    if (!(await confirmAsk(`从侧边栏移除项目「${name}」？\n只移出列表，不删除磁盘上的文件夹与会话。`))) return;
     projMenuPath = null;
     await fetch('/api/workspace/remove', {
       method: 'POST',
@@ -2722,7 +2731,7 @@
 
   // —— P6.1 改动统计条：撤销 = 工作树回滚到任务起点基线 ——
   async function undoCheckpoint(cp) {
-    if (!confirm(`撤销本次任务的改动？\n${cp.files} 个文件将恢复到任务开始前（含删除本次新建的已跟踪文件）。\nshell 副作用不可回滚。`))
+    if (!(await confirmAsk(`撤销本次任务的改动？\n${cp.files} 个文件将恢复到任务开始前（含删除本次新建的已跟踪文件）。\nshell 副作用不可回滚。`)))
       return;
     try {
       const r = await fetch('/api/checkpoints/restore', {
@@ -3133,7 +3142,7 @@
   }
 
   async function discardExt(e) {
-    if (!confirm(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`)) return;
+    if (!(await confirmAsk(`丢弃草稿插件「${e.title || e.name}」？内存内容将立即消失。`))) return;
     try {
       const r = await fetch(`/api/plugins/draft?name=${encodeURIComponent(e.name)}`, { method: 'DELETE' }).then((r) => r.json());
       if (r.error) extMsg = `丢弃失败: ${r.error}`;
@@ -3149,7 +3158,7 @@
     const key = e.trust_key;
     if (!key) return;
     const verb = action === 'pin' ? '信任' : '取消信任';
-    if (action === 'pin' && !confirm(`信任插件「${e.title || e.name}」？\n\n将记录它当前的内容指纹，之后每次加载都比对；文件被改动后会再次要求重新信任。`)) return;
+    if (action === 'pin' && !(await confirmAsk(`信任插件「${e.title || e.name}」？\n\n将记录它当前的内容指纹，之后每次加载都比对；文件被改动后会再次要求重新信任。`))) return;
     try {
       const r = await fetch('/api/plugins/trust', {
         method: 'POST',
@@ -3284,7 +3293,7 @@
           const content = String(params.content ?? '');
           if (!path) return reply(false, '缺少 path');
           // 写工作区是敏感动作：宿主替扩展问一次用户
-          if (!confirm(`插件「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`)) {
+          if (!(await confirmAsk(`插件「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`))) {
             return reply(false, '用户拒绝');
           }
           const r = await fetch('/api/workspace/file', {
@@ -3362,9 +3371,9 @@
         }
         case 'usage.recompute': {
           if (!perms.includes('usage.prices')) return reply(false, '未声明权限 usage.prices');
-          if (!confirm(`用当前价格表重算全部历史记录的费用？
+          if (!(await confirmAsk(`用当前价格表重算全部历史记录的费用？
 
-之前已记的账会按新价改写（累计花费同步刷新）。`)) {
+之前已记的账会按新价改写（累计花费同步刷新）。`))) {
             return reply(false, '用户取消');
           }
           const r = await fetch('/api/usage/recompute', { method: 'POST' });
@@ -5022,6 +5031,14 @@
     on:close={() => (wsModalOpen = false)}
   />
 <RenameModal modal={renameModal} on:close={() => (renameModal = null)} on:submit={submitRename} />
+<ConfirmModal
+  modal={confirmModal}
+  on:answer={(e) => {
+    const resolve = confirmModal && confirmModal.resolve;
+    confirmModal = null;
+    if (resolve) resolve(e.detail);
+  }}
+/>
 
 <ModelPicker
     open={modelModalOpen}

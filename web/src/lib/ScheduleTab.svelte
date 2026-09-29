@@ -10,6 +10,13 @@
   let schedulesData = [];
   let scheduleNotices = [];
   let schedMsg = '';
+  // P27 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）
+  let confirmModal = null;
+  function confirmAsk(text) {
+    return new Promise((resolve) => {
+      confirmModal = { text, resolve };
+    });
+  }
   let schedLoading = false;
   // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
   let schedEditor = null;
@@ -165,7 +172,7 @@
     }
   }
   async function deleteSchedule(id) {
-    if (!confirm('删除这条定时任务？（已跑出的会话与记录保留）')) return;
+    if (!(await confirmAsk('删除这条定时任务？（已跑出的会话与记录保留）'))) return;
     try {
       const r = await fetch(`/api/schedules?id=${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => r.json());
       if (r.ok) {
@@ -340,8 +347,36 @@
         {/if}
       {/if}
 
+      {#if confirmModal}
+        <div class="modal-backdrop" on:click={() => { const r = confirmModal.resolve; confirmModal = null; r(false); }}>
+          <div class="modal confirm-modal" on:click|stopPropagation>
+            <div class="modal-head"><b>确认</b></div>
+            <div class="confirm-text">{confirmModal.text}</div>
+            <div class="confirm-actions">
+              <button class="btn" on:click={() => { const r = confirmModal.resolve; confirmModal = null; r(false); }}>取消</button>
+              <button class="btn primary" on:click={() => { const r = confirmModal.resolve; confirmModal = null; r(true); }}>确定</button>
+            </div>
+          </div>
+        </div>
+      {/if}
 
 <style>
+  .confirm-modal {
+    min-width: 380px;
+    max-width: 520px;
+  }
+  .confirm-text {
+    white-space: pre-line;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--g6);
+  }
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+  }
   .menu-empty {
     color: var(--g5);
     font-size: 12px;
