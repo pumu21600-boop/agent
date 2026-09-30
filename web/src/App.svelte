@@ -5024,6 +5024,7 @@
             {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
             {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
             {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
+            {#if e.skills?.length}<span class="plug-chip" title="插件自带的技能（read_skill 可读，可在技能页看）">技能 {e.skills.join('、')}</span>{/if}
             <span class="flex-sp"></span>
             {#if e.draft}
               <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
@@ -5058,6 +5059,7 @@
               {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
               {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
               {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
+              {#if e.skills?.length}<span class="plug-chip" title="插件自带的技能（read_skill 可读，可在技能页看）">技能 {e.skills.join('、')}</span>{/if}
               <span class="flex-sp"></span>
               {#if e.draft}
                 <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>

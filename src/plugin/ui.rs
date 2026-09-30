@@ -27,6 +27,7 @@
 //! manifest 读不出来 / 目录不合规 → 列进清单但标 ok=false，界面显式报错，不静默忽略。
 
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -36,6 +37,26 @@ use crate::plugin::trust;
 
 /// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "plugins";
+
+/// 生态轮：停用名单的进程内副本。技能根扫描（skills::list → index_prompt）每轮对话都跑，
+/// 摸不到服务层的 settings 锁——与 wasm::set_disabled 同模式：启动（main）与启停端点两处灌入。
+static DISABLED: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+pub fn set_disabled(list: &[String]) {
+    DISABLED
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone_from(&list.to_vec());
+}
+
+pub fn disabled() -> Vec<String> {
+    DISABLED
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 /// 一个插件的描述（GET /api/plugins 直出；P18 契约 v1：面板与工具插件同构）。
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +92,9 @@ pub struct UiExt {
     pub permissions: Vec<String>,
     /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
     pub tools: Vec<ToolBrief>,
+    /// 生态轮：插件自带的技能名清单（manifest `skills: "<相对目录>"`，每子目录一个 SKILL.md）；
+    /// 纯技能插件没有 entry/ui，卡片上以此展示它贡献了什么
+    pub skills: Vec<String>,
     /// P21：插件自带设置页（manifest settings_entry，如 prices.html）——
     /// 宿主在设置→插件卡片上渲染「设置」按钮，点了在插件面板里打开该页
     pub settings_entry: String,
@@ -133,6 +157,7 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
                 .collect(),
             permissions: Vec::new(),
             tools: Vec::new(),
+            skills: Vec::new(),
             // draft 是模型自产隔离区：豁免验签
             settings_entry: String::new(),
             trust_key: String::new(),
@@ -204,6 +229,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         ui: Vec::new(),
         permissions: Vec::new(),
         tools: Vec::new(),
+        skills: Vec::new(),
         settings_entry: String::new(),
         trust_key: String::new(),
         digest: String::new(),
@@ -274,6 +300,19 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .map(str::to_string)
             .collect();
     }
+    // 生态轮：插件自带技能（manifest `skills: "<相对目录>"`，每子目录一个 SKILL.md）。
+    // 声明了但目录不合法 → 按加载失败显式报（技能会缺，不许静默）；纯技能插件没有
+    // entry/ui，走下面的「纯工具插件」路径 ok=true，靠 skills 字段在卡片上展示能力。
+    if let Some(sd) = v.get("skills").and_then(Value::as_str) {
+        match skills_dir_of(dir, sd) {
+            Ok(p) => e.skills = list_skill_names(&p),
+            Err(err) => {
+                e.ok = false;
+                e.error = Some(err);
+                return e;
+            }
+        }
+    }
     // P21 红线3：第三方插件（origin=user）先 pin 后代跑——算内容指纹、对 pin 表，
     // 未 pin / 内容已变 → 拒载（ok=false + 人话理由 + 审计），元数据照常带回供界面提示
     e.trust_key = trust::key_of(DIR, name);
@@ -319,6 +358,91 @@ fn safe_segment(s: &str) -> bool {
         && s != "."
         && s != ".."
         && !s.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+}
+
+/// 生态轮：manifest `skills` 字段 → 插件内的技能根目录（穿越防护与静态资源同一套）。
+/// 剥掉 canonicalize 带出的 `\\?\` verbatim 前缀：这个路径会进 Skill.dir 给模型当
+/// 脚本绝对路径用，verbatim 形式在 cmd/部分工具下反而不好使。
+fn skills_dir_of(dir: &Path, rel: &str) -> Result<PathBuf, String> {
+    let p = resolve_in(dir, rel)?;
+    if !p.is_dir() {
+        return Err(format!("skills 目录 {rel} 不是目录"));
+    }
+    let s = p.as_os_str().to_string_lossy();
+    Ok(match s.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest.to_string()),
+        None => p,
+    })
+}
+
+/// 技能根下的技能名（子目录里有 SKILL.md 的，按名排序）。
+fn list_skill_names(skills_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(skills_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("SKILL.md").is_file())
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+        .collect();
+    names.sort();
+    names
+}
+
+/// 生态轮：插件贡献的技能根 `(skills 目录, 插件名)`——skills::list 每轮对话调用。
+/// 只收「启用 + 清单合法 + 过信任门」的插件，工作区同名插件覆盖内置；插件间同技能名
+/// 先到先得（skills.rs 合并时项目/全局技能再压一层）。刻意不走 scan_all：这里只读
+/// manifest.json + 目录 stat，便宜；拖上 wasm 注册表与 draft 机制就重了。
+pub fn skill_roots() -> Vec<(PathBuf, String)> {
+    skill_roots_in(
+        &disabled(),
+        &crate::tools::workspace_root().join(DIR),
+        &crate::config::app_root().join(DIR),
+    )
+}
+
+fn skill_roots_in(disabled: &[String], ws: &Path, app: &Path) -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (base, location) in [(ws, "workspace"), (app, "app")] {
+        let Ok(rd) = std::fs::read_dir(base) else { continue };
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        for dir in dirs {
+            let Some(name) = dir.file_name().and_then(|s| s.to_str()).map(str::to_string) else { continue };
+            if !safe_segment(&name)
+                || disabled.iter().any(|d| d == &name)
+                || seen.iter().any(|s| s == &name)
+            {
+                continue;
+            }
+            seen.push(name.clone());
+            let Ok(text) = std::fs::read_to_string(dir.join("manifest.json")) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            if contract::check_api_version(&v).is_err() {
+                continue;
+            }
+            let Some(sd) = v.get("skills").and_then(Value::as_str) else { continue };
+            let skills_dir = match skills_dir_of(&dir, sd) {
+                Ok(p) => p,
+                Err(_) => continue, // 清单问题在插件页有显式报错；这里只当「不贡献技能」
+            };
+            let origin = contract::origin_of(&v, location);
+            if origin == contract::ORIGIN_USER {
+                // 技能正文会进系统提示（比跑代码更敏感），第三方插件同样要先 pin
+                let key = trust::key_of(DIR, &name);
+                let Ok(digest) = trust::digest_dir(&dir) else { continue };
+                let st = trust::state(&key, &origin, &digest);
+                if !st.trusted() {
+                    trust::audit_blocked(&key, &st, "skills.roots");
+                    continue;
+                }
+            }
+            out.push((skills_dir, name));
+        }
+    }
+    out
 }
 
 /// 相对路径 → 扩展目录内的绝对路径；**路径穿越硬拦**。
@@ -529,5 +653,57 @@ mod tests {
         assert!(!safe_segment("a/b"));
         assert!(!safe_segment("a\\b"));
         assert!(!safe_segment(""));
+    }
+
+    /// 生态轮：技能根扫描——只收声明 skills 的合法插件；工作区覆盖内置；停用不贡献；
+    /// 第三方（user 来源）未 pin 不贡献、pin 后贡献。
+    #[test]
+    fn skill_roots_scan_override_disable_and_trust() {
+        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let app = tmpdir("roots-app");
+        let ws = tmpdir("roots-ws");
+        let mk = |root: &Path, name: &str, manifest: &str| {
+            let d = root.join(name);
+            std::fs::create_dir_all(d.join("skills").join("docx")).unwrap();
+            std::fs::write(d.join("manifest.json"), manifest).unwrap();
+            std::fs::write(d.join("skills").join("docx").join("SKILL.md"), "---\nname: docx\ndescription: d\n---\n正文").unwrap();
+            d
+        };
+        let _builtin = mk(&app, "docplug", r#"{"apiVersion":1,"skills":"skills"}"#);
+        // 工作区同名插件（user 来源，未 pin）→ 整体遮蔽内置（与 UI 扫描 retain 同语义）：
+        // 遮蔽者自己又没过信任门 → 两边都不贡献，不让内置版从背后漏出来
+        mk(&ws, "docplug", r#"{"apiVersion":1,"skills":"skills"}"#);
+        // 工作区独有插件：停用名单里的 + 未 pin 的各一个
+        mk(&ws, "offplug", r#"{"apiVersion":1,"skills":"skills"}"#);
+        mk(&ws, "evilplug", r#"{"apiVersion":1,"skills":"skills"}"#);
+        // 不声明 skills 的插件不进技能根
+        let plain = app.join("plainplug");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("manifest.json"), r#"{"apiVersion":1}"#).unwrap();
+
+        let roots = skill_roots_in(&["offplug".to_string()], &ws, &app);
+        assert!(
+            roots.is_empty(),
+            "未过信任门的工作区插件不贡献，被遮蔽的内置也不漏: {roots:?}"
+        );
+
+        // pin 工作区两份 → 覆盖生效 + evilplug 贡献
+        let mut pins = std::collections::BTreeMap::new();
+        for n in ["docplug", "evilplug"] {
+            pins.insert(trust::key_of(DIR, n), trust::digest_dir(&ws.join(n)).unwrap());
+        }
+        trust::install(&pins);
+        let roots = skill_roots_in(&["offplug".to_string()], &ws, &app);
+        let mut names: Vec<_> = roots.iter().map(|(_, n)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["docplug", "evilplug"], "pin 后工作区覆盖内置 + 未停用者贡献");
+        let ws_docplug = roots.iter().find(|(_, n)| n == "docplug").unwrap();
+        assert!(ws_docplug.0.starts_with(&ws), "pin 后用的是工作区那份的技能目录");
+        assert!(roots.iter().all(|(p, _)| p.ends_with("skills")));
+        // 停用的始终不贡献
+        assert!(!roots.iter().any(|(_, n)| n == "offplug"));
+        trust::install(&std::collections::BTreeMap::new()); // 清场
+        let _ = std::fs::remove_dir_all(&app);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

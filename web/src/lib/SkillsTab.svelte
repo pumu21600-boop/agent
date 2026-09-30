@@ -99,10 +99,14 @@
             <div class="mcp-card">
               <div class="mcp-head">
                 <b>${s.name}</b>
-                <span class="mcp-status">{s.source === 'project' ? '项目级' : '全局'}</span>
+                <span class="mcp-status">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>
                 <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
-                <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
+                {#if s.source === 'plugin'}
+                  <span class="mcp-status" title="插件自带的技能：在插件页启停；新建同名技能可覆盖它">同名新建可覆盖</span>
+                {:else}
+                  <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
+                  <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
+                {/if}
               </div>
               <div class="mcp-cmd">{s.description || '（无描述）'}</div>
             </div>

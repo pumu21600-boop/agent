@@ -314,10 +314,11 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
                 .get("name")
                 .and_then(|x| x.as_str())
                 .ok_or("缺少 name 参数")?;
-            // P25：带 ref 读 references/ 单篇；不带读 SKILL.md 全文
+            // P25：带 ref 读 references/ 单篇；不带读 SKILL.md 全文（生态轮：头部带技能
+            // 目录——插件技能的脚本资产要用绝对路径跑）
             match v.get("ref").and_then(|x| x.as_str()) {
                 Some(r) => crate::skills::read_ref(name, r),
-                None => crate::skills::read(name),
+                None => crate::skills::read_for_agent(name),
             }
         }
         "write_file" => write_file(args, cfg.fs_unconfined),

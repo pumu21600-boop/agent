@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
     crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
     crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); // P18 027：停用名单贯通工具插件
+    crate::plugin::ui::set_disabled(&user_settings.disabled_plugins); // 生态轮：同名单贯通插件技能根
     crate::plugin::trust::install(&user_settings.trusted_plugins); // P21 红线3：第三方插件验签（pin digest）
     crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
     // P21 成本台账：价格表来自 settings.json（由「用量」插件的价格设置页维护），

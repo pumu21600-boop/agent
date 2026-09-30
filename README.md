@@ -324,6 +324,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
   设置 → 插件 里「转正」（落盘持久化、来源改 user）或「丢弃」。
 - **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
 - **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮。
+- **插件自带技能**：manifest `skills: "skills"`（相对目录，每子目录一个 SKILL.md）→ 技能进系统提示索引，模型 read_skill 可读（返回头部带技能目录，脚本资产用绝对路径跑）。纯技能插件不需要 entry/ui（内置 GitHub / Word / 表格 / PDF / 演示文稿 / 浏览器 六个生态插件就是这么落的）；停用插件或未验签的第三方插件不贡献技能，技能页里插件技能只读、同名新建可覆盖。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
 - **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 plugins、当前工作区 plugins、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
 - 参考实现：`plugins/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。

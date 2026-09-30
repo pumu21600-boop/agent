@@ -594,6 +594,7 @@ pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
                 ui: Vec::new(),
                 permissions: Vec::new(),
                 tools: e.tools.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect(),
+                skills: Vec::new(), // 工具插件不声明技能（技能走 ui::skill_roots 扫描目录形态）
                 settings_entry: String::new(), // 工具插件没有设置页
                                 trust_key: if inline {
                     String::new()

@@ -14,12 +14,14 @@ use std::path::{Path, PathBuf};
 pub struct Skill {
     pub name: String,
     pub description: String,
-    /// "project"（工作区 skills/）| "global"（~/.agent/skills/）
+    /// "project"（工作区 skills/）| "global"（~/.agent/skills/）| "plugin"（插件自带）
     pub source: String,
     pub dir: String,
     pub content: String,
     /// P25：references/ 下的参考文件名（渐进披露；read_skill 带 ref 参数按需拉全文）
     pub refs: Vec<String>,
+    /// 生态轮：贡献这个技能的插件名（非插件技能为空串）
+    pub plugin: String,
 }
 
 /// 技能根目录：(路径, 来源)。项目级在前，同名时项目覆盖全局。
@@ -113,6 +115,7 @@ fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
         content,
         name,
         refs: list_refs(dir),
+        plugin: String::new(),
     })
 }
 
@@ -135,8 +138,30 @@ pub fn list() -> Vec<Skill> {
             }
         }
     }
+    merge_plugin_skills(&mut out, &crate::plugin::ui::skill_roots());
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// 生态轮：把插件自带的技能并入清单。同名规则：项目/全局技能已在前 → 覆盖插件
+/// （用户自建同名技能压过插件版，与「项目覆盖全局」同哲学）；插件之间先到先得
+/// （工作区插件先于内置插件，各自按目录名排序，见 ui::skill_roots）。
+fn merge_plugin_skills(out: &mut Vec<Skill>, roots: &[(PathBuf, String)]) {
+    for (root, plugin) in roots {
+        let Ok(rd) = fs::read_dir(root) else {
+            continue;
+        };
+        let mut dirs: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        dirs.sort();
+        for d in dirs {
+            if let Some(mut s) = load_skill(&d, "plugin") {
+                s.plugin = plugin.clone();
+                if !out.iter().any(|x| x.name == s.name) {
+                    out.push(s);
+                }
+            }
+        }
+    }
 }
 
 /// 按名读全文（frontmatter 的 name 优先匹配，避免与 list 展示名不一致）。
@@ -154,6 +179,20 @@ pub fn read(name: &str) -> Result<String, String> {
         }
     }
     Err(format!("未找到技能「{name}」：请在对应 skills 目录下创建 <name>/SKILL.md"))
+}
+
+/// 生态轮：模型侧读取——正文前带技能目录绝对路径。插件技能的脚本资产（scripts/ 等）
+/// 要用绝对路径跑，模型只有从这里才知道技能落在磁盘何处；技能页编辑器仍走 read（原文）。
+pub fn read_for_agent(name: &str) -> Result<String, String> {
+    let dir = list()
+        .into_iter()
+        .find(|s| s.name == name.trim())
+        .map(|s| s.dir);
+    let content = read(name)?;
+    Ok(match dir {
+        Some(d) => format!("【技能目录】{d}\n（技能内的脚本/参考资料都在这个目录下，用绝对路径访问）\n\n{content}"),
+        None => content,
+    })
 }
 
 /// P25：读技能的单篇参考资料（references/<ref>）。ref 名同样过 valid_name，
@@ -250,10 +289,30 @@ fn sync_desc(full: &str, desc: &str) -> String {
     out
 }
 
+/// 插件技能不许删（目录在插件里，删了等于毁插件文件）；想覆盖走同名新建。
+/// 返回 Some(人话错) = 该拒。
+fn plugin_delete_error(s: &Skill) -> Option<String> {
+    if s.source != "plugin" {
+        return None;
+    }
+    let from = if s.plugin.is_empty() {
+        String::new()
+    } else {
+        format!("（插件 {}）", s.plugin)
+    };
+    Some(format!(
+        "「{}」是插件{}自带的技能，不能在这里删除；想覆盖它就在技能页新建一个同名技能",
+        s.name, from
+    ))
+}
+
 /// 删除技能目录（frontmatter name 优先匹配，兼容文件夹名；项目级/全局均可删）。
 pub fn delete(name: &str) -> Result<(), String> {
     valid_name(name)?;
     if let Some(s) = list().into_iter().find(|s| s.name == name) {
+        if let Some(err) = plugin_delete_error(&s) {
+            return Err(err);
+        }
         let dir = PathBuf::from(&s.dir);
         // 符号链接目录不删：remove_dir_all 对链接的行为平台相关，可能伤及链接目标
         if is_symlink(&dir) {
@@ -292,7 +351,13 @@ pub fn index_prompt() -> String {
         } else {
             format!("（含 {} 篇参考资料，按需 read_skill 带 ref 读）", sk.refs.len())
         };
-        s.push_str(&format!("- ${}: {}{}\n", sk.name, desc, refs_hint));
+        // 生态轮：插件自带技能标注来源插件，模型与用户都能看出它不是工作区自建的
+        let from = if sk.plugin.is_empty() {
+            String::new()
+        } else {
+            format!("（插件 {}）", sk.plugin)
+        };
+        s.push_str(&format!("- ${}{}: {}{}\n", sk.name, from, desc, refs_hint));
     }
     s
 }
@@ -413,5 +478,72 @@ mod tests {
         if !idx.is_empty() {
             assert!(idx.starts_with("\n\n## 可用技能"));
         }
+    }
+
+    /// 生态轮：插件技能并入清单——同名时项目/全局压过插件版，插件名落 Skill.plugin。
+    #[test]
+    fn plugin_skills_merge_with_precedence() {
+        let tmp = std::env::temp_dir().join(format!("agent-skill-plug-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let sd = tmp.join("skills");
+        fs::create_dir_all(sd.join("docx")).unwrap();
+        fs::write(
+            sd.join("docx").join("SKILL.md"),
+            "---\nname: docx\ndescription: 插件版文档技能\n---\n插件正文",
+        )
+        .unwrap();
+        fs::create_dir_all(sd.join("shared")).unwrap();
+        fs::write(sd.join("shared").join("SKILL.md"), "---\nname: shared\ndescription: 插件同名\n---\n插件正文").unwrap();
+
+        // 清单里已有一个同名项目级技能 → 插件版不得顶掉它
+        let mut out = vec![Skill {
+            name: "shared".into(),
+            description: "项目版".into(),
+            source: "project".into(),
+            dir: "nowhere".into(),
+            content: "项目正文".into(),
+            refs: vec![],
+            plugin: String::new(),
+        }];
+        merge_plugin_skills(&mut out, &[(sd, "documents".to_string())]);
+        let docx = out.iter().find(|s| s.name == "docx").expect("插件技能应并入");
+        assert_eq!(docx.source, "plugin");
+        assert_eq!(docx.plugin, "documents");
+        assert!(docx.content.contains("插件正文"));
+        let shared = out.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.source, "project", "项目级同名技能必须压过插件版");
+        assert_eq!(shared.content, "项目正文");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// 生态轮：插件技能删除被拒（给出覆盖的路），项目级技能照常可删。
+    #[test]
+    fn plugin_skill_delete_guarded() {
+        let mk = |name: &str, source: &str, plugin: &str| Skill {
+            name: name.into(),
+            description: String::new(),
+            source: source.into(),
+            dir: "nowhere".into(),
+            content: String::new(),
+            refs: vec![],
+            plugin: plugin.into(),
+        };
+        let err = plugin_delete_error(&mk("docx", "plugin", "documents")).unwrap();
+        assert!(err.contains("documents") && err.contains("不能在这里删除") && err.contains("同名技能"), "{err}");
+        assert!(plugin_delete_error(&mk("docx", "plugin", "")).is_some(), "缺插件名也要拒");
+        assert!(plugin_delete_error(&mk("x", "project", "")).is_none(), "项目级照常可删");
+    }
+
+    /// 生态轮：read_for_agent 头部带技能目录（插件技能的脚本要用绝对路径跑）。
+    #[test]
+    fn read_for_agent_includes_dir() {
+        let name = "zz-test-skill-dir";
+        save(name, "验证目录头", "步骤一").expect("save 失败");
+        let text = read_for_agent(name).expect("read_for_agent 应成功");
+        assert!(text.starts_with("【技能目录】"), "头部要有目录标注: {text}");
+        assert!(text.contains("SKILL.md") || text.contains("skills"), "目录应为真实路径: {text}");
+        assert!(text.contains("步骤一"));
+        assert!(text.ends_with(&read(name).unwrap()), "read 仍返回原文（头部之外不改正文）");
+        delete(name).expect("清理失败");
     }
 }

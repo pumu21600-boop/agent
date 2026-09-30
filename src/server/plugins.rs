@@ -117,6 +117,7 @@ pub(super) async fn post_mcp(
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：插件技能根同步停用
     crate::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
@@ -223,6 +224,7 @@ pub(super) async fn toggle_plugin(
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：停用的插件不贡献技能
     observability::event(
         EventType::State,
         json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled }),
