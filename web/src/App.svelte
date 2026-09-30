@@ -6077,6 +6077,21 @@
     color: var(--g5);
   }
   .rp-win-gap { width: 8px; flex: none; }
+  /* 右栏 tabs 行里的窗口按钮：.rp-tabs button 的特异性(0,1,1)会压过 .win-btn(0,1,0)，
+     把 padding 撑坏、图标缩成小不点——这里用更高特异性钉死尺寸 */
+  .rp-tabs .win-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .rp-tabs .win-btn svg {
+    width: 17px;
+    height: 17px;
+  }
   .win-btn:hover {
     background: var(--g3);
     color: var(--g7);
