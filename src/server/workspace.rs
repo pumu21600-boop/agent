@@ -66,7 +66,7 @@ pub(super) async fn read_workspace_file(
         return Err(err("缺少 path".into()));
     }
     let sandbox_cfg = (*state.sandbox_cfg).clone();
-    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(0);
+    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(crate::sandbox::DEFAULT_SANDBOX_CPU_PERCENT);
     let exec = crate::tools::ExecConfig {
         max_chars: 200_000,
         sandbox: sandbox_cfg,
@@ -104,7 +104,7 @@ pub(super) async fn run_shell(
         ));
     }
     let sandbox_cfg = (*state.sandbox_cfg).clone();
-    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(0);
+    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(crate::sandbox::DEFAULT_SANDBOX_CPU_PERCENT);
     let exec = crate::tools::ExecConfig {
         max_chars: 100_000,
         sandbox: sandbox_cfg,

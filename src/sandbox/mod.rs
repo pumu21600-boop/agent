@@ -15,6 +15,10 @@ mod token;
 
 pub use proc::{register_path_dir, SandboxChild};
 
+/// 沙箱整树 CPU 硬上限的默认值（单核百分比）：用户未在插件页设置时生效。
+/// 80 = 留两成核兜底交互响应；嫌拖慢构建可在插件页改 0（不限）。
+pub const DEFAULT_SANDBOX_CPU_PERCENT: u32 = 80;
+
 /// 沙箱资源上限（config.toml [sandbox]；cpu_percent 来自 settings.json 覆盖）。
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxLimits {
@@ -24,7 +28,7 @@ pub struct SandboxLimits {
     pub memory_mb: u32,
     /// 进程树内活跃进程数上限
     pub active_processes: u32,
-    /// 整树 CPU 硬上限（单核的百分比，0 = 不限；默认 0——限速会拖慢构建/装依赖）
+    /// 整树 CPU 硬上限（单核的百分比，0 = 不限；未设时取 DEFAULT_SANDBOX_CPU_PERCENT）
     pub cpu_percent: u32,
 }
 

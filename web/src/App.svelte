@@ -50,7 +50,7 @@
   let roles = {}; // P8.5 角色路由映射
   // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
   let features = { roles: true, css_tool: true, galaxy: true };
-  let sandboxCpu = 0; // 沙箱整树 CPU 硬上限（单核 %，0=不限；settings.sandbox_cpu_percent）
+  let sandboxCpu = 80; // 沙箱整树 CPU 硬上限（单核 %；settings.sandbox_cpu_percent，缺省 80）
   // —— P8.2 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
@@ -532,7 +532,7 @@
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
     roles = s.roles || {};
     features = s.features || { roles: true, css_tool: true, galaxy: true };
-    sandboxCpu = s.sandbox_cpu_percent ?? 0;
+    sandboxCpu = s.sandbox_cpu_percent ?? 80;
     workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
@@ -2974,9 +2974,10 @@
     if (k === 'galaxy' && !features.galaxy && galaxyOpen) galaxyOpen = false;
   }
 
-  // 沙箱 CPU 上限：空/0 = 不限，越界钳回 1-100
+  // 沙箱 CPU 上限：空/非数字 = 回默认 80，越界钳回 0-100（0 = 不限）
   function commitCpu(v) {
-    const n = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+    const raw = Number(v);
+    const n = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : 80;
     sandboxCpu = n;
     autoSave({ sandbox_cpu_percent: n }, 0);
   }
@@ -4967,8 +4968,8 @@
             <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '检测中…' : sandboxProbe.ok ? '检测通过' : '检测有失败'}</span>
           {/if}
           <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
-          <label class="plug-cpu" title="沙箱命令可用的 CPU 上限（单核的百分比）；留空 = 不限">
-            CPU <input type="number" min="0" max="100" value={sandboxCpu || ''} on:change={(e) => commitCpu(e.currentTarget.value)} /> %
+          <label class="plug-cpu" title="沙箱命令可用的 CPU 上限（单核的百分比）；默认 80%，0 = 不限">
+            CPU <input type="number" min="0" max="100" value={sandboxCpu} on:change={(e) => commitCpu(e.currentTarget.value)} /> %
           </label>
           <!-- 检测 = 一次做完:刷新档位 + 真拉起受限进程跑探针（用户拍板:一行一个按钮） -->
           <button class="btn ghost" on:click={() => { loadSandboxInfo(true); runSandboxProbe(); }} disabled={sbInfoLoading || sbRunning}>检测</button>
