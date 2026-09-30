@@ -826,12 +826,12 @@ pub async fn run_task(
                     true,
                 )
             } else if let Some(reason) = &d.tier_reason {
-                // P19 档位拦截（sandbox 档禁写等）：未执行，把理由回喂给模型调整做法
+                // P19 档位拦截（sandbox 档禁写等）：未执行，把理由回喂给模型调整做法。
+                // 不发用户通知（用户拍板：模型拿到理由会自行解释/换路，[通知] 行是噪音）
                 observability::event(
                     EventType::State,
                     json!({ "kind": "tier.blocked", "step": step, "tool": call.name, "reason": reason }),
                 );
-                emit_notice(&mut msgs, &on_event, format!("审批档位已拦截 {}：{}", call.name, reason));
                 (
                     format!("审批档位拦截（未执行）：{reason}。当前档位下这类操作不可用，请改用只读方式继续，或建议用户切换审批档位。"),
                     true,
