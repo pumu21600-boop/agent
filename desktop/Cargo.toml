@@ -11,6 +11,8 @@ tauri-build = { version = "2", features = [] }
 # unstable：P22 child webview（add_child）所需；devtools：child webview 开真 DevTools
 tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
 serde_json = "1"
+# ResizeDirection 在 tauri-runtime 里 re-export 不出来（tauri::ResizeDirection 不存在），无边框边缘拉伸要用
+tauri-runtime = "2"
 
 [profile.release]
 strip = true

@@ -311,6 +311,22 @@
 
   // P9 B1 Plan/Act 手动档已移除：项目类任务由模型按系统提示自动规划步骤清单（todo list），普通聊天不规划
 
+  // 无边框壳窗口控制 API（壳注入；浏览器客户端没有 → 隐藏窗口按钮/热区）
+  let winApi = null;
+  function adoptWinApi() {
+    if (!winApi && window.agentWinApi) winApi = window.agentWinApi;
+  }
+  onMount(() => {
+    adoptWinApi();
+    window.addEventListener('agentwinready', adoptWinApi);
+    // 兜底轮询：注入事件若在监听注册前已发过（首屏加载竞态），靠它接住
+    const t = setInterval(() => {
+      adoptWinApi();
+      if (winApi) clearInterval(t);
+    }, 500);
+    return () => clearInterval(t);
+  });
+
   onMount(async () => {
     await loadProviders();
     await loadSettings();
@@ -3721,7 +3737,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
       </button>
     {/if}
-    <header class="chat-head">
+    <header class="chat-head" data-tauri-drag-region>
       <div class="head-main">
         <div class="chat-title">{displayTitle}</div>
       </div>
@@ -3767,8 +3783,36 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="M14.5 4.5v15"/><path d="M17.5 9.5h1M17.5 12.5h1" stroke-linecap="round"/></svg>
         </button>
 
+        <!-- 窗口控制（无边框壳，对齐 ZCode：原生黑条撤掉，按钮做进内容行）。
+             只有桌面壳里才有 agentWinApi（壳每 2s 注入）；浏览器打开的第二个客户端不显示 -->
+        {#if winApi}
+          <div class="win-ctrls">
+            <button class="head-btn win-btn" title="最小化" aria-label="最小化" on:click={() => winApi.minimize()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"/></svg>
+            </button>
+            <button class="head-btn win-btn" title="最大化 / 还原" aria-label="最大化 / 还原" on:click={() => winApi.toggleMax()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>
+            </button>
+            <button class="head-btn win-btn win-close" title="关闭到托盘（服务保持运行）" aria-label="关闭到托盘" on:click={() => winApi.hide()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+            </button>
+          </div>
+        {/if}
+
       </div>
     </header>
+
+    <!-- 无边框窗边缘拉伸热区（Windows 无原生 resize 边框）：6px 四边+四角，按下起拖 -->
+    {#if winApi}
+      <div class="win-rz win-rz-n" on:mousedown={() => winApi.startResize('North')} title=""></div>
+      <div class="win-rz win-rz-s" on:mousedown={() => winApi.startResize('South')} title=""></div>
+      <div class="win-rz win-rz-w" on:mousedown={() => winApi.startResize('West')} title=""></div>
+      <div class="win-rz win-rz-e" on:mousedown={() => winApi.startResize('East')} title=""></div>
+      <div class="win-rz win-rz-nw" on:mousedown={() => winApi.startResize('NorthWest')} title=""></div>
+      <div class="win-rz win-rz-ne" on:mousedown={() => winApi.startResize('NorthEast')} title=""></div>
+      <div class="win-rz win-rz-sw" on:mousedown={() => winApi.startResize('SouthWest')} title=""></div>
+      <div class="win-rz win-rz-se" on:mousedown={() => winApi.startResize('SouthEast')} title=""></div>
+    {/if}
 
     <div class="chat-main">
       <div class="chat-body" bind:this={chatBody} on:scroll={onChatScroll}>
@@ -5978,7 +6022,47 @@
     padding: 12px 20px;
     border-bottom: 1px solid var(--g2);
     background: var(--g1);
+    /* 无边框壳：头部空白处可拖拽移动窗口（data-tauri-drag-region 已加） */
+    -webkit-app-region: drag;
   }
+  .chat-head button, .chat-head input, .chat-head .plug-chip {
+    -webkit-app-region: no-drag;
+  }
+  /* 窗口控制按钮组（─/▢/✕）：ZCode 同款，纯文字 tooltip，hover 才显底色 */
+  .win-ctrls {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 4px;
+  }
+  .win-btn {
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    color: var(--g5);
+  }
+  .win-btn:hover {
+    background: var(--g3);
+    color: var(--g7);
+  }
+  .win-close:hover {
+    background: #c42b1c;
+    color: #fff;
+  }
+  /* 无边框边缘拉伸热区：四边 6px + 四角 10px 见方，fixed 贴着视口边缘 */
+  .win-rz { position: fixed; z-index: 900; }
+  .win-rz-n { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+  .win-rz-s { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+  .win-rz-w { left: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+  .win-rz-e { right: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+  .win-rz-nw { top: 0; left: 0; width: 10px; height: 10px; cursor: nwse-resize; }
+  .win-rz-ne { top: 0; right: 0; width: 10px; height: 10px; cursor: nesw-resize; }
+  .win-rz-sw { bottom: 0; left: 0; width: 10px; height: 10px; cursor: nesw-resize; }
+  .win-rz-se { bottom: 0; right: 0; width: 10px; height: 10px; cursor: nwse-resize; }
   .head-main {
     min-width: 0;
   }

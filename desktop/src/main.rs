@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tauri::{LogicalPosition, LogicalSize, Manager, WebviewBuilder, WebviewUrl};
+use tauri_runtime::ResizeDirection;
 
 const SERVICE_URL: &str = "127.0.0.1:5173";
 /// 壳 WebView2 环境的 CDP 端口（与 src/browser/shell.rs 的 SHELL_CDP_PORT 保持一致）
@@ -87,6 +88,68 @@ const SHELL_CLIENT_JS: &str = r#"(function () {
 })();"#;
 /// 「⋯」菜单浮层的 webview label（与 src/browser/shell.rs 的 MENU_LABEL 一致）
 const MENU_LABEL: &str = "wv-menu";
+
+/// 窗口控制 API 注入（无边框窗，对齐 ZCode：原生黑条撤掉，─/▢/✕ 做进内容行）。
+/// 与 SHELL_CLIENT_JS 同一周期补打机制——前端不依赖 npm 包，壳注入即用；
+/// 浏览器里打开的第二个客户端没有这个 API，前端据此隐藏窗口按钮（不显示按了没反应的按钮）。
+const WIN_CTRL_JS: &str = r#"(function () {
+  if (window.agentWinApi) return;
+  var inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+  if (!inv) return;
+  try {
+    window.agentWinApi = {
+      minimize: function () { return inv('win_minimize', {}); },
+      toggleMax: function () { return inv('win_toggle_maximize', {}); },
+      hide: function () { return inv('win_hide', {}); },
+      startResize: function (dir) { return inv('win_start_resize', { dir: dir }); }
+    };
+    window.dispatchEvent(new Event('agentwinready'));
+  } catch (e) {}
+})();"#;
+
+#[tauri::command]
+fn win_minimize(win: tauri::Window) {
+    let r = win.minimize();
+    slog(&format!("win_minimize: result={:?}", r));
+}
+
+#[tauri::command]
+fn win_toggle_maximize(win: tauri::Window) {
+    let was_max = win.is_maximized().unwrap_or(false);
+    let r = if was_max { win.unmaximize() } else { win.maximize() };
+    slog(&format!(
+        "win_toggle_maximize: label={} was_max={} size={:?} result={:?}",
+        win.label(),
+        was_max,
+        win.outer_size().map(|s| (s.width, s.height)).ok(),
+        r
+    ));
+}
+
+/// 关闭 = 藏到托盘（与 CloseRequested 的处理同一语义：壳是 webview 宿主，一销毁
+/// 浏览器宿主连同 CDP 端口一起没；服务独立生命周期，退出壳不动服务）。
+#[tauri::command]
+fn win_hide(win: tauri::Window) {
+    let _ = win.hide();
+}
+
+/// 无边框窗边缘拉伸（Windows 没有原生 resize 边框，边缘热区按下时从这里起拖）。
+#[tauri::command]
+fn win_start_resize(win: tauri::Window, dir: String) {
+    use ResizeDirection::*;
+    let d = match dir.as_str() {
+        "East" => East,
+        "West" => West,
+        "North" => North,
+        "South" => South,
+        "NorthEast" => NorthEast,
+        "NorthWest" => NorthWest,
+        "SouthEast" => SouthEast,
+        "SouthWest" => SouthWest,
+        _ => return,
+    };
+    let _ = win.start_resize_dragging(d);
+}
 
 /// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/agent.exe`
 /// （开发机布局；P13 原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
@@ -423,6 +486,12 @@ fn main() {
     ensure_service();
 
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            win_minimize,
+            win_toggle_maximize,
+            win_hide,
+            win_start_resize
+        ])
         .setup(|app| {
             app.manage(WebviewHost::default());
             // 关窗 = 藏到托盘（不退出）：壳进程是 child webview 的宿主，窗口一销毁
@@ -441,6 +510,7 @@ fn main() {
                 let marker = win.clone();
                 std::thread::spawn(move || loop {
                     let _ = marker.eval(SHELL_CLIENT_JS);
+                    let _ = marker.eval(WIN_CTRL_JS);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 });
             }

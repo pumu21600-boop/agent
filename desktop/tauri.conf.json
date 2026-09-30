@@ -3,7 +3,9 @@
   "productName": "Agent",
   "version": "0.1.0",
   "identifier": "com.agent.local.desktop",
-  "build": {},
+  "build": {
+    "devUrl": "http://127.0.0.1:5173"
+  },
   "app": {
     "windows": [
       {
@@ -13,7 +15,8 @@
         "height": 860,
         "minWidth": 900,
         "minHeight": 600,
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1"
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1",
+        "decorations": false
       }
     ],
     "security": {
@@ -22,6 +25,8 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["icons/icon.ico"]
+    "icon": [
+      "icons/icon.ico"
+    ]
   }
 }
