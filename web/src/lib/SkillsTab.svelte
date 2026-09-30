@@ -72,7 +72,7 @@
 </script>
 
       {#if tab === 'skills'}
-        <div class="param-hint">消息里写 $技能名 指定</div>
+        <div class="param-hint">消息里写 $技能名 指定；插件自带的技能在「插件」页启停</div>
         <div class="sub-row">
           <button class="btn primary" on:click={newSkill}>新建技能</button>
           <button class="btn" on:click={() => dispatch('reload')}>刷新</button>
@@ -95,18 +95,16 @@
         {#if loading}
           <div class="trace-empty">加载中…</div>
         {:else}
-          {#each skills as s (s.name)}
+          <!-- 用户拍板（2026-09-30）：插件自带的技能不在这里列出（引导住在插件里，去插件页看），
+               这页只管自己建的技能；数据不过滤——composer 的 $ 技能选择菜单仍含插件技能 -->
+          {#each skills.filter((s) => s.source !== 'plugin') as s (s.name)}
             <div class="mcp-card">
               <div class="mcp-head">
                 <b>${s.name}</b>
                 <span class="mcp-status">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>
                 <span class="flex-sp"></span>
-                {#if s.source === 'plugin'}
-                  <span class="mcp-status" title="插件自带的技能：在插件页启停；新建同名技能可覆盖它">同名新建可覆盖</span>
-                {:else}
-                  <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
-                  <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
-                {/if}
+                <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
+                <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
               </div>
               <div class="mcp-cmd">{s.description || '（无描述）'}</div>
             </div>

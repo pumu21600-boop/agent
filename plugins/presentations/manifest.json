@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "演示文稿",
-  "description": "pptx 演示文稿技能：按 JSON 规格生成幻灯片（pptxgenjs），读出已有 pptx 的逐页文字（OOXML 解包）。首次使用装一次 Node 依赖。",
+  "description": "演示文稿（pptx）生成与逐页读取",
   "version": "0.1.0",
   "skills": "skills"
 }

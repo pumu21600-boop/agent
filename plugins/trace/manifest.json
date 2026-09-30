@@ -2,9 +2,15 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "时间线",
-  "description": "最近任务的事件流时间线（P10-A 内置面板顺势插件化：任务展开、事件徽章、工具调用耗时配对）。P19 契约试点之一——证明内置功能装得进插件壳。",
+  "description": "最近任务的事件流时间线",
   "version": "0.1.0",
   "entry": "index.html",
-  "ui": [{ "slot": "toolbar", "id": "trace", "title": "时间线（最近任务的事件流）" }],
+  "ui": [
+    {
+      "slot": "toolbar",
+      "id": "trace",
+      "title": "时间线（最近任务的事件流）"
+    }
+  ],
   "permissions": []
 }

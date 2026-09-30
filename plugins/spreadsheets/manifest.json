@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "表格",
-  "description": "xlsx/csv 表格技能：读出各 sheet 数据为 JSON、按 JSON 规格生成 xlsx、csv 与 xlsx 互转（SheetJS）。首次使用装一次 Node 依赖。",
+  "description": "表格（xlsx/csv）读写与互转",
   "version": "0.1.0",
   "skills": "skills"
 }

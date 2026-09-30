@@ -2,10 +2,18 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "用量",
-  "description": "成本台账面板：当前对话的 token 用量、请求次数与费用（随包内置试点）",
+  "description": "当前对话的 token 用量与费用",
   "version": "0.1.0",
   "entry": "index.html",
   "settings_entry": "prices.html",
-  "ui": [{ "slot": "dock", "id": "usage", "title": "用量" }],
-  "permissions": ["usage.prices"]
+  "ui": [
+    {
+      "slot": "dock",
+      "id": "usage",
+      "title": "用量"
+    }
+  ],
+  "permissions": [
+    "usage.prices"
+  ]
 }

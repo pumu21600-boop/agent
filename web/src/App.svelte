@@ -3091,6 +3091,22 @@
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
 
+  // 内置插件的图标（24×24 stroke 内联标记，画在 .plug-ico 里；未知插件回退首字）
+  const EXT_ICONS = {
+    board: '<path d="M4.6 16.5a7.6 7.6 0 1 1 14.8 0"/><path d="M12 14.5 15.5 9.5"/><circle cx="12" cy="15" r="0.9" fill="currentColor" stroke="none"/>',
+    trace: '<path d="M5 6.5h11.5M5 12h6.5M5 17.5h13.5"/><circle cx="19.6" cy="6.5" r="1.4"/><circle cx="14.4" cy="12" r="1.4"/><circle cx="21.4" cy="17.5" r="1.4"/>',
+    usage: '<circle cx="12" cy="12" r="8.4"/><path d="M8.8 7.5 12 12l3.2-4.5"/><path d="M12 12v5.2"/><path d="M9.3 13.8h5.4"/>',
+    browser: '<circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/>',
+    documents: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5M9.5 18h3"/>',
+    github: '<circle cx="6" cy="6" r="2.3"/><path d="M6 8.3V21"/><circle cx="18" cy="18" r="2.3"/><path d="M13 6h2.5A2.5 2.5 0 0 1 18 8.5v7.2"/>',
+    pdf: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 15.5c1.7 0 1.7-2.8 3.4-2.8s1.7 2.8 3.4 2.8"/>',
+    presentations: '<path d="M3 3.5h18"/><path d="M20 3.5V13a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 13V3.5"/><path d="M12 14.8V18"/><path d="M8.5 21 12 18l3.5 3"/>',
+    spreadsheets: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M4 10.2h16"/><path d="M10.2 5v14"/><path d="M4 15h16"/>',
+  };
+  function extIcon(name) {
+    return EXT_ICONS[name] || '';
+  }
+
   async function loadExt() {
     try {
       const r = await fetch('/api/plugins', { cache: 'no-store' }).then((r) => r.json());
@@ -5014,7 +5030,9 @@
 
         {#each builtInExts as e}
           <div class="plug-row" title={extTip(e)}>
-            <div class="plug-ico">{(e.title || e.name || '?').slice(0, 1).toUpperCase()}</div>
+            <div class="plug-ico">
+              {#if extIcon(e.name)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(e.name)}</svg>{:else}{(e.title || e.name || '?').slice(0, 1).toUpperCase()}{/if}
+            </div>
             <div class="plug-meta">
               <div class="plug-title">{e.title}</div>
               <div class="plug-desc">{e.description || e.dir}</div>
@@ -5024,7 +5042,6 @@
             {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
             {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
             {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
-            {#if e.skills?.length}<span class="plug-chip" title="插件自带的技能（read_skill 可读，可在技能页看）">技能 {e.skills.join('、')}</span>{/if}
             <span class="flex-sp"></span>
             {#if e.draft}
               <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
@@ -5049,7 +5066,9 @@
           <div class="group-label">第三方 {thirdPartyExts.length}</div>
           {#each thirdPartyExts as e}
             <div class="plug-row" title={extTip(e)}>
-              <div class="plug-ico">{(e.title || e.name || '?').slice(0, 1).toUpperCase()}</div>
+              <div class="plug-ico">
+                {#if extIcon(e.name)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(e.name)}</svg>{:else}{(e.title || e.name || '?').slice(0, 1).toUpperCase()}{/if}
+              </div>
               <div class="plug-meta">
                 <div class="plug-title">{e.title}</div>
                 <div class="plug-desc">{e.description || e.dir}</div>
@@ -5059,7 +5078,6 @@
               {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
               {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
               {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
-              {#if e.skills?.length}<span class="plug-chip" title="插件自带的技能（read_skill 可读，可在技能页看）">技能 {e.skills.join('、')}</span>{/if}
               <span class="flex-sp"></span>
               {#if e.draft}
                 <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
