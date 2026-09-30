@@ -3088,6 +3088,10 @@
 
   // 已启用的扩展（停用的不加载、不给按钮）
   $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
+  // 分组（用户 2026-09-30：Git/沙箱/内置面板插件统一归「内置」一组，别分两层）；
+  // 第三方（工作区来源 / user 来源 / 草稿）单独一组
+  $: builtInExts = extList.filter((e) => e.source !== 'workspace' && e.origin !== 'user' && !e.draft);
+  $: thirdPartyExts = extList.filter((e) => !builtInExts.includes(e));
   // P21：声明了 dock 插槽的启用插件 → 右侧面板多一个页签（与「产物/预览/网页」并列）。
   // 停用插件即从页签消失——插件自己决定要不要这个槽，宿主只认 manifest 声明。
   $: rpPluginTabs = enabledExts.flatMap((e) =>
@@ -3166,6 +3170,17 @@
   }
 
   /// 扩展启用/停用（P17）：写设置 + 刷新清单
+  // 行内 tooltip：把版本/目录/工具/权限/界面插槽收进悬停提示，行体只留一句描述（用户 2026-09-30：单行紧凑，别占地方）
+  function extTip(e) {
+    const parts = [];
+    if (e.version) parts.push(`v${e.version}`);
+    if (e.dir) parts.push(e.dir);
+    if (e.tools?.length) parts.push(`工具: ${e.tools.map((t) => `wasm__${e.name}__${t[0] ?? t.name}`).join('、')}`);
+    if (e.permissions?.length) parts.push(`权限: ${e.permissions.join('、')}`);
+    if (e.ui?.length) parts.push(`界面: ${e.ui.map((u) => u.slot).join('、')}`);
+    return parts.join('\n');
+  }
+
   async function toggleExt(e) {
     try {
       const r = await fetch('/api/plugins/toggle', {
@@ -4905,144 +4920,115 @@
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
-        {#if extList.length}
-          {#each extList as e}
-            <div class="field mcp-card">
-              <div class="mcp-head">
-                <span class="dot" class:haskey={e.ok}></span>
-                <b>{e.title}</b>
-                {#if e.version}<span class="mcp-risk">v{e.version}</span>{/if}
-                <span
-                  class="mcp-status"
-                  title={e.shadowed ? '同名内置插件存在，被当前工作区的这一份覆盖' : ''}
-                >{e.draft ? '草稿 · 未转正' : e.source === 'workspace' ? (e.shadowed ? '工作区 · 覆盖内置' : '工作区') : (e.tools && e.tools.length ? '工具插件' : '内置')}</span>
-                {#if e.origin === 'model_generated'}<span class="mcp-risk">模型自产</span>{/if}
+
+        <div class="group-label">内置 {2 + builtInExts.length}</div>
+        <div class="plug-row" title={gitRuntime?.ok ? `版本 ${gitRuntime.version} · ${gitRuntime.path}` : (gitRuntime?.error || '')}>
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">Git</div>
+            <div class="plug-desc">{gitRuntime ? (gitRuntime.ok ? `版本控制运行时 · ${gitRuntime.version}` : `不可用 · ${gitRuntime.error}`) : '读取中…'}</div>
+          </div>
+          <span class="plug-chip" class:warn={gitRuntime && !gitRuntime.ok}>{gitRuntime?.ok ? (gitRuntime.source === 'system' ? '系统 Git' : gitRuntime.source === 'portable' ? '便携版' : '内置 Git') : gitRuntime ? '不可用' : '…'}</span>
+          <button class="btn ghost" on:click={loadGitRuntime}>检测</button>
+        </div>
+        <div class="plug-row" title={sandboxInfo ? `生效档 ${sandboxInfo.effective} · 配置档 ${sandboxInfo.mode_configured} · 直跑开关${sandboxInfo.allow_unsandboxed ? '已开启' : '未开启'}` : ''}>
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">沙箱</div>
+            <div class="plug-desc">{sandboxInfo ? `命令在受限进程树里跑${sandboxInfo.fallback_reason ? ` · ${sandboxInfo.fallback_reason}` : ''}` : '读取中…'}</div>
+          </div>
+          {#if sandboxProbe}
+            <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '自检中…' : sandboxProbe.ok ? '自检通过' : '自检有失败'}</span>
+          {/if}
+          <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
+          <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>检测</button>
+          <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>自检</button>
+        </div>
+        {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
+        {#if sandboxProbe?.results?.length}
+          <div class="probe-list">
+            {#each sandboxProbe.results as p}
+              <div class="probe-row">
+                <span class="dot" class:haskey={p.ok}></span>
+                <code>{p.name}</code>
+                <span class="probe-detail">{p.detail}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#each builtInExts as e}
+          <div class="plug-row" title={extTip(e)}>
+            <div class="plug-ico">{(e.title || e.name || '?').slice(0, 1).toUpperCase()}</div>
+            <div class="plug-meta">
+              <div class="plug-title">{e.title}</div>
+              <div class="plug-desc">{e.description || e.dir}</div>
+            </div>
+            {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
+            {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
+            {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
+            {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
+            {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
+            <span class="flex-sp"></span>
+            {#if e.draft}
+              <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
+              <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
+            {:else}
+              {#if e.origin === 'user'}
+                {#if e.trusted}
+                  <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
+                {:else}
+                  <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
+                {/if}
+              {/if}
+              {#if e.settings_entry}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
+              {#if e.entry}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+              <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
+            {/if}
+          </div>
+          {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
+        {/each}
+
+        {#if thirdPartyExts.length}
+          <div class="group-label">第三方 {thirdPartyExts.length}</div>
+          {#each thirdPartyExts as e}
+            <div class="plug-row" title={extTip(e)}>
+              <div class="plug-ico">{(e.title || e.name || '?').slice(0, 1).toUpperCase()}</div>
+              <div class="plug-meta">
+                <div class="plug-title">{e.title}</div>
+                <div class="plug-desc">{e.description || e.dir}</div>
+              </div>
+              {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
+              {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
+              {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
+              {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
+              {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
+              <span class="flex-sp"></span>
+              {#if e.draft}
+                <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
+                <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
+              {:else}
                 {#if e.origin === 'user'}
                   {#if e.trusted}
-                    <span class="mcp-risk" title="内容指纹已固定，加载前会比对">已验签</span>
+                    <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
                   {:else}
-                    <span class="mcp-risk" style="color: var(--tint-orange-fg)" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>
+                    <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
                   {/if}
                 {/if}
-                {#if e.enabled === false}<span class="mcp-risk">已停用</span>{/if}
-                <span class="flex-sp"></span>
-                {#if e.draft}
-                  <button class="btn primary" on:click={() => promoteExt(e)}>转正</button>
-                  <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
-                {:else}
-                  {#if e.origin === 'user'}
-                    {#if e.trusted}
-                      <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
-                    {:else}
-                      <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
-                    {/if}
-                  {/if}
-                  {#if e.settings_entry}
-                    <button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>
-                  {/if}
-                  <button class="btn ghost" on:click={() => toggleExt(e)}>{e.enabled === false ? '启用' : '停用'}</button>
-                  {#if e.entry}<button class="btn primary" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
-                {/if}
-              </div>
-              {#if e.description}<div class="mcp-cmd">{e.description}</div>{/if}
-              {#if e.tools && e.tools.length}
-                <div class="mcp-cmd">工具：{e.tools.map((t) => `wasm__${e.name}__${t[0] ?? t.name}`).join('、')}</div>
-              {/if}
-              {#if e.permissions && e.permissions.length}
-                <div class="mcp-cmd">权限：{e.permissions.join('、')}</div>
-              {/if}
-              {#if e.ui && e.ui.length}
-                <div class="mcp-cmd">界面插槽：{e.ui.map((u) => u.slot).join('、')}</div>
-              {/if}
-              {#if e.error}
-                <div class="mcp-cmd">{e.error}</div>
-              {:else}
-                <div class="mcp-cmd">{e.dir}</div>
+                {#if e.settings_entry}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
+                {#if e.entry}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+                <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
               {/if}
             </div>
+            {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
           {/each}
-        {:else}
+        {:else if !extList.length}
           <div class="menu-empty">
             还没有插件。在 <code>{extInfo.workspace_dir}</code> 下建一个目录（内含 manifest.json
             与 index.html）即可。
           </div>
         {/if}
-        <div class="field">
-          <label>插件目录约定</label>
-          <div class="mcp-cmd">内置：{extInfo.app_dir || '（读取中）'}</div>
-          <div class="mcp-cmd">工作区：{extInfo.workspace_dir || '（读取中）'}</div>
-        </div>
-        <div class="field"><label>运行状态</label></div>
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={sandboxInfo?.ok === true}></span>
-            <b>沙箱档位</b>
-            <span class="mcp-status">
-              {sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? `（请求的 ${sandboxInfo.requested} 已回退）` : '') : '读取中…'}
-            </span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>
-              {sbInfoLoading ? '探测中…' : '重新检测'}
-            </button>
-          </div>
-          {#if sandboxInfo}
-            <div class="mcp-cmd">生效档 {sandboxInfo.effective} · 配置档 {sandboxInfo.mode_configured} · 直跑开关{sandboxInfo.allow_unsandboxed ? '已开启' : '未开启'}</div>
-            {#if sandboxInfo.fallback_reason}
-              <div class="mcp-cmd" style="color: var(--tint-orange-fg)">⚠ {sandboxInfo.fallback_reason}</div>
-            {/if}
-          {/if}
-        </div>
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={gitRuntime?.ok}></span>
-            <b>Git 运行时</b>
-            <span class="mcp-status">
-              {gitRuntime?.ok
-                ? gitRuntime.source === 'system'
-                  ? '系统 Git'
-                  : gitRuntime.source === 'portable'
-                    ? '便携版（exe 同级）'
-                    : '内置 Git'
-                : gitRuntime
-                  ? '不可用'
-                  : '读取中…'}
-            </span>
-            <span class="flex-sp"></span>
-            <button class="btn ghost" on:click={loadGitRuntime}>重新检测</button>
-          </div>
-          {#if gitRuntime?.ok}
-            <div class="mcp-cmd">版本 {gitRuntime.version} · {gitRuntime.path}</div>
-          {:else if gitRuntime}
-            <div class="mcp-cmd">{gitRuntime.error}</div>
-          {/if}
-        </div>
-        <div class="field mcp-card">
-          <div class="mcp-head">
-            <span class="dot" class:haskey={sandboxProbe?.ok === true}></span>
-            <b>沙箱自检</b>
-            <span class="mcp-status">
-              {sbRunning ? '运行中…' : sandboxProbe ? (sandboxProbe.ok ? '全部通过' : '有失败项') : '未运行'}
-            </span>
-            <span class="flex-sp"></span>
-            {#if sandboxInfo}
-              <span class="tool-badge ok">{sandboxInfo.label}</span>
-            {/if}
-            <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>运行自检</button>
-          </div>
-          {#if sandboxProbe?.results?.length}
-            <div class="probe-list">
-              {#each sandboxProbe.results as p}
-                <div class="probe-row">
-                  <span class="dot" class:haskey={p.ok}></span>
-                  <code>{p.name}</code>
-                  <span class="probe-detail">{p.detail}</span>
-                </div>
-              {/each}
-            </div>
-          {:else if sandboxProbe?.error}
-            <div class="mcp-cmd">{sandboxProbe.error}</div>
-          {/if}
-        </div>
+        <div class="param-hint">目录：内置 {extInfo.app_dir || '（读取中）'} ｜ 工作区 {extInfo.workspace_dir || '（读取中）'}</div>
       {/if}
 
       <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} />
@@ -7964,6 +7950,108 @@
   .role-item :global(.csel) {
     font-size: 12px;
     padding: 6px 8px;
+  }
+  /* —— 插件页（用户 2026-09-30 指示：学 ZCode 紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） —— */
+  .group-label {
+    margin: 16px 2px 8px;
+    font-size: 12px;
+    color: var(--g5);
+  }
+  .plug-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid var(--g3);
+    border-radius: 10px;
+    margin-bottom: 6px;
+    background: var(--g2);
+  }
+  .plug-ico {
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: var(--veil);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--g6);
+  }
+  .plug-ico svg {
+    width: 18px;
+    height: 18px;
+  }
+  .plug-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .plug-title {
+    font-weight: 650;
+    font-size: 13.5px;
+  }
+  .plug-desc {
+    font-size: 12px;
+    color: var(--g5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .plug-chip {
+    flex: none;
+    font-size: 11px;
+    line-height: 1;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px dashed var(--g4);
+    color: var(--g5);
+    white-space: nowrap;
+  }
+  .plug-chip.warn {
+    color: var(--tint-orange-fg);
+    border-color: currentColor;
+    border-style: solid;
+  }
+  .plug-sub {
+    font-size: 12px;
+    color: var(--tint-orange-fg);
+    margin: -2px 4px 8px 46px;
+    word-break: break-all;
+  }
+  .plug-row .btn {
+    flex: none;
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .switch {
+    flex: none;
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    border: none;
+    background: var(--g4);
+    cursor: pointer;
+    padding: 0;
+    transition: background 0.15s;
+  }
+  .switch .knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    transition: left 0.15s;
+  }
+  .switch.on {
+    background: var(--brand);
+  }
+  .switch.on .knob {
+    left: 18px;
   }
 </style>
 
