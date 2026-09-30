@@ -48,6 +48,8 @@
   let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
   let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记（纯手动勾选）
   let roles = {}; // P8.5 角色路由映射
+  // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
+  let features = { roles: true, css_tool: true, galaxy: true };
   // —— P8.2 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
@@ -528,6 +530,7 @@
     thinkingStyle = s.thinking_style || 'auto';
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
     roles = s.roles || {};
+    features = s.features || { roles: true, css_tool: true, galaxy: true };
     workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
@@ -2958,6 +2961,16 @@
     if (t === 'skills') loadSkills();
     if (t === 'ext') { loadGitRuntime(); loadExt(); loadSandboxInfo(); }
   }
+  // 功能桥接被关掉时若正停在该页签，自动切走（features 随 applyState 回来，可能晚于首屏）
+  $: if (settingsTab === 'roles' && features && features.roles === false) settingsTab = 'model';
+
+  // 内置功能开关（插件页功能行）：写 settings.features，联动收起受影响的入口
+  function toggleFeature(k) {
+    features = { ...features, [k]: !features[k] };
+    autoSave({ features }, 0);
+    if (k === 'css_tool' && !features.css_tool && editMode) editMode = false;
+    if (k === 'galaxy' && !features.galaxy && galaxyOpen) galaxyOpen = false;
+  }
 
   // 同上：技能/MCP/插件分区的数据原先只在 pickSettingsTab 的点击里拉，页签从 localStorage
   // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
@@ -3661,10 +3674,12 @@
     </div>
 
     <div class="side-foot">
+      {#if features.galaxy}
       <button class="foot-btn galaxy-btn" on:click={() => (galaxyOpen = true)} title="记忆库：以星云看每一次会话，支持语义搜索">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="9.2" ry="3.6" transform="rotate(-24 12 12)"/><circle cx="19.4" cy="8.6" r="1.1" fill="currentColor" stroke="none"/><circle cx="5.2" cy="15.2" r="0.9" fill="currentColor" stroke="none"/></svg>
         记忆库
       </button>
+      {/if}
       <button class="foot-btn" on:click={() => (settingsOpen = true)}>设置</button>
       {#if appVersion}
         <div class="side-version" title={`运行根：${appVersion.root}`}>v{appVersion.version}</div>
@@ -4541,7 +4556,7 @@
         <div class="settings-nav">
           <button class:active={settingsTab === 'appearance'} on:click={() => pickSettingsTab('appearance')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.5"/><circle cx="9" cy="10" r="1.2" fill="currentColor"/><circle cx="12.5" cy="8.5" r="1.2" fill="currentColor"/><circle cx="15.5" cy="11" r="1.2" fill="currentColor"/></svg> 外观</button>
           <button class:active={settingsTab === 'model'} on:click={() => pickSettingsTab('model')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> 模型配置</button>
-          <button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5"/><circle cx="17" cy="9.5" r="2.4"/><path d="M16 15.2c2.4.2 3.9 1.6 4.4 4"/></svg> 角色分工</button>
+          {#if features.roles}<button class:active={settingsTab === 'roles'} on:click={() => pickSettingsTab('roles')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8.5" r="3"/><path d="M3.5 19.5c.6-3 2.8-4.5 5.5-4.5s4.9 1.5 5.5 4.5"/><circle cx="17" cy="9.5" r="2.4"/><path d="M16 15.2c2.4.2 3.9 1.6 4.4 4"/></svg> 功能桥接</button>{/if}
           <button class:active={settingsTab === 'memory'} on:click={() => pickSettingsTab('memory')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 4.5A7.5 7.5 0 0 0 4.5 12c0 2.4 1.1 4.2 2.8 5.5.4.3.7.9.7 1.5v1.5h9V19c0-.6.3-1.2.7-1.5 1.7-1.3 2.8-3.1 2.8-5.5A7.5 7.5 0 0 0 12 4.5Z"/></svg> 记忆</button>
           <button class:active={settingsTab === 'skills'} on:click={() => pickSettingsTab('skills')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2.5 5.5 13.5H11l-1 8L18.5 10H13l1-7.5Z"/></svg> 技能</button>
           <button class:active={settingsTab === 'mcp'} on:click={() => pickSettingsTab('mcp')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 7V3.5M15 7V3.5M7 7h10v4a5 5 0 0 1-10 0Z"/><path d="M12 16v5"/></svg> MCP</button>
@@ -4573,6 +4588,7 @@
             </div>
             {#if wallpaperMsg}<div class="param-hint">{wallpaperMsg}</div>{/if}
           </div>
+          {#if features.css_tool}
           <div class="field">
             <label>CSS 注入器</label>
             <textarea
@@ -4617,6 +4633,7 @@
               </button>
             </div>
           </div>
+          {/if}
         {/if}
         {#if settingsTab === 'model'}
 
@@ -4798,9 +4815,9 @@
       </div>
 
       {/if}
-      {#if settingsTab === 'roles'}
+      {#if settingsTab === 'roles' && features.roles}
       <div class="field roles-section">
-        <label>角色分工</label>
+        <label>功能桥接</label>
         <div class="roles-grid">
           <div class="role-item">
             <span class="role-name">会话摘要 (Summary)</span>
@@ -4914,14 +4931,14 @@
         <div class="param-hint">留空 = 自动兜底</div>
       </div>
       {/if}
-      <MemoryTab tab={settingsTab} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
+      <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} on:reload={loadSkills} />
       <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.risk, e.detail.server)} />
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
-        <div class="group-label">内置 {2 + builtInExts.length}</div>
+        <div class="group-label">内置 {5 + builtInExts.length}</div>
         <div class="plug-row" title={gitRuntime?.ok ? `版本 ${gitRuntime.version} · ${gitRuntime.path}` : (gitRuntime?.error || '')}>
           <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg></div>
           <div class="plug-meta">
@@ -4943,6 +4960,30 @@
           <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
           <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>检测</button>
           <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>自检</button>
+        </div>
+        <div class="plug-row" title="给摘要/标题/嵌入/多模态/子代理/预算降级等辅助调用指定专用模型渠道（原「角色分工」）">
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8.5 8.5c-2.2 0-4 1.6-4 3.5s1.8 3.5 4 3.5M15.5 8.5c2.2 0 4 1.6 4 3.5s-1.8 3.5-4 3.5M8.5 12h7"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">功能桥接</div>
+            <div class="plug-desc">辅助调用走专用渠道 · 关掉全部回主渠道（多模态附件退回占位文本）</div>
+          </div>
+          <button class="switch" class:on={features.roles} role="switch" aria-checked={features.roles} aria-label="功能桥接 启用/停用" on:click={() => toggleFeature('roles')}><span class="knob"></span></button>
+        </div>
+        <div class="plug-row" title="界面微调引擎（右击元素改样式）与手写 CSS 注入；已调好的样式不受开关影响，重开即恢复">
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 7.5L4 12l4.5 4.5M15.5 7.5L20 12l-4.5 4.5M13.5 5l-3 14"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">css-ui注入</div>
+            <div class="plug-desc">界面微调与手写 CSS · 关掉只收工具，已调样式继续生效</div>
+          </div>
+          <button class="switch" class:on={features.css_tool} role="switch" aria-checked={features.css_tool} aria-label="css-ui注入 启用/停用" on:click={() => toggleFeature('css_tool')}><span class="knob"></span></button>
+        </div>
+        <div class="plug-row" title="记忆库可视化与语义检索入口；记忆功能本体不受开关影响">
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="8.4" ry="3.2" transform="rotate(-24 12 12)"/><circle cx="18.8" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="5.6" cy="14.8" r="0.9" fill="currentColor" stroke="none"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">星云</div>
+            <div class="plug-desc">记忆库可视化与检索入口 · 关掉不影响记忆功能</div>
+          </div>
+          <button class="switch" class:on={features.galaxy} role="switch" aria-checked={features.galaxy} aria-label="星云 启用/停用" on:click={() => toggleFeature('galaxy')}><span class="knob"></span></button>
         </div>
         {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
         {#if sandboxProbe?.results?.length}

@@ -177,14 +177,16 @@ pub(crate) fn assemble_turn_channels(
     let mut params = build_chat_params(active_cfg, gateway::providers::find(&active_cfg.provider_id));
     params.base_url = Some(base_url.clone());
     let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
-    // P8/P8.5 角色映射：优先 settings.roles，未设回落 config.toml [roles]
-    let roles = s.roles.as_ref();
+    // P8/P8.5 角色映射：优先 settings.roles，未设回落 config.toml [roles]；
+    // features.roles=false（插件页「功能桥接」关）= 整条路由链跳过，全部走主渠道/默认退化
+    let roles = if s.features.roles { s.roles.as_ref() } else { None };
+    let cfg_roles = if s.features.roles { Some(&state.roles_cfg) } else { None };
     let summary_name = roles
         .and_then(|r| r.summary.as_deref())
-        .or_else(|| state.roles_cfg.summary.as_deref());
+        .or_else(|| cfg_roles.and_then(|c| c.summary.as_deref()));
     let title_name = roles
         .and_then(|r| r.title.as_deref())
-        .or_else(|| state.roles_cfg.title.as_deref());
+        .or_else(|| cfg_roles.and_then(|c| c.title.as_deref()));
     let summary = summary_name.and_then(|n| find_channel(s, n));
     let title = title_name.and_then(|n| find_channel(s, n));
     let mut notices = Vec::new();
@@ -214,7 +216,7 @@ pub(crate) fn assemble_turn_channels(
     // P21：预算降级渠道
     let budget_name = roles
         .and_then(|r| r.budget.as_deref())
-        .or_else(|| state.roles_cfg.budget.as_deref());
+        .or_else(|| cfg_roles.and_then(|c| c.budget.as_deref()));
     let downgrade = budget_name.and_then(|n| find_channel(s, n));
     if let Some(n) = budget_name
         && downgrade.is_none()

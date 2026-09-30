@@ -258,7 +258,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
         let mut prior_summary = prior_summary;
         if !attachments.is_empty() {
-            let roles = s.roles.as_ref();
+            // features.roles=false（「功能桥接」关）= 不走专家渠道，媒体附件统一占位文本
+            let roles = if s.features.roles { s.roles.as_ref() } else { None };
             let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
             let mut forward_attachments: Vec<&MediaAttachment> = Vec::new();
 
@@ -355,7 +356,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     // 2) 若该模态未配置路由或无可用候选：对齐 DSH 替换为确定性占位文本（deterministic placeholder），绝不发起注定失败的请求
                     if candidates.is_empty() {
                         let placeholder = format!(
-                            "[{kind} omitted because no {kind}-understanding model is configured; 附件「{}」已跳过并保存至工作区 .attachments/{}。当前未在“设置 → 角色分工”中配置{}理解专家 ({})，请在设置中指定具备{}能力的多模态模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
+                            "[{kind} omitted because no {kind}-understanding model is configured; 附件「{}」已跳过并保存至工作区 .attachments/{}。当前未在“设置 → 功能桥接”中配置{}理解专家 ({})，请在设置中指定具备{}能力的多模态模型（如 Gemini、Whisper、Qwen-Audio 等），或直接粘贴文字描述]",
                             att.name,
                             safe_name,
                             kind_cn,
@@ -385,7 +386,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     };
                     if !gate_ok {
                         let text = format!(
-                            "[{} not run: 专家配置「{}/{}」未勾选{}解析能力。该{}未展示给主模型。请在「设置 → 模型配置」选中该专家配置并勾选「{}解析」（或在「角色分工」把{}理解专家换成具备该能力的模型）]",
+                            "[{} not run: 专家配置「{}/{}」未勾选{}解析能力。该{}未展示给主模型。请在「设置 → 模型配置」选中该专家配置并勾选「{}解析」（或在「功能桥接」把{}理解专家换成具备该能力的模型）]",
                             success_label, first_provider, first_model, kind_cn, kind_cn, kind_cn, kind_cn
                         );
                         projections.push(text);

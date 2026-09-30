@@ -353,7 +353,7 @@
       searched = true;
       const label = MODE_LABEL(d.mode, d.model);
       searchInfo = `${results.length} 个光点 · ${label}`;
-      if (d.mode === 'local') searchNotice = '设置 → 角色分工 → 向量嵌入，可开启真语义检索';
+      if (d.mode === 'local') searchNotice = '设置 → 功能桥接 → 向量嵌入，可开启真语义检索';
       const pts = results.map((x) => nodeById(x.id)).filter(Boolean);
       if (pts.length) fitStars(pts, 1.5);
       if (!results.length) searchInfo = `没有匹配「${q}」的会话 · ${label}`;

@@ -204,7 +204,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "子任务描述：要它做什么、产出什么（说清楚边界，它看不到你的对话历史）" },
-                    "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 角色分工里的子代理席位，未配则跟主渠道）" },
+                    "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 功能桥接里的子代理席位，未配则跟主渠道）" },
                     "approval_mode": { "type": "string", "enum": ["read-only", "sandbox", "auto", "full-access"], "description": "可选：子代理的审批档（缺省 auto）" },
                     "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（缺省 deny 拒绝并回喂；approve 才放行高危）" },
                     "timeout_secs": { "type": "integer", "description": "可选：整轮超时秒数（0 = 默认 1800）" },

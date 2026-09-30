@@ -214,11 +214,15 @@ impl SubagentDispatcher {
             model = args.model.trim().to_string();
         } else {
             let s = self.state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
-            let role_name = s
-                .roles
-                .as_ref()
-                .and_then(|r| r.subagent.as_deref())
-                .or_else(|| self.state.roles_cfg.subagent.as_deref());
+            // features.roles=false（「功能桥接」关）= 跳过 B3 链，子代理直接走主渠道
+            let role_name = if s.features.roles {
+                s.roles
+                    .as_ref()
+                    .and_then(|r| r.subagent.as_deref())
+                    .or_else(|| self.state.roles_cfg.subagent.as_deref())
+            } else {
+                None
+            };
             if let Some(name) = role_name
                 && let Some(ch) = find_channel(&s, name)
             {

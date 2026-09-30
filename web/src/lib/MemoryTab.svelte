@@ -3,6 +3,8 @@
 
   const dispatch = createEventDispatcher();
   export let tab = '';
+  // 星云入口显隐（App 侧 features.galaxy；关掉只藏入口，记忆功能本体不受影响）
+  export let showGalaxy = true;
   // 「打开记忆库」:关设置 + 开星云(两个状态都在 App 侧)
   const openGalaxy = () => dispatch('openGalaxy');
 
@@ -83,7 +85,7 @@
           <div class="field">
             <label>记忆库</label>
             <div class="sub-row">
-              <button class="btn" on:click={openGalaxy}>打开记忆库</button>
+              {#if showGalaxy}<button class="btn" on:click={openGalaxy}>打开记忆库</button>{/if}
             </div>
           </div>
           <div class="field">

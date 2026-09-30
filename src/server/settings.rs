@@ -60,6 +60,9 @@ pub struct SettingsUpdate {
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
+    /// 内置功能开关（功能桥接/css-ui注入/星云）。Some = 整体替换
+    #[serde(default)]
+    pub features: Option<crate::config::settings::FeatureSettings>,
 }
 
 /// 供应商预设列表（数据驱动自 providers.json）。
@@ -200,6 +203,10 @@ pub(super) async fn put_settings(
 
     if let Some(roles) = req.roles {
         s.roles = Some(roles);
+    }
+
+    if let Some(features) = req.features {
+        s.features = features;
     }
 
     if let Err(e) = s.save() {
@@ -348,6 +355,7 @@ fn config_state_json(s: &Settings) -> Value {
         "thinking_style_override": active.thinking_style,
         "thinking_style": effective_thinking_style(active, preset),
         "roles": s.roles,
+        "features": s.features,
     })
 }
 

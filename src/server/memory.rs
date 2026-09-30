@@ -77,6 +77,10 @@ pub(super) async fn save_memory_agents(
 /// 解析 EMBEDDING 角色渠道（B3 顺序：settings.roles.embedding > config.toml [roles].embedding）。
 /// 嵌入**不走主渠道兜底**：主模型多半没有 /embeddings 端点，未配置时用本地哈希向量更可靠。
 fn resolve_embedder<'a>(state: &'a AppState, s: &Settings) -> Option<crate::memory::library::Embedder<'a>> {
+    // features.roles=false（「功能桥接」关）= 不用专家嵌入渠道，直接本地哈希向量
+    if !s.features.roles {
+        return None;
+    }
     let name = s
         .roles
         .as_ref()

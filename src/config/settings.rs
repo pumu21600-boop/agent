@@ -101,6 +101,28 @@ pub struct RolesSettings {
     pub fallbacks: Vec<String>,
 }
 
+/// 内置功能开关（插件页「内置」组的可开关功能行）。缺省全开——旧 settings.json
+/// 无此字段时行为与从前完全一致；关掉的语义见各字段注释（全部复用现成的退化路径）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureSettings {
+    /// 功能桥接（原「角色分工」渠道路由）：关 = 摘要/标题/嵌入/多模态/子代理/预算降级
+    /// 全部回主渠道或默认退化（config.toml [roles] 一并不再生效）
+    #[serde(default = "default_true")]
+    pub roles: bool,
+    /// css-ui注入（界面微调引擎 + 手写 CSS）：关 = 收起工具入口，已调好的样式继续生效
+    #[serde(default = "default_true")]
+    pub css_tool: bool,
+    /// 星云入口（记忆库可视化/检索）：关 = 只藏入口，记忆功能本体不受影响
+    #[serde(default = "default_true")]
+    pub galaxy: bool,
+}
+
+impl Default for FeatureSettings {
+    fn default() -> Self {
+        Self { roles: true, css_tool: true, galaxy: true }
+    }
+}
+
 /// 成本台账设置（P21 插件化后由「用量」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
@@ -328,6 +350,10 @@ pub struct Settings {
     /// P21 成本台账：展示币种 / 汇率 / 模型价格表（美元 / 1M tokens 规范存储）
     #[serde(default)]
     pub cost: CostSettings,
+
+    /// 内置功能开关（插件页「内置」组的功能行；缺省全开）
+    #[serde(default)]
+    pub features: FeatureSettings,
 
     /// P22-B 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

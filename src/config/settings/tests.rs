@@ -157,3 +157,18 @@
         assert!(!text.contains("\"profiles\""), "旧字段名不再写出");
         assert!(!text.contains("disabled_extensions"), "旧字段名不再写出");
     }
+
+    #[test]
+    fn features_default_all_on_and_partial_roundtrip() {
+        // 插件页「内置」功能开关：旧 settings.json 无 features 字段 = 全开（行为不变）；
+        // 只关一个不影响其他；序列化回读一致
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.features.roles && s.features.css_tool && s.features.galaxy, "缺省全开");
+
+        let s: Settings = serde_json::from_str(r#"{"features":{"roles":false}}"#).unwrap();
+        assert!(!s.features.roles, "显式关闭生效");
+        assert!(s.features.css_tool && s.features.galaxy, "未提及的开关保持默认开");
+
+        let back = serde_json::to_string(&s.features).unwrap();
+        assert!(back.contains("\"roles\":false") && back.contains("\"css_tool\":true"), "{back}");
+    }
