@@ -24,15 +24,15 @@ function need(name) {
     if (fs.existsSync(path.join(b, name))) return require(path.join(b, name));
   }
   console.error(
-    `缺少依赖 ${name}。先装一次（装在任何工作区都能用）：\n` +
+    `missing dependency ${name}. install once (usable from any workspace):\n` +
       `  npm install --prefix "%USERPROFILE%\\.agent\\skill-modules" ${name}\n` +
-      `或直接在工作目录: npm install ${name}`
+      `or in the workspace: npm install ${name}`
   );
   process.exit(2);
 }
 
 function usage() {
-  console.error('用法: node pdf.js text <in.pdf> [maxPages] | pages <in.pdf> | merge <out.pdf> <in...> | split <in.pdf> <prefix> | fromhtml <in.html> <out.pdf>');
+  console.error('usage: node pdf.js text <in.pdf> [maxPages] | pages <in.pdf> | merge <out.pdf> <in...> | split <in.pdf> <prefix> | fromhtml <in.html> <out.pdf>');
   process.exit(1);
 }
 
@@ -81,9 +81,9 @@ async function main() {
     const max = parseInt(maxArg || '30', 10) || 30;
     const doc = await pdfParse(buf, { max });
     const text = doc.text.trim();
-    console.log(`页数(全文档): ${doc.numpages}，本次提取前 ${max} 页，字符数: ${text.length}`);
+    console.log(`pages(all): ${doc.numpages}, extracted(first ${max}), chars: ${text.length}`);
     if (!text) {
-      console.error('⚠️ 提取结果为 0 字：这多半是扫描件/图片型 PDF（没有文字层），如实告知用户，不要编造内容。');
+      console.error('⚠️ EMPTY TEXT: scanned/image-only PDF (no text layer). Report honestly, do not invent content.');
       return;
     }
     console.log('---');
@@ -105,7 +105,7 @@ async function main() {
       pages.forEach((p) => merged.addPage(p));
     }
     fs.writeFileSync(out, await merged.save());
-    console.log(`已生成 ${out}（${merged.getPageCount()} 页，来自 ${inputs.length} 个文件）`);
+    console.log(`OK merge ${out} (${merged.getPageCount()} pages from ${inputs.length} files)`);
   } else if (cmd === 'split') {
     const [file, prefix] = rest;
     if (!file || !prefix) usage();
@@ -117,14 +117,14 @@ async function main() {
       one.addPage(p);
       fs.writeFileSync(`${prefix}-${i + 1}.pdf`, await one.save());
     }
-    console.log(`已拆分为 ${src.getPageCount()} 个文件（${prefix}-1.pdf … ${prefix}-${src.getPageCount()}.pdf）`);
+    console.log(`OK split into ${src.getPageCount()} files (${prefix}-1.pdf ... ${prefix}-${src.getPageCount()}.pdf)`);
   } else if (cmd === 'fromhtml') {
     const html = rest[0];
     const out = rest[1];
     if (!html || !out) usage();
     const browser = findBrowser();
     if (!browser) {
-      console.error('没找到 Edge/Chrome/WebView2 运行时（设 AGENT_BROWSER_PATH 指到浏览器 exe 可用）：HTML 转 PDF 无法进行，如实告知用户。');
+      console.error('no Edge/Chrome/WebView2 runtime found (set AGENT_BROWSER_PATH). Cannot convert HTML; report honestly.');
       process.exit(1);
     }
     const absHtml = path.resolve(html);
@@ -135,16 +135,16 @@ async function main() {
       { stdio: 'ignore', timeout: 60000 }
     );
     if (!fs.existsSync(absOut)) {
-      console.error('浏览器跑了但没产出 PDF，检查 HTML 是否可渲染；如实告知用户。');
+      console.error('browser ran but produced no PDF; check that the HTML renders. Report honestly.');
       process.exit(1);
     }
-    console.log(`已生成 ${out}（${fs.statSync(absOut).size} 字节，浏览器: ${path.basename(browser)}）`);
+    console.log(`OK fromhtml ${out} (${fs.statSync(absOut).size} bytes, browser: ${path.basename(browser)})`);
   } else {
     usage();
   }
 }
 
 main().catch((e) => {
-  console.error(`失败: ${e.message}`);
+  console.error(`FAIL: ${e.message}`);
   process.exit(1);
 });

@@ -1,46 +1,60 @@
 ---
 name: xlsx
-description: 读/建 .xlsx 与 csv 表格：read 把各 sheet 数据导出为 JSON，make 按规格生成 xlsx，csv 与 xlsx 互转
+description: 创建与「原地」改 .xlsx：read 读出各 sheet 为 JSON、改完 make 覆盖原路径；csv 互转；勿另造脚本勿用 Python
 ---
 
 # xlsx 技能（表格）
 
-适用：读表格数据做分析/汇总、按数据生成 .xlsx、csv 与 xlsx 互转。
-走 Node + SheetJS，不依赖 Excel/WPS。
+## 硬约束（先读完再动手）
 
-## 0. 环境准备（一次性）
+1. **所有命令用 read_skill 返回的绝对「技能目录」路径开头**；read_file/shell 的相对路径相对**工作区**，不许拿它们读技能文件——必报 os error 2。
+2. **只用 `scripts/xlsx.js`（SheetJS），不许自造解析脚本、不许上 Python**（本机没有 Python；pandas/openpyxl 路线直接堵死）。
+3. **「改」已有表格 = `read` 出数据 → 改 JSON → `make` 输出覆盖原路径**（用户视角的原地改）。不新建 `xxx2.xlsx`，除非用户明确要求。
+4. 不用 subagent_spawn 验证；改完 `read` 回读核对数字行数就是验证。
+5. 依赖缺失只许装到 `~/.agent/skill-modules`；装不上停下来如实报告。
+
+## 0. 环境检测（任务第一步）
 
 ```
-npm install --prefix "%USERPROFILE%\.agent\skill-modules" xlsx
+node "<技能目录>\scripts\xlsx.js"
 ```
 
-依赖装不上时如实报错停下，不要拿 csv 改后缀名冒充 xlsx。
+打印 usage = 就绪；missing dependency → 跑页尾安装命令。
 
-## 1. 命令（`<技能目录>` 见 read_skill 返回的头部标注）
+## 1. 工作流
 
-- `node "<技能目录>\scripts\xlsx.js" read 数据.xlsx [sheet名] [行数上限]`
-  不带 sheet 名先列全部 sheet 名与行数；带则导出该 sheet 为 JSON（首行作表头）。
-  默认最多 200 行，要更多就传行数上限，别一次倒几十万行进上下文。
-- `node "<技能目录>\scripts\xlsx.js" make sheet-spec.json 输出.xlsx`
-- `node "<技能目录>\scripts\xlsx.js" csv 数据.csv 输出.xlsx`
-- `node "<技能目录>\scripts\xlsx.js" tocsv 数据.xlsx [sheet名] 输出.csv`
+1. `read_skill("xlsx")`（已做；返回头部有绝对技能目录与资产清单）
+2. `node "<技能目录>\scripts\xlsx.js" read <文件.xlsx>` 先列全部 sheet 与规模，再按需 `read <文件> <sheet> [行数上限]` 出 JSON
+3. 改数据写成工作区内 `.json`（临时文件用完即删）
+4. `node "<技能目录>\scripts\xlsx.js" make <spec.json> <输出.xlsx>`（原地改 = 原路径覆盖）
+5. `read <输出.xlsx> <sheet> 3` 抽查前几行，确认数字没变样
 
-## 2. make 规格
+## 2. read 输出
+
+`{"sheet":"月度","total_rows_limited_to":200,"rows":[[表头],[行],...]}`，首行即表头；日期单元格已转成 `YYYY-MM-DD` 人类可读串（不是序列号）。
+
+## 3. make 规格
 
 ```json
 {
   "sheets": [
-    { "name": "月度", "rows": [["月份", "销售额"], ["1月", 1200], ["2月", 1580]] },
-    { "name": "明细", "rows": [["日期", "金额"], ["2026-01-05", 320.5]] }
+    { "name": "月度", "rows": [["月份", "销售额"], ["1月", 1200], ["合计", "=SUM(B2:B3)"]] }
   ]
 }
 ```
 
-- rows 是二维数组，数字/布尔/字符串按原类型写入，日期一律先转成字符串。
-- 多个 sheet 就放多项；要公式时直接写字符串 `=SUM(B2:B13)`（打开文件时由 Excel 计算）。
+- rows 是二维数组，数字/布尔按原类型写入，日期一律先转字符串。
+- 公式直接写字符串 `=SUM(...)`（打开文件时由 Excel 计算）。
+- 多 sheet 就放多项。
 
-## 3. 边界（如实告知用户）
+## 4. 边界（如实告知用户）
 
-- 读取丢格式：颜色/合并单元格/图表拿不到，导出的是**数据**；要做图表请生成后让用户在 Excel 里加，或走图表库另行出图。
-- make 生成的是新表，不做「在原文件上小改」——改已有文件 = 读出数据 → 改数据 → 生成新版，原样式不保留，先说明再动手。
-- 大文件先 `read <文件> <sheet> 5` 看结构，确认列含义再决定导多少。
+- 读取丢格式：颜色/合并单元格/图表拿不到，导出的是**数据**；`make` 是重写文件，原样式不保留——「改几个数」可以，「保留原排版只改字」做不到，先说清再动手。
+- 大表先 `read <文件> <sheet> 5` 探结构，再决定导多少行，别一次倒几十万行进上下文。
+- `csv <in.csv> <out.xlsx>` / `tocsv <in.xlsx> [sheet] <out.csv>` 可互转；csv 里像日期/百分比的非纯数字串按原文保留。
+
+## 5. 环境安装（仅缺依赖时）
+
+```
+npm install --prefix "%USERPROFILE%\.agent\skill-modules" xlsx
+```

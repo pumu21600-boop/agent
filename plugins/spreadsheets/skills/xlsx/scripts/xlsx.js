@@ -22,15 +22,15 @@ function need(name) {
     if (fs.existsSync(path.join(b, name))) return require(path.join(b, name));
   }
   console.error(
-    `缺少依赖 ${name}。先装一次（装在任何工作区都能用）：\n` +
+    `missing dependency ${name}. install once (usable from any workspace):\n` +
       `  npm install --prefix "%USERPROFILE%\\.agent\\skill-modules" ${name}\n` +
-      `或直接在工作目录: npm install ${name}`
+      `or in the workspace: npm install ${name}`
   );
   process.exit(2);
 }
 
 function usage() {
-  console.error('用法: node xlsx.js read <in> [sheet] [limit] | make <spec.json|-> <out.xlsx> | csv <in.csv> <out.xlsx> | tocsv <in.xlsx> [sheet] <out.csv>');
+  console.error('usage: node xlsx.js read <in> [sheet] [limit] | make <spec.json|-> <out.xlsx> | csv <in.csv> <out.xlsx> | tocsv <in.xlsx> [sheet] <out.csv>');
   process.exit(1);
 }
 
@@ -62,13 +62,13 @@ function main() {
       console.log(`sheets: ${names.join(', ')}`);
       for (const n of names) {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, blankrows: false });
-        console.log(`- ${n}: ${rows.length} 行 × ${rows.reduce((m, r) => Math.max(m, r.length), 0)} 列`);
+        console.log(`- ${n}: ${rows.length} rows x ${rows.reduce((m, r) => Math.max(m, r.length), 0)} cols`);
       }
-      console.log('（用 read <文件> <sheet名> [行数上限] 导出具体 sheet 的 JSON 数据）');
+      console.log('(use: read <file> <sheet> [limit] to dump a sheet as JSON)');
       return;
     }
     if (!names.includes(b)) {
-      console.error(`没有 sheet「${b}」，可用的有: ${names.join(', ')}`);
+      console.error(`no such sheet "${b}"; available: ${names.join(', ')}`);
       process.exit(1);
     }
     const rows = normalize(
@@ -82,12 +82,12 @@ function main() {
     const spec = JSON.parse(specText);
     const wb = XLSX.utils.book_new();
     (spec.sheets || []).forEach((s, i) => {
-      if (!Array.isArray(s.rows)) throw new Error(`sheets[${i}].rows 必须是二维数组`);
+      if (!Array.isArray(s.rows)) throw new Error(`sheets[${i}].rows must be a 2D array`);
       XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(s.rows), s.name || `Sheet${i + 1}`);
     });
-    if (!wb.SheetNames.length) throw new Error('spec.sheets 为空，没有可写的内容');
+    if (!wb.SheetNames.length) throw new Error('spec.sheets is empty, nothing to write');
     XLSX.writeFile(wb, b);
-    console.log(`已生成 ${b}（sheets: ${wb.SheetNames.join(', ')}）`);
+    console.log(`OK make ${b} (sheets: ${wb.SheetNames.join(', ')})`);
   } else if (cmd === 'csv') {
     if (!a || !b) usage();
     const XLSX = need('xlsx');
@@ -109,14 +109,14 @@ function main() {
       }
     }
     XLSX.writeFile(wb, b);
-    console.log(`已生成 ${b}（来自 ${a}，sheets: ${wb.SheetNames.join(', ')}）`);
+    console.log(`OK make ${b} (from ${a}, sheets: ${wb.SheetNames.join(', ')})`);
   } else if (cmd === 'tocsv') {
     if (!a || !c) usage();
     const { XLSX, wb } = loadWorkbook(a);
     const name = b && wb.SheetNames.includes(b) ? b : wb.SheetNames[0];
     const csv = XLSX.utils.sheet_to_csv(wb.Sheets[name]);
     fs.writeFileSync(c, '\ufeff' + csv, 'utf8'); // BOM：Excel 直接打开不乱码
-    console.log(`已生成 ${c}（来自 ${a} 的 sheet「${name}」，${csv.split('\n').length - 1} 行）`);
+    console.log(`OK tocsv ${c} (from ${a} sheet "${name}", ${csv.split('\n').length - 1} rows)`);
   } else {
     usage();
   }
@@ -125,6 +125,6 @@ function main() {
 try {
   main();
 } catch (e) {
-  console.error(`失败: ${e.message}`);
+  console.error(`FAIL: ${e.message}`);
   process.exit(1);
 }

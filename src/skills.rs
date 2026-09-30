@@ -181,16 +181,38 @@ pub fn read(name: &str) -> Result<String, String> {
     Err(format!("未找到技能「{name}」：请在对应 skills 目录下创建 <name>/SKILL.md"))
 }
 
-/// 生态轮：模型侧读取——正文前带技能目录绝对路径。插件技能的脚本资产（scripts/ 等）
-/// 要用绝对路径跑，模型只有从这里才知道技能落在磁盘何处；技能页编辑器仍走 read（原文）。
+/// 生态轮：模型侧读取——正文前带技能目录绝对路径与资产清单。插件技能的脚本资产
+/// （scripts/ 等）要用绝对路径跑，模型只有从这里才知道技能落在磁盘何处；列出一层
+/// 文件名，省掉模型去 read_file 猜路径（猜相对路径必然 os error 2——那相对的是工作区）。
+/// 技能页编辑器仍走 read（原文）。
 pub fn read_for_agent(name: &str) -> Result<String, String> {
-    let dir = list()
-        .into_iter()
-        .find(|s| s.name == name.trim())
-        .map(|s| s.dir);
+    let listed = list().into_iter().find(|s| s.name == name.trim());
+    let dir = listed.as_ref().map(|s| s.dir.clone());
     let content = read(name)?;
     Ok(match dir {
-        Some(d) => format!("【技能目录】{d}\n（技能内的脚本/参考资料都在这个目录下，用绝对路径访问）\n\n{content}"),
+        Some(d) => {
+            let mut assets = fs::read_dir(&d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().file_name() != Some(std::ffi::OsStr::new("SKILL.md")))
+                        .map(|e| {
+                            let is_dir = e.path().is_dir();
+                            let n = e.file_name().to_string_lossy().to_string();
+                            if is_dir { format!("{n}/") } else { n }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            assets.sort();
+            let hint = if assets.is_empty() {
+                "（本技能无独立资产文件）".to_string()
+            } else {
+                format!("（资产：{}）", assets.join("、"))
+            };
+            format!(
+                "【技能目录】{d}\n（技能内命令一律用此绝对路径开头；read_file/shell 的相对路径是相对工作区的，不能用来读技能文件）\n{hint}\n\n{content}"
+            )
+        }
         None => content,
     })
 }

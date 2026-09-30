@@ -20,15 +20,15 @@ function need(name) {
     if (fs.existsSync(path.join(b, name))) return require(path.join(b, name));
   }
   console.error(
-    `缺少依赖 ${name}。先装一次（装在任何工作区都能用）：\n` +
+    `missing dependency ${name}. install once (usable from any workspace):\n` +
       `  npm install --prefix "%USERPROFILE%\\.agent\\skill-modules" ${name}\n` +
-      `或直接在工作目录: npm install ${name}`
+      `or in the workspace: npm install ${name}`
   );
   process.exit(2);
 }
 
 function usage() {
-  console.error('用法: node pptx.js make <spec.json|-> <out.pptx> | text <in.pptx>');
+  console.error('usage: node pptx.js make <spec.json|-> <out.pptx> | text <in.pptx>');
   process.exit(1);
 }
 
@@ -57,7 +57,7 @@ async function main() {
     }
     const buf = await pptx.write({ outputType: 'nodebuffer' });
     fs.writeFileSync(b, buf);
-    console.log(`已生成 ${b}（${(spec.slides || []).length + (spec.title ? 1 : 0)} 页，${buf.length} 字节）`);
+    console.log(`OK make ${b} (${(spec.slides || []).length + (spec.title ? 1 : 0)} slides, ${buf.length} bytes)`);
   } else if (cmd === 'text') {
     if (!a) usage();
     const JSZip = need('jszip');
@@ -66,7 +66,7 @@ async function main() {
       .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
       .sort((x, y) => parseInt(x.match(/(\d+)/)[1], 10) - parseInt(y.match(/(\d+)/)[1], 10));
     if (!slideFiles.length) {
-      console.error('这个文件里没有幻灯片（ppt/slides/*.xml 不存在）：要么不是 pptx，要么是空演示文稿。如实告知用户。');
+      console.error('no slides found (ppt/slides/*.xml missing): not a pptx, or empty deck. Report honestly.');
       process.exit(1);
     }
     for (const name of slideFiles) {
@@ -83,9 +83,9 @@ async function main() {
           .join(' ')
           .trim();
       }
-      console.log(`## 第 ${name.match(/(\d+)/)[1]} 页`);
+      console.log(`-- slide ${name.match(/(\d+)/)[1]} --`);
       console.log(texts.join('\n'));
-      if (notes) console.log(`（备注: ${notes}）`);
+      if (notes) console.log(`(notes: ${notes})`);
       console.log('');
     }
   } else {
@@ -94,6 +94,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(`失败: ${e.message}`);
+  console.error(`FAIL: ${e.message}`);
   process.exit(1);
 });
