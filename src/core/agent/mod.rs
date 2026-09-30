@@ -327,6 +327,9 @@ pub async fn run_task(
     // 否则比真实用量少一大截（实测：估算 1866 vs 实际 4750，差额≈工具 Schema）
     let tools_schema_tokens =
         tools_def.as_ref().map(|d| context::estimate_tokens(&d.to_string())).unwrap_or(0);
+    // 渠道上报的真实 prompt_tokens（上一次主循环请求）。圆环优先用它——启发式估算
+    // 对 JSON 密度估不准（实测估算 5139 vs 渠道实报 4750），真实值才能和用量面板对上
+    let mut last_real_tokens: u64 = 0;
     let mut prev_tool_sigs: Vec<String> = Vec::new();
     // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
     // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
@@ -398,19 +401,22 @@ pub async fn run_task(
         // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
         let mut breakdown = context::estimate_breakdown(&msgs);
         breakdown.tools_schema = tools_schema_tokens;
-        let used = breakdown.total();
+        let est_total = breakdown.total();
+        // token 数优先用渠道实报的真实占用（可与用量面板互相核对）；启发式估算
+        // 只在首请求前兜底（对 JSON 密度估不准）。交接阈值维持估算口径不变
+        let used = if last_real_tokens > 0 { last_real_tokens } else { est_total };
         on_event(AgentEvent::ContextUsage {
             tokens: used,
             budget: ctx_cfg.budget_tokens,
             breakdown,
         });
         // P6 自动交接：占用过阈值 → 生成交接文档（每任务一次），下一会话可接续
-        if !handoff_done && used > 0 {
+        if !handoff_done && est_total > 0 {
             let ratio = rec_cfg.handoff_token_ratio.clamp(0.05, 1.0);
             let threshold = (ctx_cfg.budget_tokens as f32 * ratio) as u64;
-            if threshold > 0 && used >= threshold {
+            if threshold > 0 && est_total >= threshold {
                 handoff_done = true;
-                let pct = ((used as f32 / ctx_cfg.budget_tokens as f32) * 100.0).round() as u64;
+                let pct = ((est_total as f32 / ctx_cfg.budget_tokens as f32) * 100.0).round() as u64;
                 let ws = tools::workspace_root().to_path_buf();
                 let session_id = observability::get().session_id().to_string();
                 let trigger =
@@ -505,6 +511,7 @@ pub async fn run_task(
 
         // 渠道真实用量（缓存命中率展示；渠道不支持时为空）
         if let Some(p) = turn.prompt_tokens {
+            last_real_tokens = p;
             on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
         }
 

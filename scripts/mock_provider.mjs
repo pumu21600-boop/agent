@@ -25,9 +25,23 @@ function sendSSE(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
-/** 分片模拟流式 delta.tool_calls（和真实渠道同形）。 */
-function emitToolCall(res, name, args) {
+/** 收尾块带 usage（真实渠道都有）：网关取 prompt_tokens 做圆环真实占用/台账。
+ *  大小按请求体 JSON 长度 /3 拟真（含 tools 定义，量级与真渠道一致）。 */
+let curParsed = null; // 当前请求体（emitToolCall 拟真 usage 用；并发子代理场景下允许串扰，假数字无碍）
+function usageOf(parsed) {
+  return { prompt_tokens: Math.max(1, Math.round(JSON.stringify(parsed || curParsed || {}).length / 3)), completion_tokens: 41 };
+}
+function finishWithUsage(res, parsed) {
   sendSSE(res, {
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: usageOf(parsed),
+  });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+/** 分片模拟流式 delta.tool_calls（和真实渠道同形）。 */
+function emitToolCall(res, name, args) {  sendSSE(res, {
     choices: [
       {
         index: 0,
@@ -48,6 +62,8 @@ function emitToolCall(res, name, args) {
     });
   }
   sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+  // 工具回合也报 usage（真实渠道如此）——圆环真实值才能在多步任务中途生效
+  sendSSE(res, { choices: [], usage: usageOf() });
   res.write('data: [DONE]\n\n');
   res.end();
 }
@@ -83,6 +99,7 @@ http
       req.on('end', () => {
         console.log('[mock] request body:', body);
         const parsed = JSON.parse(body);
+        curParsed = parsed;
         const msgs = parsed.messages || [];
         const hasToolMsg = msgs.some((m) => m.role === 'tool');
         const hasToolsParam = Array.isArray(parsed.tools) && parsed.tools.length > 0;
@@ -140,9 +157,7 @@ http
           for (let i = 0; i < text.length; i += 6) {
             sendSSE(res, { choices: [{ index: 0, delta: { content: text.slice(i, i + 6) } }] });
           }
-          sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-          res.write('data: [DONE]\n\n');
-          res.end();
+          finishWithUsage(res, parsed);
         };
         if (retryFail) {
           // 前两轮同一个必失败调用（路径不存在）；第三轮起让模型收尾说话
@@ -249,9 +264,7 @@ http
           for (let i = 0; i < final.length; i += 6) {
             sendSSE(res, { choices: [{ index: 0, delta: { content: final.slice(i, i + 6) } }] });
           }
-          sendSSE(res, { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-          res.write('data: [DONE]\n\n');
-          res.end();
+          finishWithUsage(res, parsed);
         } else if (/慢流/.test(lastText)) {
           emitSlowStream(res);
         } else {
@@ -263,8 +276,7 @@ http
                 choices: [{ index: 0, delta: { content: CHUNKS[i++] } }],
               });
             } else {
-              res.write('data: [DONE]\n\n');
-              res.end();
+              finishWithUsage(res, parsed);
               clearInterval(timer);
             }
           }, 120);

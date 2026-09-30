@@ -2240,11 +2240,18 @@
               else if (d.api_usage) {
                 const prev = (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 };
                 const api = { prompt: prev.prompt + (d.api_usage.prompt_tokens || 0), cached: prev.cached + (d.api_usage.cached_tokens || 0) };
+                // 圆环 tokens 改用渠道实报的真实占用（最新一次请求=当前上下文；
+                // 估算只兜首请求前）。回答一落地就对得上用量面板，不用等下一轮
+                const prevCtx = (usageBySession[skey] || {}).ctx || ctxUsage;
+                const ctx = d.api_usage.prompt_tokens > 0 ? { ...prevCtx, tokens: d.api_usage.prompt_tokens } : prevCtx;
                 usageBySession = {
                   ...usageBySession,
-                  [skey]: { ctx: (usageBySession[skey] || {}).ctx || ctxUsage, api },
+                  [skey]: { ctx, api },
                 };
-                if (skey === curKey()) apiTotals = api;
+                if (skey === curKey()) {
+                  apiTotals = api;
+                  ctxUsage = ctx;
+                }
               } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
