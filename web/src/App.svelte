@@ -5425,6 +5425,10 @@
     gap: 10px;
     padding: 2px 4px 14px;
   }
+  /* 窗口按钮贴侧栏右缘（用户拍板：展开态这一组放侧边栏右边） */
+  .side-head .win-ctrls {
+    margin-left: auto;
+  }
   .brand-mark {
     width: 30px;
     height: 30px;
