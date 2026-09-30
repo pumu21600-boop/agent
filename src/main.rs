@@ -9,6 +9,7 @@ mod core;
 mod fsx;
 mod gateway;
 mod hooks;
+mod jobguard;
 mod mcp;
 mod memory;
 mod observability;

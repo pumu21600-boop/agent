@@ -211,8 +211,10 @@
     const d = new Date(ts * 1000);
     const p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  $: if (tab === 'schedule') loadSchedules();
   }
+  // 组件化回归修复（审计 02）：响应式声明必须在 <script> 顶层——原先缩进在 fmtTs
+  // 函数体内被 Svelte 当普通 JS 标签编译，切页签永远不会自动拉列表
+  $: if (tab === 'schedule') loadSchedules();
 </script>
 
       {#if tab === 'schedule'}

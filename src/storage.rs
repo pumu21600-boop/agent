@@ -44,21 +44,36 @@ pub fn write_settings(path: &Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 插件名合法（与 plugins 同规：无分隔符、无穿越；额外放行 `- _ .` 组合但不接受 `.`/`..` 本身）。
+/// Windows 传统 DOS 保留设备名（不分区大小写；任意扩展名同样保留，故按首个点前缀匹配）。
+/// 审计 11：`CON.json` 之类在 Windows 会触发设备重定向，必须整段拦死。
+fn is_dos_reserved_name(name: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name);
+    RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r))
+}
+
+/// 插件名合法（与 plugins 同规：无分隔符、无穿越；额外放行 `- _ .` 组合但不接受 `.`/`..` 本身；
+/// DOS 保留设备名整段拒绝——名字会用作 plugin_data 下的目录名）。
 fn safe_plugin_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name != "."
         && name != ".."
+        && !is_dos_reserved_name(name)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// 插件数据键名合法：字母数字与 `- _`，1–64 字节。硬卡死路径分隔符与 `..`（构造上无穿越）。
+/// 插件数据键名合法：字母数字与 `- _`，1–64 字节。硬卡死路径分隔符与 `..`（构造上无穿越）；
+/// DOS 保留设备名拒绝（键名会拼成 `<key>.json`，CON 也撞设备名）。
 fn safe_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= 64
+        && !is_dos_reserved_name(key)
         && key
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -182,6 +197,19 @@ mod tests {
         write_settings(&path, "{}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dos_reserved_names_rejected() {
+        // 审计 11：CON/NUL/COM1 等传统设备名（含带扩展名形态）在 Windows 触发设备重定向
+        for bad in ["CON", "con", "Nul", "AUX", "NUL", "COM1", "lpt9", "con.json", "COM8.any"] {
+            assert!(!safe_plugin_name(bad), "{bad} 是保留设备名，必须拒绝");
+            assert!(!safe_key(bad), "{bad} 是保留设备名，必须拒绝");
+        }
+        for good in ["constant", "nulp", "com10", "auxiliary", "my.plugin", "key-1"] {
+            assert!(safe_plugin_name(good), "{good} 不该被误伤");
+        }
+        assert!(safe_key("constant") && safe_key("com10") && safe_key("auxiliary"));
     }
 
     #[test]

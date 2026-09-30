@@ -35,7 +35,6 @@
 
 mod cdp;
 mod commands;
-mod jobguard;
 mod command;
 mod panel;
 mod session;
@@ -213,7 +212,7 @@ pub(crate) struct BrowserSession {
     /// 无头模式的浏览器子进程（shell 模式为 None——没有自己的进程）
     child: Option<std::sync::Mutex<Child>>,
     /// 无头子进程的生命周期保险丝（kill-on-close；随会话 Drop 一起击杀整棵树）
-    job: Option<jobguard::ChildJob>,
+    job: Option<crate::jobguard::ChildJob>,
     /// CDP HTTP 端点端口（shell 模式 = 壳的 9223；无头 = 自拉实例的随机端口）
     port: u16,
     tabs: std::sync::Mutex<Vec<Arc<WebTab>>>,

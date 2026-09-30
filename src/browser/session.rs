@@ -480,7 +480,7 @@ pub(crate) async fn launch() -> Result<Arc<BrowserSession>, String> {
         };
         // 生命周期保险丝：服务被硬杀（stop.bat 走 taskkill /F）时无头浏览器跟着死，
         // 不留孤儿 Edge 占内存（真机踩过：用户机器上留了个杀不掉的提权孤儿）
-        let job = jobguard::ChildJob::new();
+        let job = crate::jobguard::ChildJob::new();
         if let Some(j) = job.as_ref() {
             use std::os::windows::io::AsRawHandle;
             j.assign(child.as_raw_handle() as isize);

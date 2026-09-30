@@ -377,14 +377,54 @@ fn resolve_in_workspace(rel: &str, must_exist: bool, unconfined: bool) -> Result
         }
         Ok(canon)
     } else {
-        // 目标可能还不存在：先确保父目录存在，再对父目录做穿越校验
-        let parent = full.parent().ok_or("路径无父目录")?.to_path_buf();
-        std::fs::create_dir_all(&parent).map_err(|e| format!("创建父目录失败: {e}"))?;
-        let canon_parent = parent.canonicalize().map_err(|e| format!("父目录解析失败: {e}"))?;
-        if !unconfined && !canon_parent.starts_with(&root) {
+        // 校验先行、副作用殿后（审计 06）：先把 rel 词汇规范化、完成工作区归属检查，
+        // 通过了才允许 create_dir_all——旧实现「先建父目录再校验」，越界路径会在工作区
+        // 外残留空目录。canonicalize 不认不存在的段，所以向上找最深的已存在祖先做真实
+        // 解析（junction 只可能存在于已存在段，不存在的尾段词汇拼接即真实路径）。
+        let mut parts: Vec<std::ffi::OsString> = Vec::new();
+        let mut escapes: usize = 0;
+        for seg in Path::new(rel).components() {
+            match seg {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if parts.pop().is_none() {
+                        escapes += 1;
+                    }
+                }
+                std::path::Component::Normal(n) => parts.push(n.to_os_string()),
+                // 绝对路径/带前缀在 confined 档一律拒绝（unconfined 的绝对路径已在上面放行）
+                _ => return Err(format!("路径含非法组件: {rel}")),
+            }
+        }
+        if escapes > 0 && !unconfined {
             return Err(format!("拒绝访问工作目录外的路径: {rel}"));
         }
-        Ok(canon_parent.join(full.file_name().ok_or("路径无文件名")?))
+        let base = root
+            .ancestors()
+            .nth(escapes)
+            .ok_or_else(|| format!("路径越出文件系统根: {rel}"))?;
+        let target = parts.iter().fold(base.to_path_buf(), |acc, seg| acc.join(seg));
+        // 向上找最深的已存在祖先：已存在前缀里可能藏 junction，必须 canonicalize 真实解析
+        let mut anc = target;
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !anc.exists() {
+            match (anc.file_name(), anc.parent()) {
+                (Some(name), Some(p)) if !name.is_empty() => {
+                    tail.push(name.to_os_string());
+                    anc = p.to_path_buf();
+                }
+                _ => return Err(format!("路径无法解析: {rel}")),
+            }
+        }
+        let canon_anc = anc.canonicalize().map_err(|e| format!("父目录解析失败: {e}"))?;
+        let canon = tail.iter().rev().fold(canon_anc, |acc, seg| acc.join(seg));
+        if !unconfined && !canon.starts_with(&root) {
+            return Err(format!("拒绝访问工作目录外的路径: {rel}"));
+        }
+        if let Some(parent) = canon.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+        }
+        Ok(canon)
     }
 }
 
@@ -427,6 +467,47 @@ mod tests {
         let r = execute(&cfg(), "read_file", r#"{"path":"C:\\Windows\\win.ini"}"#).await;
         assert!(r.is_err(), "绝对路径越界应被拒绝");
         std::fs::remove_dir_all(workspace_root().join(".p4-test")).ok();
+    }
+
+    #[tokio::test]
+    async fn traversal_rejection_leaves_no_dirs_outside() {
+        init_logger();
+        // 审计 06：越界路径必须在任何 create_dir_all 之前被拒——旧实现先建父目录再校验，
+        // 拒绝后工作区外残留空目录。默认工作区 = 工程根，../ 落在其父目录。
+        let residue = workspace_root().parent().unwrap().join("audit06-residue");
+        std::fs::remove_dir_all(&residue).ok();
+        let r = execute(&cfg(), "write_file", r#"{"path":"../audit06-residue/deep/x.txt","content":"x"}"#).await;
+        assert!(r.is_err() && r.unwrap_err().contains("拒绝"), "越界应被拒绝");
+        assert!(!residue.exists(), "越界拒绝后不得在工作区外残留目录: {}", residue.display());
+        // 工作区内不存在的多级路径照常自动建父目录（正常路径行为不回归）
+        let r = execute(&cfg(), "write_file", r#"{"path":".audit06/inner/x.txt","content":"ok"}"#).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(std::fs::read_to_string(workspace_root().join(".audit06").join("inner").join("x.txt")).unwrap(), "ok");
+        std::fs::remove_dir_all(workspace_root().join(".audit06")).ok();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn junction_escape_rejected() {
+        init_logger();
+        // 审计 06 的存在段变体：已存在的 junction 把路径真实引到工作区外，
+        // 校验必须 canonicalize 已存在前缀才能抓到（词汇 starts_with 抓不到）
+        let link = workspace_root().join(".audit06-link");
+        let outside = workspace_root().parent().unwrap().join("audit06-junction-target");
+        std::fs::remove_dir_all(&link).ok();
+        std::fs::create_dir_all(&outside).unwrap();
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(st.success(), "mklink /J 应成功（无需特权）");
+        let r = execute(&cfg(), "write_file", r#"{"path":".audit06-link/x.txt","content":"x"}"#).await;
+        assert!(r.is_err() && r.unwrap_err().contains("拒绝"), "经 junction 越界必须被拒绝");
+        assert!(!outside.join("x.txt").exists(), "junction 外不得写入文件");
+        std::fs::remove_dir_all(&link).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     // —— P19：fs_unconfined（auto / full-access 档）放行绝对路径读写整台电脑 ——

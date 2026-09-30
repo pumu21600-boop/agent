@@ -14,7 +14,9 @@
 //!
 //! 线程模型：每个 server 串行 Mutex（工具调用本就串行）；两种 transport 都是阻塞
 //! IO，整体调用包 tokio timeout（超时放弃等待，残留响应由「id 不匹配即跳过」自愈）。
-//! 子进程 kill_on_drop，崩溃只标记离线，绝不拖垮主服务。
+//! 子进程挂 kill-on-close Job 保险丝（crate::jobguard，审计 09）：正常断开走 reset_proc
+//! 显式 kill；服务被硬杀/崩溃时 Job 句柄随进程消失，node 进程树整树团灭不留孤儿。
+//! 崩溃只标记离线，绝不拖垮主服务。
 //!
 //! 独立国（P28 分家）：MCP 自己的配置（settings.json `mcp_servers`）、自己的 OAuth
 //! （`oauth` 子模块 + `mcp_tokens.json`）、自己的 `mcp__` 工具前缀——与「插件」
@@ -83,6 +85,8 @@ struct ServerState {
     caps: (bool, bool),
     online: bool,
     child: Option<Child>,
+    /// stdio 子进程的 kill-on-close 保险丝（审计 09：服务硬杀/崩溃时 node 树不留孤儿）
+    job: Option<crate::jobguard::ChildJob>,
     stdin: Option<ChildStdin>,
     reader: Option<BufReader<ChildStdout>>,
     /// HTTP transport 态（Some 即代表该 server 走 http）
@@ -98,6 +102,8 @@ impl ServerState {
         if let Some(c) = self.child.as_mut() {
             let _ = c.kill();
         }
+        // Job 保险丝先摘（Drop 整树击杀，含 kill 后尚未收割的孙进程），再丢子进程句柄
+        self.job = None;
         self.child = None;
         self.stdin = None;
         self.reader = None;
@@ -329,11 +335,19 @@ fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：后台服务不起黑窗
     }
     let mut child = cmd.spawn().map_err(|e| format!("启动 {} 失败: {e}", cfg.command))?;
+    // 生命周期保险丝（审计 09）：npx/node 会派生孙进程，服务被硬杀时 Child::kill
+    // 那套优雅路径来不及跑——挂 kill-on-close Job，服务一死整棵树跟着团灭。
+    let job = crate::jobguard::ChildJob::new();
+    if let Some(j) = job.as_ref() {
+        use std::os::windows::io::AsRawHandle;
+        j.assign(child.as_raw_handle() as isize);
+    }
     let stdin = child.stdin.take().ok_or("无 stdin")?;
     let stdout = child.stdout.take().ok_or("无 stdout")?;
     st.stdin = Some(stdin);
     st.reader = Some(BufReader::new(stdout));
     st.child = Some(child);
+    st.job = job;
     Ok(())
 }
 

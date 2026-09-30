@@ -21,9 +21,9 @@ use windows_sys::Win32::{
         Pipes::CreatePipe,
         SystemInformation::GetSystemDirectoryW,
         Threading::{
-            CreateProcessAsUserW, CreateProcessW, GetExitCodeProcess, ResumeThread, WaitForSingleObject,
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
-            STARTF_USESTDHANDLES, STARTUPINFOW,
+            CreateProcessAsUserW, CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess,
+            WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+            PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
         },
     },
 };
@@ -37,6 +37,31 @@ use crate::observability::{self, EventType};
 use serde_json::json;
 
 const WAIT_OBJECT_0: u32 = 0;
+
+/// RAII 句柄守卫：Drop 即 CloseHandle（审计 08：错误路径不再手动逐个补关——
+/// 每加一个早退分支就漏一个，泄漏就是这么来的）。成功路径用 [`HandleGuard::release`]
+/// 交出所有权；0 / -1（INVALID_HANDLE_VALUE）视为无效句柄不关。
+struct HandleGuard(HANDLE);
+
+impl HandleGuard {
+    fn get(&self) -> HANDLE {
+        self.0
+    }
+
+    fn release(self) -> HANDLE {
+        let h = self.0;
+        std::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        if self.0 != 0 && self.0 != -1 {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
 
 /// 追加进沙箱子进程 PATH 的额外目录（如 git 所在目录：父进程 PATH 没有它时，
 /// 工具层发现 git.exe 后在此登记，shell 里按名字调 git / git 内部 helper 才可用）。
@@ -106,12 +131,14 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             bInheritHandle: 1,
         };
         let (out_r, out_w) = create_pipe(&sa)?;
+        let (out_r, out_w) = (HandleGuard(out_r), HandleGuard(out_w));
         let (err_r, err_w) = create_pipe(&sa)?;
-        SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+        let (err_r, err_w) = (HandleGuard(err_r), HandleGuard(err_w));
+        SetHandleInformation(out_r.get(), HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(err_r.get(), HANDLE_FLAG_INHERIT, 0);
 
         // stdin 指向 NUL：不给交互输入，读它永远是 EOF
-        let nul = CreateFileW(
+        let nul = HandleGuard(CreateFileW(
             wide("NUL").as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -119,16 +146,16 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             OPEN_EXISTING,
             0,
             0, // hTemplateFile
-        );
-        if nul == 0 || nul == -1 {
+        ));
+        if nul.get() == 0 || nul.get() == -1 {
             return Err(anyhow!("打开 NUL 失败: {}", GetLastError()));
         }
         let mut si: STARTUPINFOW = mem::zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
         si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = nul;
-        si.hStdOutput = out_w;
-        si.hStdError = err_w;
+        si.hStdInput = nul.get();
+        si.hStdOutput = out_w.get();
+        si.hStdError = err_w.get();
 
         let app = wide(spec.application.to_str().ok_or_else(|| anyhow!("application 路径非 UTF-8"))?);
         // CreateProcess 可能临时改写命令行缓冲，故给 mut
@@ -152,21 +179,27 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             &mut pi,
         ) == 0
         {
+            // 全部句柄由 HandleGuard 就地回收（审计 08：原实现漏关 out_w/err_w/nul）
             let e = GetLastError();
-            CloseHandle(out_r);
-            CloseHandle(err_r);
             return Err(anyhow!("CreateProcessAsUserW 失败: {e}（检查 exe 是否存在/可执行）"));
         }
         // 父端这几份用完即关：子进程持有自己的继承副本，管道才能正常 EOF
-        CloseHandle(out_w);
-        CloseHandle(err_w);
-        CloseHandle(nul);
+        drop(out_w);
+        drop(err_w);
+        drop(nul);
 
-        job.assign(pi.hProcess)?;
-        ResumeThread(pi.hThread);
-        CloseHandle(pi.hThread);
+        let proc_h = HandleGuard(pi.hProcess);
+        let thread_h = HandleGuard(pi.hThread);
+        if let Err(e) = job.assign(proc_h.get()) {
+            // 进程还挂着起没入 Job，JobGuard 的 kill-on-close 兜不到它：
+            // 不显式击杀就是一颗永久挂起的僵尸进程（审计 08）
+            TerminateProcess(proc_h.get(), 1);
+            return Err(e);
+        }
+        ResumeThread(thread_h.get());
+        drop(thread_h); // 主线程句柄用完即关
 
-        let readers = (spawn_reader(out_r), spawn_reader(err_r));
+        let readers = (spawn_reader(out_r.release()), spawn_reader(err_r.release()));
 
         observability::event(
             EventType::State,
@@ -182,7 +215,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             }),
         );
 
-        Ok(SandboxChild { job, process: pi.hProcess, pid: pi.dwProcessId, readers: Some(readers), closed: false })
+        Ok(SandboxChild { job, process: proc_h.release(), pid: pi.dwProcessId, readers: Some(readers), closed: false })
     }
 }
 
@@ -244,10 +277,12 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             bInheritHandle: 1,
         };
         let (out_r, out_w) = create_pipe(&sa)?;
+        let (out_r, out_w) = (HandleGuard(out_r), HandleGuard(out_w));
         let (err_r, err_w) = create_pipe(&sa)?;
-        SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
-        let nul = CreateFileW(
+        let (err_r, err_w) = (HandleGuard(err_r), HandleGuard(err_w));
+        SetHandleInformation(out_r.get(), HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(err_r.get(), HANDLE_FLAG_INHERIT, 0);
+        let nul = HandleGuard(CreateFileW(
             wide("NUL").as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -255,8 +290,8 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             OPEN_EXISTING,
             0,
             0,
-        );
-        if nul == 0 || nul == -1 {
+        ));
+        if nul.get() == 0 || nul.get() == -1 {
             return Err(anyhow!("打开 NUL 失败: {}", GetLastError()));
         }
 
@@ -264,9 +299,9 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         let mut six: STARTUPINFOEXW = mem::zeroed();
         six.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
         six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        six.StartupInfo.hStdInput = nul;
-        six.StartupInfo.hStdOutput = out_w;
-        six.StartupInfo.hStdError = err_w;
+        six.StartupInfo.hStdInput = nul.get();
+        six.StartupInfo.hStdOutput = out_w.get();
+        six.StartupInfo.hStdError = err_w.get();
         six.lpAttributeList = attr_list;
 
         let app = wide(spec.application.to_str().ok_or_else(|| anyhow!("application 路径非 UTF-8"))?);
@@ -289,9 +324,7 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         ) == 0
         {
             DeleteProcThreadAttributeList(attr_list);
-            CloseHandle(out_r);
-            CloseHandle(err_r);
-            CloseHandle(nul);
+            // 句柄由 HandleGuard 就地回收（审计 08：原实现漏关 out_w/err_w）
             let e = GetLastError();
             return Err(anyhow!(
                 "AppContainer CreateProcessW 失败: {e}（LowBox 下进程可能初始化失败，可切回 mode=restricted）"
@@ -299,15 +332,23 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         }
         DeleteProcThreadAttributeList(attr_list);
         drop(attr_buf);
-        CloseHandle(out_w);
-        CloseHandle(err_w);
-        CloseHandle(nul);
+        // 父端这几份用完即关：子进程持有自己的继承副本，管道才能正常 EOF
+        drop(out_w);
+        drop(err_w);
+        drop(nul);
 
-        job.assign(pi.hProcess)?;
-        ResumeThread(pi.hThread);
-        CloseHandle(pi.hThread);
+        let proc_h = HandleGuard(pi.hProcess);
+        let thread_h = HandleGuard(pi.hThread);
+        if let Err(e) = job.assign(proc_h.get()) {
+            // 进程还挂着起没入 Job，JobGuard 的 kill-on-close 兜不到它：
+            // 不显式击杀就是一颗永久挂起的僵尸进程（审计 08，AppContainer 分支同款）
+            TerminateProcess(proc_h.get(), 1);
+            return Err(e);
+        }
+        ResumeThread(thread_h.get());
+        drop(thread_h); // 主线程句柄用完即关
 
-        let readers = (spawn_reader(out_r), spawn_reader(err_r));
+        let readers = (spawn_reader(out_r.release()), spawn_reader(err_r.release()));
 
         observability::event(
             EventType::State,
@@ -325,7 +366,7 @@ fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
             }),
         );
 
-        Ok(SandboxChild { job, process: pi.hProcess, pid: pi.dwProcessId, readers: Some(readers), closed: false })
+        Ok(SandboxChild { job, process: proc_h.release(), pid: pi.dwProcessId, readers: Some(readers), closed: false })
     }
 }
 

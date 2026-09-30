@@ -158,18 +158,11 @@ impl agent::ApprovalGate for ChatGate {
         let steer = self.steer.clone();
         let sid = self.session_id.clone();
         Box::pin(async move {
-            async fn wait_cancelled(flag: Arc<CancelFlag>) {
-                loop {
-                    if flag.is_set() {
-                        return;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
             // 引导让位（2026-09-27 用户实锤：审批挂 120s，期间「立即发送」毫无反应）：
             // 用户在审批等待期点了「立即发送」= 要改方向，挂着的操作按拒绝放行——
             // 引导消息本身留在队列里，下一个决策点被核心循环取走，模型拿着
             // 「操作已取消 + 新指令」马上重规划，引导秒级生效而不是等满超时。
+            // （SteerQueue 没有异步通知臂，100ms 探针保留——坑 31 的既定取舍。）
             async fn wait_steer(q: Arc<crate::core::steer::SteerQueue>, sid: String) {
                 loop {
                     if q.has_immediate(&sid) {
@@ -181,8 +174,12 @@ impl agent::ApprovalGate for ChatGate {
             let decision = tokio::select! {
                 r = orx => r.unwrap_or(false),
                 _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => false,
-                _ = wait_cancelled(cancel) => false,
+                // 取消走事件式等待（审计 10：原来是 100ms 手写轮询，CancelFlag 本有事件臂）
+                _ = cancel.cancelled() => false,
                 _ = wait_steer(steer, sid) => false,
+                // 客户端断开（SSE 通道关闭）= 审批卡没人能点了（审计 10）：按拒绝放行
+                // 立即返回，不再干等满 120s；服务端任务由既有取消机制兜底
+                _ = tx.closed() => false,
             };
             pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             observability::event(

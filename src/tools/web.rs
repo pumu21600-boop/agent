@@ -78,23 +78,11 @@ pub(crate) fn web_client() -> Result<reqwest::Client, String> {
         // 搜索引擎按 TLS/协议指纹分流：HTTP/2 客户端会被当成爬虫，回一张「查询对得上、结果
         // 全是别的东西」的页面（真机踩过：查「rust 语言」返回西班牙股票、德国天气）。HTTP/1.1 正常。
         .http1_only()
-        // 重定向也要过 SSRF 闸（N3）：公网页 302 跳 169.254.169.254（云元数据）/
-        // localhost（本机管理口）是经典打法。IP 字面量内段直接掐掉；域名放行——
-        // 域名解析发生在代理侧，预检覆盖不到（直连场景预检已拦）。
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let host_ok = match attempt.url().host_str() {
-                Some(h) => match h.parse::<std::net::IpAddr>() {
-                    Ok(ip) => !is_private_ip(ip),
-                    Err(_) => true,
-                },
-                None => false,
-            };
-            if !host_ok || attempt.previous().len() >= 5 {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
+        // 重定向不再交给 reqwest 自动跟（审计 12 收口）：自动跟的闸只能看 IP 字面量、
+        // 域名一律放行，「公网网页 302 跳 169.254.169.254（云元数据）/localhost（本机
+        // 管理口）」这条经典 SSRF 打法拦不住。改为 send_with_ssrf_guard 手动逐跳走
+        // ensure_public_target（域名也解析判段）。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))
 }
@@ -102,6 +90,43 @@ pub(crate) fn web_client() -> Result<reqwest::Client, String> {
 /// 响应体字节上限：流式读到这就断，后续分片丢弃，再走字符截断（N3）。
 /// 旧写法 `resp.text()` 整体读——超大/无尽头响应先撑爆内存，max_chars 字符截断拦不住。
 const WEB_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 带逐跳 SSRF 闸的 GET（审计 12）：reqwest 自动重定向已关（web_client），这里手动跟，
+/// 每一跳（含 302/307 的 Location 目标）都先过 ensure_public_target 再发——域名目标也
+/// 解析判段，重定向进内网的路彻底堵死。预算与旧 Policy 对齐：连首发最多 6 次请求。
+async fn send_with_ssrf_guard(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, String> {
+    let mut current = url.to_string();
+    for hop in 0..=5 {
+        ensure_public_target(&current).await?;
+        let resp = client
+            .get(&current)
+            .send()
+            .await
+            .map_err(|e| format!("抓取失败: {e}"))?;
+        let status = resp.status();
+        if !status.is_redirection() {
+            return Ok(resp);
+        }
+        if hop == 5 {
+            return Err("重定向次数超限（>5 跳），放弃抓取".to_string());
+        }
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| format!("服务器返回 {status} 但没有 Location"))?;
+        current = redirect_target(resp.url(), &loc)?;
+    }
+    unreachable!("hop==5 的分支已在循环内返回")
+}
+
+/// Location → 绝对 URL（相对路径按当前响应 URL 拼；非法即错）。独立纯函数便于单测。
+fn redirect_target(base: &reqwest::Url, loc: &str) -> Result<String, String> {
+    base.join(loc)
+        .map(|u| u.to_string())
+        .map_err(|e| format!("重定向地址非法（{loc}）: {e}"))
+}
 
 /// 流式读响应体（带上限）。utf8 按整体 lossy 解码：截断处可能切在汉字中间，
 /// 末字符变 U+FFFD 无所谓——紧接着还有 max_chars 截断，且这是抓取不是流式正文。
@@ -146,11 +171,11 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// SSRF 预检（N3）：拒绝指向环回/内网/链路本地的抓取目标。IP 字面量直接判段；
-/// 域名解析后逐个 IP 判段。DNS 解析失败不拦——代理场景下 DNS 在代理侧完成，
-/// 本机可能查不到（误拦比漏拦更伤：搜索/抓取是常用路径）。
-/// 本地 dev 要抓 127.0.0.1 得显式开 AGENT_WEB_ALLOW_PRIVATE=1
-/// （与 AGENT_WEB_DEBUG_DIR / AGENT_BROWSER_PATH 同款环境变量开关）。
+/// SSRF 预检（N3 + 审计 12 收口）：拒绝指向环回/内网/链路本地的抓取目标。IP 字面量直接
+/// 判段；域名解析后逐个 IP 判段。**解析失败不放行**（fail-closed）：放行等于没检——
+/// 「公网域名解析到内网 IP」正是 SSRF 的主打法，本机查不到就无法验证归属。代理场景
+/// （DNS 在代理侧完成）本地确实可能查不到，显式设 AGENT_WEB_ALLOW_PRIVATE=1 放开。
+/// 本地 dev 要抓 127.0.0.1 也走这个开关（与 AGENT_WEB_DEBUG_DIR / AGENT_BROWSER_PATH 同款）。
 async fn ensure_public_target(url: &str) -> Result<(), String> {
     if std::env::var("AGENT_WEB_ALLOW_PRIVATE").is_ok() {
         return Ok(());
@@ -162,9 +187,18 @@ async fn ensure_public_target(url: &str) -> Result<(), String> {
         Ok(ip) => vec![ip],
         Err(_) => match tokio::net::lookup_host((host, port)).await {
             Ok(it) => it.map(|s| s.ip()).collect(),
-            Err(_) => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "无法验证抓取目标：域名 {host} 解析失败（{e}）。\
+                     为防内网穿透（SSRF）不放行解析不了的目标；\
+                     本地调试或代理场景可设 AGENT_WEB_ALLOW_PRIVATE=1 放开"
+                ));
+            }
         },
     };
+    if addrs.is_empty() {
+        return Err(format!("无法验证抓取目标：域名 {host} 没有解析到任何地址（SSRF 预检不放行）"));
+    }
     for ip in addrs {
         if is_private_ip(ip) {
             return Err(format!(
@@ -182,13 +216,8 @@ pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, St
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("url 必须以 http:// 或 https:// 开头".to_string());
     }
-    ensure_public_target(url).await?;
     let client = web_client()?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("抓取失败: {e}"))?;
+    let resp = send_with_ssrf_guard(&client, url).await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("渠道返回 {status}"));
@@ -228,7 +257,7 @@ pub(crate) async fn web_search(args: &str, max_chars: usize) -> Result<String, S
     let mut hits = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     for (name, url, kind) in engines {
-        match client.get(url).send().await {
+        match send_with_ssrf_guard(&client, &url).await {
             Ok(r) if r.status().is_success() => {
                 // 关键：只认落在「搜索结果页」上的响应。Bing 会把请求重定向到首页（/?q=…），
                 // 首页上的推荐链接也带同类 CSS 类名，照解析就会把推荐位当搜索结果（真机踩过）。
@@ -556,6 +585,29 @@ pub(crate) fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ssrf_guard_blocks_private_target_before_connecting() {
+        // 审计 12：闸在发送之前——环回目标第一跳 ensure_public_target 就该拒，
+        // 连接根本不建立（本机若显式开了私网抓取开关，本用例失去前提，如实跳过）
+        if std::env::var("AGENT_WEB_ALLOW_PRIVATE").is_ok() {
+            return;
+        }
+        let client = web_client().unwrap();
+        let r = send_with_ssrf_guard(&client, "http://127.0.0.1:9/x").await;
+        assert!(r.is_err() && r.unwrap_err().contains("SSRF"), "环回目标应在发送前被拒");
+    }
+
+    #[test]
+    fn redirect_target_joins_relative_locations() {
+        // 审计 12：Location 相对路径按当前响应 URL 绝对化；非法 Location 明确报错
+        let base: reqwest::Url = "https://example.com/a/b".parse().unwrap();
+        assert_eq!(redirect_target(&base, "https://elsewhere.com/x").unwrap(), "https://elsewhere.com/x");
+        assert_eq!(redirect_target(&base, "c").unwrap(), "https://example.com/a/c");
+        assert_eq!(redirect_target(&base, "/root").unwrap(), "https://example.com/root");
+        // url 库把 "://bad" 当相对路径宽容收下；真非法的（坏 host）才报错
+        assert!(redirect_target(&base, "http://[").is_err());
+    }
 
     #[test]
     fn is_private_ip_covers_ssrf_targets() {

@@ -96,6 +96,51 @@ pub fn thinking_budget(max_tokens: u64, requested: &str) -> Option<u64> {
 /// 组装 Messages API 请求体（纯函数）：
 /// system 提顶层、role:"tool" 组队成 user 的 tool_result 块、assistant tool_calls → tool_use 块、
 /// 工具定义 function.parameters → input_schema、max_tokens 必填（缺省 8192）、温度域夹到 0..1。
+/// OpenAI 多模态 content 数组 → Anthropic content 块数组（审计 04：Anthropic Messages
+/// API 不认 `image_url` 块，原样透传必 400）。
+/// - `data:` URL → `{type:image,source:{type:base64,media_type,data}}`；
+/// - http(s) 图片链接 → `{type:image,source:{type:url}}`；
+/// - text 块与未知块原样保留；非数组（纯字符串）不动。
+fn convert_multimodal_content(content: &Value) -> Value {
+    let Some(arr) = content.as_array() else {
+        return content.clone();
+    };
+    let blocks: Vec<Value> = arr
+        .iter()
+        .map(|part| {
+            if part.get("type").and_then(Value::as_str) == Some("image_url") {
+                let url = part.pointer("/image_url/url").and_then(Value::as_str).unwrap_or("");
+                image_block(url).unwrap_or_else(|| part.clone())
+            } else {
+                part.clone()
+            }
+        })
+        .collect();
+    json!(blocks)
+}
+
+/// 单个 image_url → Anthropic image 块；不是 data:image/* 也不是 http(s) 就 None（调用方原样保留）。
+fn image_block(url: &str) -> Option<Value> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let mime = meta.split(';').next().unwrap_or("");
+        if !mime.starts_with("image/") {
+            return None;
+        }
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": mime, "data": data },
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(json!({
+            "type": "image",
+            "source": { "type": "url", "url": url },
+        }));
+    }
+    None
+}
+
 pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatParams, tools: Option<&Value>) -> Value {
     let arr = messages.as_array().cloned().unwrap_or_default();
 
@@ -156,11 +201,11 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
                 }
                 out.push(json!({ "role": "assistant", "content": blocks }));
             }
-            // user：content 原样透传（string 或多模态数组），缺省空串
+            // user：string 原样；数组过一遍多模态转换（审计 04）
             _ => {
                 let content = match m.get("content") {
                     Some(Value::String(s)) => json!(s),
-                    Some(v) if !v.is_null() => v.clone(),
+                    Some(v) if !v.is_null() => convert_multimodal_content(v),
                     _ => json!(""),
                 };
                 out.push(json!({ "role": "user", "content": content }));
@@ -353,6 +398,38 @@ mod tests {
 
     fn params() -> ChatParams {
         ChatParams { provider_id: Some("anthropic".into()), ..Default::default() }
+    }
+
+    #[test]
+    fn multimodal_image_url_converted_for_anthropic() {
+        // 审计 04：Anthropic Messages API 不认 image_url，必须转成原生 image 块
+        let msgs = json!([
+            {"role":"user","content":[
+                {"type":"text","text":"这是什么"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}},
+                {"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}},
+            ]},
+        ]);
+        let body = build_body("claude-x", &msgs, false, &params(), None);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0], json!({"type":"text","text":"这是什么"}), "text 块原样保留");
+        assert_eq!(
+            content[1],
+            json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}),
+            "data URL → base64 source"
+        );
+        assert_eq!(
+            content[2],
+            json!({"type":"image","source":{"type":"url","url":"https://example.com/cat.jpg"}}),
+            "http 图片链接 → url source"
+        );
+        // 非 image 的 data URL 与空 url 不硬转（原样保留，让渠道报明确的错）
+        let weird = json!([{"type":"image_url","image_url":{"url":"data:application/pdf;base64,AAAA"}}]);
+        let body = build_body("claude-x", &json!([{"role":"user","content":weird}]), false, &params(), None);
+        assert_eq!(body["messages"][0]["content"][0]["type"], "image_url", "非图片 data URL 原样保留");
+        // 纯文本消息不受影响
+        let body = build_body("claude-x", &json!([{"role":"user","content":"hi"}]), false, &params(), None);
+        assert_eq!(body["messages"][0]["content"], json!("hi"));
     }
 
     #[test]

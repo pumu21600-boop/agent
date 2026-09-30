@@ -4901,7 +4901,7 @@
       {/if}
       <MemoryTab tab={settingsTab} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} on:reload={loadSkills} />
-      <McpTab servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.risk, e.detail.server)} />
+      <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.risk, e.detail.server)} />
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}

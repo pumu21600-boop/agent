@@ -643,9 +643,12 @@ mod tests {
     async fn callback_server_receives_code() {
         let state = "st_abc123";
         let (port, rx) = spawn_callback_server("/callback", state).unwrap();
-        // 模拟浏览器回调（等价授权服务器 302 到 redirect_uri）
+        // 模拟浏览器回调（等价授权服务器 302 到 redirect_uri）。
+        // 必须 no_proxy：gateway 测试会进程级改 HTTPS_PROXY 指向死代理，默认客户端
+        // 会把环回请求也灌进去，并发一撞车就 ConnectionRefused（审计 03）。
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://127.0.0.1:{port}/callback?code=the_code&state={state}");
-        let body = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        let body = client.get(&url).send().await.unwrap().text().await.unwrap();
         assert!(body.contains("授权成功"), "回调页应提示成功");
         let code = rx.recv().unwrap().unwrap();
         assert_eq!(code, "the_code");
@@ -654,8 +657,10 @@ mod tests {
     #[tokio::test]
     async fn callback_server_rejects_bad_state() {
         let (port, rx) = spawn_callback_server("/callback", "st_right").unwrap();
+        // 同上：no_proxy 直连环回，不吃进程级代理环境变量
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let url = format!("http://127.0.0.1:{port}/callback?code=x&state=st_wrong");
-        let _ = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        let _ = client.get(&url).send().await.unwrap().text().await.unwrap();
         assert!(rx.recv().unwrap().is_err(), "state 不匹配必须拒绝");
     }
 }
