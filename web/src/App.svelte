@@ -2974,6 +2974,13 @@
     if (k === 'galaxy' && !features.galaxy && galaxyOpen) galaxyOpen = false;
   }
 
+  // 沙箱 CPU 上限：空/0 = 不限，越界钳回 1-100
+  function commitCpu(v) {
+    const n = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+    sandboxCpu = n;
+    autoSave({ sandbox_cpu_percent: n }, 0);
+  }
+
   // 同上：技能/MCP/插件分区的数据原先只在 pickSettingsTab 的点击里拉，页签从 localStorage
   // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
   $: if (settingsOpen && settingsTab === 'skills') loadSkills();
@@ -4960,17 +4967,9 @@
             <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '检测中…' : sandboxProbe.ok ? '检测通过' : '检测有失败'}</span>
           {/if}
           <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
-          <Select
-            value={sandboxCpu}
-            title="沙箱 CPU 上限（单核百分比）"
-            options={[
-              { value: 0, label: '不限' },
-              { value: 80, label: '80%' },
-              { value: 50, label: '50%' },
-              { value: 25, label: '25%' },
-            ]}
-            on:change={(e) => { sandboxCpu = e.detail; autoSave({ sandbox_cpu_percent: sandboxCpu }, 0); }}
-          />
+          <label class="plug-cpu" title="沙箱命令可用的 CPU 上限（单核的百分比）；留空 = 不限">
+            CPU <input type="number" min="0" max="100" value={sandboxCpu || ''} on:change={(e) => commitCpu(e.currentTarget.value)} /> %
+          </label>
           <!-- 检测 = 一次做完:刷新档位 + 真拉起受限进程跑探针（用户拍板:一行一个按钮） -->
           <button class="btn ghost" on:click={() => { loadSandboxInfo(true); runSandboxProbe(); }} disabled={sbInfoLoading || sbRunning}>检测</button>
         </div>
@@ -8080,13 +8079,29 @@
     padding: 4px 10px;
     font-size: 12px;
   }
-  .plug-row :global(.csel) {
-    font-size: 12px;
-    padding: 5px 8px;
-  }
-  .plug-row :global(.csel-wrap) {
+  .plug-cpu {
     flex: none;
-    width: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--g5);
+    white-space: nowrap;
+  }
+  .plug-cpu input {
+    width: 52px;
+    padding: 4px 6px;
+    font-size: 12px;
+    border: 1px solid var(--g3);
+    border-radius: 6px;
+    background: var(--g1);
+    color: var(--g7);
+    text-align: right;
+  }
+  .plug-cpu input::-webkit-outer-spin-button,
+  .plug-cpu input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
   .switch {
     flex: none;
