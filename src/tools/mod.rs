@@ -176,7 +176,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "shell",
-            description: "在沙箱中执行一条 Windows 命令（cmd /C，工作目录=项目根）。输出有超时与整树击杀保护。",
+            description: "在沙箱中执行一条 Windows 命令（cmd /C，工作目录=当前工作区根，见系统提示「工作区」）。输出有超时与整树击杀保护。",
             parameters: json!({
                 "type": "object",
                 "properties": {

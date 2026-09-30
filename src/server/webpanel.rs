@@ -92,9 +92,14 @@ pub(super) async fn browser_frame(headers: HeaderMap, Query(q): Query<Screenshot
 }
 
 /// POST /api/browser/activate —— 面板上报可见标签页（驱动 screencast 与后台挂起）。
+/// `id` 为空串 = 面板不看了（panel_activate 已按隐藏语义处理），前端「关面板/切走」
+/// 发的就是这个；字段整体缺失才报 400。
 /// `native`：只有壳里那个客户端的在看/不看能置壳里 webview 的显隐。
 pub(super) async fn browser_activate(headers: HeaderMap, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(id) = req.get("id").and_then(Value::as_str) else { return Err(bad("缺少 id".into())) };
+    if req.get("id").and_then(Value::as_str).is_none() {
+        return Err(bad("缺少 id".into()));
+    }
+    let id = req.get("id").and_then(Value::as_str).unwrap_or("");
     let native = panel_native(&req, &headers);
     crate::browser::panel_activate(id, native).await.map(Json).map_err(bad)
 }

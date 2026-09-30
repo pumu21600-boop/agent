@@ -111,6 +111,13 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .agents_md();
+    // 工作区目录常驻系统提示：用户说「工作区/项目」都指这里，模型据此拼绝对路径，
+    // 不再满磁盘 dir 猜位置（真机踩过：shell 工具描述写「项目根」，模型把用户说的
+    // 工作区理解成了应用仓库，白搜 6 轮目录才找对文件）
+    let workspace_hint = format!(
+        "\n\n【工作区】当前工作区目录：{}\nread_file/write_file/shell 的相对路径、用户提到的工作区文件，都以这个目录为根。\n",
+        crate::tools::workspace_root().display()
+    );
     let project_brief = {
         let is_new = state
             .session
@@ -131,7 +138,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
             String::new()
         }
     };
-    format!("{prompt}{agents_md}{project_brief}{}", crate::skills::index_prompt())
+    format!("{prompt}{agents_md}{workspace_hint}{project_brief}{}", crate::skills::index_prompt())
 }
 
 /// 一轮对话的渠道组装结果（主渠道 + 角色渠道 + 降级链 + 预算降级）。

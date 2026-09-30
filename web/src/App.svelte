@@ -3008,6 +3008,7 @@
 
   // —— P11（施工单 016）：MCP 插件分区 ——
   let mcpServers = [];
+  let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
   // 021：沙箱自检（真拉起受限进程跑探针套件）

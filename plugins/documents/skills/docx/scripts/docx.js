@@ -31,7 +31,7 @@ function need(name) {
 }
 
 function usage() {
-  console.error('usage: node docx.js nodes <in.docx> | read <in.docx> | fonts <in.docx> | make <spec.json|-> <out.docx>');
+  console.error('usage: node docx.js setfont <in.docx> <font> [headingFont] | nodes <in.docx> | read <in.docx> | fonts <in.docx> | make <spec.json|-> <out.docx>');
   process.exit(1);
 }
 
@@ -269,11 +269,52 @@ async function fontsOf(file) {
   console.log(JSON.stringify({ file: path.basename(file), total_runs: runs, fonts: Object.entries(seen).map(([k, n]) => `${k} x${n}`) }, null, 1));
 }
 
+// —— setfont：原位换字体（OOXML 手术：只改字体槽位，版式/字号/加粗全不动） ——
+// 用户最常见的活就是「把全文换成 X 字体」——一条命令，别走 nodes/make 全套。
+async function setFont(file, font, headingFont) {
+  const JSZip = need('jszip');
+  const zip = await JSZip.loadAsync(fs.readFileSync(file));
+  let east = 0;
+  const bumpSlots = (xml, f) =>
+    xml
+      .replace(/(w:eastAsia=")[^"]*(")/g, (_m, a, b) => { east++; return a + f + b; })
+      .replace(/(w:ascii=")[^"]*(")/g, `$1${f}$2`)
+      .replace(/(w:hAnsi=")[^"]*(")/g, `$1${f}$2`)
+      .replace(/(w:cs=")[^"]*(")/g, `$1${f}$2`);
+  for (const name of ['word/document.xml', 'word/styles.xml', 'word/numbering.xml']) {
+    const f = zip.file(name);
+    if (!f) continue;
+    zip.file(name, bumpSlots(await f.async('string'), font));
+  }
+  if (headingFont) {
+    const dn = zip.file('word/document.xml');
+    if (dn) {
+      const xml = await dn.async('string');
+      zip.file(
+        'word/document.xml',
+        xml.replace(/<w:p\b[\s\S]*?<\/w:p>/g, (p) =>
+          /w:pStyle w:val="(?:Heading[1-9]|[^"]*标题[^"]*)"/i.test(p)
+            ? p.replace(/(w:(?:eastAsia|ascii|hAnsi|cs)=")[^"]*(")/g, `$1${headingFont}$2`)
+            : p
+        )
+      );
+    }
+  }
+  fs.writeFileSync(file, await zip.generateAsync({ type: 'nodebuffer' }));
+  console.log(`OK setfont ${file} (body=${font}${headingFont ? `, heading=${headingFont}` : ''}, eastAsia replaced: ${east})`);
+}
+
 async function main() {
-  const [cmd, a, b] = process.argv.slice(2);
+  const [cmd, a, b, c] = process.argv.slice(2);
   if (cmd === 'make') {
     if (!a || !b) usage();
     await makeDoc(a, b);
+  } else if (cmd === 'setfont') {
+    if (!a || !b) {
+      console.error('usage: node docx.js setfont <in.docx> <font> [headingFont]');
+      process.exit(1);
+    }
+    await setFont(a, b, c || '');
   } else if (cmd === 'nodes') {
     if (!a) usage();
     const spec = await toSpec(a);

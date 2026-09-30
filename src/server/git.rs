@@ -82,7 +82,15 @@ pub(super) async fn list_checkpoints(
             let mine: Vec<_> = list.iter().filter(|c| !want.is_empty() && c.session == want).cloned().collect();
             (StatusCode::OK, Json(json!({ "checkpoints": list, "mine": mine })))
         }
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        // 仓库还没有任何提交（git log fatal: does not have any commits yet）不是错误，
+        // 是空态——空清单 + 人话备注，别 500 糊前端一脸
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            if msg.contains("does not have any commits yet") || msg.contains("not a git repository") {
+                return (StatusCode::OK, Json(json!({ "checkpoints": [], "mine": [], "note": "工作区 git 仓库还没有提交，暂无检查点" })));
+            }
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg })))
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
 }

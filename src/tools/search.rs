@@ -24,8 +24,34 @@ pub(crate) fn search(args: &str, max_chars: usize, unconfined: bool) -> Result<S
     }
     let sub = v.get("path").and_then(Value::as_str).unwrap_or(".");
     let target = resolve_in_workspace(sub, true, unconfined)?;
+    // path 指到文件时别报错（模型经常把文件当目录传）——直接对该文件内容搜索
     if target.is_file() {
-        return Err("path 请给目录（搜索整个文件请用 read_file）".to_string());
+        let output = if rg_available() {
+            Command::new("rg")
+                .args(["-n", "--no-heading", "-m", "50", query])
+                .arg(&target)
+                .current_dir(workspace_root())
+                .stdin(Stdio::null())
+                .creation_flags(0x0800_0000) // 不闪控制台窗口
+                .output()
+        } else {
+            Command::new("findstr")
+                .args(["/n", "/i", &format!("/c:{query}"), &target.to_string_lossy()])
+                .current_dir(workspace_root())
+                .stdin(Stdio::null())
+                .creation_flags(0x0800_0000)
+                .output()
+        }
+        .map_err(|e| format!("启动搜索失败: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        if text.trim().is_empty() {
+            if !err.trim().is_empty() {
+                return Err(cap(err.trim(), 500));
+            }
+            return Ok("（无匹配）".to_string());
+        }
+        return Ok(cap(text.trim_end(), max_chars));
     }
 
     use std::os::windows::process::CommandExt;

@@ -441,20 +441,25 @@ pub async fn panel_overlay(
 /// `native` = 调用方就是壳里那个客户端：只有它的「在看/不看」能置壳里 webview 的显隐
 /// （浏览器直开 5173 的第二个客户端切走页签，不该把壳里的网页一起藏了）。
 pub async fn panel_activate(id: &str, native: bool) -> Result<Value, String> {
+    // 「面板不看了」在根本没开浏览器时是 no-op：current_session 失败也别 400——
+    // 前端关面板/切走页签都会发空 id，没有网页可藏就是成功
+    if id.is_empty() {
+        if let Ok(session) = current_session().await {
+            session.touch();
+            session.clear_visible();
+            if native {
+                session.clear_shell_tab();
+                session.set_showing(false);
+            }
+            sweep_session(&session).await;
+        }
+        return Ok(json!({ "ok": true }));
+    }
     let session = current_session().await?;
     session.touch();
     // 菜单开着时激活/切页签 = 浮层锚定的那一页失效了，顺手关掉壳里浮层（幂等）
     if MENU_OPEN.swap(false, std::sync::atomic::Ordering::Relaxed) {
         shell::menu_close();
-    }
-    if id.is_empty() {
-        session.clear_visible();
-        if native {
-            session.clear_shell_tab();
-            session.set_showing(false);
-        }
-        sweep_session(&session).await;
-        return Ok(json!({ "ok": true }));
     }
     let tab = get_tab(&session, id)?;
     ensure_live(&tab).await?;

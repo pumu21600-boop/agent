@@ -2,6 +2,24 @@
 
 use super::*;
 
+/// read_file/read_page 共用的「读不动」人话化：二进制/图片文件别扔 os error 天书，
+/// 告诉模型这东西不是文本、该走什么路（图片给用户发过多模态消息，别拿文本工具啃）。
+fn read_text_err(full: &std::path::Path, e: std::io::Error) -> String {
+    let ext = full
+        .extension()
+        .map(|x| x.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let media = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "ico", "pdf", "docx", "xlsx", "pptx", "zip", "mp3", "mp4", "wav", "exe", "dll"];
+    if media.contains(&ext.as_str()) {
+        return format!(
+            "「{}」是二进制/媒体文件（{}），不是文本，别用 read_file/read_page 读。图片请让用户直接发图（走多模态），文档类用对应的文档处理技能。",
+            full.display(),
+            ext
+        );
+    }
+    format!("读文件失败（可能非 UTF-8）: {e}")
+}
+
 pub(crate) fn read_file(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let full = resolve_in_workspace(rel, true, unconfined)?;
@@ -9,7 +27,7 @@ pub(crate) fn read_file(args: &str, max_chars: usize, unconfined: bool) -> Resul
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
-    let text = std::fs::read_to_string(&full).map_err(|e| format!("读文件失败（可能非 UTF-8）: {e}"))?;
+    let text = std::fs::read_to_string(&full).map_err(|e| read_text_err(&full, e))?;
     Ok(cap(&text, max_chars))
 }
 
@@ -26,7 +44,7 @@ pub(crate) fn read_page(args: &str, max_chars: usize, unconfined: bool) -> Resul
     if full.metadata().map_err(|e| format!("读取失败: {e}"))?.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
-    let text = std::fs::read_to_string(&full).map_err(|e| format!("读文件失败（可能非 UTF-8）: {e}"))?;
+    let text = std::fs::read_to_string(&full).map_err(|e| read_text_err(&full, e))?;
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
         return Ok(format!("{rel} 是空文件"));
