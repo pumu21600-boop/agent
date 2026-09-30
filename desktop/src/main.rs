@@ -101,7 +101,8 @@ const WIN_CTRL_JS: &str = r#"(function () {
       minimize: function () { return inv('win_minimize', {}); },
       toggleMax: function () { return inv('win_toggle_maximize', {}); },
       hide: function () { return inv('win_hide', {}); },
-      startResize: function (dir) { return inv('win_start_resize', { dir: dir }); }
+      startResize: function (dir) { return inv('win_start_resize', { dir: dir }); },
+      isMaximized: function () { return inv('win_is_maximized', {}); }
     };
     window.dispatchEvent(new Event('agentwinready'));
   } catch (e) {}
@@ -131,6 +132,14 @@ fn win_toggle_maximize(win: tauri::Window) {
 #[tauri::command]
 fn win_hide(win: tauri::Window) {
     let _ = win.hide();
+}
+
+/// 当前是否最大化（前端据此把按钮切成还原图标，对齐 ZCode 全屏态）
+#[tauri::command]
+fn win_is_maximized(win: tauri::Window) -> bool {
+    let m = win.is_maximized().unwrap_or(false);
+    slog(&format!("win_is_maximized: {m}"));
+    m
 }
 
 /// 无边框窗边缘拉伸（Windows 没有原生 resize 边框，边缘热区按下时从这里起拖）。
@@ -490,7 +499,8 @@ fn main() {
             win_minimize,
             win_toggle_maximize,
             win_hide,
-            win_start_resize
+            win_start_resize,
+            win_is_maximized
         ])
         .setup(|app| {
             app.manage(WebviewHost::default());

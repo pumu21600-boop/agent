@@ -313,8 +313,15 @@
 
   // 无边框壳窗口控制 API（壳注入；浏览器客户端没有 → 隐藏窗口按钮/热区）
   let winApi = null;
+  let winMax = false; // 窗口是否最大化（按钮 ▢ ↔ 还原图标）
   function adoptWinApi() {
     if (!winApi && window.agentWinApi) winApi = window.agentWinApi;
+    refreshWinMax();
+  }
+  function refreshWinMax() {
+    if (winApi && winApi.isMaximized) {
+      winApi.isMaximized().then((v) => { winMax = !!v; }).catch(() => {});
+    }
   }
   onMount(() => {
     adoptWinApi();
@@ -324,7 +331,11 @@
       adoptWinApi();
       if (winApi) clearInterval(t);
     }, 500);
-    return () => clearInterval(t);
+    // 最大化态跟随：系统级 Win+↑ / 双击标题栏 / 壳外还原都会 resize，节流 300ms 查一次
+    let rzT = null;
+    const onRz = () => { clearTimeout(rzT); rzT = setTimeout(refreshWinMax, 300); };
+    window.addEventListener('resize', onRz);
+    return () => { clearInterval(t); clearTimeout(rzT); window.removeEventListener('resize', onRz); };
   });
 
   onMount(async () => {
@@ -3790,8 +3801,13 @@
             <button class="head-btn win-btn" title="最小化" aria-label="最小化" on:click={() => winApi.minimize()}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"/></svg>
             </button>
-            <button class="head-btn win-btn" title="最大化 / 还原" aria-label="最大化 / 还原" on:click={() => winApi.toggleMax()}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>
+            <button class="head-btn win-btn" title={winMax ? '还原窗口' : '最大化'} aria-label={winMax ? '还原窗口' : '最大化'} on:click={() => winApi.toggleMax().then(refreshWinMax, refreshWinMax)}>
+              {#if winMax}
+                <!-- 全屏态：两个叠放矩形 = 还原（对齐 ZCode） -->
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="7.5" width="12" height="12" rx="2"/><path d="M8 7.5V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-1.5"/></svg>
+              {:else}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>
+              {/if}
             </button>
             <button class="head-btn win-btn win-close" title="关闭到托盘（服务保持运行）" aria-label="关闭到托盘" on:click={() => winApi.hide()}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
