@@ -88,7 +88,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 单个 DOM 快照元素（服务端 diff、渲染与兜底定位用）。
 #[derive(Clone, PartialEq)]
-struct OutlineNode {
+pub(crate) struct OutlineNode {
     reference: String,
     tag: String,
     role: Option<String>,
@@ -106,7 +106,7 @@ struct OutlineNode {
 
 /// 语义正文节点（只负责"读懂页面"，不占 action ref）。
 #[derive(Clone, PartialEq)]
-struct DomNode {
+pub(crate) struct DomNode {
     tag: String,
     depth: usize,
     in_viewport: bool,
@@ -201,14 +201,14 @@ impl WebTab {
 
 /// 浏览器宿主模式（P22）。
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HostMode {
+pub(crate) enum HostMode {
     /// 无头 Edge/Chrome（壳不在时的兜底）
     Headless,
     /// 桌面壳 child webview（服务经 CDP + 控制通道驱动）
     Shell,
 }
 
-struct BrowserSession {
+pub(crate) struct BrowserSession {
     mode: HostMode,
     /// 无头模式的浏览器子进程（shell 模式为 None——没有自己的进程）
     child: Option<std::sync::Mutex<Child>>,

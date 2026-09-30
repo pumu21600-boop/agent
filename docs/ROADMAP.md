@@ -63,6 +63,11 @@
 | P27.2 CI 时区测试修复（2026-09-28，GitHub CI 14 连败实锤） | next_run_uses_last_run_as_base 把期望 epoch 写死 3600（按东八区算），CI 托管 runner 是 UTC、实现按本地时区解析 cron，实算 32400——该测试引入起 dev 每次 push 必挂。改为查性质不赌运行环境时区：结果换算回本地必须是 09:00:00 且落在基准后一天内。tzutil 切 UTC 真机复验两时区 13 个 schedule 用例全过。254 测试 + clippy 零告警，版本 0.29.1 | ✅ 已完成（0.29.1，未打 tag） |
 | P28 插件分家（2026-09-29，用户直派「不用建施工单，直接开始做」） | MCP 搬独立国：src/plugin/mcp*.rs → src/mcp/（mod+oauth，20 处引用改道，唯一过境点 ToolBrief 工具总线）；目录二合一：ui-ext/ 并入根 plugins/（三内置面板 git mv），两个扫描器互容忍半边缺席，ui::scan_all 合成一份清单；转正一次写盘（draft::promote 收成 plugins/<name>/ 单目录，死代码 write_all 删）；改名带迁移：disabled_plugins（serde alias）、信任键统一 plugins:<name>（load 迁移、抽纯函数 migrate_legacy_trust_keys 带单测）、/api/ext→/api/plugins 六路由 + 前端同步、静态 /ui-ext/*→/plugins/*、server/ext.rs→plugins.rs。隔离冒烟实锤（7799 临时实例不碰用户进程）：新路由 200、面板资源 200、MCP 200、旧 settings 落盘实锤迁移。255 测试 + clippy 零告警，版本 0.30.0；详见 docs/workorders/031 | ✅ 已完成（0.30.0，本地提交未推送） |
 | P13 | Tauri 桌面封装。**已启用（2026-09-22 起，随 P20.4 转正）**：壳 = 内置浏览器宿主（child webview + 控制通道 9225 + CDP 9223），start.bat 优先起壳、壳保活服务，用户日常使用中；窗口/托盘/服务保活均真机在跑。与 web 解耦不变（WebView 加载 5173，前端改动零影响）。**留口**：desktop/ 仍是开发布局（服务 exe 路径按 desktop/ 上两级解析），打包分发时改同级目录探测；壳启动后窗口会自行 resize 一次（保存的窗口 bounds 恢复时序，启动早期发生，机制待查） | ✅ 已启用 |
+| P1 配置层收敛（2026-09-29，施工单 032） | serde alias 垫片退役、配置迁移收敛单一入口（storage::write_settings 一门原子写）、配置面地图入库（settings.json = 唯一运行时用户配置）；验收记录见 docs/agent-copy-验收交接文档.md | ✅ 已完成（0.31.0） |
+| P2 巨石文件拆分（2026-09-29，施工单 033，P19 范式分件验收） | 七件全施工完：settings 测试抽离 / browser 四国 / chat 三域 / agent 四域 / gateway 适配器域 / tools 工具族五国 / App.svelte 一轮组件化（弹窗四页签组件 + 纯函数出库 lib/dom.js、format.js）；共享根定态 + pub(crate) 收口 + glob 再出口，行数对账随件归档；行为差异三点如实登记（弹窗重开页签临时态重置、skills/schedule 预取变单取）；256+5 测试全绿 | ✅ 已完成（0.32.0，用户真机已验） |
+| 真机 bug 修复轮（2026-09-29，用户实锤；提交代号 P27.x 与 09-28 壳 P27 撞号，以本行主题为准） | 删项目点了没反应（桌面壳 confirm() 静默失效）、最上面的工作区删不掉且无提示、思考吃「最大输出长度」额度（撤自动续写，发送值 = 配置值 + max(配置值,8192)）、托盘幽灵图标（重启服务托盘堆积）、无 workspace 标记会话串进新工作区、通知 display_only 落盘 + replay 剥离 | ✅ 已完成（用户真机已验） |
+| 终版代码审查修复轮（2026-09-29，审查报告 19 项：9 真 bug + 9 健壮性缺陷 + 1 项降级） | SSE 字节缓冲（含 eval 漏扫同款）、重命名冲突 orig 后缀、失败不动 updated_at、SSRF 预检 + 开关等；后端真机冒烟 5/5 | ✅ 已完成（用户真机已验） |
+| P2 收口（2026-09-30） | 版本 bump 0.32.0 + 本大表补登（P1/P2/两修复轮/收口）+ clippy 22 条基线清零：browser 根四类型 OutlineNode/DomNode/HostMode/BrowserSession 升 pub(crate) 对齐子模块已升级函数的可见性，另清 gateway 测试 field_reassign_with_default（--all-targets 全绿零告警） | ✅ 已完成（0.32.0，随本轮推送） |
 
 ## 二、对话（施工单）协作约定
 
@@ -155,7 +160,7 @@
 
 2. **P8 厂商思考参数真 key 冒烟**：MiniMax/Claude/豆包/混元官方端点的 thinking 形态（坑 14 B4：新形态入词表必须附真实渠道冒烟记录）；需对应用户的厂商 key，StepFun 渠道覆盖不到。
 3. **browser 工具真模型全流程**：navigate/跨站点新页/面板同步已用 step-5-preview 实测（补丁五）；snapshot/click/fill/select/wait_for/scroll/get_state 等仍只有 mock 剧本 + CDP 直驱冒烟（028）——可让真模型跑一轮补实（少量额度，用户已给渠道）。
-4. **E1 拆分**（tools/mod.rs 单文件拆分）：纯机械、无行为收益，低优先级。
+4. **E1 拆分**（tools/mod.rs 单文件拆分）：纯机械、无行为收益，低优先级。（✅ 2026-09-29 随 P2 件 6 完成：tools 工具族五国拆分，mod.rs 1808→760）
 5. **MCP OAuth / WASM 宿主函数**：分别需对照服务端 / ABI 变更，继续留口。
 6. **settings.json 旧格式迁移垫片**：版本兼容问题，留待大版本。
 7. **prices.json 补全**：目前只带 DeepSeek 一条样例；用户常用渠道的单价（含 StepFun step-5-preview）按公开价目手填后报表才有费用列。
