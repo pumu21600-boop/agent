@@ -16,28 +16,28 @@ pub(crate) fn rg_available() -> bool {
     })
 }
 
-pub(crate) fn search(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
+pub(crate) fn search(ws: &Path, args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let query = v.get("query").and_then(Value::as_str).ok_or("缺少 query 参数")?;
     if query.trim().is_empty() {
         return Err("query 为空".to_string());
     }
     let sub = v.get("path").and_then(Value::as_str).unwrap_or(".");
-    let target = resolve_in_workspace(sub, true, unconfined)?;
+    let target = resolve_in_workspace(ws, sub, true, unconfined)?;
     // path 指到文件时别报错（模型经常把文件当目录传）——直接对该文件内容搜索
     if target.is_file() {
         let output = if rg_available() {
             Command::new("rg")
                 .args(["-n", "--no-heading", "-m", "50", query])
                 .arg(&target)
-                .current_dir(workspace_root())
+                .current_dir(ws)
                 .stdin(Stdio::null())
                 .creation_flags(0x0800_0000) // 不闪控制台窗口
                 .output()
         } else {
             Command::new("findstr")
                 .args(["/n", "/i", &format!("/c:{query}"), &target.to_string_lossy()])
-                .current_dir(workspace_root())
+                .current_dir(ws)
                 .stdin(Stdio::null())
                 .creation_flags(0x0800_0000)
                 .output()
@@ -60,7 +60,7 @@ pub(crate) fn search(args: &str, max_chars: usize, unconfined: bool) -> Result<S
         Command::new("rg")
             .args(["-n", "--no-heading", "-m", "50", query])
             .arg(&target)
-            .current_dir(workspace_root())
+            .current_dir(ws)
             .stdin(Stdio::null())
             .creation_flags(0x0800_0000) // 不闪控制台窗口
             .output()

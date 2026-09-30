@@ -226,9 +226,35 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         m.insert(session_id.clone(), mode.clone());
     }
 
+    // 审计 07：SSE 断线感知——send 失败即对端没了（关网页/断网/刷新）。
+    // cancel_on_disconnect 开 → 看门狗取消本轮；关（默认）→ 任务跑完，刷新可续聊。
+    let peer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_on_disconnect = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .features
+        .cancel_on_disconnect;
+    if cancel_on_disconnect {
+        let watch_reg = state.cancel.clone();
+        let watch_sid = session_id.clone();
+        let watch_gone = peer_gone.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if watch_gone.load(std::sync::atomic::Ordering::Relaxed) {
+                    watch_reg.cancel(&watch_sid);
+                    break;
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
+        // 非 move 闭包：按引用捕获 tx / peer_gone——ChatGate 后面还要 tx.clone()
         let send = |payload: Value| {
-            let _ = tx.send(Ok(json_event(payload)));
+            if tx.send(Ok(json_event(payload))).is_err() {
+                peer_gone.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         };
         // D2：本轮取消标志（会话级）——新会话不再复位别人的标志，停止只停本会话。
         // N1：标志已在进入 handler 时占位登记（同会话并发在门口就 409）。
@@ -626,6 +652,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 cancel: cancel.clone(),
                 steer: steer_queue.clone(),
             },
+                crate::tools::workspace_root(),
                 |ev| match ev {
                     AgentEvent::Content(c) => send(json!({ "content": c })),
                     // P26：思考=关时不上报 reasoning——渠道（如 StepFun 推理模型）无视

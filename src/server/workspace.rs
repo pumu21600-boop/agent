@@ -73,6 +73,7 @@ pub(super) async fn read_workspace_file(
         unsandboxed: false,
         fs_unconfined: false,
         cpu_percent,
+        workspace: crate::tools::workspace_root(),
     };
     match crate::tools::execute(
         &exec,
@@ -111,6 +112,7 @@ pub(super) async fn run_shell(
         unsandboxed: false,
         fs_unconfined: false,
         cpu_percent,
+        workspace: crate::tools::workspace_root(),
     };
     match crate::tools::execute(&exec, "shell", &json!({ "command": command }).to_string()).await {
         Ok(output) => Ok(Json(json!({ "ok": true, "output": output }))),

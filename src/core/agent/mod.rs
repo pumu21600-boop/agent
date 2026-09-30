@@ -257,6 +257,8 @@ pub async fn run_task(
     // P9 B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
     plan_mode: bool,
     gate: &dyn ApprovalGate,
+    // 审计 05：本任务固定使用的工作区（无头/定时任务按触发时钉住；前台每轮传当前全局）
+    ws: std::path::PathBuf,
     on_event: impl Fn(AgentEvent) + Send + Sync,
 ) -> anyhow::Result<LoopOutcome> {
     let primary = &channels.primary;
@@ -658,6 +660,7 @@ pub async fn run_task(
             unsandboxed: !gate.sandbox_enabled(),
             fs_unconfined: gate.file_tools_unconfined(),
             cpu_percent,
+            workspace: ws.clone(),
         };
         use futures_util::StreamExt;
 
@@ -1122,6 +1125,7 @@ mod tests {
             None,
             false,
             &G,
+            crate::tools::workspace_root(),
             move |ev: AgentEvent| match ev {
                 AgentEvent::Notice(t) => notices_c.lock().unwrap().push(t),
                 AgentEvent::Snapshot { messages } => snaps_c.lock().unwrap().push(messages),

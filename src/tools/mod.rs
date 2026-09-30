@@ -65,6 +65,9 @@ pub struct ExecConfig {
     /// 文件工具是否允许越出工作区（auto / full-access 档=true；read-only / sandbox 档锁死工作区）。
     /// 相对路径永远以工作区为基准；放行的只是绝对路径与 `..` 出界。
     pub fs_unconfined: bool,
+    /// 本轮任务自己的工作区（审计 05）：后台任务（定时/无头/子代理）按触发时的
+    /// 工作区执行，前台用户中途切换工作区不会把在跑的任务拽到新工作区去
+    pub workspace: PathBuf,
 }
 
 fn builtin_tools() -> Vec<ToolSpec> {
@@ -306,8 +309,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         return crate::plugin::wasm::call_tool(name, args).await;
     }
     match name {
-        "read_file" => read_file(args, cfg.max_chars, cfg.fs_unconfined),
-        "read_page" => read_page(args, cfg.max_chars, cfg.fs_unconfined),
+        "read_file" => read_file(&cfg.workspace, args, cfg.max_chars, cfg.fs_unconfined),
+        "read_page" => read_page(&cfg.workspace, args, cfg.max_chars, cfg.fs_unconfined),
         "read_skill" => {
             let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
             let name = v
@@ -321,9 +324,9 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
                 None => crate::skills::read_for_agent(name),
             }
         }
-        "write_file" => write_file(args, cfg.fs_unconfined),
-        "edit_file" => edit_file(args, cfg.fs_unconfined),
-        "search" => search(args, cfg.max_chars, cfg.fs_unconfined),
+        "write_file" => write_file(&cfg.workspace, args, cfg.fs_unconfined),
+        "edit_file" => edit_file(&cfg.workspace, args, cfg.fs_unconfined),
+        "search" => search(&cfg.workspace, args, cfg.max_chars, cfg.fs_unconfined),
         "web_fetch" => web_fetch(args, cfg.max_chars).await,
         "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
@@ -342,7 +345,7 @@ pub fn write_workspace_relative(rel: &str, content: &str) -> Result<usize, Strin
     if content.len() > MAX_FILE_BYTES {
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
-    let full = resolve_in_workspace(rel, false, false)?;
+    let full = resolve_in_workspace(&workspace_root(), rel, false, false)?;
     crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
     Ok(content.len())
 }
@@ -356,11 +359,11 @@ fn cap(s: &str, max: usize) -> String {
 /// `must_exist=false` 时对不存在的路径校验其父目录（写文件用）。
 /// `unconfined=true`（auto/full-access 档）允许绝对路径越出工作区——整台电脑可读写；
 /// read-only / sandbox 档传 false，工作区边界照旧硬拦。
-fn resolve_in_workspace(rel: &str, must_exist: bool, unconfined: bool) -> Result<PathBuf, String> {
+fn resolve_in_workspace(root: &Path, rel: &str, must_exist: bool, unconfined: bool) -> Result<PathBuf, String> {
     if rel.trim().is_empty() {
         return Err("path 为空".to_string());
     }
-    let root = workspace_root().canonicalize().map_err(|e| format!("工作目录解析失败: {e}"))?;
+    let root = root.canonicalize().map_err(|e| format!("工作目录解析失败: {e}"))?;
     // 放行档的绝对路径：原样使用，不做工作区归属检查（相对路径仍以工作区为基准）
     if unconfined && Path::new(rel).is_absolute() {
         if must_exist {
@@ -453,7 +456,33 @@ mod tests {
     }
 
     fn cfg() -> ExecConfig {
-        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, fs_unconfined: false, cpu_percent: 0 }
+        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, fs_unconfined: false, cpu_percent: 0, workspace: workspace_root() }
+    }
+
+    /// 审计 05：ExecConfig.workspace 钉住的工作区优先于全局——后台任务跑到一半
+    /// 用户切换工作区，任务的文件操作仍落在自己触发时的那个工作区，不被拽走
+    #[tokio::test]
+    async fn tools_use_pinned_workspace_not_global() {
+        init_logger();
+        let pinned = std::env::temp_dir().join(format!("agent-ws-pinned-{}", std::process::id()));
+        let other = std::env::temp_dir().join(format!("agent-ws-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pinned);
+        let _ = std::fs::remove_dir_all(&other);
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let old = workspace_root();
+        set_workspace_root(&other); // 全局切到别处（模拟用户切换）
+        let mut c = cfg();
+        c.workspace = pinned.clone();
+        let r = execute(&c, "write_file", r#"{"path":"pinned.txt","content":"钉住"}"#).await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(pinned.join("pinned.txt").is_file(), "文件必须落在钉住的工作区");
+        assert!(!other.join("pinned.txt").exists(), "不许被全局新值拽走");
+        let r = execute(&c, "read_file", r#"{"path":"pinned.txt"}"#).await;
+        assert_eq!(r.unwrap(), "钉住");
+        set_workspace_root(&old);
+        let _ = std::fs::remove_dir_all(&pinned);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[tokio::test]

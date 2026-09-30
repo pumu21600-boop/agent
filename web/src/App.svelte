@@ -5028,6 +5028,14 @@
           </div>
           <button class="switch" class:on={features.galaxy} role="switch" aria-checked={features.galaxy} aria-label="星云 启用/停用" on:click={() => toggleFeature('galaxy')}><span class="knob"></span></button>
         </div>
+        <div class="plug-row" title="开 = 检测到网页断开（关页面/断网/刷新）就取消本轮任务，不再继续烧 token；关 = 任务在后台跑完，刷新页面回来能接着聊">
+          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.7-5.7M20 12a8 8 0 0 1-13.7 5.7"/><path d="M17.5 3v3.5H14M6.5 21v-3.5H10"/></svg></div>
+          <div class="plug-meta">
+            <div class="plug-title">断线取消</div>
+            <div class="plug-desc">网页断开即停本轮 · 关则后台跑完（刷新可续聊）</div>
+          </div>
+          <button class="switch" class:on={features.cancel_on_disconnect} role="switch" aria-checked={features.cancel_on_disconnect} aria-label="断线取消 启用/停用" on:click={() => toggleFeature('cancel_on_disconnect')}><span class="knob"></span></button>
+        </div>
 
         {#each builtInExts as e}
           <div class="plug-row" title={extTip(e)}>

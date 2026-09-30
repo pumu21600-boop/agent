@@ -18,12 +18,18 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// 无头运行期间的工作区切换守卫：Drop 还原全局根。
 /// 放在跑整轮的任务里（随任务生命周期）——取消/超时后任务在后台收尾期间
 /// 工作区保持切换态，收尾完才还原，不会漏还原也不会提前还。
+/// 审计 05：用户中途主动切换过工作区就以用户为准——守卫只把「还是我设的那个值」
+/// 还原回旧的，绝不覆盖用户在跑期间做的选择（任务自身的文件操作已由
+/// run_task 的 ws 参数钉住，不依赖全局）。
 struct WorkspaceGuard {
     old: std::path::PathBuf,
+    guarded: std::path::PathBuf,
 }
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
-        crate::tools::set_workspace_root(&self.old);
+        if crate::tools::workspace_root() == self.guarded {
+            crate::tools::set_workspace_root(&self.old);
+        }
     }
 }
 
@@ -324,12 +330,17 @@ pub(crate) async fn run_headless_inner(
         let cancel = run_flag.clone();
         let _run = CancelRun::from_flag(cancel_registry.clone(), &sid, run_flag);
         // 守卫随任务生命周期：取消/超时后后台收尾期间工作区保持切换态，收尾完才还原
+        let pinned_ws = if ws_override.is_empty() {
+            crate::tools::workspace_root()
+        } else {
+            std::path::PathBuf::from(&ws_override)
+        };
         let _ws_guard = if ws_override.is_empty() {
             None
         } else {
             let p = std::path::PathBuf::from(&ws_override);
             if p.is_dir() {
-                Some(WorkspaceGuard { old: crate::tools::set_workspace_root(&p) })
+                Some(WorkspaceGuard { guarded: p.clone(), old: crate::tools::set_workspace_root(&p) })
             } else {
                 None
             }
@@ -362,6 +373,7 @@ pub(crate) async fn run_headless_inner(
                 prior_summary.clone(),
                 plan_mode,
                 &gate,
+                pinned_ws.clone(),
                 |ev| match ev {
                     agent::AgentEvent::Content(c) => {
                         col_task.answer.lock().unwrap_or_else(|e| e.into_inner()).push_str(&c)

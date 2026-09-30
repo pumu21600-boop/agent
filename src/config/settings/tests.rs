@@ -172,3 +172,13 @@
         let back = serde_json::to_string(&s.features).unwrap();
         assert!(back.contains("\"roles\":false") && back.contains("\"css_tool\":true"), "{back}");
     }
+
+    #[test]
+    fn cancel_on_disconnect_defaults_off() {
+        // 审计 07：断线取消默认关——任务后台跑完，刷新可续聊；用户显式开才取消
+        let s: crate::config::settings::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!s.features.cancel_on_disconnect);
+        let on: crate::config::settings::Settings =
+            serde_json::from_str(r#"{"features":{"cancel_on_disconnect":true}}"#).unwrap();
+        assert!(on.features.cancel_on_disconnect);
+    }

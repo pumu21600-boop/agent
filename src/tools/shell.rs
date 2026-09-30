@@ -17,7 +17,7 @@ pub(crate) async fn run_in_sandbox(
     let spec = SandboxSpec {
         application,
         command_line,
-        working_dir: workspace_root().to_path_buf(),
+        working_dir: cfg.workspace.clone(),
         limits: SandboxLimits {
             timeout_ms,
             memory_mb: cfg.sandbox.memory_mb,

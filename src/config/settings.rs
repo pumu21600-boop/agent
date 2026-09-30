@@ -115,11 +115,15 @@ pub struct FeatureSettings {
     /// 星云入口（记忆库可视化/检索）：关 = 只藏入口，记忆功能本体不受影响
     #[serde(default = "default_true")]
     pub galaxy: bool,
+    /// SSE 断线即取消本轮任务（审计 07）：关（默认）= 任务在后台跑完，刷新页面能接着聊；
+    /// 开 = 检测到连接断开就取消本轮，不再继续烧 token
+    #[serde(default)]
+    pub cancel_on_disconnect: bool,
 }
 
 impl Default for FeatureSettings {
     fn default() -> Self {
-        Self { roles: true, css_tool: true, galaxy: true }
+        Self { roles: true, css_tool: true, galaxy: true, cancel_on_disconnect: false }
     }
 }
 

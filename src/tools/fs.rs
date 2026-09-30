@@ -20,9 +20,9 @@ fn read_text_err(full: &std::path::Path, e: std::io::Error) -> String {
     format!("读文件失败（可能非 UTF-8）: {e}")
 }
 
-pub(crate) fn read_file(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
+pub(crate) fn read_file(ws: &Path, args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {    let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
-    let full = resolve_in_workspace(rel, true, unconfined)?;
+    let full = resolve_in_workspace(ws, rel, true, unconfined)?;
     let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
@@ -32,7 +32,7 @@ pub(crate) fn read_file(args: &str, max_chars: usize, unconfined: bool) -> Resul
 }
 
 /// 分页读取大文件（P5）：按行分页，页码越界自动钳到最后/第一页。
-pub(crate) fn read_page(args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
+pub(crate) fn read_page(ws: &Path, args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let page = v.get("page").and_then(Value::as_u64).ok_or("缺少 page 参数")?;
@@ -40,7 +40,7 @@ pub(crate) fn read_page(args: &str, max_chars: usize, unconfined: bool) -> Resul
         return Err("page 从 1 开始".to_string());
     }
     let page_size = v.get("page_size").and_then(Value::as_u64).unwrap_or(200).clamp(10, 1000) as usize;
-    let full = resolve_in_workspace(rel, true, unconfined)?;
+    let full = resolve_in_workspace(ws, rel, true, unconfined)?;
     if full.metadata().map_err(|e| format!("读取失败: {e}"))?.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
@@ -69,14 +69,14 @@ pub(crate) fn read_page(args: &str, max_chars: usize, unconfined: bool) -> Resul
 /// 共用（审查 N2——edit_file 原先无上限，模型误编辑大文件时整文件读入内存）。
 pub(crate) const MAX_FILE_BYTES: usize = 512 * 1024;
 
-pub(crate) fn write_file(args: &str, unconfined: bool) -> Result<String, String> {
+pub(crate) fn write_file(ws: &Path, args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let content = v.get("content").and_then(Value::as_str).ok_or("缺少 content 参数")?;
     if content.len() > MAX_FILE_BYTES {
         return Err(format!("内容过大（{} 字节，上限 512KB）", content.len()));
     }
-    let full = resolve_in_workspace(rel, false, unconfined)?;
+    let full = resolve_in_workspace(ws, rel, false, unconfined)?;
     // 原子写：写到一半失败不能留下半截文件（模型写代码文件时这是最常见的损坏来源）
     crate::fsx::write_atomic_str(&full, content).map_err(|e| format!("写文件失败: {e}"))?;
     Ok(format!("已写入 {} 字节 → {}", content.len(), rel))
@@ -84,7 +84,7 @@ pub(crate) fn write_file(args: &str, unconfined: bool) -> Result<String, String>
 
 /// 局部修改（P16）：文件里唯一出现的 old_string → new_string。
 /// 大文件改几行用它，省 token 也避免重写全文时误伤其他内容。
-pub(crate) fn edit_file(args: &str, unconfined: bool) -> Result<String, String> {
+pub(crate) fn edit_file(ws: &Path, args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
     let old = v.get("old_string").and_then(Value::as_str).ok_or("缺少 old_string 参数")?;
@@ -99,7 +99,7 @@ pub(crate) fn edit_file(args: &str, unconfined: bool) -> Result<String, String> 
     if new.len() > MAX_FILE_BYTES {
         return Err(format!("new_string 过大（{} 字节，上限 512KB）", new.len()));
     }
-    let full = resolve_in_workspace(rel, true, unconfined)?;
+    let full = resolve_in_workspace(ws, rel, true, unconfined)?;
     let meta = full.metadata().map_err(|e| format!("读取失败: {e}"))?;
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
