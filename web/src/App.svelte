@@ -4955,11 +4955,11 @@
             <div class="plug-desc">{sandboxInfo ? `命令在受限进程树里跑${sandboxInfo.fallback_reason ? ` · ${sandboxInfo.fallback_reason}` : ''}` : '读取中…'}</div>
           </div>
           {#if sandboxProbe}
-            <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '自检中…' : sandboxProbe.ok ? '自检通过' : '自检有失败'}</span>
+            <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '检测中…' : sandboxProbe.ok ? '检测通过' : '检测有失败'}</span>
           {/if}
           <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
-          <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>检测</button>
-          <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>自检</button>
+          <!-- 检测 = 一次做完:刷新档位 + 真拉起受限进程跑探针（用户拍板:一行一个按钮） -->
+          <button class="btn ghost" on:click={() => { loadSandboxInfo(true); runSandboxProbe(); }} disabled={sbInfoLoading || sbRunning}>检测</button>
         </div>
         {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
         {#if sandboxProbe?.results?.length}

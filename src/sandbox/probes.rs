@@ -556,7 +556,7 @@ pub fn resolve_tier(cfg: &SandboxConfig, unsandboxed_allowed: bool) -> TierRepor
             } else {
                 (
                     Box::new(super::backend::RestrictedTier),
-                    Some(format!("AppContainer canary 未通过：{}（已回退受限 token 沙箱）", canary.detail)),
+                    Some(format!("AppContainer canary 未通过：{}（已回退沙箱档）", canary.detail)),
                 )
             }
         }

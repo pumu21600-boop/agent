@@ -65,7 +65,7 @@ impl SandboxTier for RestrictedTier {
         "restricted"
     }
     fn label(&self) -> &'static str {
-        "受限 token 沙箱"
+        "沙箱"
     }
     fn describe(&self) -> String {
         "Job Objects 管进程树（kill-on-close 团灭、内存/进程数上限）+ 受限 token 剥特权 + 白名单环境（密钥进不来）+ 默认断网。".into()
