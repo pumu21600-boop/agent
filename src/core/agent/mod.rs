@@ -323,6 +323,10 @@ pub async fn run_task(
     // A3 能力标记「工具调用」闭环（施工单 012）：capabilities.tools=false 时不携带 tools
     // 参数，模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响（replay 只动消息字段）。
     let tools_def = tools_def_for(&primary.params);
+    // 工具定义随每次请求发给模型（渠道计入 prompt tokens），圆环必须算上——
+    // 否则比真实用量少一大截（实测：估算 1866 vs 实际 4750，差额≈工具 Schema）
+    let tools_schema_tokens =
+        tools_def.as_ref().map(|d| context::estimate_tokens(&d.to_string())).unwrap_or(0);
     let mut prev_tool_sigs: Vec<String> = Vec::new();
     // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
     // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
@@ -392,7 +396,8 @@ pub async fn run_task(
             msgs = compacted;
         }
         // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
-        let breakdown = context::estimate_breakdown(&msgs);
+        let mut breakdown = context::estimate_breakdown(&msgs);
+        breakdown.tools_schema = tools_schema_tokens;
         let used = breakdown.total();
         on_event(AgentEvent::ContextUsage {
             tokens: used,

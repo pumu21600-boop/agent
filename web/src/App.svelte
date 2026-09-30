@@ -426,13 +426,15 @@
   // 常态浅灰（同参考样式）；占用高时转警示色
   $: ctxColor = ctxPct >= 85 ? 'var(--tint-red-fg)' : ctxPct >= 60 ? 'var(--tint-yellow-fg)' : 'var(--g6)';
   $: ctxRows = (() => {
-    const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0 };
-    const sum = Math.max(1, b.messages + b.tools + b.system + b.other);
+    const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0, tools_schema: 0 };
+    const sum = Math.max(1, b.messages + b.tools + b.system + b.other + (b.tools_schema || 0));
     const row = (label, v, color) => ({ label, v, color, pct: ((v / sum) * 100).toFixed(1) + '%' });
     return [
       row('消息', b.messages, 'var(--tint-blue-fg)'),
       row('工具结果', b.tools, 'var(--tint-cyan-fg)'),
       row('系统提示词', b.system, 'var(--tint-blue-fg)'),
+      // 随请求发送的 tools JSON Schema（后端计入总量；旧后端无此字段按 0 兜底）
+      row('工具定义', b.tools_schema || 0, 'var(--tint-green-fg)'),
       row('其他', b.other, 'var(--g5)'),
     ];
   })();

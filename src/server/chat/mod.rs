@@ -678,6 +678,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                                 "tools": breakdown.tools,
                                 "system": breakdown.system,
                                 "other": breakdown.other,
+                                "tools_schema": breakdown.tools_schema,
                             },
                         }
                     })),

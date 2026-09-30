@@ -70,11 +70,14 @@ pub struct Breakdown {
     pub system: u64,
     /// tool_calls 结构与每条消息的固定开销
     pub other: u64,
+    /// 工具定义（随每次请求发送的 tools JSON Schema，渠道计入 prompt tokens；
+    /// 不算它圆环会比真实用量少一大截）。由调用方（核心循环）估算后填入。
+    pub tools_schema: u64,
 }
 
 impl Breakdown {
     pub fn total(&self) -> u64 {
-        self.messages + self.tools + self.system + self.other
+        self.messages + self.tools + self.system + self.other + self.tools_schema
     }
 }
 
