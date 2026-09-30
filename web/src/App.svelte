@@ -4961,6 +4961,19 @@
           <button class="btn ghost" on:click={() => loadSandboxInfo(true)} disabled={sbInfoLoading}>检测</button>
           <button class="btn ghost" on:click={runSandboxProbe} disabled={sbRunning}>自检</button>
         </div>
+        {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
+        {#if sandboxProbe?.results?.length}
+          <div class="probe-list">
+            {#each sandboxProbe.results as p}
+              <div class="probe-row">
+                <span class="dot" class:haskey={p.ok}></span>
+                <code>{p.name}</code>
+                <span class="probe-detail">{p.detail}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
         <div class="plug-row" title="给摘要/标题/嵌入/多模态/子代理/预算降级等辅助调用指定专用模型渠道（原「角色分工」）">
           <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8.5 8.5c-2.2 0-4 1.6-4 3.5s1.8 3.5 4 3.5M15.5 8.5c2.2 0 4 1.6 4 3.5s-1.8 3.5-4 3.5M8.5 12h7"/></svg></div>
           <div class="plug-meta">
@@ -4985,18 +4998,6 @@
           </div>
           <button class="switch" class:on={features.galaxy} role="switch" aria-checked={features.galaxy} aria-label="星云 启用/停用" on:click={() => toggleFeature('galaxy')}><span class="knob"></span></button>
         </div>
-        {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
-        {#if sandboxProbe?.results?.length}
-          <div class="probe-list">
-            {#each sandboxProbe.results as p}
-              <div class="probe-row">
-                <span class="dot" class:haskey={p.ok}></span>
-                <code>{p.name}</code>
-                <span class="probe-detail">{p.detail}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
 
         {#each builtInExts as e}
           <div class="plug-row" title={extTip(e)}>

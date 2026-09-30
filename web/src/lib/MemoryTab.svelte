@@ -82,12 +82,14 @@
               <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
             </div>
           </div>
+          {#if showGalaxy}
           <div class="field">
             <label>记忆库</label>
             <div class="sub-row">
-              {#if showGalaxy}<button class="btn" on:click={openGalaxy}>打开记忆库</button>{/if}
+              <button class="btn" on:click={openGalaxy}>打开记忆库</button>
             </div>
           </div>
+          {/if}
           <div class="field">
             <label>约定文件</label>
             <div class="chips">
