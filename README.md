@@ -1,4 +1,4 @@
-# agent —— Windows 原生类 Codex 自主编码 Agent
+# agent —— Windows 原生自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
 当前进度：**P28 完成**（插件/MCP/Skill 分家：MCP 搬独立国 src/mcp/、ui-ext/ 并入 plugins/、/api/ext→/api/plugins 与字段/信任键改名带迁移，隔离冒烟实锤；详见 docs/workorders/031）；P27 壳面板归属 + 取消及时性 + CI 时区修复（native 身份章 / X-Agent-Client / select! 中断 / 不赌运行环境时区，0.29.x）；此前 **P23 完成**（供应商预设收敛到五个——OpenAI 兼容/Anthropic/DeepSeek/StepFun/GLM，旧预设 id 契约知识保留在端点探测、存量渠道不受影响；**Anthropic Messages 原生协议适配器**：请求侧 OpenAI 会话形状→Messages 形状、响应侧 SSE 事件流合成回 OpenAI 分片、下游零改动，思考=thinking 预算自动取输出上限一半；**思考参数 400 自适应降级**：端点拒收思考字段自动剥参重试+登记+下一轮人话提示，两协议通用）；此前 P22 完成（无头会话 / 定时任务 / 子代理并行 / 主动记忆提醒，收尾期反馈批次见 ROADMAP P22.1）；P21 成本台账 + 红线收口（每次模型调用在网关单点记账，token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位/费用，价格表带生效时间，按供应商/模型出报表；红线一 = 全局花费上限硬闸，红线二 = 第三方插件来源验签（pin 内容指纹））；此前 P20.4 内置浏览器搬进桌面壳（壳里跑 child webview 真页面，服务经 CDP + 控制通道驱动，壳不在自动回落无头）、P20 浏览器内核（CDP 直连 + 语义定位点击 + DOM 增量 diff）与沙箱统一（SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / 内置插件试点；App.svelte 拆分未落地——仍 8919 行单文件）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
