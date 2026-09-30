@@ -3570,6 +3570,24 @@
         <button class="icon-btn" title="收起侧栏" on:click={() => (sidebarCollapsed = true)}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><line x1="9.8" y1="4.5" x2="9.8" y2="19.5"/></svg>
         </button>
+        <!-- 窗口控制（无边框壳）：侧栏展开时放在侧栏右端（brand 行内）；收起态侧栏太窄，回顶栏 -->
+        {#if !sidebarCollapsed && winApi}
+          <div class="win-ctrls">
+            <button class="head-btn win-btn" title="最小化" aria-label="最小化" on:click={() => winApi.minimize()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"/></svg>
+            </button>
+            <button class="head-btn win-btn" title={winMax ? '还原窗口' : '最大化'} aria-label={winMax ? '还原窗口' : '最大化'} on:click={() => winApi.toggleMax().then(refreshWinMax, refreshWinMax)}>
+              {#if winMax}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="7.5" width="12" height="12" rx="2"/><path d="M8 7.5V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-1.5"/></svg>
+              {:else}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>
+              {/if}
+            </button>
+            <button class="head-btn win-btn win-close" title="关闭到托盘（服务保持运行）" aria-label="关闭到托盘" on:click={() => winApi.hide()}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg>
+            </button>
+          </div>
+        {/if}
       </div>
 
       <button class="new-chat" on:click={startNewSession}>
@@ -3795,8 +3813,9 @@
         </button>
 
         <!-- 窗口控制（无边框壳，对齐 ZCode：原生黑条撤掉，按钮做进内容行）。
-             只有桌面壳里才有 agentWinApi（壳每 2s 注入）；浏览器打开的第二个客户端不显示 -->
-        {#if winApi}
+             只有桌面壳里才有 agentWinApi（壳每 2s 注入）；浏览器打开的第二个客户端不显示。
+             侧栏展开时按钮在侧栏右端（见 brand 行），这里只兜收起态 -->
+        {#if winApi && sidebarCollapsed}
           <div class="win-ctrls">
             <button class="head-btn win-btn" title="最小化" aria-label="最小化" on:click={() => winApi.minimize()}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 12h12"/></svg>
@@ -3959,10 +3978,6 @@
     {#if !chatPinned}
       <button class="jump-bottom" on:click={scrollToBottom} title="回到底部">回到底部</button>
     {/if}
-
-    <div class="handoff-bar">
-      <button class="handoff-btn" on:click={makeHandoff} title="把当前会话压成交接文档 HANDOFF.md（写入工作区）">交接文档</button>
-    </div>
 
     <footer class="chat-input">
       {#if dockCp || (gitInfo && gitInfo.is_repo)}
@@ -4155,6 +4170,8 @@
                 </div>
               {/if}
             </div>
+            <!-- 「交接文档」从 composer 外浮动条挪进来（原来在卡片外缘，窄窗口/壳里被裁成半个字） -->
+            <button class="handoff-btn" on:click={makeHandoff} title="把当前会话压成交接文档 HANDOFF.md（写入工作区）">交接文档</button>
           </div>
           <div class="composer-right">
             {#if ctxUsage.budget > 0}
@@ -5885,13 +5902,8 @@
     width: 15px;
     height: 15px;
   }
-  .handoff-bar {
-    flex: none;
-    display: flex;
-    justify-content: flex-end;
-    padding: 0 16px 4px;
-  }
   .handoff-btn {
+    flex: none;
     background: transparent;
     border: none;
     color: var(--g4);
@@ -5899,6 +5911,7 @@
     padding: 3px 8px;
     border-radius: 7px;
     cursor: pointer;
+    white-space: nowrap;
   }
   .handoff-btn:hover {
     color: var(--g6);
