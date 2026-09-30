@@ -50,6 +50,7 @@
   let roles = {}; // P8.5 角色路由映射
   // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
   let features = { roles: true, css_tool: true, galaxy: true };
+  let sandboxCpu = 0; // 沙箱整树 CPU 硬上限（单核 %，0=不限；settings.sandbox_cpu_percent）
   // —— P8.2 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
@@ -531,6 +532,7 @@
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
     roles = s.roles || {};
     features = s.features || { roles: true, css_tool: true, galaxy: true };
+    sandboxCpu = s.sandbox_cpu_percent ?? 0;
     workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
@@ -4958,6 +4960,17 @@
             <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '检测中…' : sandboxProbe.ok ? '检测通过' : '检测有失败'}</span>
           {/if}
           <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
+          <Select
+            value={sandboxCpu}
+            title="沙箱 CPU 上限（单核百分比）"
+            options={[
+              { value: 0, label: '不限' },
+              { value: 80, label: '80%' },
+              { value: 50, label: '50%' },
+              { value: 25, label: '25%' },
+            ]}
+            on:change={(e) => { sandboxCpu = e.detail; autoSave({ sandbox_cpu_percent: sandboxCpu }, 0); }}
+          />
           <!-- 检测 = 一次做完:刷新档位 + 真拉起受限进程跑探针（用户拍板:一行一个按钮） -->
           <button class="btn ghost" on:click={() => { loadSandboxInfo(true); runSandboxProbe(); }} disabled={sbInfoLoading || sbRunning}>检测</button>
         </div>
@@ -8066,6 +8079,14 @@
     flex: none;
     padding: 4px 10px;
     font-size: 12px;
+  }
+  .plug-row :global(.csel) {
+    font-size: 12px;
+    padding: 5px 8px;
+  }
+  .plug-row :global(.csel-wrap) {
+    flex: none;
+    width: auto;
   }
   .switch {
     flex: none;

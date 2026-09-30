@@ -355,6 +355,10 @@ pub struct Settings {
     #[serde(default)]
     pub features: FeatureSettings,
 
+    /// 沙箱整树 CPU 硬上限（单核百分比，0/缺省 = 不限；插件页「沙箱」行可改）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_cpu_percent: Option<u32>,
+
     /// P22-B 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<crate::schedule::ScheduleTask>,

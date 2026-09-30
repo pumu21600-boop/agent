@@ -181,6 +181,7 @@ pub(crate) fn limits_of(cfg: &SandboxConfig) -> SandboxLimits {
         timeout_ms: cfg.timeout_ms,
         memory_mb: cfg.memory_mb,
         active_processes: cfg.active_processes,
+        cpu_percent: 0, // 自检只验隔离机制不验限速，探针不背限速包袱
     }
 }
 
@@ -479,7 +480,7 @@ pub(crate) fn restricted_host_limitation() -> Option<String> {
             match run(&cmd_spec(
                 "/C echo agent-host-canary-ok",
                 &probe_workdir(),
-                SandboxLimits { timeout_ms: 10_000, memory_mb: 512, active_processes: 8 },
+                SandboxLimits { timeout_ms: 10_000, memory_mb: 512, active_processes: 8, cpu_percent: 0 },
             )) {
                 // 正常执行 → 本机支持，探针全部照跑
                 Ok(o) if o.stdout.contains("agent-host-canary-ok") => None,
@@ -660,7 +661,7 @@ mod tests {
             application: crate::sandbox::system_cmd(),
             command_line: format!(r#""{}" /c echo hi-from-appcontainer"#, crate::sandbox::system_cmd().display()),
             working_dir: ws,
-            limits: SandboxLimits { timeout_ms: 15_000, memory_mb: 1024, active_processes: 32 },
+            limits: SandboxLimits { timeout_ms: 15_000, memory_mb: 1024, active_processes: 32, cpu_percent: 0 },
             restricted: true,
             appcontainer: true,
             allow_network: false, // 默认断网（NULL capabilities 分支）

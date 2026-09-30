@@ -60,6 +60,8 @@ pub struct ExecConfig {
     /// 本机直跑（脱沙箱）：shell/git 用完整用户 token + 继承父环境
     /// （AppContainer / 网络出向不在此重复存——run_in_sandbox 按 sandbox.mode 现算）
     pub unsandboxed: bool,
+    /// 整树 CPU 硬上限百分比（0 = 不限；来自 settings.json 的 sandbox_cpu_percent）
+    pub cpu_percent: u32,
     /// 文件工具是否允许越出工作区（auto / full-access 档=true；read-only / sandbox 档锁死工作区）。
     /// 相对路径永远以工作区为基准；放行的只是绝对路径与 `..` 出界。
     pub fs_unconfined: bool,
@@ -450,7 +452,7 @@ mod tests {
     }
 
     fn cfg() -> ExecConfig {
-        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, fs_unconfined: false }
+        ExecConfig { sandbox: SandboxConfig::default(), max_chars: 8000, unsandboxed: false, fs_unconfined: false, cpu_percent: 0 }
     }
 
     #[tokio::test]

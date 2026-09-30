@@ -66,11 +66,13 @@ pub(super) async fn read_workspace_file(
         return Err(err("缺少 path".into()));
     }
     let sandbox_cfg = (*state.sandbox_cfg).clone();
+    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(0);
     let exec = crate::tools::ExecConfig {
         max_chars: 200_000,
         sandbox: sandbox_cfg,
         unsandboxed: false,
         fs_unconfined: false,
+        cpu_percent,
     };
     match crate::tools::execute(
         &exec,
@@ -102,11 +104,13 @@ pub(super) async fn run_shell(
         ));
     }
     let sandbox_cfg = (*state.sandbox_cfg).clone();
+    let cpu_percent = state.settings.read().unwrap_or_else(|e| e.into_inner()).sandbox_cpu_percent.unwrap_or(0);
     let exec = crate::tools::ExecConfig {
         max_chars: 100_000,
         sandbox: sandbox_cfg,
         unsandboxed: false,
         fs_unconfined: false,
+        cpu_percent,
     };
     match crate::tools::execute(&exec, "shell", &json!({ "command": command }).to_string()).await {
         Ok(output) => Ok(Json(json!({ "ok": true, "output": output }))),

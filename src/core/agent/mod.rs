@@ -248,6 +248,8 @@ pub async fn run_task(
     cancel: &CancelFlag,
     cfg: &AgentConfig,
     sandbox_cfg: &SandboxConfig,
+    // 沙箱整树 CPU 硬上限百分比（0=不限；settings.json 的 sandbox_cpu_percent）
+    cpu_percent: u32,
     ctx_cfg: &ContextConfig,
     rec_cfg: &RecoveryConfig,
     mem: &crate::memory::Memory,
@@ -655,6 +657,7 @@ pub async fn run_task(
             max_chars: cfg.tool_result_max_chars,
             unsandboxed: !gate.sandbox_enabled(),
             fs_unconfined: gate.file_tools_unconfined(),
+            cpu_percent,
         };
         use futures_util::StreamExt;
 
@@ -1112,6 +1115,7 @@ mod tests {
             &cancel,
             &AgentConfig::default(),
             &SandboxConfig::default(),
+            0,
             &ContextConfig::default(),
             &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
             &mem,

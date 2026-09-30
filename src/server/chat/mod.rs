@@ -605,6 +605,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 &cancel,
                 &cfg,
                 &sandbox_cfg,
+                s.sandbox_cpu_percent.unwrap_or(0),
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,

@@ -22,6 +22,7 @@ pub(crate) async fn run_in_sandbox(
             timeout_ms,
             memory_mb: cfg.sandbox.memory_mb,
             active_processes: cfg.sandbox.active_processes,
+            cpu_percent: cfg.cpu_percent,
         },
         restricted: false,
         appcontainer: false,

@@ -13,8 +13,10 @@ use windows_sys::Win32::{
     System::{
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
-            JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
-            JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+            JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+            JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
             JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
             JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
@@ -85,6 +87,23 @@ impl JobGuard {
                 {
                     CloseHandle(handle);
                     bail!("SetInformationJobObject(ExtendedLimit) 失败: {}", GetLastError());
+                }
+                // CPU 硬上限（可选，cpu_percent>0 才设）：整树压到单核的 N%——
+                // 防超时窗口内吃满一颗核拖卡宿主；默认 0 = 不限（构建/装依赖类活儿不限速）
+                if limits.cpu_percent > 0 {
+                    let mut rate: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = mem::zeroed();
+                    rate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                    rate.Anonymous.CpuRate = limits.cpu_percent.min(100) * 100; // 单位 = 百分比×100
+                    if SetInformationJobObject(
+                        handle,
+                        JobObjectCpuRateControlInformation,
+                        &rate as *const _ as *const _,
+                        mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                    ) == 0
+                    {
+                        CloseHandle(handle);
+                        bail!("SetInformationJobObject(CpuRate) 失败: {}", GetLastError());
+                    }
                 }
                 // UI 限制是独立的信息类，分开设
                 let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
@@ -159,7 +178,7 @@ mod tests {
     use super::*;
 
     fn limits() -> SandboxLimits {
-        SandboxLimits { timeout_ms: 5_000, memory_mb: 256, active_processes: 4 }
+        SandboxLimits { timeout_ms: 5_000, memory_mb: 256, active_processes: 4, cpu_percent: 0 }
     }
 
     fn read_limits(job: &JobGuard) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
@@ -174,6 +193,22 @@ mod tests {
                 &mut ret,
             );
             assert_ne!(ok, 0, "QueryInformationJobObject 失败: {}", GetLastError());
+            info
+        }
+    }
+
+    fn read_cpu_rate(job: &JobGuard) -> JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+        unsafe {
+            let mut info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = mem::zeroed();
+            let mut ret = 0u32;
+            let ok = QueryInformationJobObject(
+                job.handle,
+                JobObjectCpuRateControlInformation,
+                &mut info as *mut _ as *mut _,
+                mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+                &mut ret,
+            );
+            assert_ne!(ok, 0, "QueryInformationJobObject(CpuRate) 失败: {}", GetLastError());
             info
         }
     }
@@ -220,6 +255,22 @@ mod tests {
                 assert_ne!(ui.UIRestrictionsClass & flag, 0, "UI 限制缺位（{:#x}）", ui.UIRestrictionsClass);
             }
         }
+    }
+
+    /// CPU 硬上限回读：cpu_percent=50 必须以 ENABLE|HARD_CAP + MaxRate=50 落进内核；
+    /// 默认 0 = 完全不设 CpuRate 信息类（保持不限速语义）。
+    #[test]
+    fn cpu_rate_control_is_really_applied() {
+        let l = SandboxLimits { cpu_percent: 50, ..limits() };
+        let job = JobGuard::new(&l, true).expect("建带 CPU 上限的 Job 应成功");
+        let rate = read_cpu_rate(&job);
+        assert_ne!(rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, 0, "CpuRate 未启用");
+        assert_ne!(rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, 0, "CpuRate 非硬顶");
+        let cpu = unsafe { rate.Anonymous.CpuRate };
+        assert_eq!(cpu, 5_000, "CpuRate = 百分比×100（50% → 5000）");
+
+        let off = JobGuard::new(&limits(), true).expect("建默认 Job 应成功");
+        assert_eq!(read_cpu_rate(&off).ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, 0, "默认不得设 CpuRate");
     }
 
     /// 本机直跑：只留生命周期保险丝，不带资源笼（内存/进程数上限都不设）。

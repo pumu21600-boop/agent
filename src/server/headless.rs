@@ -355,6 +355,7 @@ pub(crate) async fn run_headless_inner(
                 &cancel,
                 &cfg,
                 &sandbox_cfg,
+                s.sandbox_cpu_percent.unwrap_or(0),
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,

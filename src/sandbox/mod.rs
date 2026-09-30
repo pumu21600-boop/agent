@@ -15,7 +15,7 @@ mod token;
 
 pub use proc::{register_path_dir, SandboxChild};
 
-/// 沙箱资源上限（config.toml [sandbox]）。
+/// 沙箱资源上限（config.toml [sandbox]；cpu_percent 来自 settings.json 覆盖）。
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxLimits {
     /// 墙钟超时：到点整树击杀
@@ -24,6 +24,8 @@ pub struct SandboxLimits {
     pub memory_mb: u32,
     /// 进程树内活跃进程数上限
     pub active_processes: u32,
+    /// 整树 CPU 硬上限（单核的百分比，0 = 不限；默认 0——限速会拖慢构建/装依赖）
+    pub cpu_percent: u32,
 }
 
 /// 一次受限拉起的完整描述（持有所有权，构造方便）。
