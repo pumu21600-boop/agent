@@ -174,6 +174,8 @@ pub(super) async fn open_session(
             "summary": f.summary,
             "messages": f.messages,
             "workspace": f.workspace,
+            // 用量快照：重启/重开后恢复圆环与缓存行（无快照的旧会话为 null，前端按零兜底）
+            "usage": f.usage,
             "current_workspace": crate::tools::workspace_root().display().to_string(),
             "switched": switched,
             "warning": warning,

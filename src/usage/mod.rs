@@ -419,6 +419,11 @@ pub fn report(group: &str, range: &str, session: &str) -> Report {
         if !session.is_empty() && r.session_id != session {
             continue;
         }
+        // 会话口径（面板「本次对话用量」）只算对话本身：标题/摘要是记账杂项，
+        // 不是对话消耗（2026-10-01 用户实锤）；全局报表不传 session 时仍含全部用途
+        if !session.is_empty() && (r.purpose == "title" || r.purpose == "summary") {
+            continue;
+        }
         if let Some(f) = from {
             let Ok(ts) = DateTime::parse_from_rfc3339(&r.ts) else { continue };
             if ts.with_timezone(&Utc) < f {
@@ -622,6 +627,28 @@ mod tests {
         assert_eq!(b.totals.prompt_tokens, 5000);
         let all = report(GROUP_PROVIDER, "all", "");
         assert!(all.totals.prompt_tokens >= 6000, "不传 session = 全量");
+    }
+
+    #[test]
+    fn session_report_excludes_title_and_summary() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ledger();
+        prices_star();
+        // 会话口径只算对话：标题/摘要调用不摊进「本次对话用量」（2026-10-01 用户实锤）
+        record(rec_at("sess-scope", "api.x.com", "m", (1000, 50, 0, "ok", 10)));
+        let mut title_rec = rec_at("sess-scope", "api.y.com", "title-m", (133, 50, 0, "ok", 300));
+        title_rec.purpose = "title".into();
+        record(title_rec);
+        let mut sum_rec = rec_at("sess-scope", "api.y.com", "sum-m", (2000, 100, 0, "ok", 500));
+        sum_rec.purpose = "summary".into();
+        record(sum_rec);
+        let card = report(GROUP_MODEL, "all", "sess-scope");
+        assert_eq!(card.totals.requests, 1, "标题/摘要不计入会话卡");
+        assert_eq!(card.totals.prompt_tokens, 1000);
+        assert!(!card.rows.iter().any(|r| r.key == "title-m"), "按模型行也不应出现辅助渠道");
+        // 全局口径（不传 session）仍含全部用途——成本全景不能漏
+        let global = report(GROUP_MODEL, "all", "");
+        assert!(global.rows.iter().any(|r| r.key == "title-m"));
     }
 
     #[test]

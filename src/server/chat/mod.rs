@@ -609,6 +609,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // P21：同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
         let task_tokens = std::sync::atomic::AtomicU64::new(0);
         let budget_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 用量快照槽：种子取会话文件里上次落盘的快照（跨请求/跨重启延续累计）；
+        // ContextUsage 事件只进槽，磁盘写搭 ApiUsage 的车（每步响应后必有一次，终态精确）
+        let usage_slot = std::sync::Mutex::new(
+            session.get(&session_id).and_then(|f| f.usage).unwrap_or_default(),
+        );
         loop {
             let outcome = agent::run_task(
                 &gateway,
@@ -669,19 +674,32 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
                     }
                     AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
-                    AgentEvent::ContextUsage { tokens, budget, breakdown } => send(json!({
-                        "context_usage": {
-                            "tokens": tokens,
-                            "budget": budget,
-                            "breakdown": {
-                                "messages": breakdown.messages,
-                                "tools": breakdown.tools,
-                                "system": breakdown.system,
-                                "other": breakdown.other,
-                                "tools_schema": breakdown.tools_schema,
-                            },
+                    AgentEvent::ContextUsage { tokens, budget, breakdown } => {
+                        // 快照进槽（不落盘：磁盘写搭本步 ApiUsage 的车）
+                        {
+                            let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                            u.tokens = tokens;
+                            u.budget = budget;
+                            u.messages = breakdown.messages;
+                            u.tools = breakdown.tools;
+                            u.system = breakdown.system;
+                            u.other = breakdown.other;
+                            u.tools_schema = breakdown.tools_schema;
                         }
-                    })),
+                        send(json!({
+                            "context_usage": {
+                                "tokens": tokens,
+                                "budget": budget,
+                                "breakdown": {
+                                    "messages": breakdown.messages,
+                                    "tools": breakdown.tools,
+                                    "system": breakdown.system,
+                                    "other": breakdown.other,
+                                    "tools_schema": breakdown.tools_schema,
+                                },
+                            }
+                        }))
+                    }
                     AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                         // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
                         // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
@@ -698,6 +716,18 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             && !budget_fired.swap(true, std::sync::atomic::Ordering::Relaxed)
                         {
                             crate::hooks::notify_budget_exceeded(&session_id, total, budget);
+                        }
+                        // 用量快照落盘（读-改-写）：tokens 同步为本次实报（与前端圆环同口径），
+                        // 主循环累计并入。重启后 /api/sessions/open 靠它恢复圆环与缓存行
+                        let snap = {
+                            let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                            u.tokens = prompt_tokens;
+                            u.api_prompt = u.api_prompt.saturating_add(prompt_tokens);
+                            u.api_cached = u.api_cached.saturating_add(cached_tokens.unwrap_or(0));
+                            u.clone()
+                        };
+                        if let Err(e) = session.update_usage(&session_id, snap) {
+                            observability::debug(&format!("用量快照落盘失败: {e}"));
                         }
                         send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                     }

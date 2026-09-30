@@ -60,6 +60,7 @@
   // 027：用量按会话记账 —— key → { ctx, api }。后台会话的流写各自账本，
   // 切回会话时从账本恢复（跑完的会话不再发事件，不记账就会显示 0）。
   let usageBySession = {};
+  let serverUsage = {}; // 服务端会话文件里的用量快照（重启/重开后恢复圆环；打开会话时刷新）
 
   // —— 获取模型弹窗 ——
   let modelModalOpen = false;
@@ -2408,9 +2409,30 @@
     }
   }
 
+  // 服务端用量快照（/api/sessions/open 的 r.usage）→ 圆环/缓存行同形
+  function usageFromServer(su) {
+    return {
+      ctx: {
+        tokens: su.tokens || 0,
+        budget: su.budget || 0,
+        breakdown: {
+          messages: su.messages || 0,
+          tools: su.tools || 0,
+          system: su.system || 0,
+          other: su.other || 0,
+          tools_schema: su.tools_schema || 0,
+        },
+      },
+      api: { prompt: su.api_prompt || 0, cached: su.api_cached || 0 },
+    };
+  }
+
   // 切到某会话：从按会话账本恢复用量；没账本的新会话清零（预算保留——圆环常驻）
   function restoreUsage(key) {
-    const u = usageBySession[key];
+    // 活数据（本页收到的 SSE 事件）最新；没有才落回服务端快照（重启/重开后的恢复路径），
+    // 并扶正为会话账本，后续切换不再反复读盘
+    const u = usageBySession[key] || serverUsage[key];
+    if (u && !usageBySession[key]) usageBySession = { ...usageBySession, [key]: u };
     ctxUsage = u ? u.ctx : { tokens: 0, budget: ctxUsage.budget, breakdown: null };
     apiTotals = u ? u.api : { prompt: 0, cached: 0 };
   }
@@ -2442,6 +2464,9 @@
       }
       currentSessionId = id;
       currentTitle = r.title || (sessions.find((x) => x.id === id)?.title ?? '');
+      // 服务端用量快照（会话文件里随事件落盘的那份）：重启/重开程序后圆环和缓存行
+      // 从这里恢复，不用等下一轮请求再攒。活数据优先，这里只兜底
+      if (r.usage) serverUsage = { ...serverUsage, [id]: usageFromServer(r.usage) };
       // 本地已有缓冲就用本地（含流式思考等尚未落盘的新内容），没有才从服务端重建
       if (!sessionMsgs[id]) {
         sessionMsgs = { ...sessionMsgs, [id]: rebuildFromSession(r.messages || []) };

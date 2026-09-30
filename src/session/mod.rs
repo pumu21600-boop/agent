@@ -11,6 +11,32 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// 会话级用量快照（圆环与缓存行的落盘续命）：随 ContextUsage/ApiUsage 事件更新进会话
+/// 文件，重启/重开程序后由 /api/sessions/open 带回前端恢复，不用等下一轮请求再攒。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    /// 圆环 token 数（渠道实报的真实占用优先，估算兜底）
+    pub tokens: u64,
+    /// 圆环预算（模型 context_length 或全局 [context].budget_tokens）
+    pub budget: u64,
+    /// 分类占比（估算口径）：user+assistant 正文 / 工具结果 / 系统提示词 / 结构开销 / 工具定义
+    #[serde(default)]
+    pub messages: u64,
+    #[serde(default)]
+    pub tools: u64,
+    #[serde(default)]
+    pub system: u64,
+    #[serde(default)]
+    pub other: u64,
+    #[serde(default)]
+    pub tools_schema: u64,
+    /// 主循环渠道实报累计（平均缓存命中率行）
+    #[serde(default)]
+    pub api_prompt: u64,
+    #[serde(default)]
+    pub api_cached: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
     pub id: String,
@@ -32,6 +58,9 @@ pub struct SessionFile {
     /// DSH 式侧边栏：归档（默认列表隐藏，管理模式可见/可取消）
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    /// 用量快照（重启后恢复圆环/缓存行；旧文件缺省 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SessionUsage>,
 }
 
 /// 列表条目（不携带消息体）。
@@ -125,6 +154,7 @@ impl SessionManager {
             workspace: workspace.to_string(),
             pinned: false,
             archived: false,
+            usage: None,
         };
         self.write(&f)?;
         Ok(f)
@@ -145,8 +175,17 @@ impl SessionManager {
         }
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let (title, created_at, old_summary, workspace, pinned, archived) = match self.get(id) {
-            Some(old) => (old.title, old.created_at, old.summary, old.workspace, old.pinned, old.archived),
+        // 用量快照随文件保留：save 由消息侧高频调用，不能把 update_usage 写的快照抹掉
+        let (title, created_at, old_summary, workspace, pinned, archived, old_usage) = match self.get(id) {
+            Some(old) => (
+                old.title,
+                old.created_at,
+                old.summary,
+                old.workspace,
+                old.pinned,
+                old.archived,
+                old.usage,
+            ),
             None => (
                 first_user_title(messages),
                 now.clone(),
@@ -154,6 +193,7 @@ impl SessionManager {
                 crate::tools::workspace_root().display().to_string(),
                 false,
                 false,
+                None,
             ),
         };
         let file = SessionFile {
@@ -166,8 +206,20 @@ impl SessionManager {
             workspace,
             pinned,
             archived,
+            usage: old_usage,
         };
         self.write(&file)
+    }
+
+    /// 只更新用量快照（读-改-写，其余字段以盘上为准）。ContextUsage/ApiUsage 事件时调；
+    /// 会话文件还没落盘时失败即跳过（下一事件再补，圆环少一次快照不致命）。
+    pub fn update_usage(&self, id: &str, usage: SessionUsage) -> anyhow::Result<()> {
+        if !safe_id(id) {
+            anyhow::bail!("非法 session id");
+        }
+        let mut f = self.get(id).ok_or_else(|| anyhow::anyhow!("会话不存在: {id}"))?;
+        f.usage = Some(usage);
+        self.write(&f)
     }
 
     pub fn get(&self, id: &str) -> Option<SessionFile> {
@@ -319,6 +371,8 @@ impl SessionManager {
             workspace: f.workspace,
             pinned: false,
             archived: false,
+            // 分叉不带用量快照：台账记录归属原会话 id，分叉从零攒自己的账
+            usage: None,
         };
         self.write(&file)?;
         Ok(new_id)
@@ -358,6 +412,63 @@ mod tests {
         let d = tempdir::TempDir::new(tag);
         let m = SessionManager::new(d.path());
         (d, m)
+    }
+
+    #[test]
+    fn usage_snapshot_survives_save_and_restart() {
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("usage-snap");
+        let a = m.new_id();
+        m.save(&a, &[json!({"role":"user","content":"你好"})], None).unwrap();
+
+        // 模拟一轮对话的用量事件：ApiUsage 落快照（tokens=渠道实报，累计并入）
+        m.update_usage(
+            &a,
+            SessionUsage {
+                tokens: 4750,
+                budget: 1_000_000,
+                messages: 10,
+                tools: 0,
+                system: 1467,
+                other: 0,
+                tools_schema: 3273,
+                api_prompt: 4750,
+                api_cached: 0,
+            },
+        )
+        .unwrap();
+
+        // 后续消息侧 save（快照保存）不得抹掉用量快照
+        m.save(
+            &a,
+            &[json!({"role":"user","content":"你好"}), json!({"role":"assistant","content":"你好！有什么可以帮你的？"})],
+            None,
+        )
+        .unwrap();
+        let f = m.get(&a).expect("会话应在");
+        let u = f.usage.expect("save 后用量快照应保留");
+        assert_eq!(u.tokens, 4750);
+        assert_eq!(u.api_prompt, 4750);
+        assert_eq!(u.tools_schema, 3273);
+
+        // 再次事件：累计叠加（跨请求/跨重启延续）；tokens 跟随最新一次实报
+        m.update_usage(
+            &a,
+            SessionUsage { tokens: 3972, api_prompt: 4750 + 3972, api_cached: 128, ..u.clone() },
+        )
+        .unwrap();
+        let f2 = m.get(&a).unwrap();
+        let u2 = f2.usage.unwrap();
+        assert_eq!(u2.api_prompt, 8722);
+        assert_eq!(u2.api_cached, 128);
+        assert_eq!(u2.tokens, 3972, "tokens 跟随最新一次实报");
+
+        // 不存在的会话：明确报错而不是悄悄写盘
+        assert!(m.update_usage("no-such-session", SessionUsage::default()).is_err());
     }
 
     #[test]

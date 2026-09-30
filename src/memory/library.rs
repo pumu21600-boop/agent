@@ -660,6 +660,7 @@ mod tests {
             workspace: "C:\\ws\\demo".into(),
             pinned: false,
             archived: false,
+            usage: None,
         };
         let d = digest_of(&f);
         assert!(d.contains("修登录") && d.contains("登录改 JWT"), "{d}");
