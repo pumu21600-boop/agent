@@ -1,0 +1,74 @@
+# 上下文 Token 统计问题总结
+
+> 项目：`agent-copy`（Rust 工程）
+> 范围：上下文工程的 token 估算、裁剪与用量统计链路
+
+## 统计链路
+
+```
+src/context/mod.rs（估算 + 裁剪）
+   → src/core/agent/mod.rs（预算判定 / 圆环）
+   → src/gateway/accounting.rs（用量台账）
+   → src/server/chat/mod.rs（事件 / 落盘）
+   → src/session/mod.rs（SessionUsage）
+   → web/src/App.svelte（圆环 / 明细卡）
+```
+
+## 主要问题
+
+### 1. 双口径分裂（最核心）
+
+- 裁剪与交接判定用启发式估算 `estimate_messages`（`src/context/mod.rs`），而圆环显示优先用渠道实报 `last_real_tokens + last_completion_tokens`（`src/core/agent/mod.rs:410-414`）。
+- 后果：圆环按实报走、裁剪按估算走，二者会不一致——可能出现圆环还没满就已裁剪，或圆环已满却迟迟不裁剪。
+
+### 2. `tools_schema` 不计入裁剪预算
+
+- 工具 Schema 只在圆环 breakdown 里补上（`src/core/agent/mod.rs:406`），`compact_messages` 判定超预算时完全不含它。
+- 代码注释自述差额约 1884（估算 1866 vs 实际 4750），真实 prompt 明显大于裁剪所见的量级，裁剪时机被系统性推迟。
+
+### 3. 圆环数值滞后一步、且裁剪后不回落
+
+- `ContextUsage` 在每步模型调用**之前**发出（`src/core/agent/mod.rs:415`），用的是**上一轮**实报值，本步新增要等下一次才反映。
+- 上下文被裁剪变小后 `last_real_tokens` 未重置，圆环仍显示裁剪前的旧大数。
+
+### 4. 同一快照两个来源写法不一致
+
+- 事件推送的 `tokens` 用核心循环算出的 `used`，而落盘时 `src/server/chat/mod.rs:725` 又按 `prompt_tokens + completion` 覆盖同一字段，口径不统一。
+
+### 5. 估算遗漏字段
+
+- `estimate_message`（`src/context/mod.rs:35-46`）只统计 `content` 与 `tool_calls`，不含随消息持久化的 `reasoning_content`（见 `src/core/agent/mod.rs` 落 `final_msg`）及 `role` / `name`。思考型模型的真实占用被系统性低估。
+
+### 6. 摘要失败导致早期对话永久丢失
+
+- 折叠后只留占位符 `[早期对话已省略 N 条消息]`（`src/context/mod.rs:216`）；若 `summarize_folded` 返回 `None`（`src/core/agent/mod.rs:391-394`），被折叠的原文不会回填，早期上下文永久丢失。
+
+### 7. 默认预算高于常见模型窗口
+
+- `default_budget_tokens() = 96_000`（`src/config/mod.rs:347`），`config.toml` 同为 96000，前端兜底也硬编码 96000（`web/src/App.svelte:571`）。
+- 模型未配 `context_length` 时圆环按 96000 计算，但很多渠道（常见 64K 窗口）会远早于此就报超长。
+
+### 8. 裁剪达标不强求
+
+- 折到保护区（最近 N 个工具结果）后即停止，`tokens_after` 可能仍大于预算（`src/context/mod.rs:317` 测试注释也承认“本身可能超预算，此时不强求达标”）。
+
+## 建议方向
+
+- 统一契约：估算用于裁剪、实报仅用于展示；或在裁剪入口也加上 `tools_schema`。
+- 裁剪后重置 `last_real_tokens`，避免圆环回落滞后。
+- `estimate_message` 补上 `reasoning_content` 等字段。
+- 默认预算按当前模型窗口动态取值，而非固定 96000。
+
+## 复核结论（2026-10-01，逐条对码核实）
+
+| # | 定性 | 处理 |
+|---|---|---|
+| 1 | 双口径并存属实，但「估算管裁剪、实报管展示」是合理分工（实报无法回放历史，估算无法精确），非缺陷 | 不改；#2/#5 修后两口径差距已收窄 |
+| 2 | **实锤**。工具定义 ~3.3k tokens 随请求发送却不占裁剪预算，裁剪被系统性推迟 | **已修**：`compact_messages` 增 `tools_schema_tokens` 参数，before/after/折叠比较全计入（带新单测） |
+| 3a | 滞后属实但有限：每步响应后 `api_usage` 即刷新（prompt+completion），只有工具执行窗口内短暂滞后；静止时圆环精确 | 不改（窗口期引入混合口径反而更乱） |
+| 3b | **实锤**。裁剪后 `last_real_tokens` 不重置，圆环停在旧大数 | **已修**：`stats.compacted` 时清零实报值，回落到按当前消息的估算 |
+| 4 | 表述不准：落盘只发生在 ApiUsage 臂，快照 tokens 单一来源；但 ContextUsage 臂确有冗余写入 | **已顺手修**：ContextUsage 臂只更分类占比，不再写 tokens |
+| 5 | **实锤**（范围有限）：reasoning 随消息持久化，DeepSeek 契约白名单渠道会回放进 prompt，估算漏算；对剥离渠道是保守高估（与估算器取向一致） | **已修**：`estimate_message`/`estimate_breakdown` 计入 `reasoning_content`；role/name 有固定开销覆盖，不另加 |
+| 6 | 属实但属边缘权衡：摘要调用失败（辅助渠道故障）时折叠原文不回填；原文仍在 agent.jsonl 请求日志里（轮转保留）可追溯 | 暂不改；可选方向=失败时把折叠原文写进 HANDOFF.md 附件，待拍板 |
+| 7 | 风险成立但当前不咬人：默认 96000 只在模型未配 `context_length` 时生效，现有配置全部显式配了窗口 | 待拍板：把默认降到 65536（保守方向）还是引入按供应商的窗口表 |
+| 8 | 设计如此（测试注释自述）：保护区（最近 N 个工具结果+最后一轮）本身超预算时不强求，否则会把「正在用的上下文」裁掉 | 不改 |

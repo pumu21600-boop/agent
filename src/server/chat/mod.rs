@@ -675,10 +675,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     }
                     AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
                     AgentEvent::ContextUsage { tokens, budget, breakdown } => {
-                        // 快照进槽（不落盘：磁盘写搭本步 ApiUsage 的车）
+                        // 快照进槽（只更分类占比；tokens 单一来源 = ApiUsage 的 prompt+completion，
+                        // 避免同一字段两个写法）。磁盘写搭本步 ApiUsage 的车
                         {
                             let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
-                            u.tokens = tokens;
                             u.budget = budget;
                             u.messages = breakdown.messages;
                             u.tools = breakdown.tools;

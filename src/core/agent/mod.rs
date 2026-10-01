@@ -364,8 +364,12 @@ pub async fn run_task(
         {
             // P7：摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
             msgs.retain(|m| !is_summary_msg(m));
-            let (mut compacted, stats) = context::compact_messages(&msgs, ctx_cfg);
+            let (mut compacted, stats) = context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens);
             if stats.compacted {
+                // 实报值是裁剪前上下文的产物，裁剪后已失真——清零回落到估算口径
+                //（重新按当前消息算），否则圆环停在旧大数等下一次响应才刷新
+                last_real_tokens = 0;
+                last_completion_tokens = 0;
                 observability::event(
                     EventType::State,
                     json!({
