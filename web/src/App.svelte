@@ -435,7 +435,9 @@
   $: ctxRows = (() => {
     const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0, tools_schema: 0 };
     const sum = Math.max(1, b.messages + b.tools + b.system + b.other + (b.tools_schema || 0));
-    const row = (label, v, color) => ({ label, v, color, pct: ((ctxPct * v) / sum).toFixed(1) + '%' });
+    // 构成比（各行 / 上下文总量）：回答「上下文里装的是什么」。
+    // 不要按圆环百分比分摊——窗口大时 ctxPct 舍入成 0，五行会一起变 0.0%（实锤）
+    const row = (label, v, color) => ({ label, v, color, pct: ((v / sum) * 100).toFixed(1) + '%' });
     return [
       row('消息', b.messages, 'var(--tint-blue-fg)'),
       row('工具结果', b.tools, 'var(--tint-cyan-fg)'),
@@ -4211,7 +4213,7 @@
                 <div class="ctx-card">
                   <div class="ctx-card-head">
                     <b>上下文容量</b>
-                    <span>{fmtTok(ctxUsage.projected)}/{fmtTok(ctxUsage.window)}（{ctxPct}%）</span>
+                    <span>{fmtTok(ctxUsage.projected)}/{fmtTok(ctxUsage.window)}（{ctxPctText}）</span>
                   </div>
                   <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
                   {#each ctxRows as row}
