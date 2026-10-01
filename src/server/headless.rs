@@ -391,7 +391,7 @@ pub(crate) async fn run_headless_inner(
                             .unwrap_or_else(|e| e.into_inner())
                             .push(json!({ "name": name, "ok": ok, "preview": preview }));
                     }
-                    agent::AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
+                    agent::AgentEvent::ApiUsage { prompt_tokens, cached_tokens, completion_tokens: _ } => {
                         // P18 钩子 + P21 预算降级：与 /api/chat 同一套记账
                         // P22-C：子代理花销并进本任务预算（水印增量）
                         let sub_total = subagent::subagent_tokens(&sid);

@@ -2241,10 +2241,12 @@
               else if (d.api_usage) {
                 const prev = (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 };
                 const api = { prompt: prev.prompt + (d.api_usage.prompt_tokens || 0), cached: prev.cached + (d.api_usage.cached_tokens || 0) };
-                // 圆环 tokens 改用渠道实报的真实占用（最新一次请求=当前上下文；
-                // 估算只兜首请求前）。回答一落地就对得上用量面板，不用等下一轮
+                // 圆环 tokens 改用渠道实报的真实占用 + 本次输出（回复已进上下文，下次请求
+                // 必带；估算只兜首请求前）。回答一落地就对得上用量面板，不用等下一轮
                 const prevCtx = (usageBySession[skey] || {}).ctx || ctxUsage;
-                const ctx = d.api_usage.prompt_tokens > 0 ? { ...prevCtx, tokens: d.api_usage.prompt_tokens } : prevCtx;
+                const ctx = d.api_usage.prompt_tokens > 0
+                  ? { ...prevCtx, tokens: d.api_usage.prompt_tokens + (d.api_usage.completion_tokens || 0) }
+                  : prevCtx;
                 usageBySession = {
                   ...usageBySession,
                   [skey]: { ctx, api },

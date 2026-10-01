@@ -35,8 +35,9 @@ pub enum AgentEvent {
     StepLimit(u32),
     /// 上下文占用与分类占比（每轮模型调用前更新；P5 圆环数据源）
     ContextUsage { tokens: u64, budget: u64, breakdown: context::Breakdown },
-    /// 渠道返回的真实用量（P5：缓存命中率展示）
-    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
+    /// 渠道返回的真实用量（P5：缓存命中率展示）。completion 一并带出：回复落地即进
+    /// 上下文，圆环的「当前占用」= 最近 prompt + 该次 completion
+    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64>, completion_tokens: Option<u64> },
     /// 会话快照（P6）：当前全量消息（不含 system），server 收到即落盘
     Snapshot { messages: Vec<Value> },
     /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
@@ -330,6 +331,8 @@ pub async fn run_task(
     // 渠道上报的真实 prompt_tokens（上一次主循环请求）。圆环优先用它——启发式估算
     // 对 JSON 密度估不准（实测估算 5139 vs 渠道实报 4750），真实值才能和用量面板对上
     let mut last_real_tokens: u64 = 0;
+    // 上一次请求的输出 tokens：回复落地即进上下文（下次请求必带），圆环要算上
+    let mut last_completion_tokens: u64 = 0;
     let mut prev_tool_sigs: Vec<String> = Vec::new();
     // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
     // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
@@ -402,9 +405,13 @@ pub async fn run_task(
         let mut breakdown = context::estimate_breakdown(&msgs);
         breakdown.tools_schema = tools_schema_tokens;
         let est_total = breakdown.total();
-        // token 数优先用渠道实报的真实占用（可与用量面板互相核对）；启发式估算
-        // 只在首请求前兜底（对 JSON 密度估不准）。交接阈值维持估算口径不变
-        let used = if last_real_tokens > 0 { last_real_tokens } else { est_total };
+        // token 数优先用渠道实报的真实占用 + 上次回复的输出（回复已进上下文，下次请求
+        // 必带）；启发式估算只在首请求前兜底。交接阈值维持估算口径不变
+        let used = if last_real_tokens > 0 {
+            last_real_tokens + last_completion_tokens
+        } else {
+            est_total
+        };
         on_event(AgentEvent::ContextUsage {
             tokens: used,
             budget: ctx_cfg.budget_tokens,
@@ -512,7 +519,12 @@ pub async fn run_task(
         // 渠道真实用量（缓存命中率展示；渠道不支持时为空）
         if let Some(p) = turn.prompt_tokens {
             last_real_tokens = p;
-            on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
+            last_completion_tokens = turn.completion_tokens.unwrap_or(0);
+            on_event(AgentEvent::ApiUsage {
+                prompt_tokens: p,
+                cached_tokens: turn.cached_tokens,
+                completion_tokens: turn.completion_tokens,
+            });
         }
 
         // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
