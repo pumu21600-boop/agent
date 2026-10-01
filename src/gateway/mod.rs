@@ -176,6 +176,22 @@ pub struct AssistantTurn {
     pub cached_tokens: Option<u64>,
     /// 结束原因（P7.6："length"=输出被 max_tokens 截断，核心循环据此提示用户）
     pub finish_reason: Option<String>,
+    /// 思考流的时间跨度：首个 reasoning 分片与最后一个分片的到达时刻（「思考 · 持续了 N 秒」用）
+    pub reasoning_first_at: Option<std::time::Instant>,
+    pub reasoning_last_at: Option<std::time::Instant>,
+}
+
+impl AssistantTurn {
+    /// 思考持续毫秒：首尾分片的时间差；没有思考（或只有一个分片）返回 None
+    pub fn reasoning_ms(&self) -> Option<u64> {
+        match (self.reasoning_first_at, self.reasoning_last_at) {
+            (Some(a), Some(b)) => {
+                let ms = b.duration_since(a).as_millis() as u64;
+                if ms > 0 { Some(ms) } else { None }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -350,6 +350,8 @@ pub async fn run_task(
     // session 一并记上：时间线按工作区过滤要把任务归属回聊天会话——日志顶层 session_id
     // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实锤过）
     observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
+    // 「工作用时」的起点：从任务开始到回复落地的总时长（前端「工作中 N 分 N 秒」的数据源）
+    let task_started = std::time::Instant::now();
     if plan_mode {
         observability::event(
             EventType::State,
@@ -525,6 +527,7 @@ pub async fn run_task(
         // 锚点配对用的估价快照：就是上面那次测量的估价（send 前 msgs 不再变——
         // 降级提示是 display_only，计价 0，不会让估价失真）。拿到实报时与它配对成新锚点
         let est_at_request = est_total;
+        let call_started = std::time::Instant::now();
         let (outcome, chain_notices) = run_chain(
             gateway,
             &chain,
@@ -536,6 +539,8 @@ pub async fn run_task(
             &on_event,
         )
         .await;
+        // 本步模型调用耗时（中间步骤消息的 step_ms）
+        let call_ms = call_started.elapsed().as_millis() as u64;
         if matches!(&outcome, Ok(ChatOutcome::Cancelled)) {
             return Ok(LoopOutcome::Cancelled);
         }
@@ -615,9 +620,15 @@ pub async fn run_task(
             }
             // P6：最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
             // 随消息持久化，前端切回会话时恢复；回放侧由 replay.rs 按渠道契约决定去留）
+            // 顺带落时长：「工作用时」（整轮，用户要的 ZCode 式工作时间）与「思考 · 持续了」
+            // （本步 reasoning 分片首尾差）——刷新/切回会话后这两个数字还在
             let mut final_msg = json!({ "role": "assistant", "content": final_text });
             if !turn.reasoning.is_empty() {
                 final_msg["reasoning_content"] = json!(turn.reasoning);
+            }
+            final_msg["work_ms"] = json!(task_started.elapsed().as_millis() as u64);
+            if let Some(ms) = turn.reasoning_ms() {
+                final_msg["reasoning_ms"] = json!(ms);
             }
             msgs.push(final_msg);
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
@@ -718,6 +729,11 @@ pub async fn run_task(
         {
             // P26：思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
             asst_msg["reasoning_content"] = json!(turn.reasoning);
+        }
+        // 中间步骤也带上时长（思考持续 + 本步耗时）：刷新后每一步的气泡也能显示
+        asst_msg["step_ms"] = json!(call_ms);
+        if let Some(ms) = turn.reasoning_ms() {
+            asst_msg["reasoning_ms"] = json!(ms);
         }
         msgs.push(asst_msg);
         // 带工具调用的回复同样先落地再报：锚点更新 + 圆环重算（工具结果回填后，

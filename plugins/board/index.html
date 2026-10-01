@@ -299,27 +299,40 @@
       const FILE_ICO = '<svg class="fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/></svg>';
 
       // —— 面包屑：完整绝对路径的每一段都可点（用户要求：路径大一点、可点、点到哪到哪）——
-      // 工作区内的段（含工作区自己）→ 直接把浏览根切过去；工作区外的段（C:/Users/Desktop
-      // 这些）服务端不能列（只列工作区内目录）→ 点了回工作区根并说明——保证点哪都有反应。
+      // 选中文件时**跟着选中项走**：显示 工作区… › 该文件所在文件夹 › 文件名（用户实锤：
+      // 选中文件上面这行路径应该变到对应文件夹）；没选中就显示当前浏览根。
+      // 文件夹段点了切浏览根（清选中）；文件名段点了在新标签页预览。
+      // 工作区外的段服务端不能列（只列工作区内目录）→ 点了回工作区根并说明——点哪都有反应。
       function renderCrumb() {
         const el = document.getElementById('crumb');
         const sep = wsPath.includes('\\') ? '\\' : '/';
         const wsNorm = String(wsPath || '').replace(/[\\/]+$/, '');
         const wsParts = wsNorm.split(/[\\/]+/).filter(Boolean);
-        const subParts = root ? root.split('/').filter(Boolean) : [];
+        const isFile = !!selection;
+        const focusParts = (selection || root) ? String(selection || root).split('/').filter(Boolean) : [];
+        const folderParts = isFile ? focusParts.slice(0, -1) : focusParts;
+        const fileName = isFile ? focusParts[focusParts.length - 1] : '';
         let html = '';
         wsParts.forEach((seg, i) => {
           if (i > 0) html += '<span class="sep">›</span>';
-          const isCur = i === wsParts.length - 1 && !subParts.length;
+          const isCur = i === wsParts.length - 1 && !folderParts.length && !isFile;
           html += `<button data-ws="${i}" class="${isCur ? 'cur' : ''}" title="${esc(wsParts.slice(0, i + 1).join(sep))}">${esc(seg)}</button>`;
         });
-        subParts.forEach((seg, i) => {
-          const rel = subParts.slice(0, i + 1).join('/');
-          html += `<span class="sep">›</span><button data-rel="${esc(rel)}" class="${i === subParts.length - 1 ? 'cur' : ''}">${esc(seg)}</button>`;
+        folderParts.forEach((seg, i) => {
+          const rel = folderParts.slice(0, i + 1).join('/');
+          const isCur = !isFile && i === folderParts.length - 1;
+          html += `<span class="sep">›</span><button data-rel="${esc(rel)}" class="${isCur ? 'cur' : ''}">${esc(seg)}</button>`;
         });
+        if (isFile) {
+          html += `<span class="sep">›</span><button data-file="${esc(selection)}" class="cur" title="在新标签页预览">${esc(fileName)}</button>`;
+        }
         el.innerHTML = html;
         el.querySelectorAll('button').forEach((b) => {
           b.onclick = () => {
+            if (b.dataset.file !== undefined) {
+              openPreview(b.dataset.file);
+              return;
+            }
             if (b.dataset.ws !== undefined) {
               const idx = Number(b.dataset.ws);
               if (idx === wsParts.length - 1) {
@@ -333,6 +346,7 @@
               root = b.dataset.rel || '';
               status('');
             }
+            selection = '';
             render();
           };
         });
@@ -402,23 +416,27 @@
         document.querySelectorAll('.row').forEach((el) => {
           if (el.dataset.d) {
             // 文件夹：单击展开/收起（箭头跟着转向）；双击进入（设为浏览根，面包屑随之前进）
-            el.onclick = () => toggleDir(el.dataset.d);
+            el.onclick = () => {
+              selection = ''; // 焦点回到文件夹：路径栏显示浏览根
+              toggleDir(el.dataset.d);
+            };
             el.ondblclick = () => {
+              selection = '';
               root = el.dataset.d;
               expanded.delete(root);
               render();
             };
           } else if (el.dataset.f) {
-            // 文件：单击只选中，双击才预览（用户 2026-10-01 要求）
+            // 文件：单击只选中（路径栏跟着变到该文件的文件夹），双击才预览（用户 2026-10-01 要求）
             el.onclick = () => {
               selection = el.dataset.f;
-              document.querySelectorAll('.row').forEach((x) => x.classList.toggle('sel', x.dataset.f === selection));
+              render();
             };
             el.ondblclick = () => openPreview(el.dataset.f);
             el.oncontextmenu = (ev) => {
               ev.preventDefault();
               selection = el.dataset.f;
-              document.querySelectorAll('.row').forEach((x) => x.classList.toggle('sel', x.dataset.f === selection));
+              render();
               openMenu(ev, el.dataset.f);
             };
           }

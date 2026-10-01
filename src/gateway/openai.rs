@@ -219,6 +219,10 @@ impl StreamAgg {
         self.turn.content.push_str(&delta.content);
         if let Some(r) = &delta.reasoning {
             self.turn.reasoning.push_str(r);
+            // 思考时长口径：首尾 reasoning 分片的到达时刻差（「思考 · 持续了 N 秒」）
+            let now = std::time::Instant::now();
+            self.turn.reasoning_first_at.get_or_insert(now);
+            self.turn.reasoning_last_at = Some(now);
         }
         observability::event(EventType::ModelChunk, payload);
         observability::debug(&format!("[gateway] sse: {data}"));
@@ -228,7 +232,12 @@ impl StreamAgg {
     /// 流结束：hold 里若剩半截标签（如截断在 "<thi"），按当前通道归位；tool_calls 落位。
     pub(crate) fn finish(&mut self) {
         let (tail_think, tail_content) = self.think_split.finish();
-        self.turn.reasoning.push_str(&tail_think);
+        if !tail_think.is_empty() {
+            self.turn.reasoning.push_str(&tail_think);
+            let now = std::time::Instant::now();
+            self.turn.reasoning_first_at.get_or_insert(now);
+            self.turn.reasoning_last_at = Some(now);
+        }
         self.turn.content.push_str(&tail_content);
         self.turn.tool_calls = std::mem::take(&mut self.calls);
     }

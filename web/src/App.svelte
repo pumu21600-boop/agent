@@ -885,6 +885,66 @@
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
   // 思考过程展开态（按消息 id 记；流式 patch 换对象不丢开合——原生 details 在重渲染下会闪回，用户反馈展开不了）
   let thinkingOpenMap = {};
+  // —— 思考块与「工作中」计时（ZCode 同款，用户 2026-10-01）——
+  // 思考块固定高度 + 自动跟随：新分片贴底；滚轮往上滚 → 暂停跟随（出「回到底部」按钮）；
+  // 滚回最底 → 恢复跟随。时长两个口径：整轮「工作中/工作用时」（收尾冻结）与
+  // 「思考 · 持续了 N 秒」（reasoning 分片的时间差累加，间隔 >5s 的按 5s 计）。
+  let thinkFollowMap = {}; // 消息 id → 是否跟随（false 时显示「回到底部」）
+  let thinkBoxEls = {}; // 消息 id → 思考滚动容器（bind:this）
+  let nowTick = Date.now(); // 实时计时滴答（流式期间每秒更新）
+  let tickTimer = null;
+  $: anyStreaming = Object.values(sessionMsgs).some((arr) => arr.some((m) => m.role === 'assistant' && m.streaming));
+  $: if (anyStreaming && !tickTimer) tickTimer = setInterval(() => (nowTick = Date.now()), 1000);
+  $: if (!anyStreaming && tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+  /// 轮收尾：停表（工作用时冻结；思考计时不再涨）
+  function endTurn(m) {
+    return {
+      ...m,
+      streaming: false,
+      workMs: m.workMs || (m.workStartedAt ? Date.now() - m.workStartedAt : 0),
+      thinkMs: m.thinkMs || 0,
+    };
+  }
+  /// 「3 分 47 秒」/「27 秒」；不到 1 秒显示 1 秒（别给 0 秒这种怪数字）
+  function fmtDurCn(ms) {
+    const s = Math.max(1, Math.round((ms || 0) / 1000));
+    if (s < 60) return `${s} 秒`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return r ? `${m} 分 ${r} 秒` : `${m} 分`;
+  }
+  /// 思考框自动跟随：内容增长时贴底；用户上滚 → 停（followchange 通知界面）；
+  /// 滚回最底 → 恢复
+  function thinkFollow(node) {
+    let following = true;
+    const nearBottom = () => node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+    const onScroll = () => {
+      const nf = nearBottom();
+      if (nf !== following) {
+        following = nf;
+        node.dispatchEvent(new CustomEvent('followchange', { detail: { following: nf } }));
+      }
+    };
+    const mo = new MutationObserver(() => {
+      if (following) node.scrollTop = node.scrollHeight;
+    });
+    node.addEventListener('scroll', onScroll, { passive: true });
+    mo.observe(node, { childList: true, characterData: true, subtree: true });
+    node.scrollTop = node.scrollHeight;
+    return {
+      destroy() {
+        node.removeEventListener('scroll', onScroll);
+        mo.disconnect();
+      },
+    };
+  }
+  function jumpThink(id) {
+    const el = thinkBoxEls[id];
+    if (el) el.scrollTop = el.scrollHeight;
+  }
   let webActiveId = '';
   let webAddress = '';
   let webBusy = false;
@@ -2230,7 +2290,7 @@
     updMsgs(key, (a) => [
       ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer } : m)),
       ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: effectiveMsg, attachments: atts }]),
-      { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true },
+      { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() },
     ]);
     const ac = new AbortController();
     // 引导（立即发送）不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
@@ -2313,9 +2373,17 @@
                 }
                 const nid = nextId();
                 stream.asstId = nid;
-                updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], streaming: true }]);
+                updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() }]);
               } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
-              else if (d.reasoning) patch((m) => ({ ...m, thinking: m.thinking + d.reasoning }));
+              // 思考分片：文字累积 + 「思考 · 持续了 N 秒」的实时计时。
+              // 计时口径：相邻分片的时间差累加，单段间隔超过 5 秒的按 5 秒计
+              // （中间夹着工具执行的长间隙不是思考时间，别把跑工具的时间算进去）
+              else if (d.reasoning)
+                patch((m) => {
+                  const now = Date.now();
+                  const gap = m.thinkLastAt ? Math.min(now - m.thinkLastAt, 5000) : 0;
+                  return { ...m, thinking: m.thinking + d.reasoning, thinkLastAt: now, thinkMs: (m.thinkMs || 0) + gap };
+                });
               // 降级链换渠道重试：丢掉本步已推的半截内容（长度由服务端按 UTF-16 码元数给出）
               else if (d.reset)
                 patch((m) => ({
@@ -2402,16 +2470,16 @@
                 };
                 if (skey === curKey()) apiTotals = api;
               } else if (d.step_limit) {
-                patch((m) => ({ ...m, streaming: false }));
+                patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
               } else if (d.error) {
-                patch((m) => ({ ...m, streaming: false }));
+                patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'error', content: d.error });
               } else if (d.cancelled) {
-                patch((m) => ({ ...m, streaming: false }));
+                patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'system', content: '已停止' });
               } else if (d.done) {
-                patch((m) => ({ ...m, streaming: false }));
+                patch(endTurn);
               }
             } catch (e) {
               // 忽略坏行
@@ -2427,7 +2495,7 @@
       updMsgs(skey, (a) =>
         a.map((m) => (m.approval && m.approval.decided === null ? { ...m, approval: { ...m.approval, decided: false } } : m))
       );
-      patch((m) => ({ ...m, streaming: false }));
+      patch(endTurn);
     } finally {
       if (ownsTurn) {
         // 这条流结束（本会话可再次发送）；只清本会话的流登记，别的会话在跑不受影响。
@@ -3034,6 +3102,10 @@
             preview: '',
           })),
           streaming: false,
+          // 时长随消息落盘（服务端写）：整轮「工作用时」只在收尾消息上，中间步骤有「用时」
+          workMs: m.work_ms || 0,
+          stepMs: m.step_ms || 0,
+          thinkMs: m.reasoning_ms || 0,
         };
         out.push(asst);
       } else if (m.role === 'system') {
@@ -4094,19 +4166,47 @@
         {:else if m.role === 'assistant'}
           <div class="msg assistant">
             <div class="bubble asst-bubble">
+              {#if m.workStartedAt || m.workMs || m.stepMs}
+                <div class="work-line">
+                  {#if m.streaming && m.workStartedAt}
+                    工作中 {fmtDurCn(nowTick - m.workStartedAt)}
+                  {:else if m.workMs}
+                    工作用时 {fmtDurCn(m.workMs)}
+                  {:else if m.stepMs}
+                    用时 {fmtDurCn(m.stepMs)}
+                  {/if}
+                </div>
+              {/if}
               {#if m.thinking}
-                {@const thinkingOpen = thinkingOpenMap[m.id] || false}
+                {@const thinkingOpen = thinkingOpenMap[m.id] ?? !!m.streaming}
+                {@const liveThinkMs = m.streaming
+                  ? (m.thinkMs || 0) + (m.thinkLastAt && nowTick - m.thinkLastAt < 5000 ? nowTick - m.thinkLastAt : 0)
+                  : m.thinkMs || 0}
                 <div class="thinking">
                   <button
                     class="thinking-summary"
                     on:click={() => (thinkingOpenMap = { ...thinkingOpenMap, [m.id]: !thinkingOpen })}
                     title={thinkingOpen ? '收起思考过程' : '展开思考过程'}
                   >
-                    <span class="thinking-caret">{thinkingOpen ? '▼' : '▶'}</span>
-                    思考过程
+                    <svg class="thinking-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4.6a4.2 4.2 0 0 0-4.2 4.2c0 .9.3 1.7.8 2.4a3.6 3.6 0 0 0 1.4 6.5h4a3.6 3.6 0 0 0 1.4-6.5c.5-.7.8-1.5.8-2.4A4.2 4.2 0 0 0 12 4.6Z"/><path d="M10.6 20.4h2.8"/></svg>
+                    <span class="thinking-label">{liveThinkMs >= 1000 ? `思考 · 持续了 ${fmtDurCn(liveThinkMs)}` : '思考'}</span>
+                    <svg class="thinking-caret" class:open={thinkingOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
                   </button>
                   {#if thinkingOpen}
-                    <div class="thinking-body">{m.thinking}</div>
+                    <div
+                      class="thinking-box"
+                      class:streaming={m.streaming}
+                      use:thinkFollow
+                      bind:this={thinkBoxEls[m.id]}
+                      on:followchange={(e) => (thinkFollowMap = { ...thinkFollowMap, [m.id]: e.detail.following })}
+                    >
+                      <div class="thinking-body">{m.thinking}</div>
+                      {#if thinkFollowMap[m.id] === false}
+                        <button class="think-jump" title="回到底部（继续跟随）" on:click={() => jumpThink(m.id)}>
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v13"/><path d="m6 12 6 6 6-6"/></svg>
+                        </button>
+                      {/if}
+                    </div>
                   {/if}
                 </div>
               {/if}
@@ -7580,6 +7680,13 @@
     font-size: 12px;
     color: var(--g5);
   }
+  /* —— 思考块（ZCode 同款）：固定高度 + 自动跟随 + 「思考 · 持续了 N 秒」 —— */
+  .work-line {
+    font-size: 12px;
+    color: var(--g5);
+    margin-bottom: 6px;
+    font-variant-numeric: tabular-nums;
+  }
   .thinking {
     margin-bottom: 8px;
   }
@@ -7596,18 +7703,70 @@
     user-select: none;
     font-family: inherit;
   }
+  .thinking-summary:hover {
+    color: var(--g7);
+  }
+  .thinking-ico {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    opacity: 0.85;
+  }
+  .thinking-label {
+    font-variant-numeric: tabular-nums;
+  }
   .thinking-caret {
-    font-size: 10px;
-    line-height: 1;
+    width: 11px;
+    height: 11px;
+    flex: none;
+    transition: transform 0.15s;
+  }
+  .thinking-caret.open {
+    transform: rotate(90deg);
+  }
+  /* 流式期间固定高度（不随文字增长跳变）；读完后按内容自适应、超长也封顶 340 */
+  .thinking-box {
+    position: relative;
+    margin-top: 6px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    overflow-y: auto;
+    max-height: 340px;
+  }
+  .thinking-box.streaming {
+    height: 240px;
   }
   .thinking-body {
-    margin-top: 6px;
-    padding: 8px;
-    background: var(--g1);
-    border-left: 2px solid var(--g3);
+    padding: 8px 10px 14px;
     font-size: 13px;
     color: var(--g6);
     white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .think-jump {
+    position: sticky;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--g4);
+    background: var(--g2);
+    color: var(--g7);
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 35%);
+  }
+  .think-jump svg {
+    width: 13px;
+    height: 13px;
+  }
+  .think-jump:hover {
+    background: var(--g3);
   }
   .tool-card {
     margin-bottom: 8px;
