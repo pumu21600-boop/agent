@@ -350,6 +350,15 @@ pub fn write_workspace_relative(rel: &str, content: &str) -> Result<usize, Strin
     Ok(content.len())
 }
 
+/// 供服务层复用（文件预览/图片直出/目录列举）：把工作区相对路径解析成绝对路径，
+/// 工作区边界与沙箱档照旧硬拦（rel 为空 = 工作区根，目录列举用）。
+pub fn resolve_workspace_path(rel: &str) -> Result<PathBuf, String> {
+    if rel.trim().is_empty() {
+        return Ok(workspace_root());
+    }
+    resolve_in_workspace(&workspace_root(), rel, true, false)
+}
+
 fn cap(s: &str, max: usize) -> String {
     // P5 起工具结果统一走头尾压缩（替代旧的单向硬截断）
     crate::context::compress(s, max)

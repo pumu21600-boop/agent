@@ -1,15 +1,15 @@
 {
   "apiVersion": 1,
   "source": "built_in",
-  "title": "项目速览",
-  "description": "工作区文件列表：点开在新标签页预览，右键复制路径",
-  "version": "0.5.0",
+  "title": "项目文件",
+  "description": "工作区文件树：文件夹可展开，双击文件在新标签页预览/编辑",
+  "version": "0.6.0",
   "entry": "index.html",
   "ui": [
     {
       "slot": "dock",
       "id": "board",
-      "title": "项目速览"
+      "title": "项目文件"
     }
   ],
   "permissions": [

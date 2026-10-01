@@ -87,6 +87,113 @@ pub(super) async fn read_workspace_file(
     }
 }
 
+/// GET /api/workspace/dir?path=xx —— 列工作区某个目录的**直接子项**（「项目文件」树面板数据源）：
+/// 折叠/展开按需拉一层，不把整棵树铺开。path 缺省/空 = 工作区根。
+/// 跳过 SKIP_DIRS 那批噪音目录；每类最多 500 项，超了带 truncated。
+pub(super) async fn list_workspace_dir(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const MAX_ENTRIES: usize = 500;
+    const SKIP_DIRS: [&str; 9] = [
+        ".git",
+        ".agent",
+        ".attachments",
+        ".workbuddy",
+        "node_modules",
+        "target",
+        "dist",
+        "logs",
+        "__pycache__",
+    ];
+    let rel = params.get("path").map(|s| s.trim()).unwrap_or("").to_string();
+    let res = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let dir = crate::tools::resolve_workspace_path(&rel)?;
+        if !dir.is_dir() {
+            return Err(format!("不是目录: {rel}"));
+        }
+        let rd = std::fs::read_dir(&dir).map_err(|e| format!("读取目录失败: {e}"))?;
+        let mut dirs: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        let mut truncated = false;
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                if SKIP_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                if dirs.len() >= MAX_ENTRIES {
+                    truncated = true;
+                    continue;
+                }
+                dirs.push(name);
+            } else {
+                if files.len() >= MAX_ENTRIES {
+                    truncated = true;
+                    continue;
+                }
+                files.push(name);
+            }
+        }
+        dirs.sort();
+        files.sort();
+        Ok(json!({ "ok": true, "dirs": dirs, "files": files, "truncated": truncated }))
+    })
+    .await;
+    match res {
+        Ok(Ok(v)) => Ok(Json(v)),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
+}
+
+/// GET /api/workspace/raw?path=xx —— 原样直出工作区文件字节（图片预览用）。
+/// 只给浏览器渲染，不解析成文本；工作区边界与 read_file 同一套硬拦，单文件上限 8MB。
+pub(super) async fn read_workspace_raw(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    use axum::response::IntoResponse;
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let path = params.get("path").map(|s| s.trim()).unwrap_or("").to_string();
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
+    }
+    let res = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
+        let full = crate::tools::resolve_workspace_path(&path)?;
+        let meta = std::fs::metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("不是文件: {path}"));
+        }
+        if meta.len() > MAX_BYTES {
+            return Err(format!("文件过大（{} 字节，上限 8MB）", meta.len()));
+        }
+        let bytes = std::fs::read(&full).map_err(|e| format!("读取失败: {e}"))?;
+        let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ct = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "bmp" => "image/bmp",
+            "ico" => "image/x-icon",
+            "avif" => "image/avif",
+            _ => "application/octet-stream",
+        };
+        Ok((bytes, ct.to_string()))
+    })
+    .await;
+    match res {
+        Ok(Ok((bytes, ct))) => Ok((
+            [(axum::http::header::CONTENT_TYPE, ct), (axum::http::header::CACHE_CONTROL, "no-store".to_string())],
+            bytes,
+        )
+            .into_response()),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ShellReq {
     pub command: String,

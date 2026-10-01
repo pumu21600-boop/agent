@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>项目速览</title>
+    <title>项目文件</title>
     <style>
       :root {
         color-scheme: dark;
@@ -23,8 +23,7 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 10px 12px 8px;
-        border-bottom: 1px solid #24272f;
+        padding: 10px 12px 6px;
       }
       .head b {
         font-size: 13px;
@@ -32,16 +31,8 @@
         color: #e8ebf2;
         flex: none;
       }
-      .ws {
+      .head .flex {
         flex: 1;
-        min-width: 0;
-        font-size: 12px;
-        color: #858b98;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        direction: rtl;
-        text-align: left;
       }
       button {
         padding: 5px 12px;
@@ -57,11 +48,47 @@
         color: #fff;
         border-color: #3a3e49;
       }
+      /* 路径面包屑：字号加大、每段可点（点到哪，浏览根就到哪里） */
+      .crumb {
+        display: flex;
+        align-items: center;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        scrollbar-width: none;
+        gap: 2px;
+        padding: 2px 12px 8px;
+        font-size: 13px;
+      }
+      .crumb::-webkit-scrollbar {
+        display: none;
+      }
+      .crumb button {
+        border: none;
+        background: transparent;
+        padding: 1px 4px;
+        border-radius: 5px;
+        color: #858b98;
+        font-size: 13px;
+        white-space: nowrap;
+      }
+      .crumb button:hover {
+        color: #e8ebf2;
+        background: #1c1e24;
+      }
+      .crumb button.cur {
+        color: #e8ebf2;
+        font-weight: 600;
+      }
+      .crumb .sep {
+        color: #4b5563;
+        flex: none;
+      }
       .toolbar {
         display: flex;
         gap: 8px;
         align-items: center;
-        padding: 8px 12px;
+        padding: 0 12px 8px;
+        border-bottom: 1px solid #24272f;
       }
       input {
         flex: 1;
@@ -83,10 +110,9 @@
         flex: 1;
         min-height: 120px;
         overflow-y: auto;
-        border-top: 1px solid #24272f;
-        padding: 4px 6px;
+        padding: 6px;
       }
-      /* 经典文件树样式：一个箭头指向文件名（用户 2026-10-01 拍板，去掉彩色标签） */
+      /* 经典树：文件夹一行（箭头可转），文件一行；单击只选中，双击才预览 */
       .row {
         display: flex;
         align-items: center;
@@ -95,6 +121,7 @@
         border-radius: 6px;
         cursor: default;
         user-select: none;
+        white-space: nowrap;
       }
       .row:hover {
         background: #1c1e24;
@@ -107,22 +134,34 @@
         width: 12px;
         height: 12px;
         color: #6b7280;
+        transition: transform 0.12s;
       }
-      .row:hover .arw {
+      .row.open .arw {
+        transform: rotate(90deg);
         color: #b9bfca;
       }
-      .path {
-        flex: 1;
-        min-width: 0;
-        white-space: nowrap;
+      .row .fico {
+        flex: none;
+        width: 13px;
+        height: 13px;
+        color: #565e6c;
+      }
+      .row .nm {
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      .path .dir {
+      .row.dir .nm {
+        color: #d8dbe2;
+      }
+      .row.file .nm {
+        color: #b9bfca;
+      }
+      .row.loading .nm::after {
+        content: ' …';
         color: #858b98;
       }
-      .path .name {
-        color: #d8dbe2;
+      .row .dim {
+        color: #6b7280;
       }
       .status {
         flex: none;
@@ -181,18 +220,18 @@
   </head>
   <body>
     <!--
-      「项目速览」= 工作区文件列表（2026-10-01 按用户要求重做）：经典树样式（箭头 + 文件名），
-      点击在右侧边栏**新标签页预览**（宿主桥 preview.open，预览内容由宿主标签渲染）；
-      右键复制路径 / 文件名 / 绝对路径，或把路径插进宿主输入框。
-      本页跑在 sandbox="allow-scripts" 的 iframe 里（不透明源）：fetch 不到 /api，
-      clipboard API 也不归它使——数据与剪贴板一律走 postMessage 白名单
-      （workspace.info / workspace.files / preview.open / clipboard.write / composer.insert）。
+      「项目文件」= 工作区文件树（2026-10-01 用户第三轮反馈后重做）：
+      文件夹折叠成一行、箭头点了转方向才展开（按需拉一层，不整树铺开）；
+      顶部路径面包屑可点（点到哪，浏览根到哪）；单击只选中、**双击**才在新标签页预览；
+      右键复制路径/文件名/绝对路径。数据一律走 postMessage 白名单
+      （workspace.info / workspace.dir / workspace.files / preview.open / clipboard.write / composer.insert）。
     -->
     <div class="head">
       <b>项目文件</b>
-      <span class="ws" id="ws" title="">…</span>
-      <button id="refresh" title="重新加载列表">↻</button>
+      <span class="flex"></span>
+      <button id="refresh" title="重新加载">↻</button>
     </div>
+    <div class="crumb" id="crumb"></div>
     <div class="toolbar">
       <input id="filter" placeholder="过滤文件路径…" />
       <span class="count" id="count"></span>
@@ -205,8 +244,12 @@
       const pending = new Map();
       let seq = 0;
       let wsPath = '';
-      let files = [];
-      let selected = '';
+      let root = ''; // 当前浏览根（工作区相对路径，'' = 工作区根）
+      let expanded = new Set(); // 展开的目录（相对路径）
+      let childCache = new Map(); // 目录 → { dirs, files, truncated }
+      let flat = []; // workspace.files 的平铺清单（过滤用）
+      let filtering = false;
+      let selection = '';
 
       function call(method, params) {
         return new Promise((resolve, reject) => {
@@ -246,55 +289,156 @@
       function absPath(rel) {
         if (!wsPath) return rel;
         const sep = wsPath.includes('\\') ? '\\' : '/';
-        return wsPath.replace(/[\\/]+$/, '') + sep + rel.replace(/\//g, sep);
+        return wsPath.replace(/[\\/]+$/, '') + sep + String(rel).replace(/\//g, sep);
       }
       function nameOf(rel) {
-        const i = rel.lastIndexOf('/');
-        return i < 0 ? rel : rel.slice(i + 1);
+        const i = String(rel).lastIndexOf('/');
+        return i < 0 ? rel : String(rel).slice(i + 1);
       }
-      const ARROW =
-        '<svg class="arw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
+      const ARROW = '<svg class="arw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
+      const FILE_ICO = '<svg class="fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/></svg>';
 
-      function renderList() {
-        const q = document.getElementById('filter').value.trim().toLowerCase();
-        const shown = q ? files.filter((f) => f.toLowerCase().includes(q)) : files;
-        const list = document.getElementById('list');
-        document.getElementById('count').textContent = q ? `${shown.length} / ${files.length}` : `${files.length} 个文件`;
-        if (!shown.length) {
-          list.innerHTML = `<div class="empty">${files.length ? '没有匹配的文件' : '工作区里没有文件'}</div>`;
-          return;
+      // —— 面包屑：工作区名 + 当前根的各段（每段可点，点了浏览根就到那） ——
+      function renderCrumb() {
+        const el = document.getElementById('crumb');
+        const wsName = wsPath ? nameOf(wsPath.replace(/[\\/]+$/, '')) || wsPath : '(未知)';
+        const parts = ['']; // 根 = 工作区
+        if (root) for (const seg of root.split('/')) parts.push((parts[parts.length - 1] ? parts[parts.length - 1] + '/' : '') + seg);
+        let html = `<button data-root="" title="${esc(wsPath)}" class="${root ? '' : 'cur'}">${esc(wsName)}</button>`;
+        for (let i = 1; i < parts.length; i++) {
+          const rel = parts[i];
+          html += `<span class="sep">›</span><button data-root="${esc(rel)}" class="${i === parts.length - 1 ? 'cur' : ''}">${esc(nameOf(rel))}</button>`;
         }
-        list.innerHTML = shown
-          .map((f) => {
-            const i = f.lastIndexOf('/');
-            const dir = i < 0 ? '' : f.slice(0, i + 1);
-            const nm = i < 0 ? f : f.slice(i + 1);
-            return `<div class="row${f === selected ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(absPath(f))}">
-              ${ARROW}
-              <span class="path"><span class="dir">${esc(dir)}</span><span class="name">${esc(nm)}</span></span>
-            </div>`;
-          })
-          .join('');
-        list.querySelectorAll('.row').forEach((el) => {
-          el.onclick = () => openPreview(el.dataset.f);
-          el.oncontextmenu = (ev) => {
-            ev.preventDefault();
-            selectRow(el.dataset.f);
-            openMenu(ev, el.dataset.f);
+        el.innerHTML = html;
+        el.querySelectorAll('button').forEach((b) => {
+          b.onclick = () => {
+            root = b.dataset.root || '';
+            render();
           };
         });
-      }
-      function selectRow(f) {
-        selected = f;
-        document.querySelectorAll('.row').forEach((el) => el.classList.toggle('sel', el.dataset.f === f));
+        // 路径长了先把右端（当前目录）滚进视野
+        el.scrollLeft = el.scrollWidth;
       }
 
-      // 点击 = 在右侧边栏新标签页预览（宿主执行；本页不再内嵌预览）
+      // —— 树渲染：文件夹一行，展开才往下画一层 ——
+      function rowsHtml(rel, depth) {
+        const c = childCache.get(rel);
+        const pad = 6 + depth * 14;
+        if (c === 'loading') return `<div class="row loading" style="padding-left:${pad}px">${ARROW}<span class="nm dim">加载中</span></div>`;
+        if (!c) return '';
+        let html = '';
+        for (const d of c.dirs) {
+          const drel = rel ? rel + '/' + d : d;
+          const open = expanded.has(drel);
+          html += `<div class="row dir${open ? ' open' : ''}" data-d="${esc(drel)}" style="padding-left:${pad}px" title="${esc(drel)}">${ARROW}<span class="nm">${esc(d)}</span></div>`;
+          if (open) html += rowsHtml(drel, depth + 1);
+        }
+        for (const f of c.files) {
+          const frel = rel ? rel + '/' + f : f;
+          html += `<div class="row file${frel === selection ? ' sel' : ''}" data-f="${esc(frel)}" style="padding-left:${pad}px" title="${esc(absPath(frel))}">${FILE_ICO}<span class="nm">${esc(f)}</span></div>`;
+        }
+        return html;
+      }
+
+      function render() {
+        const list = document.getElementById('list');
+        renderCrumb();
+        const q = document.getElementById('filter').value.trim().toLowerCase();
+        filtering = !!q;
+        if (filtering) {
+          // 过滤态：平铺匹配（树只画了展开过的层，过滤要能搜整个工作区）
+          const shown = flat.filter((f) => f.toLowerCase().includes(q));
+          document.getElementById('count').textContent = `${shown.length} / ${flat.length}`;
+          if (!shown.length) {
+            list.innerHTML = '<div class="empty">没有匹配的文件</div>';
+            return;
+          }
+          list.innerHTML = shown
+            .map((f) => {
+              const i = f.lastIndexOf('/');
+              const dir = i < 0 ? '' : f.slice(0, i + 1);
+              const nm = i < 0 ? f : f.slice(i + 1);
+              return `<div class="row file${f === selection ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(absPath(f))}">${FILE_ICO}<span class="nm"><span class="dim">${esc(dir)}</span>${esc(nm)}</span></div>`;
+            })
+            .join('');
+          bindRows();
+          return;
+        }
+        const c = childCache.get(root);
+        if (c && c !== 'loading') {
+          document.getElementById('count').textContent = `${c.dirs.length + c.files.length} 项`;
+        } else if (c === 'loading') {
+          document.getElementById('count').textContent = '…';
+        }
+        if (!childCache.has(root)) {
+          list.innerHTML = '<div class="empty">加载中…</div>';
+          return;
+        }
+        const html = rowsHtml(root, 0);
+        list.innerHTML = html || '<div class="empty">这个文件夹是空的</div>';
+        bindRows();
+      }
+
+      function bindRows() {
+        document.querySelectorAll('.row').forEach((el) => {
+          if (el.dataset.d) {
+            // 文件夹：单击展开/收起（箭头跟着转向）；双击进入（设为浏览根，面包屑随之前进）
+            el.onclick = () => toggleDir(el.dataset.d);
+            el.ondblclick = () => {
+              root = el.dataset.d;
+              expanded.delete(root);
+              render();
+            };
+          } else if (el.dataset.f) {
+            // 文件：单击只选中，双击才预览（用户 2026-10-01 要求）
+            el.onclick = () => {
+              selection = el.dataset.f;
+              document.querySelectorAll('.row').forEach((x) => x.classList.toggle('sel', x.dataset.f === selection));
+            };
+            el.ondblclick = () => openPreview(el.dataset.f);
+            el.oncontextmenu = (ev) => {
+              ev.preventDefault();
+              selection = el.dataset.f;
+              document.querySelectorAll('.row').forEach((x) => x.classList.toggle('sel', x.dataset.f === selection));
+              openMenu(ev, el.dataset.f);
+            };
+          }
+        });
+      }
+
+      async function listDir(rel) {
+        childCache.set(rel, 'loading');
+        render();
+        try {
+          const r = await call('workspace.dir', { path: rel });
+          childCache.set(rel, { dirs: (r && r.dirs) || [], files: (r && r.files) || [], truncated: !!(r && r.truncated) });
+          if (r && r.truncated) status('条目较多，只列了每个类型的前 500 个', true);
+        } catch (e) {
+          childCache.delete(rel);
+          status('读取目录失败: ' + (e.message || e), true);
+        }
+        render();
+      }
+      function toggleDir(rel) {
+        if (expanded.has(rel)) {
+          expanded.delete(rel);
+          render();
+          return;
+        }
+        expanded.add(rel);
+        if (!childCache.has(rel)) {
+          listDir(rel);
+          return;
+        }
+        render();
+      }
+
+      // 双击 = 在右侧边栏新标签页预览（宿主执行；本页不弹提示）
       async function openPreview(f) {
-        selectRow(f);
+        selection = f;
         try {
           await call('preview.open', { path: f });
-          status('已在新标签页打开：' + f);
+          status('');
         } catch (e) {
           status('打开失败: ' + (e.message || e), true);
         }
@@ -346,42 +490,41 @@
           status('复制失败: ' + (e.message || e), true);
         }
       }
+      // 插入输入框：不弹提示（用户要求）——输入框本身可见，无需再报一遍
       async function insert(f) {
         try {
           await call('composer.insert', { text: '@' + f + ' ' });
-          status('已插入输入框：@' + f);
         } catch (e) {
           status('插入失败: ' + (e.message || e), true);
         }
       }
+
+      document.getElementById('filter').oninput = () => render();
 
       async function loadAll() {
         status('');
         try {
           const w = await call('workspace.info');
           wsPath = (w && w.current) || '';
-          const wsEl = document.getElementById('ws');
-          wsEl.textContent = wsPath || '(未知)';
-          wsEl.title = wsPath;
         } catch {
           wsPath = '';
         }
-        try {
-          const r = await call('workspace.files');
-          files = (r && r.files) || [];
-          document.getElementById('count').textContent = `${files.length} 个文件`;
-          if (!files.length) {
-            document.getElementById('list').innerHTML = '<div class="empty">工作区里没有文件</div>';
-            return;
-          }
-          if (r && r.truncated) status('文件较多，列表只取了前 500 个');
-          renderList();
-        } catch (e) {
-          document.getElementById('list').innerHTML = '<div class="empty">读取失败: ' + esc(e.message || e) + '</div>';
-          status('读取失败: ' + (e.message || e), true);
-        }
+        // 平铺清单只给过滤用（树是懒加载的）
+        call('workspace.files')
+          .then((r) => {
+            flat = (r && r.files) || [];
+            if (filtering) render();
+          })
+          .catch(() => {});
+        expanded = new Set();
+        childCache = new Map();
+        root = '';
+        render();
+        listDir('');
       }
-      document.getElementById('refresh').onclick = loadAll;
+      document.getElementById('refresh').onclick = () => {
+        loadAll();
+      };
 
       // 握手：宿主会回 agent:init，收到再拉数据（未登记时桥调用会被丢弃）
       parent.postMessage({ type: 'agent:hello' }, '*');

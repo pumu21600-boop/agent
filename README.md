@@ -50,7 +50,7 @@ agent/
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目速览、trace/ 时间线、usage/ 用量）
+├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目文件、trace/ 时间线、usage/ 用量）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
@@ -327,7 +327,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - **插件自带技能**：manifest `skills: "skills"`（相对目录，每子目录一个 SKILL.md）→ 技能进系统提示索引，模型 read_skill 可读（返回头部带技能目录，脚本资产用绝对路径跑）。纯技能插件不需要 entry/ui（内置 GitHub / Word / 表格 / PDF / 演示文稿 / 浏览器 六个生态插件就是这么落的）；停用插件或未验签的第三方插件不贡献技能。技能页只列自己建的技能，插件技能的管理（启停/信任）都在插件页；composer 的 `$` 技能选择菜单含插件技能，新建同名技能可覆盖插件版。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
 - **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 plugins、当前工作区 plugins、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
-- 参考实现：`plugins/board/`（项目速览）。清单写坏不会静默：标红给原因，「打开」禁用。
+- 参考实现：`plugins/board/`（项目文件）。清单写坏不会静默：标红给原因，「打开」禁用。
 
 # 用量台账与成本红线（P21）
 

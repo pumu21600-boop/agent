@@ -27,12 +27,12 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 {
   "apiVersion": 1,
   "source": "user",
-  "title": "项目速览",
+  "title": "项目文件",
   "description": "…",
   "version": "0.3.0",
   "entry": "index.html",
   "tool_file": "calc.wat",
-  "ui": [{ "slot": "toolbar", "id": "board", "title": "项目速览" }],
+  "ui": [{ "slot": "toolbar", "id": "board", "title": "项目文件" }],
   "permissions": ["composer.insert", "notify", "bus.publish", "workspace.write", "storage"]
 }
 ```
@@ -98,23 +98,36 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
 - 价格表是**内核配置**（settings.json 的 `cost` 节），插件只是编辑器：停用插件不影响计价与硬闸。
 - 金额一律**美元**规范存储；人民币是展示层（`cost.currency` + `usd_cny_rate` 折算），切币种不动账。
 
-## 五之三、项目文件列表（board 面板重做的两口新桥）
+## 五之三、项目文件（board 面板，2026-10-01 三轮反馈后定稿）
 
-「项目速览」重做为工作区文件列表后新增两口桥（2026-10-01）：
+工作区文件**树**面板：文件夹折叠成一行、箭头点了转向才按需展开一层（`workspace.dir` 一次
+只列一个目录的直接子项，不整树铺开）；顶部路径面包屑可点（点到哪，浏览根到哪）；单击只
+选中、**双击**才在新标签页预览；右键复制路径/文件名/绝对路径、插入输入框。相关桥：
 
-- `workspace.file`（只读，不占权限）→ 读工作区文本文件内容（`{path}`，沿用 read_file 的越界防护与 200KB 头尾压缩，读不到以 reject 回带人话）；
-- `clipboard.write`（写，须声明 `clipboard`）→ 宿主页代写剪贴板（`{text}`）。插件 iframe 是 sandbox 不透明源，`navigator.clipboard` 与 `execCommand` 都不归它使，复制一律由宿主页执行；用户右键触发，未声明权限的插件一律拒。
+- `workspace.dir`（只读，不占权限）→ 列工作区某目录直接子项（`{path}` 缺省=工作区根；
+  返回 `{dirs, files, truncated}`，跳过 .git/node_modules/target 等噪音目录，每类上限 500）；
+- `workspace.file`（只读，不占权限）→ 读工作区文本文件内容（`{path}`，沿用 read_file 的越界
+  防护与 200KB 头尾压缩，读不到以 reject 回带人话）；
+- `clipboard.write`（写，须声明 `clipboard`）→ 宿主页代写剪贴板（`{text}`）。插件 iframe 是
+  sandbox 不透明源，`navigator.clipboard` 与 `execCommand` 都不归它使，复制一律由宿主页执行；
+  用户右键触发，未声明权限的插件一律拒。
+
+宿主侧文件预览标签（从「项目文件」双击或「产物」点击打开）：
+
+- `GET /api/workspace/raw?path=` 直出原始字节（图片预览用，工作区边界同 read_file 硬拦，上限 8MB）；
+- 文本可**编辑保存**（`POST /api/workspace/file`，512KB 上限、原子写）；**内容被 200KB 头尾压缩
+  过的文件不给编辑**（`……[中间省略` 标记，保存会把省略段写没——宁可不让改也不许写坏文件）。
 
 ## 五之四、右侧边栏统一标签页（2026-10-01 用户拍板）
 
-顶栏只留「终端 + 侧边面板」两个按钮；产物/网页/插件面板（时间线/项目速览/用量）/文件预览
+顶栏只留「终端 + 侧边面板」两个按钮；产物/网页/插件面板（时间线/项目文件/用量）/文件预览
 全在右侧边栏开**标签页**——标签可关（× 在激活标签上），尾部 `+` 加面板，关光显示
 「打开标签页」选择页。manifest 里 `ui.slot = "dock"` 的插件（内部把旧 `toolbar` 视同面板
 并入）出现在 `+` 菜单与选择页里，不再有顶栏插件按钮。每标签一份 iframe 常驻不重载
 （切走切回状态不丢）。
 
 - `preview.open`（只读，不占权限）→ 宿主在右侧边栏新开该文件的预览标签（`{path}`）；
-  项目速览点击文件即走它，「产物」列表点击同样开标签（不再是固定的「预览」页签）。
+  项目文件点击文件即走它，「产物」列表点击同样开标签（不再是固定的「预览」页签）。
 - `trace.recent` 现在**只返回当前工作区**的任务：任务的聊天会话归属取 `task.start` 的
   `session`（新日志）或任务内 `session.saved` 的 `session`（旧日志），工作区→会话映射
   由服务端从会话文件算。注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），

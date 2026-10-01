@@ -210,6 +210,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/browser/tab", delete(browser_close_tab))
         .route("/api/workspace/files", get(list_workspace_files))
         .route("/api/workspace/file", get(read_workspace_file))
+        .route("/api/workspace/dir", get(list_workspace_dir))
+        .route("/api/workspace/raw", get(read_workspace_raw))
         .route("/api/changes", get(list_changes))
         .route("/api/shell", post(run_shell))
         .route("/api/skills", get(list_skills).post(post_skills))

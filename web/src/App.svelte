@@ -874,7 +874,7 @@
   let rpFiles = [];
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
-  let rpPreviewCache = {}; // path → { loading, content }（标签切换不重拉）
+  let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, saving, savedAt }（标签切换不重拉）
   let dockPaneFrames = {}; // 插件标签的 iframe（bind:this），按插件名
 
   // —— P20.1 网页（右侧面板「网页」页签）——
@@ -1516,15 +1516,65 @@
     terminalOpen = false;
     activateRpTab(key);
   }
+  // —— 文件预览标签：文本可编辑保存；图片走 /api/workspace/raw 直出 ——
+  const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
+  function previewIsImage(path) {
+    const i = String(path).lastIndexOf('.');
+    return i > 0 && RP_IMG_EXT.has(String(path).slice(i + 1).toLowerCase());
+  }
+  // 后端 200KB 头尾压缩标记（context::OMITTED_MARK）：压缩过的内容拿去保存会把中间
+  // 省略掉的部分整段写没——这类文件不给编辑，宁可不让改也不许写坏文件
+  function previewTruncated(text) {
+    return String(text || '').includes('……[中间省略');
+  }
+  function rpSet(path, patch) {
+    rpPreviewCache = { ...rpPreviewCache, [path]: { ...(rpPreviewCache[path] || {}), ...patch } };
+  }
   async function loadPreview(path, force) {
     const hit = rpPreviewCache[path];
-    if (hit && !hit.loading && !force) return;
-    rpPreviewCache = { ...rpPreviewCache, [path]: { loading: true, content: (hit && hit.content) || '' } };
+    if (hit && !hit.loading && !hit.error && hit.content !== undefined && !force) return;
+    rpSet(path, { loading: true, error: '', editing: false, draft: '', savedAt: '' });
+    // 图片走 /api/workspace/raw 直出渲染，不去拉文本（拉了必 400，白留一条控制台报错）
+    if (previewIsImage(path)) {
+      rpSet(path, { loading: false, content: '', error: '' });
+      return;
+    }
     try {
       const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(path)}`).then((r) => r.json());
-      rpPreviewCache = { ...rpPreviewCache, [path]: { loading: false, content: r.ok ? r.content : `读取失败: ${r.error}` } };
+      rpSet(path, { loading: false, content: r.ok ? r.content : '', error: r.ok ? '' : r.error || '读取失败' });
     } catch (e) {
-      rpPreviewCache = { ...rpPreviewCache, [path]: { loading: false, content: `读取失败: ${e.message || e}` } };
+      rpSet(path, { loading: false, content: '', error: e.message || String(e) });
+    }
+  }
+  function startEditPreview(path) {
+    rpSet(path, { editing: true, draft: (rpPreviewCache[path] || {}).content || '', error: '' });
+  }
+  function cancelEditPreview(path) {
+    rpSet(path, { editing: false, draft: '' });
+  }
+  async function savePreview(path) {
+    const hit = rpPreviewCache[path] || {};
+    if (hit.saving) return;
+    rpSet(path, { saving: true, error: '' });
+    try {
+      const r = await fetch('/api/workspace/file', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, content: hit.draft || '' }),
+      }).then((x) => x.json());
+      if (!r.ok) {
+        rpSet(path, { saving: false, error: r.error || '保存失败' });
+        return;
+      }
+      rpSet(path, {
+        saving: false,
+        content: hit.draft || '',
+        editing: false,
+        draft: '',
+        savedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      });
+    } catch (e) {
+      rpSet(path, { saving: false, error: e.message || String(e) });
     }
   }
   function openRightPanel() {
@@ -3499,12 +3549,18 @@
         case 'workspace.files':
           reply(true, await get('/api/workspace/files'));
           break;
-        // 读工作区文本文件（「项目速览」文件预览用）：与 workspace.files 同为只读信息类，
+        // 读工作区文本文件（「项目文件」文件预览用）：与 workspace.files 同为只读信息类，
         // 不占权限白名单；读不到的（二进制/越界）以 reject 带回人话
         case 'workspace.file': {
           const path = String(params.path || '').trim();
           if (!path) return reply(false, '缺少 path');
           reply(true, await get(`/api/workspace/file?path=${encodeURIComponent(path)}`));
+          break;
+        }
+        // 列工作区某目录的直接子项（「项目文件」树面板折叠/展开按需拉一层）
+        case 'workspace.dir': {
+          const path = String(params.path || '').trim();
+          reply(true, await get(`/api/workspace/dir?path=${encodeURIComponent(path)}`));
           break;
         }
         case 'git.status':
@@ -4614,9 +4670,41 @@
               {:else if t.kind === 'file'}
                 <div class="rp-preview-head">
                   <span class="rp-preview-path" title={t.path}>{t.path}</span>
+                  <span class="flex-sp"></span>
+                  {#if (rpPreviewCache[t.path] || {}).savedAt}
+                    <span class="rp-saved">已保存 {(rpPreviewCache[t.path] || {}).savedAt}</span>
+                  {/if}
+                  {#if (rpPreviewCache[t.path] || {}).editing}
+                    <button class="rp-btn" title="保存（写回工作区文件）" disabled={(rpPreviewCache[t.path] || {}).saving} on:click={() => savePreview(t.path)}>
+                      {(rpPreviewCache[t.path] || {}).saving ? '保存中…' : '保存'}
+                    </button>
+                    <button class="rp-btn" title="取消编辑（丢弃改动）" on:click={() => cancelEditPreview(t.path)}>取消</button>
+                  {:else if !previewIsImage(t.path) && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
+                    <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
+                  {/if}
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
-                <pre class="rp-preview">{rpPreviewCache[t.path] && rpPreviewCache[t.path].loading ? '读取中…' : (rpPreviewCache[t.path] && rpPreviewCache[t.path].content) || '（空文件）'}</pre>
+                {#if previewIsImage(t.path)}
+                  <div class="rp-image-wrap">
+                    <img class="rp-image" src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} alt={t.path} />
+                  </div>
+                {:else if (rpPreviewCache[t.path] || {}).loading}
+                  <pre class="rp-preview">读取中…</pre>
+                {:else if (rpPreviewCache[t.path] || {}).error}
+                  <pre class="rp-preview">{`读取失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
+                {:else if (rpPreviewCache[t.path] || {}).editing}
+                  <textarea
+                    class="rp-edit"
+                    spellcheck="false"
+                    value={(rpPreviewCache[t.path] || {}).draft || ''}
+                    on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
+                  ></textarea>
+                {:else}
+                  {#if previewTruncated((rpPreviewCache[t.path] || {}).content)}
+                    <div class="rp-note">文件较大，预览是头尾压缩过的（中间省略）——为避免把省略部分写没，不提供编辑</div>
+                  {/if}
+                  <pre class="rp-preview">{((rpPreviewCache[t.path] || {}).content) || '（空文件）'}</pre>
+                {/if}
               {:else if t.kind === 'ext'}
                 <div class="web-wrap">
                   {#if enabledExts.find((e) => e.name === t.name)}
@@ -6850,9 +6938,9 @@
     align-items: center;
     gap: 4px;
     padding: 4px 6px 4px 10px !important;
-    max-width: 140px;
-    min-width: 0;
-    flex: 0 1 auto; /* 可收缩：五个标签也放得下，标题超长走省略号 */
+    max-width: 150px;
+    min-width: 54px; /* 标签多时也保持可读宽度，超出交给标签条横向滚动（用户：别挤成一团） */
+    flex: 0 1 auto;
   }
   .rp-tab .rp-tab-title {
     overflow: hidden;
@@ -6931,41 +7019,41 @@
   .rp-pane.hidden {
     display: none;
   }
-  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode） */
+  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode；用户反馈太紧凑 → 卡片放宽） */
   .rp-open {
     margin: auto;
     text-align: center;
-    padding: 0 8px;
+    padding: 0 12px;
     max-width: 100%;
   }
   .rp-open-title {
-    font-size: 15px;
+    font-size: 17px;
     font-weight: 600;
     color: var(--g7);
-    margin-bottom: 6px;
+    margin-bottom: 8px;
   }
   .rp-open-sub {
-    font-size: 12.5px;
+    font-size: 13px;
     color: var(--g5);
-    margin-bottom: 16px;
+    margin-bottom: 22px;
   }
   .rp-open-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
+    gap: 12px;
   }
   .rp-open-card {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding: 18px 10px;
-    border-radius: 10px;
+    gap: 12px;
+    padding: 26px 14px;
+    border-radius: 12px;
     border: 1px solid var(--g3);
     background: var(--g1);
     color: var(--g6);
-    font-size: 12.5px;
+    font-size: 13.5px;
     cursor: pointer;
   }
   .rp-open-card:hover {
@@ -6974,10 +7062,10 @@
     border-color: var(--g4);
   }
   .rp-open-card svg {
-    width: 18px;
-    height: 18px;
+    width: 22px;
+    height: 22px;
   }
-  /* 文件预览标签的头部（路径吸顶 + 重新读取） */
+  /* 文件预览标签的头部（路径吸顶 + 编辑/保存/重读） */
   .rp-preview-head {
     position: sticky;
     top: -8px;
@@ -7002,6 +7090,68 @@
     background: transparent;
     border: none;
     border-radius: 0;
+  }
+  .rp-btn {
+    flex: none;
+    padding: 2px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--g3);
+    background: transparent;
+    color: var(--g6);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .rp-btn:hover {
+    color: var(--g7);
+    border-color: var(--g4);
+  }
+  .rp-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .rp-saved {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--tint-green-fg, #7fd6a4);
+  }
+  .rp-note {
+    flex: none;
+    margin: 0 0 6px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: var(--tint-yellow-bg, #3a3417);
+    color: var(--tint-yellow-fg, #e8d47f);
+    font-size: 12px;
+  }
+  .rp-image-wrap {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    overflow: auto;
+    padding: 6px;
+  }
+  .rp-image {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 6px;
+    background: var(--g1);
+  }
+  .rp-edit {
+    flex: 1;
+    min-height: 0;
+    margin: 0;
+    padding: 8px;
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    background: var(--g1);
+    color: var(--g6);
+    font: 12.5px/1.55 Consolas, "Cascadia Code", monospace;
+    resize: none;
+    outline: none;
+  }
+  .rp-edit:focus {
+    border-color: var(--brand, #4c8dff);
   }
   .rp-refresh {
     background: transparent;
