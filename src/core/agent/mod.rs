@@ -273,16 +273,32 @@ fn emit_context_usage(
 
 /// 渠道实报落地：锚点跟随最新一次实报 + 发 ApiUsage（缓存行累计 / 预算钩子 / 落盘靠它）。
 /// 放在 assistant 消息 push **之后**调用——那时上下文已含这条回复，服务端一次落盘即终态。
+/// 渠道实报落地：锚点跟随本次响应 + 发 ApiUsage（缓存行累计 / 预算钩子 / 落盘靠它）。
+/// 放在 assistant 消息 push **之后**调用——那时上下文已含这条回复。
+/// 锚点真实值 = 实报 prompt + 渠道实报 completion（同一把尺子）：**输入+输出 =
+/// 上下文**，用户拿用量面板能直接对上账；completion 缺失时才回落本地估算增量。
+/// 配对估价 = 回复落地后的本地估价（之后的工具结果/裁剪增量都以它为零点）。
 fn report_api_usage(
-    prompt_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
+    msgs: &[Value],
+    turn: &crate::gateway::AssistantTurn,
     est_at_request: u64,
+    tools_schema_tokens: u64,
+    count_reasoning: bool,
     anchor: &mut Option<(u64, u64)>,
     on_event: &(impl Fn(AgentEvent) + Send + Sync),
 ) {
-    if let Some(p) = prompt_tokens {
-        *anchor = Some((p, est_at_request));
-        on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens });
+    if let Some(p) = turn.prompt_tokens {
+        let est_now = context::estimate_breakdown(msgs, count_reasoning).total() + tools_schema_tokens;
+        let real = match turn.completion_tokens {
+            Some(c) => p + c,
+            None => {
+                // 渠道不回 completion：本地估算回复增量兜底（est_now − 请求时估价）
+                let delta = est_now.saturating_sub(est_at_request);
+                p + delta
+            }
+        };
+        *anchor = Some((real, est_now));
+        on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens: turn.cached_tokens });
     }
 }
 
@@ -606,9 +622,11 @@ pub async fn run_task(
             // 回复已落地 → 先报实报（更新锚点），再按新锚点重算占用推给前端：
             // 圆环含这条回答，服务端那次落盘就是终态（重启后不丢这截增量）
             report_api_usage(
-                turn.prompt_tokens,
-                turn.cached_tokens,
+                &msgs,
+                &turn,
                 est_at_request,
+                tools_schema_tokens,
+                count_reasoning,
                 &mut anchor,
                 &on_event,
             );
@@ -703,9 +721,11 @@ pub async fn run_task(
         // 带工具调用的回复同样先落地再报：锚点更新 + 圆环重算（工具结果回填后，
         // 下一步开头那次测量会把它们按增量补上）
         report_api_usage(
-            turn.prompt_tokens,
-            turn.cached_tokens,
+            &msgs,
+            &turn,
             est_at_request,
+            tools_schema_tokens,
+            count_reasoning,
             &mut anchor,
             &on_event,
         );
@@ -1193,12 +1213,12 @@ mod tests {
         assert_eq!(outcome.unwrap(), LoopOutcome::Done);
         let seq = seen.lock().unwrap().clone();
         assert_eq!(api.load(std::sync::atomic::Ordering::Relaxed), 2, "两次请求各报一次实报");
-        // 期望序列：① 首请求前（纯估算，无锚点）② 第 1 轮回复落地（锚点 1000）
-        //           ③ 工具结果回填后（锚点仍是 1000，但增量必须补上工具结果）④ 末轮回复落地（锚点 2500）
+        // 期望序列：① 首请求前（纯估算，无锚点）② 第 1 轮回复落地（锚点 = 实报 1000+输出20）
+        //           ③ 工具结果回填后（锚点不变，增量必须补上工具结果）④ 末轮回复落地（锚点 2500+输出30）
         assert!(seq.len() >= 4, "至少要四次占用事件，实际 {seq:?}");
         assert_eq!(seq[0].0, None, "首请求前没有实报锚点 → 纯估算");
-        assert_eq!(seq[1].0, Some(1000), "第 1 轮回复落地后锚点 = 渠道实报");
-        assert_eq!(seq[2].0, Some(1000), "工具结果回填不会换锚点");
+        assert_eq!(seq[1].0, Some(1020), "第 1 轮回复落地后锚点 = 实报 prompt + completion");
+        assert_eq!(seq[2].0, Some(1020), "工具结果回填不会换锚点");
         assert!(
             seq[2].1 > seq[1].1,
             "工具结果必须计入圆环：回填后 {} 应大于回复刚落地时的 {}",
@@ -1206,8 +1226,8 @@ mod tests {
             seq[1].1
         );
         let last = seq.last().unwrap();
-        assert_eq!(last.0, Some(2500), "末次锚点 = 第二次实报");
-        assert!(last.1 >= 2500, "圆环不低于实报本身，实际 {}", last.1);
+        assert_eq!(last.0, Some(2530), "末次锚点 = 第二次实报 prompt + completion");
+        assert!(last.1 >= 2530, "圆环不低于实报本身，实际 {}", last.1);
     }
 
     #[test]

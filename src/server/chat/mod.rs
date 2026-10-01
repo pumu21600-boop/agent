@@ -616,11 +616,13 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             session.get(&session_id).and_then(|f| f.usage).unwrap_or_default(),
         );
         loop {
-            // 锚点带入本轮的起点：上一轮结束时的 (实报 pressure, 锚点估价) —— 新起一轮
-            // 不会退回估算口径（DSH 的测量是会话级的，样本一直有效）
+            // 锚点带入本轮的起点：上一轮结束时的 (占用终值 projected, 锚点估价) ——
+            // 新起一轮不会退回估算口径（DSH 的测量是会话级的，样本一直有效）。
+            // 必须用 projected（含最后一次回复），用 pressure（裸 prompt）会把上一轮
+            // 的回复整段漏掉（锚点真实值与 anchor_est 不配对）
             let prior_anchor = {
                 let u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
-                u.pressure.filter(|p| *p > 0 && u.anchor_est > 0).map(|p| (p, u.anchor_est))
+                u.anchor()
             };
             let outcome = agent::run_task(
                 &gateway,
