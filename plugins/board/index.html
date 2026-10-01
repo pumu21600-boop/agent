@@ -4,9 +4,67 @@
     <meta charset="utf-8" />
     <title>项目文件</title>
     <style>
-      :root {
-        color-scheme: dark;
+:root {
+        --bg: #17181c;
+        --fg: #d8dbe2;
+        --strong: #e8ebf2;
+        --dim: #858b98;
+        --hover: #1c1e24;
+        --sel: #22242c;
+        --line: #24272f;
+        --line2: #2c2f38;
+        --btn: #b9bfca;
+        --btn-hover: #ffffff;
+        --btn-line-h: #3a3e49;
+        --input-bg: #121317;
+        --arrow: #6b7280;
+        --arrow-h: #b9bfca;
+        --fico: #565e6c;
+        --sep: #4b5563;
+        --ok: #7fd6a4;
+        --err: #ff9b9b;
+        --t-blue-bg: #1e2a3d;
+        --t-blue-fg: #9fd0ff;
+        --t-green-bg: #16301f;
+        --t-green-fg: #7fd6a4;
+        --t-red-bg: #3d1e1e;
+        --t-red-fg: #ff9b9b;
+        --t-yellow-bg: #3a3417;
+        --t-yellow-fg: #e8d47f;
+        --t-gray-bg: #2c2f38;
+        --t-gray-fg: #b9bfca;
       }
+      body.light {
+        --bg: #f6f7f9;
+        --fg: #1f2328;
+        --strong: #0d1117;
+        --dim: #626b78;
+        --hover: #e9eaee;
+        --sel: #dfe2e8;
+        --line: #e2e4e8;
+        --line2: #d3d6dc;
+        --btn: #4a5260;
+        --btn-hover: #0d1117;
+        --btn-line-h: #b3bac4;
+        --input-bg: #ffffff;
+        --arrow: #8b93a1;
+        --arrow-h: #4a5260;
+        --fico: #9aa1ac;
+        --sep: #9aa1ac;
+        --ok: #1a7f37;
+        --err: #cf222e;
+        --t-blue-bg: #dde9ff;
+        --t-blue-fg: #0b62d0;
+        --t-green-bg: #dcf3e5;
+        --t-green-fg: #1a7f37;
+        --t-red-bg: #ffe1e1;
+        --t-red-fg: #cf222e;
+        --t-yellow-bg: #fff3c4;
+        --t-yellow-fg: #9a6700;
+        --t-gray-bg: #e8eaee;
+        --t-gray-fg: #4a5260;
+      }
+
       * {
         box-sizing: border-box;
       }
@@ -16,8 +74,8 @@
         flex-direction: column;
         height: 100vh;
         font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
-        background: #17181c;
-        color: #d8dbe2;
+        background: var(--bg);
+        color: var(--fg);
       }
       .head {
         display: flex;
@@ -28,7 +86,7 @@
       .head b {
         font-size: 13px;
         font-weight: 600;
-        color: #e8ebf2;
+        color: var(--strong);
         flex: none;
       }
       .head .flex {
@@ -37,16 +95,16 @@
       button {
         padding: 5px 12px;
         border-radius: 7px;
-        border: 1px solid #2c2f38;
+        border: 1px solid var(--line2);
         background: transparent;
-        color: #b9bfca;
+        color: var(--btn);
         font-size: 12px;
         cursor: pointer;
         flex: none;
       }
       button:hover {
-        color: #fff;
-        border-color: #3a3e49;
+        color: var(--btn-hover);
+        border-color: var(--btn-line-h);
       }
       /* 路径面包屑：字号加大、每段可点（点到哪，浏览根就到哪里） */
       .crumb {
@@ -67,20 +125,20 @@
         background: transparent;
         padding: 1px 4px;
         border-radius: 5px;
-        color: #858b98;
+        color: var(--dim);
         font-size: 13px;
         white-space: nowrap;
       }
       .crumb button:hover {
-        color: #e8ebf2;
-        background: #1c1e24;
+        color: var(--strong);
+        background: var(--hover);
       }
       .crumb button.cur {
-        color: #e8ebf2;
+        color: var(--strong);
         font-weight: 600;
       }
       .crumb .sep {
-        color: #4b5563;
+        color: var(--sep);
         flex: none;
       }
       .toolbar {
@@ -88,22 +146,22 @@
         gap: 8px;
         align-items: center;
         padding: 0 12px 8px;
-        border-bottom: 1px solid #24272f;
+        border-bottom: 1px solid var(--line);
       }
       input {
         flex: 1;
         min-width: 0;
         padding: 5px 9px;
         border-radius: 7px;
-        border: 1px solid #2c2f38;
-        background: #121317;
-        color: #d8dbe2;
+        border: 1px solid var(--line2);
+        background: var(--input-bg);
+        color: var(--fg);
         font-size: 12px;
       }
       .count {
         flex: none;
         font-size: 12px;
-        color: #858b98;
+        color: var(--dim);
         font-variant-numeric: tabular-nums;
       }
       .list {
@@ -124,74 +182,74 @@
         white-space: nowrap;
       }
       .row:hover {
-        background: #1c1e24;
+        background: var(--hover);
       }
       .row.sel {
-        background: #22242c;
+        background: var(--sel);
       }
       .row .arw {
         flex: none;
         width: 12px;
         height: 12px;
-        color: #6b7280;
+        color: var(--arrow);
         transition: transform 0.12s;
       }
       .row.open .arw {
         transform: rotate(90deg);
-        color: #b9bfca;
+        color: var(--btn);
       }
       .row .fico {
         flex: none;
         width: 13px;
         height: 13px;
-        color: #565e6c;
+        color: var(--fico);
       }
       .row .nm {
         overflow: hidden;
         text-overflow: ellipsis;
       }
       .row.dir .nm {
-        color: #d8dbe2;
+        color: var(--fg);
       }
       .row.file .nm {
-        color: #b9bfca;
+        color: var(--btn);
       }
       .row.loading .nm::after {
         content: ' …';
-        color: #858b98;
+        color: var(--dim);
       }
       .row .dim {
-        color: #6b7280;
+        color: var(--arrow);
       }
       .status {
         flex: none;
         min-height: 24px;
         padding: 4px 12px;
         font-size: 12px;
-        color: #7fd6a4;
-        border-top: 1px solid #24272f;
+        color: var(--ok);
+        border-top: 1px solid var(--line);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
       }
       .status.err {
-        color: #ff9b9b;
+        color: var(--err);
       }
       .empty {
         padding: 24px 12px;
         text-align: center;
-        color: #858b98;
+        color: var(--dim);
         font-size: 12px;
       }
       .menu {
         position: fixed;
         z-index: 10;
         min-width: 160px;
-        background: #1c1e24;
-        border: 1px solid #2c2f38;
+        background: var(--hover);
+        border: 1px solid var(--line2);
         border-radius: 8px;
         padding: 4px;
-        box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+        box-shadow: 0 8px 24px rgb(0 0 0 / 32%);
       }
       .menu.hidden {
         display: none;
@@ -205,16 +263,16 @@
         padding: 6px 10px;
         border-radius: 6px;
         font-size: 12px;
-        color: #d8dbe2;
+        color: var(--fg);
       }
       .menu button:hover {
-        background: #22242c;
-        color: #fff;
+        background: var(--sel);
+        color: var(--btn-hover);
       }
       .menu .sep {
         height: 1px;
         margin: 4px 6px;
-        background: #2c2f38;
+        background: var(--line2);
       }
     </style>
   </head>
@@ -268,6 +326,8 @@
         const d = ev.data || {};
         // agent:init = 宿主已登记本 frame：此刻起桥调用才会被受理，初始拉数据挂这里
         if (d.type === 'agent:init') {
+          // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
+          document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
           loadAll();
           return;
         }

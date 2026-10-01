@@ -4,9 +4,67 @@
     <meta charset="utf-8" />
     <title>时间线 · 最近任务</title>
     <style>
-      :root {
-        color-scheme: dark;
+:root {
+        --bg: #17181c;
+        --fg: #d8dbe2;
+        --strong: #e8ebf2;
+        --dim: #858b98;
+        --hover: #1c1e24;
+        --sel: #22242c;
+        --line: #24272f;
+        --line2: var(--t-gray-bg);
+        --btn: var(--t-gray-fg);
+        --btn-hover: #ffffff;
+        --btn-line-h: #3a3e49;
+        --input-bg: #121317;
+        --arrow: #6b7280;
+        --arrow-h: var(--t-gray-fg);
+        --fico: #565e6c;
+        --sep: #4b5563;
+        --ok: var(--t-green-fg);
+        --err: var(--t-red-fg);
+        --t-blue-bg: var(--t-blue-bg);
+        --t-blue-fg: var(--t-blue-fg);
+        --t-green-bg: var(--t-green-bg);
+        --t-green-fg: var(--t-green-fg);
+        --t-red-bg: var(--t-red-bg);
+        --t-red-fg: var(--t-red-fg);
+        --t-yellow-bg: var(--t-yellow-bg);
+        --t-yellow-fg: var(--t-yellow-fg);
+        --t-gray-bg: var(--t-gray-bg);
+        --t-gray-fg: var(--t-gray-fg);
       }
+      body.light {
+        --bg: #f6f7f9;
+        --fg: #1f2328;
+        --strong: #0d1117;
+        --dim: #626b78;
+        --hover: #e9eaee;
+        --sel: #dfe2e8;
+        --line: #e2e4e8;
+        --line2: #d3d6dc;
+        --btn: #4a5260;
+        --btn-hover: #0d1117;
+        --btn-line-h: #b3bac4;
+        --input-bg: #ffffff;
+        --arrow: #8b93a1;
+        --arrow-h: #4a5260;
+        --fico: #9aa1ac;
+        --sep: #9aa1ac;
+        --ok: #1a7f37;
+        --err: #cf222e;
+        --t-blue-bg: #dde9ff;
+        --t-blue-fg: #0b62d0;
+        --t-green-bg: #dcf3e5;
+        --t-green-fg: #1a7f37;
+        --t-red-bg: #ffe1e1;
+        --t-red-fg: #cf222e;
+        --t-yellow-bg: #fff3c4;
+        --t-yellow-fg: #9a6700;
+        --t-gray-bg: #e8eaee;
+        --t-gray-fg: #4a5260;
+      }
+
       * {
         box-sizing: border-box;
       }
@@ -14,8 +72,8 @@
         margin: 0;
         padding: 12px 14px;
         font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
-        background: #17181c;
-        color: #d8dbe2;
+        background: var(--bg);
+        color: var(--fg);
       }
       .head {
         display: flex;
@@ -27,38 +85,38 @@
         margin: 0;
         font-size: 13px;
         font-weight: 600;
-        color: #e8ebf2;
+        color: var(--strong);
         flex: 1;
       }
       button {
         padding: 5px 12px;
         border-radius: 7px;
-        border: 1px solid #2c2f38;
+        border: 1px solid var(--line2);
         background: transparent;
-        color: #b9bfca;
+        color: var(--btn);
         font-size: 12px;
         cursor: pointer;
       }
       button:hover {
-        color: #fff;
-        border-color: #3a3e49;
+        color: var(--btn-hover);
+        border-color: var(--btn-line-h);
       }
       .empty {
-        color: #858b98;
+        color: var(--dim);
         font-size: 13px;
         text-align: center;
         padding: 24px 0;
       }
       .note {
         font-size: 12px;
-        color: #e8d47f;
-        background: #3a3417;
+        color: var(--t-yellow-fg);
+        background: var(--t-yellow-bg);
         border-radius: 6px;
         padding: 6px 10px;
         margin-bottom: 10px;
       }
       .task {
-        border: 1px solid #2c2f38;
+        border: 1px solid var(--line2);
         border-radius: 8px;
         overflow: hidden;
         margin-bottom: 8px;
@@ -68,26 +126,26 @@
         align-items: center;
         gap: 10px;
         width: 100%;
-        background: #1c1e24;
+        background: var(--hover);
         border: none;
-        color: #e8ebf2;
+        color: var(--strong);
         padding: 8px 12px;
         cursor: pointer;
         font-size: 13px;
         text-align: left;
       }
       .task-head:hover {
-        background: #22242c;
+        background: var(--sel);
       }
       .idx {
-        color: #9fd0ff;
+        color: var(--t-blue-fg);
         font-weight: 600;
       }
       .time {
         font-variant-numeric: tabular-nums;
       }
       .meta {
-        color: #858b98;
+        color: var(--dim);
         font-size: 12px;
         flex: 1;
       }
@@ -109,15 +167,15 @@
         align-items: baseline;
         gap: 8px;
         padding: 3px 0;
-        border-bottom: 1px dashed #22242c;
+        border-bottom: 1px dashed var(--sel);
         font-size: 12px;
-        color: #b9bfca;
+        color: var(--btn);
       }
       .ev:last-child {
         border-bottom: none;
       }
       .offset {
-        color: #858b98;
+        color: var(--dim);
         font-variant-numeric: tabular-nums;
         min-width: 52px;
         text-align: right;
@@ -130,46 +188,46 @@
         font-size: 11px;
       }
       .b-st {
-        background: #1e2a3d;
-        color: #9fd0ff;
+        background: var(--t-blue-bg);
+        color: var(--t-blue-fg);
       }
       .b-call {
-        background: #16301f;
-        color: #7fd6a4;
+        background: var(--t-green-bg);
+        color: var(--ok);
       }
       .b-res {
-        background: #1c1e24;
-        color: #7fd6a4;
+        background: var(--hover);
+        color: var(--ok);
       }
       .b-fail {
-        background: #3d1e1e;
-        color: #ff9b9b;
+        background: var(--t-red-bg);
+        color: var(--err);
       }
       .b-chunk {
-        background: #2c2f38;
-        color: #b9bfca;
+        background: var(--line2);
+        color: var(--btn);
       }
       .b-th {
-        background: #1e2a3d;
-        color: #9fd0ff;
+        background: var(--t-blue-bg);
+        color: var(--t-blue-fg);
       }
       .b-err {
-        background: #3d1e1e;
-        color: #ff9b9b;
+        background: var(--t-red-bg);
+        color: var(--err);
       }
       .sum {
         flex: 1;
         word-break: break-all;
       }
       .pair {
-        color: #e8d47f;
+        color: var(--t-yellow-fg);
         font-variant-numeric: tabular-nums;
       }
       .folded {
         margin-top: 6px;
         font-size: 12px;
-        color: #858b98;
-        border-top: 1px solid #24272f;
+        color: var(--dim);
+        border-top: 1px solid var(--line);
         padding-top: 6px;
       }
     </style>
@@ -211,6 +269,8 @@
         // agent:init = 宿主已登记本 frame（load 事件后），此刻起桥调用才会被受理——
         // 初始拉数据必须挂在这里，脚本一跑就调用会因未登记被宿主丢弃（真机踩过）。
         if (d.type === 'agent:init') {
+          // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
+          document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
           load();
           return;
         }

@@ -2374,7 +2374,11 @@
                 const nid = nextId();
                 stream.asstId = nid;
                 updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() }]);
-              } else if (d.content) patch((m) => ({ ...m, content: m.content + d.content }));
+              } else if (d.content) {
+                // 正文开始 = 思考结束：思考计时当场冻结（用户实锤 bug：进入回答后
+                // 「思考 · 持续了」还在走）
+                patch((m) => ({ ...m, content: m.content + d.content, thinkFrozen: true, thinkLastAt: 0 }));
+              }
               // 思考分片：文字累积 + 「思考 · 持续了 N 秒」的实时计时。
               // 计时口径：相邻分片的时间差累加，单段间隔超过 5 秒的按 5 秒计
               // （中间夹着工具执行的长间隙不是思考时间，别把跑工具的时间算进去）
@@ -2382,7 +2386,7 @@
                 patch((m) => {
                   const now = Date.now();
                   const gap = m.thinkLastAt ? Math.min(now - m.thinkLastAt, 5000) : 0;
-                  return { ...m, thinking: m.thinking + d.reasoning, thinkLastAt: now, thinkMs: (m.thinkMs || 0) + gap };
+                  return { ...m, thinking: m.thinking + d.reasoning, thinkLastAt: now, thinkMs: (m.thinkMs || 0) + gap, thinkFrozen: false };
                 });
               // 降级链换渠道重试：丢掉本步已推的半截内容（长度由服务端按 UTF-16 码元数给出）
               else if (d.reset)
@@ -2403,6 +2407,8 @@
                 patch((m) => ({
                   ...m,
                   tools: [...(m.tools || []), { name: d.tool_call.name, args: d.tool_call.args, status: 'running' }],
+                  thinkFrozen: true, // 开始调工具 = 思考也结束了
+                  thinkLastAt: 0,
                 }));
               else if (d.tool_result)
                 patch((m) => {
@@ -3153,6 +3159,8 @@
     ? localStorage.getItem('theme')
     : 'dark';
   let theme = resolveTheme(themeMode);
+  // 组件初始化阶段就会调 applyThemeMode，那时插件桥还没建（extFrameEls 在 TDZ 里会抛）
+  let extsBridgeReady = false;
   function resolveTheme(mode) {
     return mode === 'system' ? (sysDark.matches ? 'dark' : 'light') : mode;
   }
@@ -3161,15 +3169,19 @@
     localStorage.setItem('theme', m);
     theme = resolveTheme(m);
     document.documentElement.dataset.theme = theme;
+    // 主题变了，已在跑的插件 iframe 也要换肤：重发一次 init（插件按 payload.theme 切 body.light）
+    if (extsBridgeReady) {
+      for (const name of Object.keys(extFrameEls)) {
+        const ext = extList.find((e) => e.name === name);
+        postToName(name, { type: 'agent:init', payload: extInitPayload(ext) });
+      }
+    }
   }
   function toggleTheme() {
     applyThemeMode(theme === 'dark' ? 'light' : 'dark');
   }
   sysDark.addEventListener('change', () => {
-    if (themeMode === 'system') {
-      theme = resolveTheme('system');
-      document.documentElement.dataset.theme = theme;
-    }
+    if (themeMode === 'system') applyThemeMode('system'); // 走同一条路：换肤 + 通知插件
   });
   applyThemeMode(themeMode); // 首屏即应用（组件初始化阶段，早于首帧渲染）
 
@@ -3544,7 +3556,8 @@
     return {
       version: appVersion?.version || '',
       root: appVersion?.root || '',
-      theme: themeMode,
+      theme: theme, // 已解析的实际主题（dark/light），system 模式也下发真值，插件别自己猜
+      theme_mode: themeMode,
       sessionId: currentSessionId,
       title: displayTitle,
       // P17：告诉扩展「你是谁」（权限 / 插槽声明它自己在 manifest 里写）
@@ -3554,6 +3567,7 @@
 
   /// 扩展 iframe 元素表：面板里那个 + 后台常驻的那些（扩展间通信要它们都活着）。
   let extFrameEls = {};
+  extsBridgeReady = true; // 插件桥就位：此后主题切换才会通知到插件 iframe
   function extWindowName(win) {
     for (const [name, el] of Object.entries(extFrameEls)) {
       if (el && el.contentWindow === win) return name;
@@ -4179,8 +4193,8 @@
               {/if}
               {#if m.thinking}
                 {@const thinkingOpen = thinkingOpenMap[m.id] ?? !!m.streaming}
-                {@const liveThinkMs = m.streaming
-                  ? (m.thinkMs || 0) + (m.thinkLastAt && nowTick - m.thinkLastAt < 5000 ? nowTick - m.thinkLastAt : 0)
+                {@const liveThinkMs = m.streaming && !m.thinkFrozen
+                  ? (m.thinkMs || 0) + (m.thinkLastAt && nowTick - m.thinkLastAt < 2000 ? nowTick - m.thinkLastAt : 0)
                   : m.thinkMs || 0}
                 <div class="thinking">
                   <button
@@ -7604,7 +7618,7 @@
     box-sizing: border-box;
   }
   .msg.user {
-    justify-content: flex-end;
+    justify-content: flex-start; /* 气泡去掉后与回复同侧左对齐（用户 2026-10-01） */
   }
   /* 排队中的消息（027）：气泡里带「立即发送」按钮——并进正在跑的那一轮，引导它的回答 */
   .queued-row {
@@ -7655,20 +7669,22 @@
   .content {
     white-space: pre-wrap;
   }
+  /* 用户消息不再画气泡（用户 2026-10-01：去掉气泡，ZCode 式纯文本）；
+     模型回复也没有边框底色，工具/审批/思考块自己带边框即可 */
   .user-bubble {
-    background: var(--brand);
-    color: var(--brand-ink);
-    border-bottom-right-radius: 4px;
+    color: var(--g7);
+    padding: 2px 0;
   }
   .asst-bubble {
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-bottom-left-radius: 4px;
+    padding: 2px 0;
     max-width: 100%;
     width: 100%;
   }
+  .msg.user .bubble,
   .msg.assistant .bubble {
-    max-width: 100%;
+    background: transparent;
+    border: none;
+    border-radius: 6px;
   }
   .error-bubble {
     background: var(--tint-red-bg);
@@ -7724,7 +7740,8 @@
   .thinking-caret.open {
     transform: rotate(90deg);
   }
-  /* 流式期间固定高度（不随文字增长跳变）；读完后按内容自适应、超长也封顶 340 */
+  /* 流式期间封顶 240px（不随吐字跳变），读完后按内容自适应、超长封顶 340。
+     开始没多少字时框就是内容高度——攒到一定量才固定并开始滚动（用户 2026-10-01） */
   .thinking-box {
     position: relative;
     margin-top: 6px;
@@ -7735,7 +7752,7 @@
     max-height: 340px;
   }
   .thinking-box.streaming {
-    height: 240px;
+    max-height: 240px;
   }
   .thinking-body {
     padding: 8px 10px 14px;
