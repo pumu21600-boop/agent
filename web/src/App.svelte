@@ -899,13 +899,15 @@
     clearInterval(tickTimer);
     tickTimer = null;
   }
-  /// 轮收尾：停表（工作用时冻结；思考计时不再涨）
+  /// 轮收尾：停表（工作用时冻结；还开着的思考阶段也关表累加）
   function endTurn(m) {
+    const closed = m.thinkPhaseStart ? Date.now() - m.thinkPhaseStart : 0;
     return {
       ...m,
       streaming: false,
       workMs: m.workMs || (m.workStartedAt ? Date.now() - m.workStartedAt : 0),
-      thinkMs: m.thinkMs || 0,
+      thinkMs: (m.thinkMs || 0) + closed,
+      thinkPhaseStart: 0,
     };
   }
   /// 「3 分 47 秒」/「27 秒」；不到 1 秒显示 1 秒（别给 0 秒这种怪数字）
@@ -2375,19 +2377,17 @@
                 stream.asstId = nid;
                 updMsgs(skey, (a) => [...a, ...adds, { id: nid, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() }]);
               } else if (d.content) {
-                // 正文开始 = 思考结束：思考计时当场冻结（用户实锤 bug：进入回答后
-                // 「思考 · 持续了」还在走）
-                patch((m) => ({ ...m, content: m.content + d.content, thinkFrozen: true, thinkLastAt: 0 }));
-              }
-              // 思考分片：文字累积 + 「思考 · 持续了 N 秒」的实时计时。
-              // 计时口径：相邻分片的时间差累加，单段间隔超过 5 秒的按 5 秒计
-              // （中间夹着工具执行的长间隙不是思考时间，别把跑工具的时间算进去）
-              else if (d.reasoning)
+                // 正文 = 本段思考结束：把这段的跨度累进总时长并停表（实时数字不再走）。
+                // **不能清计时锚点 了事**——真渠道的思考常以少量大分片到达，按「分片间隔」
+                // 累加会得 0，时长就显示不出来（用户实锤）；按阶段跨度算才对
                 patch((m) => {
-                  const now = Date.now();
-                  const gap = m.thinkLastAt ? Math.min(now - m.thinkLastAt, 5000) : 0;
-                  return { ...m, thinking: m.thinking + d.reasoning, thinkLastAt: now, thinkMs: (m.thinkMs || 0) + gap, thinkFrozen: false };
+                  const closed = m.thinkPhaseStart ? Date.now() - m.thinkPhaseStart : 0;
+                  return { ...m, content: m.content + d.content, thinkMs: (m.thinkMs || 0) + closed, thinkPhaseStart: 0 };
                 });
+              }
+              // 思考分片：文字累积；首片开表（阶段跨度计时），多步任务里后续思考再开新表
+              else if (d.reasoning)
+                patch((m) => ({ ...m, thinking: m.thinking + d.reasoning, thinkPhaseStart: m.thinkPhaseStart || Date.now() }));
               // 降级链换渠道重试：丢掉本步已推的半截内容（长度由服务端按 UTF-16 码元数给出）
               else if (d.reset)
                 patch((m) => ({
@@ -2404,12 +2404,15 @@
                 }
                 if (add.length) updMsgs(skey, (a) => [...a, ...add]);
               } else if (d.tool_call)
-                patch((m) => ({
-                  ...m,
-                  tools: [...(m.tools || []), { name: d.tool_call.name, args: d.tool_call.args, status: 'running' }],
-                  thinkFrozen: true, // 开始调工具 = 思考也结束了
-                  thinkLastAt: 0,
-                }));
+                patch((m) => {
+                  const closed = m.thinkPhaseStart ? Date.now() - m.thinkPhaseStart : 0;
+                  return {
+                    ...m,
+                    tools: [...(m.tools || []), { name: d.tool_call.name, args: d.tool_call.args, status: 'running' }],
+                    thinkMs: (m.thinkMs || 0) + closed, // 调工具 = 本段思考结束，停表
+                    thinkPhaseStart: 0,
+                  };
+                });
               else if (d.tool_result)
                 patch((m) => {
                   const tools = [...(m.tools || [])];
@@ -4193,8 +4196,8 @@
               {/if}
               {#if m.thinking}
                 {@const thinkingOpen = thinkingOpenMap[m.id] ?? !!m.streaming}
-                {@const liveThinkMs = m.streaming && !m.thinkFrozen
-                  ? (m.thinkMs || 0) + (m.thinkLastAt && nowTick - m.thinkLastAt < 2000 ? nowTick - m.thinkLastAt : 0)
+                {@const liveThinkMs = m.thinkPhaseStart
+                  ? (m.thinkMs || 0) + (nowTick - m.thinkPhaseStart)
                   : m.thinkMs || 0}
                 <div class="thinking">
                   <button
@@ -7618,7 +7621,7 @@
     box-sizing: border-box;
   }
   .msg.user {
-    justify-content: flex-start; /* 气泡去掉后与回复同侧左对齐（用户 2026-10-01） */
+    justify-content: flex-end; /* 只去气泡，位置还在右边（用户 2026-10-02 纠正） */
   }
   /* 排队中的消息（027）：气泡里带「立即发送」按钮——并进正在跑的那一轮，引导它的回答 */
   .queued-row {
