@@ -44,15 +44,23 @@ pub struct UsageQuery {
 /// GET /api/usage/prices —— 价格设置页要的一切：现有价格表、可选渠道、币种与汇率、累计/上限。
 pub(super) async fn get_usage_prices(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
-    // 渠道清单：从现有配置带出（名称 + host + 模型），价格键就是 host + 模型 id
+    // 渠道清单：从现有配置带出（名称 + host + 模型），价格键就是 host + 模型 id。
+    // models 带该渠道**配置的全部模型**（用户实锤：不只当前选中的那个——一个渠道里
+    // 多个模型价目不同，价格页要能按渠道带出模型来选）
     let channels: Vec<Value> = s
         .configs
         .iter()
         .map(|c| {
+            let mut models = c.models.clone();
+            let active = c.effective_model();
+            if !active.is_empty() && !models.iter().any(|m| m == &active) {
+                models.insert(0, active.clone());
+            }
             json!({
                 "name": c.name,
                 "host": host_of(&c.effective_base_url()),
-                "model": c.effective_model(),
+                "model": active,
+                "models": models,
             })
         })
         .collect();

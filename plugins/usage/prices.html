@@ -151,14 +151,28 @@ async function load() {
   }
 }
 
+function channelModels(host) {
+  const c = channels.find((x) => x.host === host);
+  const list = (c && c.models) || [];
+  return [...new Set([...list, '*'])]; // 去重 + 通配兜底放最后
+}
+
 function drawRows() {
   const opts = (sel) =>
     channels.map((c) => `<option value="${c.host}" ${c.host === sel ? 'selected' : ''}>${c.name} · ${c.host}</option>`).join('');
+  // 模型格：选中渠道后带出该渠道配置的模型做下拉建议（datalist，仍可手填 * 或别的 id）
+  const modelCell = (r, i) => {
+    const models = channelModels(r.provider);
+    const dl = `mdl-${i}`;
+    const extra = r.model && !models.includes(r.model) ? `<option value="${r.model}"></option>` : '';
+    return `<input list="${dl}" value="${r.model}" onchange="setModel(${i}, this.value)" placeholder="模型 id 或 *" />
+      <datalist id="${dl}">${extra}${models.map((m) => `<option value="${m}"></option>`).join('')}</datalist>`;
+  };
   $('rows').innerHTML = rows
     .map(
       (r, i) => `<tr>
       <td><select onchange="setHost(${i}, this.value)"><option value=""></option>${opts(r.provider)}</select></td>
-      <td><input value="${r.model}" onchange="setModel(${i}, this.value)" placeholder="模型 id 或 *" /></td>
+      <td>${modelCell(r, i)}</td>
       <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.prompt)}" onchange="setP(${i}, 'prompt', this.value)" /></td>
       <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.cached)}" onchange="setP(${i}, 'cached', this.value)" /></td>
       <td><input type="number" step="0.0001" min="0" value="${toDisplay(r.completion)}" onchange="setP(${i}, 'completion', this.value)" /></td>
@@ -172,7 +186,11 @@ function drawRows() {
 
 function addRow() { rows.push({ provider: '', model: '', prompt: 0, cached: 0, completion: 0 }); drawRows(); }
 function delRow(i) { rows.splice(i, 1); drawRows(); }
-function setHost(i, v) { rows[i].provider = v; }
+function setHost(i, v) {
+  rows[i].provider = v;
+  // 换渠道：模型建议列表跟着换（已填的模型 id 不动，用户自己决定改不改）
+  drawRows();
+}
 function setModel(i, v) { rows[i].model = v.trim(); }
 function setP(i, k, v) { rows[i][k] = toUsd(v); }
 
