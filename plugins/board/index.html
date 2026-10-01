@@ -298,26 +298,45 @@
       const ARROW = '<svg class="arw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
       const FILE_ICO = '<svg class="fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/></svg>';
 
-      // —— 面包屑：工作区名 + 当前根的各段（每段可点，点了浏览根就到那） ——
+      // —— 面包屑：完整绝对路径的每一段都可点（用户要求：路径大一点、可点、点到哪到哪）——
+      // 工作区内的段（含工作区自己）→ 直接把浏览根切过去；工作区外的段（C:/Users/Desktop
+      // 这些）服务端不能列（只列工作区内目录）→ 点了回工作区根并说明——保证点哪都有反应。
       function renderCrumb() {
         const el = document.getElementById('crumb');
-        const wsName = wsPath ? nameOf(wsPath.replace(/[\\/]+$/, '')) || wsPath : '(未知)';
-        const parts = ['']; // 根 = 工作区
-        if (root) for (const seg of root.split('/')) parts.push((parts[parts.length - 1] ? parts[parts.length - 1] + '/' : '') + seg);
-        let html = `<button data-root="" title="${esc(wsPath)}" class="${root ? '' : 'cur'}">${esc(wsName)}</button>`;
-        for (let i = 1; i < parts.length; i++) {
-          const rel = parts[i];
-          html += `<span class="sep">›</span><button data-root="${esc(rel)}" class="${i === parts.length - 1 ? 'cur' : ''}">${esc(nameOf(rel))}</button>`;
-        }
+        const sep = wsPath.includes('\\') ? '\\' : '/';
+        const wsNorm = String(wsPath || '').replace(/[\\/]+$/, '');
+        const wsParts = wsNorm.split(/[\\/]+/).filter(Boolean);
+        const subParts = root ? root.split('/').filter(Boolean) : [];
+        let html = '';
+        wsParts.forEach((seg, i) => {
+          if (i > 0) html += '<span class="sep">›</span>';
+          const isCur = i === wsParts.length - 1 && !subParts.length;
+          html += `<button data-ws="${i}" class="${isCur ? 'cur' : ''}" title="${esc(wsParts.slice(0, i + 1).join(sep))}">${esc(seg)}</button>`;
+        });
+        subParts.forEach((seg, i) => {
+          const rel = subParts.slice(0, i + 1).join('/');
+          html += `<span class="sep">›</span><button data-rel="${esc(rel)}" class="${i === subParts.length - 1 ? 'cur' : ''}">${esc(seg)}</button>`;
+        });
         el.innerHTML = html;
         el.querySelectorAll('button').forEach((b) => {
           b.onclick = () => {
-            root = b.dataset.root || '';
+            if (b.dataset.ws !== undefined) {
+              const idx = Number(b.dataset.ws);
+              if (idx === wsParts.length - 1) {
+                root = '';
+                status('');
+              } else {
+                root = '';
+                status(`「${b.textContent}」在工作区外，只能浏览工作区内的目录——已回到工作区根`, true);
+              }
+            } else {
+              root = b.dataset.rel || '';
+              status('');
+            }
             render();
           };
         });
-        // 路径长了先把右端（当前目录）滚进视野
-        el.scrollLeft = el.scrollWidth;
+        el.scrollLeft = el.scrollWidth; // 路径长了先把右端（当前目录）滚进视野
       }
 
       // —— 树渲染：文件夹一行，展开才往下画一层 ——

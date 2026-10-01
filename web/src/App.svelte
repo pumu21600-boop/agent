@@ -7019,12 +7019,15 @@
   .rp-pane.hidden {
     display: none;
   }
-  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode；用户反馈太紧凑 → 卡片放宽） */
+  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode；用户两轮反馈太紧凑 → 撑满面板宽度） */
   .rp-open {
     margin: auto;
     text-align: center;
-    padding: 0 12px;
-    max-width: 100%;
+    /* 关键：margin:auto 下容器是收缩宽度，卡片只有内容那么宽（用户实锤"还是很紧凑"）；
+       撑满（限宽 480）让两列卡片真正变大 */
+    width: 100%;
+    max-width: 480px;
+    padding: 0 14px;
   }
   .rp-open-title {
     font-size: 17px;
@@ -7040,20 +7043,20 @@
   .rp-open-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
+    gap: 14px;
   }
   .rp-open-card {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 12px;
-    padding: 26px 14px;
+    gap: 14px;
+    padding: 30px 16px;
     border-radius: 12px;
     border: 1px solid var(--g3);
     background: var(--g1);
     color: var(--g6);
-    font-size: 13.5px;
+    font-size: 14px;
     cursor: pointer;
   }
   .rp-open-card:hover {
@@ -7062,8 +7065,8 @@
     border-color: var(--g4);
   }
   .rp-open-card svg {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
   }
   /* 文件预览标签的头部（路径吸顶 + 编辑/保存/重读） */
   .rp-preview-head {
