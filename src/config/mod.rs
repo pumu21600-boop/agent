@@ -156,21 +156,15 @@ pub struct RecoveryConfig {
     /// shadow repo checkpoint 总开关（danger≥1 工具执行前拍快照）
     #[serde(default = "default_checkpoint_enabled")]
     pub checkpoint_enabled: bool,
-    /// 上下文占用达到预算该比例时自动生成交接文档 HANDOFF.md
-    #[serde(default = "default_handoff_ratio")]
-    pub handoff_token_ratio: f32,
 }
 
 fn default_checkpoint_enabled() -> bool {
     true
 }
-fn default_handoff_ratio() -> f32 {
-    0.8
-}
 
 impl Default for RecoveryConfig {
     fn default() -> Self {
-        Self { checkpoint_enabled: default_checkpoint_enabled(), handoff_token_ratio: default_handoff_ratio() }
+        Self { checkpoint_enabled: default_checkpoint_enabled() }
     }
 }
 

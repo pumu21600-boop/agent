@@ -151,7 +151,6 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/picker", post(pick_workspace))
         .route("/api/workspace/remove", post(remove_workspace))
         .route("/api/workspace/alias", post(alias_workspace))
-        .route("/api/handoff", post(make_handoff))
         .route("/api/checkpoints", get(list_checkpoints))
         .route("/api/git/status", get(git_status))
         .route("/api/git/info", get(git_runtime_info))

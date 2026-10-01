@@ -76,8 +76,6 @@ recent_tool_results_kept = 6
 [recovery]
 # P6 恢复与续命：danger≥1 工具执行前拍影子仓库检查点（<workspace>/.agent/shadow）
 checkpoint_enabled = true
-# 上下文占用达预算该比例时自动生成交接文档 HANDOFF.md（每任务一次）
-handoff_token_ratio = 0.8
 
 [memory]
 # P7 记忆 v1：总开关（false 时 events.log/index/AGENTS.md 注入/滚动摘要全停）

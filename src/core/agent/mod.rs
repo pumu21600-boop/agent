@@ -363,8 +363,6 @@ pub async fn run_task(
     } else {
         None
     };
-    // P6 自动交接：本任务内只触发一次
-    let mut handoff_done = false;
     // 会话标题素材：本任务第一次最终回答（引导续跑后不从「好的已结束」生成标题）
     let mut title_source: Option<String> = None;
 
@@ -475,51 +473,8 @@ pub async fn run_task(
             &on_event,
         );
         let est_total = breakdown.total();
-        // P6 自动交接：占用过阈值 → 生成交接文档（每任务一次），下一会话可接续
-        if !handoff_done && est_total > 0 {
-            let ratio = rec_cfg.handoff_token_ratio.clamp(0.05, 1.0);
-            let threshold = (ctx_cfg.budget_tokens as f32 * ratio) as u64;
-            if threshold > 0 && est_total >= threshold {
-                handoff_done = true;
-                let pct = ((est_total as f32 / ctx_cfg.budget_tokens as f32) * 100.0).round() as u64;
-                let ws = tools::workspace_root().to_path_buf();
-                let session_id = observability::get().session_id().to_string();
-                let trigger =
-                    format!("自动：上下文占用 {pct}%（阈值 {}%）", (ratio * 100.0).round() as u64);
-                let task_msgs = snapshot_msgs(&msgs);
-                let res = tokio::task::spawn_blocking(move || {
-                    recovery::write_handoff(
-                        &ws,
-                        &recovery::HandoffInput {
-                            trigger,
-                            session_id,
-                            messages: Some(task_msgs),
-                        },
-                    )
-                })
-                .await;
-                match res {
-                    Ok(Ok(path)) => {
-                        observability::event(
-                            EventType::State,
-                            json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "auto", "context_pct": pct }),
-                        );
-                        mem.record("handoff.written", json!({ "trigger": "auto", "context_pct": pct }));
-                        emit_notice(
-                            &mut msgs,
-                            &on_event,
-                            format!("上下文占用 {pct}%，已自动生成交接文档 {}", path.display()),
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        observability::event(EventType::Error, json!({ "message": format!("自动 HANDOFF 生成失败: {e}") }))
-                    }
-                    Err(e) => {
-                        observability::event(EventType::Error, json!({ "message": format!("自动 HANDOFF 任务失败: {e}") }))
-                    }
-                }
-            }
-        }
+        // P6 交接文档已按用户要求移除（2026-10-01）：上下文满时的自动 HANDOFF 生成
+        // 与 composer 手动按钮都不做了——会话落盘+摘要已保障续命，不再另生文档
         observability::debug(&format!("[loop] step {step} 调用模型 {}", primary.model));
 
         // P8 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）

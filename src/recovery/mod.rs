@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, anyhow, bail};
-use chrono::{Local, SecondsFormat, Utc};
-use serde_json::Value;
+use chrono::{SecondsFormat, Utc};
 
 /// 单个检查点（id 为影子仓库完整 commit 哈希）。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -467,130 +466,7 @@ fn one_line(s: &str, max_chars: usize) -> String {
     flat.chars().take(max_chars).collect()
 }
 
-/// 从消息数组里取纯文本（string / null / 分段数组都兜住）。
-fn content_text(v: Option<&Value>) -> String {
-    match v {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| p.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
-}
 
-/// HANDOFF 输入：触发说明 + 会话消息（无会话时 None）。
-pub struct HandoffInput {
-    /// 如「手动」「自动：上下文占用 83%（阈值 80%）」
-    pub trigger: String,
-    pub session_id: String,
-    pub messages: Option<Vec<Value>>,
-}
-
-/// 生成交接文档 `<workspace>/HANDOFF.md`。
-/// 头部四要素（项目名/git remote/commit/时间戳）照总架构 §9 强制写入；正文 v1 从简，不调模型。
-pub fn write_handoff(ws: &Path, input: &HandoffInput) -> anyhow::Result<PathBuf> {
-    let bin = crate::tools::git_exe().ok();
-    let (remote, commit) = match &bin {
-        Some(b) => (
-            git_ok(b, None, ws, &["remote", "get-url", "origin"])
-                .map(|s| if s.is_empty() { "（未配置 origin）".into() } else { s })
-                .unwrap_or_else(|_| "（未配置 origin）".to_string()),
-            git_ok(b, None, ws, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "（非 git 仓库）".to_string()),
-        ),
-        None => ("（未配置 origin）".into(), "（git 不可用）".into()),
-    };
-    let project = ws
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| ws.to_string_lossy().to_string());
-
-    let mut md = String::new();
-    md.push_str(&format!("# HANDOFF — {project}\n\n"));
-    md.push_str("> 本文件由 agent 自动生成（P6 恢复与续命），供下一会话接续。崩溃/换会话后先读本文件。\n\n");
-    md.push_str("| 项 | 值 |\n|---|---|\n");
-    md.push_str(&format!("| 项目名 | {project} |\n"));
-    md.push_str(&format!("| git remote | {remote} |\n"));
-    md.push_str(&format!("| HEAD commit | {commit} |\n"));
-    md.push_str(&format!(
-        "| 时间戳 | {}（UTC {}） |\n",
-        Local::now().format("%Y-%m-%d %H:%M:%S %z"),
-        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
-    ));
-    md.push_str(&format!("| session | {} |\n", input.session_id));
-    md.push_str(&format!("| 触发 | {} |\n\n", input.trigger));
-
-    if let Some(msgs) = &input.messages {
-        // 最近用户请求（≤5，每条压成一行）
-        let users: Vec<String> = msgs
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .filter_map(|m| {
-                let t = content_text(m.get("content"));
-                let t = one_line(&t, 200);
-                (!t.is_empty()).then_some(t)
-            })
-            .collect();
-        md.push_str("## 最近用户请求\n\n");
-        if users.is_empty() {
-            md.push_str("（无）\n\n");
-        } else {
-            for (i, u) in users.iter().rev().take(5).rev().enumerate() {
-                md.push_str(&format!("{}. {u}\n", i + 1));
-            }
-            md.push('\n');
-        }
-
-        // 最后一次助手回答（前 500 字）
-        let last_asst = msgs
-            .iter()
-            .rev()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .filter_map(|m| {
-                let t = content_text(m.get("content"));
-                (!t.trim().is_empty()).then_some(t)
-            })
-            .next();
-        md.push_str("## 最后一次助手回答（前 500 字）\n\n");
-        match last_asst {
-            Some(t) => md.push_str(&format!("{}\n\n", t.chars().take(500).collect::<String>())),
-            None => md.push_str("（无）\n\n"),
-        }
-
-        // 本会话工具调用计数
-        let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-        for m in msgs {
-            if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
-                for c in calls {
-                    if let Some(n) = c.pointer("/function/name").and_then(Value::as_str) {
-                        *counts.entry(n.to_string()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        md.push_str("## 本会话工具调用\n\n");
-        if counts.is_empty() {
-            md.push_str("（无）\n\n");
-        } else {
-            let line = counts
-                .into_iter()
-                .map(|(k, v)| format!("{k} ×{v}"))
-                .collect::<Vec<_>>()
-                .join("、");
-            md.push_str(&format!("{line}\n\n"));
-        }
-    }
-
-    md.push_str("## 边界说明\n\n");
-    md.push_str("- 文件改动可用检查点回滚（GET /api/checkpoints 列表、POST /api/checkpoints/restore 恢复）；shell 副作用不可回滚。\n");
-    md.push_str("- 会话消息在 `<日志目录>/session.json`，新会话用 DELETE /api/session。\n");
-
-    let path = ws.join("HANDOFF.md");
-    crate::fsx::write_atomic_str(&path, &md)
-        .with_context(|| format!("写 HANDOFF 失败: {}", path.display()))?;
-    Ok(path)
-}
 
 #[cfg(test)]
 mod tests {
@@ -795,60 +671,5 @@ mod tests {
         assert!(err.to_string().contains("非法"));
     }
 
-    #[test]
-    fn handoff_header_fields() {
-        if !git_have() {
-            return;
-        }
-        let ws = temp_ws("handoff");
-        let w = ws.path();
-        ws.git(&["init", "--quiet"]);
-        ws.git(&["config", "user.name", "test"]);
-        ws.git(&["config", "user.email", "test@local"]);
-        std::fs::write(w.join("x.txt"), "x\n").unwrap();
-        ws.git(&["add", "x.txt"]);
-        ws.git(&["commit", "--quiet", "-m", "base"]);
 
-        let path = write_handoff(
-            w,
-            &HandoffInput {
-                trigger: "自动：上下文占用 83%（阈值 80%）".into(),
-                session_id: "sid-test".into(),
-                messages: Some(vec![
-                    json!({"role": "user", "content": "帮我修编译错误"}),
-                    json!({"role": "assistant", "content": "正在看", "tool_calls": [
-                        {"function": {"name": "read_file"}},
-                        {"function": {"name": "read_file"}},
-                        {"function": {"name": "shell"}}
-                    ]}),
-                    json!({"role": "tool", "content": "…"}),
-                    json!({"role": "assistant", "content": "修好了，原因是 xxx"}),
-                ]),
-            },
-        )
-        .unwrap();
-        assert_eq!(path, w.join("HANDOFF.md"));
-        let md = std::fs::read_to_string(&path).unwrap();
-        assert!(md.contains("# HANDOFF — "), "项目名: {md}");
-        assert!(md.contains("agent-p6-handoff"), "用目录名当项目名: {md}");
-        assert!(md.contains("git remote"), "remote 字段: {md}");
-        assert!(md.contains("（未配置 origin）"), "无 remote 时标注: {md}");
-        assert!(md.contains("HEAD commit"), "commit 字段: {md}");
-        assert!(!md.contains("（非 git 仓库）"), "真仓库应有 commit 哈希: {md}");
-        assert!(md.contains("时间戳"), "时间戳字段: {md}");
-        assert!(md.contains("sid-test"), "session id: {md}");
-        assert!(md.contains("83%"), "触发原因: {md}");
-        assert!(md.contains("帮我修编译错误"), "最近请求: {md}");
-        assert!(md.contains("修好了"), "最后回答: {md}");
-        assert!(md.contains("read_file ×2"), "工具计数: {md}");
-        assert!(md.contains("shell ×1"), "工具计数: {md}");
-    }
-
-    #[test]
-    fn content_text_variants() {
-        assert_eq!(content_text(Some(&json!("abc"))), "abc");
-        assert_eq!(content_text(Some(&Value::Null)), "");
-        assert_eq!(content_text(Some(&json!([{"text": "a"}, {"text": "b"}]))), "ab");
-        assert_eq!(content_text(None), "");
-    }
 }

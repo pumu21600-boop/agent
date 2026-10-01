@@ -201,26 +201,5 @@ pub(super) async fn clear_session(State(state): State<AppState>, axum::extract::
     }
 }
 
-/// POST /api/handoff —— 手动生成交接文档（消息取自会话落盘）。
-pub(super) async fn make_handoff(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let ws = crate::tools::workspace_root().to_path_buf();
-    let session_id = observability::get().session_id().to_string();
-    let messages = state.session.latest().map(|f| f.messages);
-    let input = crate::recovery::HandoffInput {
-        trigger: "手动（用户请求）".to_string(),
-        session_id,
-        messages,
-    };
-    let res = tokio::task::spawn_blocking(move || crate::recovery::write_handoff(&ws, &input)).await;
-    match res {
-        Ok(Ok(path)) => {
-            observability::event(
-                EventType::State,
-                json!({ "kind": "handoff.written", "path": path.display().to_string(), "trigger": "manual" }),
-            );
-            (StatusCode::OK, Json(json!({ "ok": true, "path": path.display().to_string() })))
-        }
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-    }
-}
+// 注：P6 交接文档生成（/api/handoff 手动 + 核心循环 80% 自动）已按用户要求移除
+// （2026-10-01）——会话落盘与滚动摘要已保障跨任务续命，不再另生 HANDOFF.md。

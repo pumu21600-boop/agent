@@ -111,7 +111,6 @@ export const ELEMENT_ALIASES = [
   { sel: '.proj', name: '项目行' },
   { sel: '.proj-name', name: '项目名' },
   { sel: '.foot-btn', name: '侧栏底部按钮' },
-  { sel: '.handoff-btn', name: '交接文档按钮' },
   { sel: '.cp-dock', name: '改动条容器', pick: 'self' },
   { sel: '.cp-undo', name: '撤销按钮' },
   { sel: '.ctx-wrap', name: '上下文圆环容器', pick: 'self' },

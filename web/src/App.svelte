@@ -2906,20 +2906,6 @@
     return out;
   }
 
-  async function makeHandoff() {
-    try {
-      const r = await fetch('/api/handoff', { method: 'POST' });
-      const d = await r.json();
-      pushMsg(curKey(), {
-        id: nextId(),
-        role: 'system',
-        content: d.ok ? `交接文档已生成：${d.path}` : `HANDOFF 生成失败：${d.error}`,
-      });
-    } catch (e) {
-      pushMsg(curKey(), { id: nextId(), role: 'error', content: `[HANDOFF 请求失败] ${e}` });
-    }
-  }
-
   // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）。
   // remember=true → 本会话内「同类操作」不再询问（P9 A3）；后端拒绝记忆 Dangerous 档。
   async function decideApproval(id, approved, remember = false) {
@@ -4205,8 +4191,6 @@
                 </div>
               {/if}
             </div>
-            <!-- 「交接文档」从 composer 外浮动条挪进来（原来在卡片外缘，窄窗口/壳里被裁成半个字） -->
-            <button class="handoff-btn" on:click={makeHandoff} title="把当前会话压成交接文档 HANDOFF.md（写入工作区）">交接文档</button>
           </div>
           <div class="composer-right">
             {#if ctxUsage.window > 0}
@@ -5962,21 +5946,6 @@
   .galaxy-btn svg {
     width: 15px;
     height: 15px;
-  }
-  .handoff-btn {
-    flex: none;
-    background: transparent;
-    border: none;
-    color: var(--g4);
-    font-size: 12px;
-    padding: 3px 8px;
-    border-radius: 7px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .handoff-btn:hover {
-    color: var(--g6);
-    background: var(--g1);
   }
   .chat {
     flex: 1;
