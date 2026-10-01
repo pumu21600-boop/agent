@@ -3519,6 +3519,17 @@
           reply(true, await get(`/api/usage?group=${group}&range=${range}&session=${sid}`));
           break;
         }
+        // 圆环同源的当前上下文占用（活数据）：面板的「输入 token」是各次请求累计，
+        // 和圆环的窗口占用是两个口径——同一张卡里并排放，对照关系自明
+        case 'session.usage': {
+          reply(true, {
+            tokens: ctxUsage.tokens,
+            budget: ctxUsage.budget,
+            breakdown: ctxUsage.breakdown,
+            api: apiTotals,
+          });
+          break;
+        }
         // —— P21 价格设置（写操作，须声明 usage.prices 权限）——
         case 'usage.prices': {
           reply(true, await get('/api/usage/prices'));

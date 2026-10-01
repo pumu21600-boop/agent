@@ -108,13 +108,16 @@ async function refresh() {
     const r = await req('usage.session', { group: 'model', range: 'all' });
     currency = r.currency || 'USD';
     rate = r.usd_cny_rate || 7.2;
-    render(r, sid);
+    // 圆环同源的当前上下文占用（旧版宿主没有这路 RPC 时隐藏该行，不影响其余卡片）
+    let ctx = null;
+    try { ctx = await req('session.usage', {}); } catch (e) { ctx = null; }
+    render(r, sid, ctx);
   } catch (e) {
     $('body').innerHTML = `<div class="err">${String(e.message || e).replace(/</g, '&lt;')}</div>`;
   }
 }
 
-function render(r, sid) {
+function render(r, sid, ctx) {
   const t = r.totals || {};
   $('spend').textContent = money(r.spend_total_usd);
   $('cap').textContent = r.spend_cap_usd > 0 ? money(r.spend_cap_usd) : '未设置（不限）';
@@ -129,9 +132,19 @@ function render(r, sid) {
       )} · ${money(x.cost_usd)}</span></div>`
     )
     .join('');
+  // 当前上下文 = 模型窗口此刻的占用（最近一次请求实报，= 输入框旁圆环）；
+  // 输入 token 是各次请求的累计流量，一个是快照一个是累计，两个数本来就不相等
+  const wan = (n) => (n >= 10000 ? num(Math.round(n / 10000)) + '万' : num(n));
+  const ctxRow =
+    ctx && ctx.budget > 0
+      ? `<div class="row" title="模型窗口当前的占用（最近一次请求的实报，与输入框旁圆环同源）。「输入 token」是各次请求的累计，一个是窗口快照、一个是累计流量。"><span class="k">当前上下文（= 圆环）</span><span class="v">${num(
+          ctx.tokens
+        )} / ${wan(ctx.budget)}</span></div>`
+      : '';
   $('body').innerHTML = `
     <div class="card">
-      <div class="row"><span class="k">输入 token（其中缓存命中）</span><span class="v big">${num(t.prompt_tokens)}<span style="font-size:12px;color:#9a9aa2">（${num(t.cached_tokens)}）</span></span></div>
+      <div class="row"><span class="k" title="各次请求的输入合计（计费口径）">输入 token（累计）</span><span class="v big">${num(t.prompt_tokens)}<span style="font-size:12px;color:#9a9aa2">（缓存命中 ${num(t.cached_tokens)}）</span></span></div>
+      ${ctxRow}
       <div class="row"><span class="k">输出 token</span><span class="v big">${num(t.completion_tokens)}</span></div>
       <div class="row"><span class="k">请求次数（失败）</span><span class="v">${num(t.requests)}（${num(t.errors)}）</span></div>
       <div class="row"><span class="k">本次对话费用</span><span class="v big">${money(t.cost_usd)}</span></div>
