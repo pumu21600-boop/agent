@@ -106,6 +106,9 @@ struct Collectors {
     cached_tokens: AtomicU64,
     last_snapshot: std::sync::Mutex<Vec<Value>>,
     summary: std::sync::Mutex<Option<String>>,
+    /// 会话用量快照（与 /api/chat 同一份口径）：无头轮过去完全不落盘，导致
+    /// `agent.exe run` / 定时任务 / 子代理跑过的会话切回去圆环是空的——现在同样维护。
+    usage: std::sync::Mutex<crate::session::SessionUsage>,
 }
 
 /// 无人值守审批门：档位语义全部复用 ChatGate（同一把尺子），只有 ask() 按策略自动决定。
@@ -271,6 +274,10 @@ pub(crate) async fn run_headless_inner(
     }
 
     let col = Arc::new(Collectors::default());
+    // 用量快照种子：接着会话文件里上次落盘的那份（跨轮/跨重启延续累计与锚点）
+    if let Some(u) = state.session.get(&session_id).and_then(|f| f.usage) {
+        *col.usage.lock().unwrap_or_else(|e| e.into_inner()) = u;
+    }
     let notices_cell = Arc::new(std::sync::Mutex::new(notices));
     let (gtx, _grx) = mpsc::unbounded_channel();
     let gate = HeadlessGate {
@@ -349,6 +356,9 @@ pub(crate) async fn run_headless_inner(
         let mut error: Option<String> = None;
         let mut followups = 0u32;
         loop {
+            // 跨轮沿用锚点：上一轮结束时的 (基线占用, 配对估价)，与 /api/chat 同源
+            let prior_anchor =
+                col_task.usage.lock().unwrap_or_else(|e| e.into_inner()).anchor();
             let outcome = agent::run_task(
                 &gateway,
                 &agent::LoopChannels {
@@ -360,6 +370,7 @@ pub(crate) async fn run_headless_inner(
                     budget_hit: budget_fired.clone(),
                     // P22-C：主任务挂派发器；子代理轮不挂（禁嵌套）
                     subagents: subagents.clone(),
+                    prior_anchor,
                 },
                 &system_prompt,
                 &history,
@@ -391,7 +402,7 @@ pub(crate) async fn run_headless_inner(
                             .unwrap_or_else(|e| e.into_inner())
                             .push(json!({ "name": name, "ok": ok, "preview": preview }));
                     }
-                    agent::AgentEvent::ApiUsage { prompt_tokens, cached_tokens, added_tokens: _ } => {
+                    agent::AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                         // P18 钩子 + P21 预算降级：与 /api/chat 同一套记账
                         // P22-C：子代理花销并进本任务预算（水印增量）
                         let sub_total = subagent::subagent_tokens(&sid);
@@ -408,6 +419,20 @@ pub(crate) async fn run_headless_inner(
                         col_task.requests.fetch_add(1, Ordering::Relaxed);
                         col_task.prompt_tokens.fetch_add(prompt_tokens, Ordering::Relaxed);
                         col_task.cached_tokens.fetch_add(cached_tokens.unwrap_or(0), Ordering::Relaxed);
+                        // 累计并入用量快照（缓存行）；落盘搭 ContextUsage 的车（见下）
+                        let mut u = col_task.usage.lock().unwrap_or_else(|e| e.into_inner());
+                        u.apply_api(prompt_tokens, cached_tokens);
+                    }
+                    // 上下文占用：与 /api/chat 同一条落盘路径（无头轮也续圆环快照）
+                    agent::AgentEvent::ContextUsage { pressure, projected, window, breakdown } => {
+                        let snap = {
+                            let mut u = col_task.usage.lock().unwrap_or_else(|e| e.into_inner());
+                            u.apply_context(pressure, projected, window, &breakdown);
+                            u.clone()
+                        };
+                        if let Err(e) = session_mgr.update_usage(&sid, snap) {
+                            observability::debug(&format!("无头轮用量快照落盘失败: {e}"));
+                        }
                     }
                     // P6 会话落盘：与 /api/chat 同一落点（无头轮也续命会话文件）
                     agent::AgentEvent::Snapshot { messages } => {

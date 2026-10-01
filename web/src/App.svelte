@@ -39,7 +39,10 @@
   let approvalBySession = {};
   $: approvalEffective = approvalBySession[currentSessionId || '@new'] || approvalMode;
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
-  let ctxUsage = { tokens: 0, budget: 0, breakdown: null }; // 上下文占用（P5 圆环+明细卡）
+  // 上下文占用（P5 圆环+明细卡）。口径对齐 DSH token-meter：三个数语义分开——
+  // projected=下一次请求的预估占用（圆环分子，实报锚点+带符号增量）、
+  // pressure=最近一次渠道实报的 prompt（锚点，没拿到时为 null）、window=模型窗口（圆环分母）
+  let ctxUsage = { projected: 0, pressure: null, window: 0, breakdown: null };
   let ctxLen = 0; // 当前模型上下文长度（0=默认）
   let maxOut = 0; // 当前模型最大输出长度（0=默认）
   let temperature = null; // 采样温度（null=渠道默认）
@@ -419,17 +422,20 @@
   }
 
   // —— 上下文圆环（P5）——
-  $: ctxPct = ctxUsage.budget ? Math.min(100, Math.round((ctxUsage.tokens / ctxUsage.budget) * 100)) : 0;
+  // 分子 = projected（下一次请求的预估占用），分母 = window（模型窗口）
+  $: ctxPct = ctxUsage.window ? Math.min(100, Math.round((ctxUsage.projected / ctxUsage.window) * 100)) : 0;
   // 占用极少时百分比仍为 0，但弧保底 2%（实色弧可见，圆环"活"着）
-  $: ctxArcPct = ctxUsage.tokens > 0 && ctxPct === 0 ? 2 : ctxPct;
-  $: ctxPctText = ctxUsage.tokens > 0 && ctxPct === 0 ? '<1%' : ctxPct + '%';
+  $: ctxArcPct = ctxUsage.projected > 0 && ctxPct === 0 ? 2 : ctxPct;
+  $: ctxPctText = ctxUsage.projected > 0 && ctxPct === 0 ? '<1%' : ctxPct + '%';
   $: ctxCirc = 2 * Math.PI * 13;
   // 常态浅灰（同参考样式）；占用高时转警示色
   $: ctxColor = ctxPct >= 85 ? 'var(--tint-red-fg)' : ctxPct >= 60 ? 'var(--tint-yellow-fg)' : 'var(--g6)';
+  // 构成行：估算构成**按圆环的百分比分摊**（DSH 同一根环的画法）——各行加起来正好是
+  // 圆环那个数，不再各算各的分母；构成本身是近似值，只当构成看，不当总量
   $: ctxRows = (() => {
     const b = ctxUsage.breakdown || { messages: 0, tools: 0, system: 0, other: 0, tools_schema: 0 };
     const sum = Math.max(1, b.messages + b.tools + b.system + b.other + (b.tools_schema || 0));
-    const row = (label, v, color) => ({ label, v, color, pct: ((v / sum) * 100).toFixed(1) + '%' });
+    const row = (label, v, color) => ({ label, v, color, pct: ((ctxPct * v) / sum).toFixed(1) + '%' });
     return [
       row('消息', b.messages, 'var(--tint-blue-fg)'),
       row('工具结果', b.tools, 'var(--tint-cyan-fg)'),
@@ -567,8 +573,8 @@
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
     // 圆环常驻：会话未开始时也用配置预算初始化（context_length 或全局默认 96000）
-    if (!ctxUsage.budget) {
-      ctxUsage = { ...ctxUsage, budget: s.context_length || 96000 };
+    if (!ctxUsage.window) {
+      ctxUsage = { ...ctxUsage, window: s.context_length || 96000 };
     }
     configs = s.configs || [];
     activeConfigId = s.active_config_id || '';
@@ -2227,34 +2233,30 @@
                 if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
               }
               else if (d.context_usage) {
-                // 用量按会话记账（后台会话写各自账本）；正在看的才刷到显示
+                // 用量按会话记账（后台会话写各自账本）；正在看的才刷到显示。
+                // 圆环的**唯一**写入口：后端按「实报锚点 + 带符号增量」算好 projected 推来，
+                // 前端只做展示，不再自己加减（旧写法与 api_usage 两处都写，口径会打架）
+                const ctx = {
+                  projected: d.context_usage.projected || 0,
+                  pressure: d.context_usage.pressure ?? null,
+                  window: d.context_usage.window || 0,
+                  breakdown: d.context_usage.breakdown || null,
+                };
                 usageBySession = {
                   ...usageBySession,
-                  [skey]: {
-                    ctx: { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null },
-                    api: (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 },
-                  },
+                  [skey]: { ctx, api: (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 } },
                 };
-                if (skey === curKey())
-                  ctxUsage = { tokens: d.context_usage.tokens, budget: d.context_usage.budget, breakdown: d.context_usage.breakdown || null };
+                if (skey === curKey()) ctxUsage = ctx;
               }
               else if (d.api_usage) {
+                // 渠道实报只进「累计流量」账（平均缓存命中率行）；圆环不在这里改
                 const prev = (usageBySession[skey] || {}).api || { prompt: 0, cached: 0 };
                 const api = { prompt: prev.prompt + (d.api_usage.prompt_tokens || 0), cached: prev.cached + (d.api_usage.cached_tokens || 0) };
-                // 圆环 tokens = 渠道实报 prompt + 留存增量（正文+工具参数，思考内容不进
-                // 上下文不算；估算只兜首请求前）。回答一落地就刷新，不用等下一轮
-                const prevCtx = (usageBySession[skey] || {}).ctx || ctxUsage;
-                const ctx = d.api_usage.prompt_tokens > 0
-                  ? { ...prevCtx, tokens: d.api_usage.prompt_tokens + (d.api_usage.added_tokens || 0) }
-                  : prevCtx;
                 usageBySession = {
                   ...usageBySession,
-                  [skey]: { ctx, api },
+                  [skey]: { ctx: (usageBySession[skey] || {}).ctx || ctxUsage, api },
                 };
-                if (skey === curKey()) {
-                  apiTotals = api;
-                  ctxUsage = ctx;
-                }
+                if (skey === curKey()) apiTotals = api;
               } else if (d.step_limit) {
                 patch((m) => ({ ...m, streaming: false }));
                 pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
@@ -2411,12 +2413,15 @@
     }
   }
 
-  // 服务端用量快照（/api/sessions/open 的 r.usage）→ 圆环/缓存行同形
+  // 服务端用量快照（/api/sessions/open 的 r.usage）→ 圆环/缓存行同形。
+  // 旧会话文件里是 tokens/budget（改造前口径）——后端已用 serde alias 收下并改写成
+  // projected/window，这里对老服务端载荷也做一次兜底，免得切回旧会话圆环空掉
   function usageFromServer(su) {
     return {
       ctx: {
-        tokens: su.tokens || 0,
-        budget: su.budget || 0,
+        projected: su.projected ?? su.tokens ?? 0,
+        pressure: su.pressure ?? null,
+        window: su.window ?? su.budget ?? 0,
         breakdown: {
           messages: su.messages || 0,
           tools: su.tools || 0,
@@ -2429,13 +2434,13 @@
     };
   }
 
-  // 切到某会话：从按会话账本恢复用量；没账本的新会话清零（预算保留——圆环常驻）
+  // 切到某会话：从按会话账本恢复用量；没账本的新会话清零（窗口保留——圆环常驻）
   function restoreUsage(key) {
     // 活数据（本页收到的 SSE 事件）最新；没有才落回服务端快照（重启/重开后的恢复路径），
     // 并扶正为会话账本，后续切换不再反复读盘
     const u = usageBySession[key] || serverUsage[key];
     if (u && !usageBySession[key]) usageBySession = { ...usageBySession, [key]: u };
-    ctxUsage = u ? u.ctx : { tokens: 0, budget: ctxUsage.budget, breakdown: null };
+    ctxUsage = u ? u.ctx : { projected: 0, pressure: null, window: ctxUsage.window, breakdown: null };
     apiTotals = u ? u.api : { prompt: 0, cached: 0 };
   }
 
@@ -3525,8 +3530,9 @@
         // 和圆环的窗口占用是两个口径——同一张卡里并排放，对照关系自明
         case 'session.usage': {
           reply(true, {
-            tokens: ctxUsage.tokens,
-            budget: ctxUsage.budget,
+            projected: ctxUsage.projected,
+            pressure: ctxUsage.pressure,
+            window: ctxUsage.window,
             breakdown: ctxUsage.breakdown,
             api: apiTotals,
           });
@@ -4203,9 +4209,9 @@
             <button class="handoff-btn" on:click={makeHandoff} title="把当前会话压成交接文档 HANDOFF.md（写入工作区）">交接文档</button>
           </div>
           <div class="composer-right">
-            {#if ctxUsage.budget > 0}
+            {#if ctxUsage.window > 0}
               <div class="ctx-wrap">
-                <svg class="ctx-ring" viewBox="0 0 30 30" width="22" height="22" title="上下文占用">
+                <svg class="ctx-ring" viewBox="0 0 30 30" width="22" height="22" title="上下文占用（下一次请求的预估）">
                   <circle class="ctx-track" cx="15" cy="15" r="13" />
                   <circle
                     class="ctx-arc"
@@ -4221,7 +4227,7 @@
                 <div class="ctx-card">
                   <div class="ctx-card-head">
                     <b>上下文容量</b>
-                    <span>{fmtTok(ctxUsage.tokens)}/{fmtTok(ctxUsage.budget)}（{ctxPct}%）</span>
+                    <span>{fmtTok(ctxUsage.projected)}/{fmtTok(ctxUsage.window)}（{ctxPct}%）</span>
                   </div>
                   <div class="ctx-bar"><div class="ctx-bar-fill" style:width={`${ctxPct}%`}></div></div>
                   {#each ctxRows as row}
@@ -4235,7 +4241,13 @@
                     <span class="ctx-label">平均缓存命中率</span>
                     <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
                   </div>
-                  <div class="ctx-card-foot">超过预算自动归档旧工具结果并折叠早期对话</div>
+                  <div class="ctx-row cache-row">
+                    <span class="ctx-label">最近一次实报</span>
+                    <span class="ctx-val">{ctxUsage.pressure == null ? '—' : fmtTok(ctxUsage.pressure)}</span>
+                  </div>
+                  <!-- 口径说清：分子是「下一次请求」的预估（渠道实报锚点 + 之后的上下文增减，
+                       裁剪会让它当场回落）；构成行是估算值按圆环百分比分摊（加总 = 圆环） -->
+                  <div class="ctx-card-foot">占用 = 最近一次实报 + 其后的上下文增减；构成行为估算分摊。超过预算自动归档旧工具结果并折叠早期对话</div>
                 </div>
               </div>
             {:else}

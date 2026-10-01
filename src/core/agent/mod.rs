@@ -33,11 +33,15 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     ToolResult { name: String, ok: bool, preview: String },
     StepLimit(u32),
-    /// 上下文占用与分类占比（每轮模型调用前更新；P5 圆环数据源）
-    ContextUsage { tokens: u64, budget: u64, breakdown: context::Breakdown },
-    /// 渠道返回的真实用量（P5：缓存命中率展示）。added_tokens = 本次回复里会留存
-    /// 进上下文的部分（正文 + 工具调用参数）；思考内容默认剥离不回放，不计入
-    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64>, added_tokens: u64 },
+    /// 上下文占用（每步模型调用前 + 每次回复落地后各发一次；P5 圆环数据源）。
+    /// 口径对齐 DSH token-meter 的 `contextPressure`：三个数语义分开、单一来源——
+    /// `pressure`（最近一次渠道实报的 prompt，锚点，未拿到实报时为 None）、
+    /// `projected`（**下一次请求**的预估占用 = pressure + 自锚点以来的带符号增量，
+    /// 圆环分子，裁剪后会自动回落）、`window`（模型窗口，圆环分母）。
+    /// `breakdown` 是**估算**构成（近似值，不参与任何决策）。
+    ContextUsage { pressure: Option<u64>, projected: u64, window: u64, breakdown: context::Breakdown },
+    /// 渠道返回的真实用量（P5：缓存命中率累计 + 预算钩子 + 圆环锚点更新）。
+    ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
     /// 会话快照（P6）：当前全量消息（不含 system），server 收到即落盘
     Snapshot { messages: Vec<Value> },
     /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
@@ -104,6 +108,10 @@ pub struct LoopChannels {
     /// P22-C 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
     /// 工具调用 subagent_spawn 由核心循环拦截交给它——实现见 server/subagent.rs。
     pub subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>>,
+    /// 上一轮结束时的占用锚点 `(实报 pressure, 锚点时的本地估价)`，由 server 从会话用量
+    /// 快照带入：跨轮沿用锚点，圆环不会因为新起一轮就退回估算口径（DSH 的测量是会话级
+    /// 的，样本一直有效）。None/首轮 = 纯估算起步。
+    pub prior_anchor: Option<(u64, u64)>,
 }
 
 /// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
@@ -239,6 +247,45 @@ fn emit_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + S
     persist_notice(msgs, on_event, &text);
 }
 
+/// 测一次上下文占用并推给前端（唯一出口：圆环/构成/落盘全部读它）。
+/// `anchor = (实报 prompt, 那次请求发出时的本地估价)`；增量带符号，所以回复落地、
+/// 工具回填、追发消息会自动补上，裁剪/折叠会自动回落（见 `context::projected_tokens`）。
+/// 返回本次估价（构成 + 工具定义），调用方按需用于交接阈值等。
+fn emit_context_usage(
+    msgs: &[Value],
+    anchor: Option<(u64, u64)>,
+    tools_schema_tokens: u64,
+    count_reasoning: bool,
+    window: u64,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) -> context::Breakdown {
+    let mut breakdown = context::estimate_breakdown(msgs, count_reasoning);
+    breakdown.tools_schema = tools_schema_tokens;
+    let projected = context::projected_tokens(anchor, breakdown.total());
+    on_event(AgentEvent::ContextUsage {
+        pressure: anchor.map(|(real, _)| real),
+        projected,
+        window,
+        breakdown,
+    });
+    breakdown
+}
+
+/// 渠道实报落地：锚点跟随最新一次实报 + 发 ApiUsage（缓存行累计 / 预算钩子 / 落盘靠它）。
+/// 放在 assistant 消息 push **之后**调用——那时上下文已含这条回复，服务端一次落盘即终态。
+fn report_api_usage(
+    prompt_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+    est_at_request: u64,
+    anchor: &mut Option<(u64, u64)>,
+    on_event: &(impl Fn(AgentEvent) + Send + Sync),
+) {
+    if let Some(p) = prompt_tokens {
+        *anchor = Some((p, est_at_request));
+        on_event(AgentEvent::ApiUsage { prompt_tokens: p, cached_tokens });
+    }
+}
+
 /// 执行一个任务：messages 为前端带来的对话历史（不含 system）。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task(
@@ -341,12 +388,11 @@ pub async fn run_task(
         );
         crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
     };
-    // 渠道上报的真实 prompt_tokens（上一次主循环请求）。圆环优先用它——启发式估算
-    // 对 JSON 密度估不准（实测估算 5139 vs 渠道实报 4750），真实值才能和用量面板对上
-    let mut last_real_tokens: u64 = 0;
-    // 上一次回复的留存增量（正文 + 工具调用参数）：回复落地即进上下文（下次请求
-    // 必带），圆环要算上。思考内容不回放，不在此列
-    let mut last_added_tokens: u64 = 0;
+    // 占用锚点（对齐 DSH token-meter）：`(渠道实报 prompt_tokens, 那次请求发出时的本地估价)`。
+    // 圆环 = 实报 + 自锚点以来的带符号增量，所以「回复落地即进上下文」「工具结果回填」
+    // 「裁剪后回落」全都是自动的，不再需要手工维护 last_real/last_added 两个数。
+    // 起点可由 server 从上一轮的用量快照带入（跨轮沿用样本，见 LoopChannels::prior_anchor）。
+    let mut anchor: Option<(u64, u64)> = channels.prior_anchor.filter(|(p, e)| *p > 0 && *e > 0);
     let mut prev_tool_sigs: Vec<String> = Vec::new();
     // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
     // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
@@ -381,10 +427,8 @@ pub async fn run_task(
             let (mut compacted, stats) =
                 context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens, count_reasoning);
             if stats.compacted {
-                // 实报值是裁剪前上下文的产物，裁剪后已失真——清零回落到估算口径
-                //（重新按当前消息算），否则圆环停在旧大数等下一次响应才刷新
-                last_real_tokens = 0;
-                last_added_tokens = 0;
+                // 裁剪后不再清空实报值（旧做法：清零回落估算，等于把真实锚点丢了）：
+                // 锚点 + 带符号增量天然处理缩水——当前估价变小，增量就是负的，圆环当场回落。
                 observability::event(
                     EventType::State,
                     json!({
@@ -420,23 +464,17 @@ pub async fn run_task(
             }
             msgs = compacted;
         }
-        // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
-        let mut breakdown = context::estimate_breakdown(&msgs, count_reasoning);
-        breakdown.tools_schema = tools_schema_tokens;
+        // 圆环数据源（唯一出口）：锚点 + 带符号增量 → 占用；构成走估算，只当近似值。
+        // 交接阈值仍用估算口径（est_total）。
+        let breakdown = emit_context_usage(
+            &msgs,
+            anchor,
+            tools_schema_tokens,
+            count_reasoning,
+            ctx_cfg.budget_tokens,
+            &on_event,
+        );
         let est_total = breakdown.total();
-        // token 数优先用渠道实报的真实占用 + 上次回复的留存增量（正文+工具参数，回复
-        // 已进上下文，下次请求必带；思考内容不计入）；估算只在首请求前兜底。
-        // 交接阈值维持估算口径不变
-        let used = if last_real_tokens > 0 {
-            last_real_tokens + last_added_tokens
-        } else {
-            est_total
-        };
-        on_event(AgentEvent::ContextUsage {
-            tokens: used,
-            budget: ctx_cfg.budget_tokens,
-            breakdown,
-        });
         // P6 自动交接：占用过阈值 → 生成交接文档（每任务一次），下一会话可接续
         if !handoff_done && est_total > 0 {
             let ratio = rec_cfg.handoff_token_ratio.clamp(0.05, 1.0);
@@ -511,6 +549,9 @@ pub async fn run_task(
             chain.push(primary);
         }
         chain.extend(channels.fallbacks.iter());
+        // 锚点配对用的估价快照：就是上面那次测量的估价（send 前 msgs 不再变——
+        // 降级提示是 display_only，计价 0，不会让估价失真）。拿到实报时与它配对成新锚点
+        let est_at_request = est_total;
         let (outcome, chain_notices) = run_chain(
             gateway,
             &chain,
@@ -536,23 +577,8 @@ pub async fn run_task(
             ChatOutcome::Done(t) => t,
         };
 
-        // 渠道真实用量（缓存命中率展示；渠道不支持时为空）
-        if let Some(p) = turn.prompt_tokens {
-            last_real_tokens = p;
-            // 留存增量：正文 + 工具调用参数（completion 含推理 token，不能直接用——
-            // 思考默认剥离不回放，用户拍板一律不计入上下文）
-            last_added_tokens = context::estimate_tokens(&turn.content)
-                + turn
-                    .tool_calls
-                    .iter()
-                    .map(|c| 8 + context::estimate_tokens(&c.arguments))
-                    .sum::<u64>();
-            on_event(AgentEvent::ApiUsage {
-                prompt_tokens: p,
-                cached_tokens: turn.cached_tokens,
-                added_tokens: last_added_tokens,
-            });
-        }
+        // 渠道真实用量：锚点更新 + 缓存行累计在回复落地后报（见下面两处 report_api_usage），
+        // 这样服务端那一次 usage 落盘就是含本条回复的终态。
 
         // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
         // P27.3 起思考预算已在网关侧扩容（effective_max_tokens：思考开启时发送
@@ -622,6 +648,23 @@ pub async fn run_task(
             }
             msgs.push(final_msg);
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+            // 回复已落地 → 先报实报（更新锚点），再按新锚点重算占用推给前端：
+            // 圆环含这条回答，服务端那次落盘就是终态（重启后不丢这截增量）
+            report_api_usage(
+                turn.prompt_tokens,
+                turn.cached_tokens,
+                est_at_request,
+                &mut anchor,
+                &on_event,
+            );
+            emit_context_usage(
+                &msgs,
+                anchor,
+                tools_schema_tokens,
+                count_reasoning,
+                ctx_cfg.budget_tokens,
+                &on_event,
+            );
             // 标题素材取本任务**第一次**最终回答：引导续跑后的「好的，已结束」不该当会话标题
             if title_source.is_none() {
                 title_source = Some(final_text.clone());
@@ -702,6 +745,23 @@ pub async fn run_task(
             asst_msg["reasoning_content"] = json!(turn.reasoning);
         }
         msgs.push(asst_msg);
+        // 带工具调用的回复同样先落地再报：锚点更新 + 圆环重算（工具结果回填后，
+        // 下一步开头那次测量会把它们按增量补上）
+        report_api_usage(
+            turn.prompt_tokens,
+            turn.cached_tokens,
+            est_at_request,
+            &mut anchor,
+            &on_event,
+        );
+        emit_context_usage(
+            &msgs,
+            anchor,
+            tools_schema_tokens,
+            count_reasoning,
+            ctx_cfg.budget_tokens,
+            &on_event,
+        );
 
         // —— P12 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
         // fs_unconfined / unsandboxed 每步现读 gate：运行中切档，从下一步起按新档位执行
@@ -1044,6 +1104,157 @@ mod tests {
         assert_eq!(p.files, vec!["src/core/agent.rs", "src/server.rs"]);
     }
 
+    // —— 占用口径对齐 DSH（实报锚点 + 带符号增量）的端到端回归 ——
+    // 旧实现圆环 = 上次实报 + (正文+工具调用参数)，**整块工具结果不进圆环**：用户盯着
+    // 圆环等模型读工具结果的那段时间，显示的数偏小，要等下一次响应才跳一下。
+    // 这里两轮 mock 把它钉死：工具结果回填后那一次测量必须比响应刚落地的值更大。
+    #[tokio::test]
+    async fn context_usage_tracks_anchor_and_tool_results() {
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = hits.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let _ = Read::read(&mut s, &mut buf);
+                        let n = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // 第 1 轮：要一个工具（结果会回填进上下文）；第 2 轮：最终回答
+                        let body = if n == 0 {
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"config.toml\\\"}\"}}]}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":20}}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"读完了\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2500,\"completion_tokens\":30}}\n\n\
+                             data: [DONE]\n\n"
+                        };
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = s.write_all(r.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let ch = Channel::new(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "mock-model",
+            "sk-dummy",
+            ChatParams::default(),
+        );
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-ctxmeter-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false },
+            ws.join("global"),
+        );
+        // 收集每次 ContextUsage（pressure, projected）与 ApiUsage 次数
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(Option<u64>, u64)>::new()));
+        let api = Arc::new(AtomicUsize::new(0));
+        let seen_c = seen.clone();
+        let api_c = api.clone();
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = CancelFlag::new();
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "看看配置" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            move |ev: AgentEvent| match ev {
+                AgentEvent::ContextUsage { pressure, projected, .. } => {
+                    seen_c.lock().unwrap().push((pressure, projected))
+                }
+                AgentEvent::ApiUsage { .. } => {
+                    api_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            },
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(outcome.unwrap(), LoopOutcome::Done);
+        let seq = seen.lock().unwrap().clone();
+        assert_eq!(api.load(std::sync::atomic::Ordering::Relaxed), 2, "两次请求各报一次实报");
+        // 期望序列：① 首请求前（纯估算，无锚点）② 第 1 轮回复落地（锚点 1000）
+        //           ③ 工具结果回填后（锚点仍是 1000，但增量必须补上工具结果）④ 末轮回复落地（锚点 2500）
+        assert!(seq.len() >= 4, "至少要四次占用事件，实际 {seq:?}");
+        assert_eq!(seq[0].0, None, "首请求前没有实报锚点 → 纯估算");
+        assert_eq!(seq[1].0, Some(1000), "第 1 轮回复落地后锚点 = 渠道实报");
+        assert_eq!(seq[2].0, Some(1000), "工具结果回填不会换锚点");
+        assert!(
+            seq[2].1 > seq[1].1,
+            "工具结果必须计入圆环：回填后 {} 应大于回复刚落地时的 {}",
+            seq[2].1,
+            seq[1].1
+        );
+        let last = seq.last().unwrap();
+        assert_eq!(last.0, Some(2500), "末次锚点 = 第二次实报");
+        assert!(last.1 >= 2500, "圆环不低于实报本身，实际 {}", last.1);
+    }
+
     #[test]
     fn parse_plan_tolerant_marks() {
         // 中文冒号 + markdown 加粗 + 「-」列表符 + 反引号包裹路径
@@ -1136,6 +1347,7 @@ mod tests {
             downgrade: None,
             budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             subagents: None,
+            prior_anchor: None,
         };
         let ws = std::env::temp_dir().join(format!("agent-trunc-{}-{}", std::process::id(), port));
         std::fs::create_dir_all(&ws).unwrap();

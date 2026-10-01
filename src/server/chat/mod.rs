@@ -610,11 +610,18 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         let task_tokens = std::sync::atomic::AtomicU64::new(0);
         let budget_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // 用量快照槽：种子取会话文件里上次落盘的快照（跨请求/跨重启延续累计）；
-        // ContextUsage 事件只进槽，磁盘写搭 ApiUsage 的车（每步响应后必有一次，终态精确）
+        // ContextUsage 事件进槽并在那一刻落盘（每步至少两次、永远是含最新回复的终态），
+        // ApiUsage 只更新槽里的累计与锚点（缓存行/预算用）
         let usage_slot = std::sync::Mutex::new(
             session.get(&session_id).and_then(|f| f.usage).unwrap_or_default(),
         );
         loop {
+            // 锚点带入本轮的起点：上一轮结束时的 (实报 pressure, 锚点估价) —— 新起一轮
+            // 不会退回估算口径（DSH 的测量是会话级的，样本一直有效）
+            let prior_anchor = {
+                let u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
+                u.pressure.filter(|p| *p > 0 && u.anchor_est > 0).map(|p| (p, u.anchor_est))
+            };
             let outcome = agent::run_task(
                 &gateway,
                 // 续跑一轮时这些值复用（Channel 是克隆廉价的连接参数快照）
@@ -628,6 +635,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     budget_hit: budget_fired.clone(),
                     // P22-C：子代理派发（None 的任务不许派发）
                     subagents: subagents.clone(),
+                    prior_anchor,
                 },
                 // 提示词保持最小：prompts/system.md（"用中文简洁回答"）+ AGENTS.md 仓库事实 + 技能索引（无技能时不占上下文）。
                 // 不注入模型名/身份/角色——用户明确要求，模型自造身份属可接受代价（坑 13）
@@ -674,22 +682,22 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         send(json!({ "tool_result": { "name": name, "ok": ok, "preview": preview } }))
                     }
                     AgentEvent::StepLimit(n) => send(json!({ "step_limit": n })),
-                    AgentEvent::ContextUsage { tokens, budget, breakdown } => {
-                        // 快照进槽（只更分类占比；tokens 单一来源 = ApiUsage 的 prompt+completion，
-                        // 避免同一字段两个写法）。磁盘写搭本步 ApiUsage 的车
-                        {
+                    AgentEvent::ContextUsage { pressure, projected, window, breakdown } => {
+                        // 快照进槽并落盘：这是圆环/构成/跨轮锚点的唯一来源
+                        //（每步至多三次事件，最后一次必是含最新回复的终态）
+                        let snap = {
                             let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
-                            u.budget = budget;
-                            u.messages = breakdown.messages;
-                            u.tools = breakdown.tools;
-                            u.system = breakdown.system;
-                            u.other = breakdown.other;
-                            u.tools_schema = breakdown.tools_schema;
+                            u.apply_context(pressure, projected, window, &breakdown);
+                            u.clone()
+                        };
+                        if let Err(e) = session.update_usage(&session_id, snap) {
+                            observability::debug(&format!("用量快照落盘失败: {e}"));
                         }
                         send(json!({
                             "context_usage": {
-                                "tokens": tokens,
-                                "budget": budget,
+                                "pressure": pressure,
+                                "projected": projected,
+                                "window": window,
                                 "breakdown": {
                                     "messages": breakdown.messages,
                                     "tools": breakdown.tools,
@@ -700,7 +708,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             }
                         }))
                     }
-                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens, added_tokens } => {
+                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
                         // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
                         // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
                         // P22-C：子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
@@ -717,20 +725,12 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         {
                             crate::hooks::notify_budget_exceeded(&session_id, total, budget);
                         }
-                        // 用量快照落盘（读-改-写）：tokens = 本次实报 prompt + 留存增量
-                        // （正文+工具参数，思考不计入），主循环累计并入。重启后
-                        // /api/sessions/open 靠它恢复圆环与缓存行
-                        let snap = {
+                        // 累计并入槽（缓存命中率行）；圆环不在这里改口径——它只认 ContextUsage
+                        {
                             let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
-                            u.tokens = prompt_tokens + added_tokens;
-                            u.api_prompt = u.api_prompt.saturating_add(prompt_tokens);
-                            u.api_cached = u.api_cached.saturating_add(cached_tokens.unwrap_or(0));
-                            u.clone()
-                        };
-                        if let Err(e) = session.update_usage(&session_id, snap) {
-                            observability::debug(&format!("用量快照落盘失败: {e}"));
+                            u.apply_api(prompt_tokens, cached_tokens);
                         }
-                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens, "added_tokens": added_tokens } }))
+                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                     }
                     // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                     AgentEvent::Snapshot { messages } => {

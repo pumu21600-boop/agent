@@ -31,11 +31,21 @@ pub fn estimate_tokens(text: &str) -> u64 {
     cjk + other.div_ceil(2) + ascii.div_ceil(4)
 }
 
+/// 界面专用气泡（通知/错误）：随快照落盘给界面回放，发送前由 gateway replay 剥离
+/// （`apply_outgoing_transforms`），**模型永远看不到**——对齐 DSH「只给模型可见内容计价」，
+/// 计价 0，否则估算/预算/圆环都会被没发出去的内容顶高。
+fn is_display_only(m: &Value) -> bool {
+    m.get("display_only").and_then(Value::as_bool) == Some(true)
+}
+
 /// 单条消息估算（role 开销 + content + tool_calls；`count_reasoning` 时含 reasoning_content）。
 /// 思考是否计入**跟随回放判定**（should_preserve_replay）：DeepSeek/zai 契约与白名单
 /// 模型每轮把思考重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入
 /// （用户拍板 2026-10-01：切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
 fn estimate_message(m: &Value, count_reasoning: bool) -> u64 {
+    if is_display_only(m) {
+        return 0;
+    }
     let mut total: u64 = 4;
     if let Some(c) = m.get("content") {
         total += value_tokens(c);
@@ -92,6 +102,9 @@ impl Breakdown {
 pub fn estimate_breakdown(messages: &[Value], count_reasoning: bool) -> Breakdown {
     let mut b = Breakdown::default();
     for m in messages {
+        if is_display_only(m) {
+            continue;
+        }
         match m.get("role").and_then(Value::as_str).unwrap_or("") {
             "system" => b.system += estimate_message(m, false),
             "tool" => b.tools += estimate_message(m, false),
@@ -114,6 +127,26 @@ pub fn estimate_breakdown(messages: &[Value], count_reasoning: bool) -> Breakdow
         }
     }
     b
+}
+
+/// 占用口径（对齐 DSH token-meter 的 `projectedTokens`）：**实报锚点 + 自锚点以来的
+/// 带符号增量**。`anchor = (渠道实报 prompt_tokens, 那次请求发出时的本地估价)`，
+/// `est_now` = 当前上下文的本地估价。
+///
+/// 三个要点（都是本地自己算增量算不出来的）：
+/// 1. 工具结果/追发消息等**在请求之后**落进上下文的部分自动计入（本地估价涨了多少就补多少）；
+/// 2. 裁剪/折叠让上下文变小时增量是**负的**，圆环当场回落，不需要清空实报值；
+/// 3. 渠道实报与本地估价不是一个尺子（实报是真实分词），所以只拿它当锚，增量用本地尺子量。
+///
+/// 没用过实报（首请求前）或渠道不回 usage 时 anchor 为 None → 纯估算兜底。
+pub fn projected_tokens(anchor: Option<(u64, u64)>, est_now: u64) -> u64 {
+    match anchor {
+        Some((real, est_at_request)) => {
+            let delta = est_now as i128 - est_at_request as i128;
+            (real as i128 + delta).clamp(0, u64::MAX as i128) as u64
+        }
+        None => est_now,
+    }
 }
 
 /// 头尾压缩：短文本原样返回；超限保留头 60% + 尾 40%。
@@ -234,7 +267,12 @@ pub fn compact_messages(
             let kept: Vec<Value> = out
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !folded_ranges.iter().any(|(s, e)| *i >= *s && *i < *e))
+                // 0 号（system）由下面单独前置，绝不能再进 kept——否则折叠后 system 出现两次：
+                // 请求里多发一份（实测 system ≈1386 tokens）、tokens_after/审计/圆环都算两遍，
+                // 而且这份重复会随 snapshot_msgs（只 skip(1)）落进会话文件当历史重发。
+                .filter(|(i, _)| {
+                    *i != 0 && !folded_ranges.iter().any(|(s, e)| *i >= *s && *i < *e)
+                })
                 .map(|(_, m)| m.clone())
                 .collect();
             let mut new_out = vec![out[0].clone()];
@@ -398,6 +436,60 @@ mod tests {
         assert!(stats.folded.iter().any(|m| m.get("content").and_then(Value::as_str) == Some("问题0")));
         // 折叠后 out 里不再有这些原文（占位符替代）
         assert!(!out.iter().any(|m| m.get("content").and_then(Value::as_str) == Some("问题0")));
+    }
+
+    #[test]
+    fn fold_keeps_exactly_one_system_message() {
+        // 实锤回归（折叠后 system 被复制一份）：kept 曾把 0 号消息也收进去，而它又单独
+        // 前置了一次 → 输出 [system, 占位, system, …]。后果：请求多发一份 system、
+        // tokens_after/圆环重复计入、重复那份还会随快照落进会话文件。
+        let long_result = "r".repeat(6000);
+        let mut messages = vec![json!({ "role": "system", "content": "SYS" })];
+        for i in 0..8 {
+            messages.push(user_msg(&format!("问题{i}")));
+            messages.push(asst_msg());
+            messages.push(tool_msg(&long_result));
+        }
+        messages.push(user_msg("最后问题"));
+        let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 2 };
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
+        assert!(stats.folded_messages > 0, "该用例必须真的折叠");
+        let systems = out
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+            .count();
+        assert_eq!(systems, 1, "折叠后只允许有一条 system（0 号那条）: {out:?}");
+        assert_eq!(out[0]["content"], "SYS");
+        // 折叠确实让估价变小（重复的那份会把 tokens_after 顶高，等于白折）
+        assert!(stats.tokens_after < stats.tokens_before);
+    }
+
+    #[test]
+    fn display_only_bubbles_are_not_priced() {
+        // 通知/错误气泡只给界面看（发送前被 gateway replay 剥离），不该进估算/预算
+        let msgs = vec![
+            json!({ "role": "system", "content": "sys" }),
+            user_msg("问题"),
+            json!({ "role": "system", "content": format!("[通知] {}", "啰嗦".repeat(500)), "display_only": true }),
+        ];
+        let b = estimate_breakdown(&msgs, false);
+        assert_eq!(b.system, 4 + 1, "只算真正的 system 提示词");
+        assert_eq!(estimate_messages(&msgs, false), 4 + 1 + 4 + 2, "display_only 计价 0");
+        // 预算判定也不该被它顶高
+        let cfg = CompactConfig { budget_tokens: 100, recent_tool_results_kept: 1 };
+        let (_, stats) = compact_messages(&msgs, &cfg, 0, false);
+        assert!(!stats.compacted, "气泡不该把上下文顶过预算");
+    }
+
+    #[test]
+    fn projected_follows_anchor_with_signed_delta() {
+        // 锚点 + 带符号增量：涨了补上（工具结果/追发消息），缩了回落（裁剪），没锚点用估算
+        let anchor = Some((10_000u64, 9_000u64));
+        assert_eq!(projected_tokens(anchor, 9_000), 10_000, "上下文没变 → 就是实报值");
+        assert_eq!(projected_tokens(anchor, 12_000), 13_000, "新增 3000 估价的工具结果 → 补上");
+        assert_eq!(projected_tokens(anchor, 4_000), 5_000, "裁剪掉 5000 → 负增量，当场回落");
+        assert_eq!(projected_tokens(anchor, 0), 1_000, "极端缩水不出现负数");
+        assert_eq!(projected_tokens(None, 7_777), 7_777, "首请求前/渠道不回 usage → 纯估算");
     }
 
     #[test]

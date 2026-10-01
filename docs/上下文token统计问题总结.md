@@ -72,3 +72,39 @@ src/context/mod.rs（估算 + 裁剪）
 | 6 | 属实但属边缘权衡：摘要调用失败（辅助渠道故障）时折叠原文不回填；原文仍在 agent.jsonl 请求日志里（轮转保留）可追溯 | 暂不改；可选方向=失败时把折叠原文写进 HANDOFF.md 附件，待拍板 |
 | 7 | 风险成立但当前不咬人：默认 96000 只在模型未配 `context_length` 时生效，现有配置全部显式配了窗口 | 待拍板：把默认降到 65536（保守方向）还是引入按供应商的窗口表 |
 | 8 | 设计如此（测试注释自述）：保护区（最近 N 个工具结果+最后一轮）本身超预算时不强求，否则会把「正在用的上下文」裁掉 | 不改 |
+
+## 第三轮：对齐 DSH token-meter 的占用口径（2026-10-01 落地）
+
+对照本机 DSH 实现（`@deepseek-ai/dsh-token-meter`、`dsh-compaction-basic`、客户端 `ContextMeter`）
+逐条对齐。DSH 的核心是**一个测量源 + 一个锚点**：`measure()` 回放会话日志给出确定性的表面定价，
+提供方实报只在「规范 envelope 完全一致」时复用；占用显示 = `projectedTokens`（样本 + 样本之后
+表面的**带符号**位移），压缩读 `measure()`，UI 数字不参与任何决策。
+
+| 前两轮问题 | 本轮处理 |
+|---|---|
+| ① 折叠后 system 提示词被复制一份（`kept` 未排除下标 0；实测输出 `[system, 占位, system, …]`，请求多发一份、统计算两遍、还随快照写进会话文件） | **已修**：`kept` 只收下标 ≥1；回归测试 `fold_keeps_exactly_one_system_message` |
+| ② 圆环漏算整块工具结果（旧口径 `last_real + added(正文+工具参数)`——盯着圆环等模型读工具结果的那段时间显示偏小，要等下次响应才跳） | **已修**：换成 DSH 的「实报锚点 + 带符号增量」（`context::projected_tokens`）：工具结果/追发消息自动补上，裁剪当场回落，不再需要清零实报值 |
+| ③ 无头/定时/子代理会话不落用量快照 → 切回去圆环是空的 | **已修**：`SessionUsage::apply_context/apply_api` 收成一处共用，headless 事件臂同样落盘 |
+| ⑤ 圆环/构成/交接三个分母各说各话 | **已修（展示口径）**：圆环 = projected/window；构成行按圆环百分比分摊（加总 = 圆环，DSH 同一根环的画法）；卡片补「最近一次实报」行与口径说明。交接阈值仍走估算口径（未动） |
+| ⑥ real 路径增量与估算器的思考口径不一致（回放渠道来回跳） | **已消除**：增量不再单独算，统一由 `estimate_*` 的 `count_reasoning` 决定 |
+| ⑦ display_only 气泡（通知/错误）被本地估算计入，却不发给模型 | **已修**：`estimate_message`/`estimate_breakdown` 对 display_only 计价 0——模型看不到的不计价 |
+| ④ 预算 = 整个模型窗口，没给输出留余量 | **未动（下一步）**：DSH 阈值 `floor(min(W×0.8, W−O−B))`，O = 生效输出上限、B = 65536 余量；逐字保留预算还必须在阈值之下（配置不合法直接拒载） |
+| ⑧ 折叠达标不强求 / 摘要不参与裁剪 | 未动。DSH 的差异主要在阈值公式与「保留预算 < 阈值」的校验，随 ④ 一起做 |
+
+### 会话用量快照字段（旧文件自动升级，serde alias）
+
+| 字段 | 语义 |
+|---|---|
+| `projected` | 圆环分子：**下一次请求**的预估占用 = 实报锚点 + 自锚点以来的带符号增量 |
+| `pressure` | 最近一次渠道实报的 prompt（锚点，展示「最近一次实报」用） |
+| `anchor_est` | 与 `projected` 配对的本地估价（DSH 的 `sampledSurfaceTokens`）：跨轮沿用锚点靠这一对，新起一轮不会退回估算 |
+| `window` | 圆环分母（模型 `context_length` 或全局 `[context].budget_tokens`） |
+| `tokens` / `budget` | 旧字段名，读取时按 alias 收下（→ projected / window），写出只用新名 |
+
+### 对齐依据（本机 DSH 实现，只读核对）
+
+- `dsh-token-meter/lib/index.js:641-683`：`totalTokens = baseline + surfaceDeltaTokens`，锚点 envelope 不等就整体重估，增量可为负
+- `dsh-token-meter/lib/index.js:509-513`：`projectedTokens = max(0, pressureTokens + surfaceTokens − sampledSurfaceTokens)`（样本在 assistant 消息入 surface **之前**打戳，见 `:456-466`）
+- `dsh-client-ui-conversation/lib/client.js:16912-16920`：UI 占用 = `projectedTokens ?? pressureTokens` ÷ `contextWindow`；`:17031-17040` 构成段按圆环百分比分摊
+- `dsh-token-meter/lib/types/estimate.js`：固定启发式（4 字符/token、块开销 4、角色开销 4），文档明说「构成行只当近似构成，绝不当总量」
+- `dsh-compaction-basic/README.zh.md:62-69`：阈值 = `floor(min(W × thresholdRatio, W − O − headroomTokens))`，`retainRatio` 必须小于阈值

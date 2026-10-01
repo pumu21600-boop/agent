@@ -132,14 +132,17 @@ function render(r, sid, ctx) {
       )} · ${money(x.cost_usd)}</span></div>`
     )
     .join('');
-  // 当前上下文 = 模型窗口此刻的占用（最近一次请求实报，= 输入框旁圆环）；
-  // 输入 token 是各次请求的累计流量，一个是快照一个是累计，两个数本来就不相等
+  // 当前上下文 = 模型窗口此刻的占用（= 输入框旁圆环：渠道实报锚点 + 之后的上下文增减，
+  // 答的是"下一次请求多大"）；输入 token 是各次请求的累计流量，一个是快照一个是累计，
+  // 两个数本来就不相等。字段名：projected/window（旧宿主给 tokens/budget，按 ?? 兜底）
   const wan = (n) => (n >= 10000 ? num(Math.round(n / 10000)) + '万' : num(n));
+  const ctxUsed = ctx ? (ctx.projected ?? ctx.tokens) : undefined;
+  const ctxWindow = ctx ? (ctx.window ?? ctx.budget) : undefined;
   const ctxRow =
-    ctx && ctx.budget > 0
-      ? `<div class="row" title="模型窗口当前的占用（最近一次请求的实报，与输入框旁圆环同源）。「输入 token」是各次请求的累计，一个是窗口快照、一个是累计流量。"><span class="k">当前上下文（= 圆环）</span><span class="v">${num(
-          ctx.tokens
-        )} / ${wan(ctx.budget)}</span></div>`
+    ctx && ctxWindow > 0
+      ? `<div class="row" title="模型窗口此刻的占用（= 输入框旁圆环：最近一次渠道实报 + 其后的上下文增减，裁剪会当场回落）。「输入 token」是各次请求的累计，一个是窗口快照、一个是累计流量。"><span class="k">当前上下文（= 圆环）</span><span class="v">${num(
+          ctxUsed
+        )} / ${wan(ctxWindow)}</span></div>`
       : '';
   $('body').innerHTML = `
     <div class="card">

@@ -13,12 +13,28 @@ use serde_json::Value;
 
 /// 会话级用量快照（圆环与缓存行的落盘续命）：随 ContextUsage/ApiUsage 事件更新进会话
 /// 文件，重启/重开程序后由 /api/sessions/open 带回前端恢复，不用等下一轮请求再攒。
+///
+/// 口径对齐 DSH token-meter：圆环不再存「一个 tokens」，而是拆成三个语义明确的字段——
+/// `projected`（下一次请求的预估占用，圆环分子）、`pressure`（最近一次渠道实报的 prompt，
+/// 锚点）、`window`（模型窗口，圆环分母）。旧文件里的 `tokens`/`budget` 用 serde alias 兼容。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsage {
-    /// 圆环 token 数（渠道实报的真实占用优先，估算兜底）
-    pub tokens: u64,
-    /// 圆环预算（模型 context_length 或全局 [context].budget_tokens）
-    pub budget: u64,
+    /// 圆环分子：下一次请求的预估占用 = 实报锚点 + 自锚点以来的带符号增量
+    /// （`context::projected_tokens`）。旧字段名 tokens 语义最接近它，按 alias 收下。
+    #[serde(default, alias = "tokens")]
+    pub projected: u64,
+    /// 实报锚点：最近一次渠道实报的 prompt_tokens（渠道不回 usage / 首请求前为 None）。
+    /// **展示用**（「实报 x」），跨轮沿用锚点用的是下面 projected + anchor_est 这一对。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<u64>,
+    /// 与本次 `projected` 配对的本地估价（对齐 DSH 的 sampledSurfaceTokens）。
+    /// 跨轮沿用锚点靠 `(projected, anchor_est)` 这一对：下一轮的占用 =
+    /// projected + (当轮估价 − anchor_est)，所以新起一轮不会退回估算口径。
+    #[serde(default)]
+    pub anchor_est: u64,
+    /// 圆环分母：模型窗口（模型 context_length 或全局 [context].budget_tokens）
+    #[serde(default, alias = "budget")]
+    pub window: u64,
     /// 分类占比（估算口径）：user+assistant 正文 / 工具结果 / 系统提示词 / 结构开销 / 工具定义
     #[serde(default)]
     pub messages: u64,
@@ -35,6 +51,41 @@ pub struct SessionUsage {
     pub api_prompt: u64,
     #[serde(default)]
     pub api_cached: u64,
+}
+
+impl SessionUsage {
+    /// 上下文占用事件 → 快照（圆环三字段 + 构成 + 跨轮锚点对）。chat 与无头两条路径
+    /// 共用这一处，避免「网页聊天写、无头/定时/子代理不写」导致切回去圆环是空的。
+    pub fn apply_context(
+        &mut self,
+        pressure: Option<u64>,
+        projected: u64,
+        window: u64,
+        b: &crate::context::Breakdown,
+    ) {
+        self.pressure = pressure;
+        self.projected = projected;
+        self.window = window;
+        // 本次 projected 的配对估价 = 本次构成总量（构成与测量同一口径，见 context::Breakdown）
+        self.anchor_est = b.total();
+        self.messages = b.messages;
+        self.tools = b.tools;
+        self.system = b.system;
+        self.other = b.other;
+        self.tools_schema = b.tools_schema;
+    }
+
+    /// 渠道实报累计并入（平均缓存命中率行）。圆环锚点不在这里更新——
+    /// 锚点随 ContextUsage 一起落（那时回复已进上下文，落盘即终态）。
+    pub fn apply_api(&mut self, prompt_tokens: u64, cached_tokens: Option<u64>) {
+        self.api_prompt = self.api_prompt.saturating_add(prompt_tokens);
+        self.api_cached = self.api_cached.saturating_add(cached_tokens.unwrap_or(0));
+    }
+
+    /// 跨轮沿用锚点：`(基线占用, 该基线对应的本地估价)`。没数据（新会话/旧文件）返回 None。
+    pub fn anchor(&self) -> Option<(u64, u64)> {
+        (self.projected > 0 && self.anchor_est > 0).then_some((self.projected, self.anchor_est))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,12 +476,14 @@ mod tests {
         let a = m.new_id();
         m.save(&a, &[json!({"role":"user","content":"你好"})], None).unwrap();
 
-        // 模拟一轮对话的用量事件：ApiUsage 落快照（tokens=渠道实报，累计并入）
+        // 模拟一轮对话的用量事件：ApiUsage 落快照（projected=圆环分子，累计并入）
         m.update_usage(
             &a,
             SessionUsage {
-                tokens: 4750,
-                budget: 1_000_000,
+                projected: 4750,
+                pressure: Some(4750),
+                anchor_est: 5100,
+                window: 1_000_000,
                 messages: 10,
                 tools: 0,
                 system: 1467,
@@ -451,24 +504,43 @@ mod tests {
         .unwrap();
         let f = m.get(&a).expect("会话应在");
         let u = f.usage.expect("save 后用量快照应保留");
-        assert_eq!(u.tokens, 4750);
+        assert_eq!(u.projected, 4750);
+        assert_eq!(u.pressure, Some(4750));
         assert_eq!(u.api_prompt, 4750);
         assert_eq!(u.tools_schema, 3273);
+        assert_eq!(u.anchor(), Some((4750, 5100)), "跨轮锚点 = (基线占用, 配对估价)");
 
-        // 再次事件：累计叠加（跨请求/跨重启延续）；tokens 跟随最新一次实报
+        // 再次事件：累计叠加（跨请求/跨重启延续）；圆环跟随最新一次锚点
         m.update_usage(
             &a,
-            SessionUsage { tokens: 3972, api_prompt: 4750 + 3972, api_cached: 128, ..u.clone() },
+            SessionUsage { projected: 3972, api_prompt: 4750 + 3972, api_cached: 128, ..u.clone() },
         )
         .unwrap();
         let f2 = m.get(&a).unwrap();
         let u2 = f2.usage.unwrap();
         assert_eq!(u2.api_prompt, 8722);
         assert_eq!(u2.api_cached, 128);
-        assert_eq!(u2.tokens, 3972, "tokens 跟随最新一次实报");
+        assert_eq!(u2.projected, 3972, "圆环跟随最新一次占用");
 
         // 不存在的会话：明确报错而不是悄悄写盘
         assert!(m.update_usage("no-such-session", SessionUsage::default()).is_err());
+    }
+
+    #[test]
+    fn legacy_usage_snapshot_still_loads() {
+        // 旧会话文件里是 tokens/budget 两个字段（改造前口径），别名收下不许丢数据
+        let old: SessionUsage = serde_json::from_str(
+            r#"{"tokens":4750,"budget":128000,"messages":10,"tools":0,"system":1467,
+                "other":0,"tools_schema":3273,"api_prompt":4750,"api_cached":128}"#,
+        )
+        .expect("旧格式必须能读");
+        assert_eq!(old.projected, 4750, "旧 tokens 语义最接近 projected");
+        assert_eq!(old.window, 128000, "旧 budget → window");
+        assert_eq!(old.pressure, None, "旧文件没有实报锚点");
+        // 新写出去的是新字段名
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(text.contains("\"projected\"") && text.contains("\"window\""));
+        assert!(!text.contains("\"tokens\""), "不再吐出旧字段名");
     }
 
     #[test]
