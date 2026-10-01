@@ -30,6 +30,7 @@
         font-size: 13px;
         font-weight: 600;
         color: #e8ebf2;
+        flex: none;
       }
       .ws {
         flex: 1;
@@ -79,16 +80,19 @@
         font-variant-numeric: tabular-nums;
       }
       .list {
-        flex: 1 1 46vh;
+        flex: 1;
         min-height: 120px;
         overflow-y: auto;
         border-top: 1px solid #24272f;
+        padding: 4px 6px;
       }
+      /* 经典文件树样式：一个箭头指向文件名（用户 2026-10-01 拍板，去掉彩色标签） */
       .row {
         display: flex;
         align-items: center;
-        gap: 8px;
-        padding: 4px 12px;
+        gap: 6px;
+        padding: 3px 8px;
+        border-radius: 6px;
         cursor: default;
         user-select: none;
       }
@@ -98,34 +102,14 @@
       .row.sel {
         background: #22242c;
       }
-      .ext {
+      .row .arw {
         flex: none;
-        width: 30px;
-        height: 20px;
-        border-radius: 4px;
-        display: grid;
-        place-items: center;
-        font-size: 10px;
-        font-weight: 600;
-        letter-spacing: 0.2px;
-        background: #2c2f38;
+        width: 12px;
+        height: 12px;
+        color: #6b7280;
+      }
+      .row:hover .arw {
         color: #b9bfca;
-      }
-      .ext.e-code {
-        background: #16301f;
-        color: #7fd6a4;
-      }
-      .ext.e-doc {
-        background: #3a3417;
-        color: #e8d47f;
-      }
-      .ext.e-cfg {
-        background: #1e2a3d;
-        color: #9fd0ff;
-      }
-      .ext.e-media {
-        background: #33204d;
-        color: #c9a6f5;
       }
       .path {
         flex: 1;
@@ -139,54 +123,6 @@
       }
       .path .name {
         color: #d8dbe2;
-      }
-      .preview {
-        flex: none;
-        height: 40vh;
-        display: flex;
-        flex-direction: column;
-        border-top: 1px solid #2c2f38;
-        background: #121317;
-        min-height: 0;
-      }
-      .preview.hidden,
-      .menu.hidden {
-        display: none;
-      }
-      .pv-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        border-bottom: 1px solid #24272f;
-        font-size: 12px;
-        color: #e8ebf2;
-      }
-      .pv-head .nm {
-        flex: 1;
-        min-width: 0;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .pv-head button {
-        padding: 2px 8px;
-        font-size: 11px;
-      }
-      .pv-body {
-        flex: 1;
-        margin: 0;
-        padding: 8px 12px;
-        overflow: auto;
-        font: 12px/1.55 Consolas, "Cascadia Code", "Courier New", monospace;
-        color: #b9bfca;
-        white-space: pre-wrap;
-        word-break: break-all;
-      }
-      .pv-note {
-        padding: 4px 12px 8px;
-        font-size: 11px;
-        color: #858b98;
       }
       .status {
         flex: none;
@@ -211,12 +147,15 @@
       .menu {
         position: fixed;
         z-index: 10;
-        min-width: 150px;
+        min-width: 160px;
         background: #1c1e24;
         border: 1px solid #2c2f38;
         border-radius: 8px;
         padding: 4px;
         box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+      }
+      .menu.hidden {
+        display: none;
       }
       .menu button {
         display: block;
@@ -242,11 +181,12 @@
   </head>
   <body>
     <!--
-      「项目速览」= 工作区文件列表（2026-10-01 按用户要求重做）：点文件预览内容，
+      「项目速览」= 工作区文件列表（2026-10-01 按用户要求重做）：经典树样式（箭头 + 文件名），
+      点击在右侧边栏**新标签页预览**（宿主桥 preview.open，预览内容由宿主标签渲染）；
       右键复制路径 / 文件名 / 绝对路径，或把路径插进宿主输入框。
       本页跑在 sandbox="allow-scripts" 的 iframe 里（不透明源）：fetch 不到 /api，
       clipboard API 也不归它使——数据与剪贴板一律走 postMessage 白名单
-      （workspace.info / workspace.files / workspace.file / clipboard.write / composer.insert）。
+      （workspace.info / workspace.files / preview.open / clipboard.write / composer.insert）。
     -->
     <div class="head">
       <b>项目文件</b>
@@ -258,14 +198,6 @@
       <span class="count" id="count"></span>
     </div>
     <div id="list" class="list"><div class="empty">加载中…</div></div>
-    <div id="preview" class="preview hidden">
-      <div class="pv-head">
-        <span class="nm" id="pv-name"></span>
-        <button id="pv-close" title="关闭预览">✕</button>
-      </div>
-      <pre id="pv-body" class="pv-body"></pre>
-      <div id="pv-note" class="pv-note"></div>
-    </div>
     <div id="status" class="status"></div>
     <div id="menu" class="menu hidden"></div>
 
@@ -274,8 +206,7 @@
       let seq = 0;
       let wsPath = '';
       let files = [];
-      let selected = ''; // 当前选中（预览中）的相对路径
-      const MAX_SHOW = 20000; // 预览渲染上限（超出截断展示，后端读取上限 200KB）
+      let selected = '';
 
       function call(method, params) {
         return new Promise((resolve, reject) => {
@@ -312,18 +243,6 @@
       function esc(s) {
         return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
       }
-      function extOf(path) {
-        const i = path.lastIndexOf('.');
-        const e = i > 0 ? path.slice(i + 1).toLowerCase() : '';
-        return e.length > 4 ? e.slice(0, 4) : e;
-      }
-      const CODE = new Set(['rs', 'js', 'mjs', 'ts', 'svelte', 'html', 'css', 'wat', 'wasm', 'py', 'go', 'java', 'c', 'cpp', 'h', 'sh', 'sql', 'json', 'jsonl']);
-      const DOC = new Set(['md', 'txt', 'docx', 'pdf', 'doc', 'rtf']);
-      const CFG = new Set(['toml', 'yaml', 'yml', 'ini', 'conf', 'lock', 'cfg', 'env']);
-      const MEDIA = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'mp3', 'wav', 'mp4', 'webm']);
-      function extClass(e) {
-        return CODE.has(e) ? 'e-code' : DOC.has(e) ? 'e-doc' : CFG.has(e) ? 'e-cfg' : MEDIA.has(e) ? 'e-media' : '';
-      }
       function absPath(rel) {
         if (!wsPath) return rel;
         const sep = wsPath.includes('\\') ? '\\' : '/';
@@ -333,92 +252,64 @@
         const i = rel.lastIndexOf('/');
         return i < 0 ? rel : rel.slice(i + 1);
       }
+      const ARROW =
+        '<svg class="arw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>';
 
-      // —— 列表渲染（过滤即时生效，选中行高亮）——
       function renderList() {
         const q = document.getElementById('filter').value.trim().toLowerCase();
         const shown = q ? files.filter((f) => f.toLowerCase().includes(q)) : files;
         const list = document.getElementById('list');
-        document.getElementById('count').textContent = q
-          ? `${shown.length} / ${files.length}`
-          : `${files.length} 个文件`;
+        document.getElementById('count').textContent = q ? `${shown.length} / ${files.length}` : `${files.length} 个文件`;
         if (!shown.length) {
           list.innerHTML = `<div class="empty">${files.length ? '没有匹配的文件' : '工作区里没有文件'}</div>`;
           return;
         }
         list.innerHTML = shown
           .map((f) => {
-            const e = extOf(f);
             const i = f.lastIndexOf('/');
             const dir = i < 0 ? '' : f.slice(0, i + 1);
             const nm = i < 0 ? f : f.slice(i + 1);
-            return `<div class="row${f === selected ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(f)}">
-              <span class="ext ${extClass(e)}">${esc(e || '·')}</span>
+            return `<div class="row${f === selected ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(absPath(f))}">
+              ${ARROW}
               <span class="path"><span class="dir">${esc(dir)}</span><span class="name">${esc(nm)}</span></span>
             </div>`;
           })
           .join('');
         list.querySelectorAll('.row').forEach((el) => {
-          el.onclick = () => preview(el.dataset.f);
+          el.onclick = () => openPreview(el.dataset.f);
           el.oncontextmenu = (ev) => {
             ev.preventDefault();
-            selectRow(el.dataset.f, false);
+            selectRow(el.dataset.f);
             openMenu(ev, el.dataset.f);
           };
         });
       }
-
-      function selectRow(f, doPreview) {
+      function selectRow(f) {
         selected = f;
         document.querySelectorAll('.row').forEach((el) => el.classList.toggle('sel', el.dataset.f === f));
-        if (doPreview) preview(f);
       }
 
-      // ——  Preview：宿主桥读工作区文本文件（read_file 同款越界防护与截断）——
-      async function preview(f) {
-        selectRow(f, false);
-        const box = document.getElementById('preview');
-        const nm = document.getElementById('pv-name');
-        const body = document.getElementById('pv-body');
-        const note = document.getElementById('pv-note');
-        box.classList.remove('hidden');
-        nm.textContent = f;
-        nm.title = absPath(f);
-        body.textContent = '读取中…';
-        note.textContent = '';
+      // 点击 = 在右侧边栏新标签页预览（宿主执行；本页不再内嵌预览）
+      async function openPreview(f) {
+        selectRow(f);
         try {
-          const r = await call('workspace.file', { path: f });
-          const text = (r && r.content) || '';
-          // 后端 cap 是头尾压缩（context::compress），中间插 OMITTED_MARK「……[中间省略」——
-          // 文件超上限时内容变短且带这个标记，据此提示用户（不是文件真容）
-          const truncated = text.includes('……[中间省略');
-          body.textContent = text.length > MAX_SHOW ? text.slice(0, MAX_SHOW) + '\n…（预览只显示前 20000 字符，完整内容请直接打开文件）' : text;
-          note.textContent = truncated
-            ? '注意：文件超过读取上限，内容是头尾压缩后的（中间有省略）'
-            : `${text.length} 字符 · 右键可复制路径`;
+          await call('preview.open', { path: f });
+          status('已在新标签页打开：' + f);
         } catch (e) {
-          body.textContent = '';
-          note.textContent = '读取失败: ' + (e.message || e);
-          status('读取失败: ' + (e.message || e), true);
+          status('打开失败: ' + (e.message || e), true);
         }
       }
-      document.getElementById('pv-close').onclick = () => {
-        document.getElementById('preview').classList.add('hidden');
-        document.querySelectorAll('.row.sel').forEach((el) => el.classList.remove('sel'));
-        selected = '';
-      };
-      document.getElementById('filter').oninput = renderList;
 
-      // —— 右键菜单：复制路径 / 复制文件名 / 插入输入框 ——
       const menu = document.getElementById('menu');
       function openMenu(ev, f) {
         const items = [
+          ['在新标签页预览', () => openPreview(f)],
+          ['sep'],
           ['复制相对路径', () => copy(f, '相对路径')],
           ['复制绝对路径', () => copy(absPath(f), '绝对路径')],
           ['复制文件名', () => copy(nameOf(f), '文件名')],
           ['sep'],
           ['插入到输入框', () => insert(f)],
-          ['预览', () => preview(f)],
         ];
         menu.innerHTML = items
           .map(([label, fn]) => (label === 'sep' ? '<div class="sep"></div>' : `<button data-a="${esc(label)}">${esc(label)}</button>`))
@@ -433,7 +324,6 @@
           };
         });
         menu.classList.remove('hidden');
-        // 贴边收拢：菜单弹出后不允许溢出 iframe 视口
         const w = menu.offsetWidth;
         const h = menu.offsetHeight;
         menu.style.left = Math.max(4, Math.min(ev.clientX, window.innerWidth - w - 4)) + 'px';
@@ -465,7 +355,6 @@
         }
       }
 
-      // —— 初始加载：工作区信息 + 文件列表 ——
       async function loadAll() {
         status('');
         try {
@@ -481,9 +370,8 @@
           const r = await call('workspace.files');
           files = (r && r.files) || [];
           document.getElementById('count').textContent = `${files.length} 个文件`;
-          const list = document.getElementById('list');
           if (!files.length) {
-            list.innerHTML = '<div class="empty">工作区里没有文件</div>';
+            document.getElementById('list').innerHTML = '<div class="empty">工作区里没有文件</div>';
             return;
           }
           if (r && r.truncated) status('文件较多，列表只取了前 500 个');

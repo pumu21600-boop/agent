@@ -831,15 +831,51 @@
   let termInput = '';
   let termRunning = false;
   let termOutEl;
-  // 右侧面板开合与页签持久化（跟 rpWidth/侧栏宽一个 pattern）——否则每次重开 App 面板
+  // 右侧面板开合持久化（跟 rpWidth/侧栏宽一个 pattern）——否则每次重开 App 面板
   // 都是关着的，内置浏览器得点两级才找得到（用户截图反馈过"浏览器不在侧边栏"）。
-  // 首启默认停在「网页」：内置浏览器是该面板最需要被看见的能力。
   let rightPanelOpen = localStorage.getItem('rpOpen') === null ? true : localStorage.getItem('rpOpen') === '1';
-  let rpTab = localStorage.getItem('rpTab') || 'web';
+  // —— 右侧边栏 = 统一标签页（用户 2026-10-01 拍板）——
+  // 产物/网页/插件面板（时间线/项目速览/用量）/文件预览全在这里开标签页；标签可关、
+  // 尾部 + 号加面板、关光了显示「打开标签页」选择页。首启把用户点名的五个面板开好
+  // （插件没启用的话渲染时自然消失）。持久化：rpTabs（开着哪些）+ rpTab（激活 key）。
+  const RP_BUILTIN = [
+    { key: 'artifacts', kind: 'artifacts', title: '产物' },
+    { key: 'web', kind: 'web', title: '网页' },
+  ];
+  function rpDefaultTabs() {
+    return [
+      { key: 'ext:trace', kind: 'ext', name: 'trace', title: '时间线' },
+      { key: 'ext:board', kind: 'ext', name: 'board', title: '项目速览' },
+      { key: 'artifacts', kind: 'artifacts', title: '产物' },
+      { key: 'web', kind: 'web', title: '网页' },
+      { key: 'ext:usage', kind: 'ext', name: 'usage', title: '用量' },
+    ];
+  }
+  let rpTabs = (() => {
+    try {
+      const raw = JSON.parse(localStorage.getItem('rpTabs') || 'null');
+      if (Array.isArray(raw) && raw.length) return raw.filter((t) => t && t.key && t.kind);
+    } catch {}
+    return rpDefaultTabs();
+  })();
+  // 老 localStorage（单 rpTab：'preview'/'ext:x'/'web'）迁移：'preview' 已撤（预览改为
+  // 按文件开标签），插件 key 不在列表就补一条，实在对不上就用第一个标签。
+  let rpTab = (() => {
+    const want = localStorage.getItem('rpTab') || '';
+    if (rpTabs.some((t) => t.key === want)) return want;
+    if (want.startsWith('ext:')) {
+      const name = want.slice(4);
+      rpTabs.push({ key: want, kind: 'ext', name, title: name });
+      return want;
+    }
+    return (rpTabs[0] || {}).key || '';
+  })();
+  let rpAddOpen = false; // 标签栏 + 号的添加菜单
   let rpFiles = [];
   let rpLoading = false;
-  let rpPreviewPath = '';
-  let rpPreviewContent = '';
+  let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
+  let rpPreviewCache = {}; // path → { loading, content }（标签切换不重拉）
+  let dockPaneFrames = {}; // 插件标签的 iframe（bind:this），按插件名
 
   // —— P20.1 网页（右侧面板「网页」页签）——
   // P21：截图轮询改 screencast 帧端点（内存直出）；面板可见时 600ms 自动刷帧
@@ -929,11 +965,12 @@
   }
 
   $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
-  // 右侧面板开合/页签持久化（换任何路径改这两个状态都会落盘）
+  // 右侧面板开合/标签持久化（换任何路径改这几个状态都会落盘）
   $: {
     try {
       localStorage.setItem('rpOpen', rightPanelOpen ? '1' : '0');
       localStorage.setItem('rpTab', rpTab);
+      localStorage.setItem('rpTabs', JSON.stringify(rpTabs));
     } catch {}
   }
   // 空白页（about:blank）显示空态引导；有地址就渲染截图
@@ -1404,14 +1441,30 @@
     return '';
   }
 
+  /// 产物基线（用户实锤 bug：有产物不显示——cp 消息不落盘，刷新后消息流里没有基线，
+  /// 「产物」整列空；改动条早有兜底，两处统一到这里）：
+  /// 本会话消息流里的检查点 → 本会话自己的检查点 → 全局最新检查点。
+  async function resolveBaseline() {
+    const inStream = currentBaseline();
+    if (inStream) return inStream;
+    try {
+      const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
+      const r = await fetch(`/api/checkpoints${q}`).then((r) => r.json());
+      const latest = (r.mine || [])[0] || (r.checkpoints || [])[0];
+      return latest ? latest.id : '';
+    } catch {
+      return '';
+    }
+  }
+
   async function loadArtifacts() {
-    const baseline = currentBaseline();
+    rpLoading = true;
+    const baseline = await resolveBaseline();
     if (!baseline) {
       rpFiles = [];
       rpLoading = false;
       return;
     }
-    rpLoading = true;
     try {
       const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((r) => r.json());
       rpFiles = r.files || [];
@@ -1421,22 +1474,63 @@
     rpLoading = false;
   }
 
-  async function previewFile(f) {
-    rpPreviewPath = f;
-    rpTab = 'preview';
-    rpPreviewContent = '';
-    try {
-      const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(f)}`).then((r) => r.json());
-      rpPreviewContent = r.ok ? r.content : `读取失败: ${r.error}`;
-    } catch (e) {
-      rpPreviewContent = `读取失败: ${e.message || e}`;
+  // —— 右侧标签页：增 / 关 / 激活 / 文件预览标签 ——
+  function activateRpTab(key) {
+    rpTab = key;
+    rpAddOpen = false;
+    const t = rpTabs.find((x) => x.key === key);
+    if (!t) return;
+    if (t.kind === 'artifacts') loadArtifacts();
+    if (t.kind === 'web') loadWebState();
+    if (t.kind === 'file') loadPreview(t.path);
+  }
+  function addRpTab(p) {
+    if (!rpTabs.some((t) => t.key === p.key)) rpTabs = [...rpTabs, { key: p.key, kind: p.kind, name: p.name, title: p.title }];
+    activateRpTab(p.key);
+  }
+  function closeRpTab(key) {
+    const i = rpTabs.findIndex((t) => t.key === key);
+    if (i < 0) return;
+    const rest = rpTabs.filter((t) => t.key !== key);
+    rpTabs = rest;
+    if (rpTab === key) {
+      const next = rest[i] || rest[i - 1]; // 优先右邻，没有取左邻；都没有 = 关光 → 选择页
+      rpTab = next ? next.key : '';
+      if (next) activateRpTab(next.key);
     }
   }
-
+  // 插件面板（时间线/项目速览/用量）开成标签：点「+」菜单或空态选择页进来的
+  function rpExtTitle(name) {
+    const e = enabledExts.find((x) => x.name === name);
+    if (!e) return name;
+    const u = (e.ui || []).find((x) => x.slot === 'dock' || x.slot === 'toolbar');
+    return (u && u.title) || e.title || name;
+  }
+  function openPreviewTab(path) {
+    const key = 'file:' + path;
+    if (!rpTabs.some((t) => t.key === key)) {
+      rpTabs = [...rpTabs, { key, kind: 'file', path, title: path.split('/').pop() || path }];
+    }
+    rpPreviewPath = path;
+    rightPanelOpen = true;
+    terminalOpen = false;
+    activateRpTab(key);
+  }
+  async function loadPreview(path, force) {
+    const hit = rpPreviewCache[path];
+    if (hit && !hit.loading && !force) return;
+    rpPreviewCache = { ...rpPreviewCache, [path]: { loading: true, content: (hit && hit.content) || '' } };
+    try {
+      const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(path)}`).then((r) => r.json());
+      rpPreviewCache = { ...rpPreviewCache, [path]: { loading: false, content: r.ok ? r.content : `读取失败: ${r.error}` } };
+    } catch (e) {
+      rpPreviewCache = { ...rpPreviewCache, [path]: { loading: false, content: `读取失败: ${e.message || e}` } };
+    }
+  }
   function openRightPanel() {
-    // 不再强制跳「产物」——记住用户上次停在哪个页签（首启默认「网页」）
-    if (rpTab === 'artifacts') loadArtifacts();
-    if (rpTab === 'web') loadWebState();
+    // 打开面板时把激活标签的数据拉起来（首启无标签则显示「打开标签页」选择页）
+    const t = rpTabs.find((x) => x.key === rpTab);
+    if (t) activateRpTab(t.key);
   }
 
   // —— 改动条：钉在输入框上方。实时会话用消息流里的检查点；
@@ -1454,12 +1548,10 @@
     }
   }
   // porcelain 状态码 → 人看的短标签
-  // 点文件 → 右侧面板直接预览内容（改动条里的路径同样可读）
+  // 点文件 → 右侧边栏新开预览标签（改动条里的路径同样可读）
   function openGitFile(path) {
     gitPopOpen = false;
-    rightPanelOpen = true;
-    terminalOpen = false;
-    previewFile(path);
+    openPreviewTab(path);
   }
 
   // —— 手动提交（界面上直接 commit，不必让 AI 代劳）——
@@ -1524,16 +1616,16 @@
         return;
       }
     }
+    // 消息流里没有检查点（cp 不落盘，刷新后就没有）→ 走 resolveBaseline 同一套兜底，
+    // 与「产物」标签共用（分叉过一次：产物列空而改动条有数，用户实锤）
+    const baseline = await resolveBaseline();
+    if (!baseline) {
+      dockCp = null;
+      return;
+    }
     try {
-      const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
-      const r = await fetch(`/api/checkpoints${q}`).then((r) => r.json());
-      const latest = (r.mine || [])[0] || (r.checkpoints || [])[0];
-      if (!latest) {
-        dockCp = null;
-        return;
-      }
-      const c = await fetch(`/api/changes?baseline=${encodeURIComponent(latest.id)}`).then((x) => x.json());
-      dockCp = { id: latest.id, files: (c.files || []).length, additions: null, deletions: null };
+      const c = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((x) => x.json());
+      dockCp = { id: baseline, files: (c.files || []).length, additions: null, deletions: null };
     } catch (e) {
       dockCp = null;
     }
@@ -3143,7 +3235,6 @@
   let extOpen = false;
   let extCurrent = null; // 当前打开的扩展（{ name, title, ... }）
   let extFrame = null; // 面板里那个 iframe 元素（当前打开的扩展）
-  let dockExtFrame = null; // 右侧面板里承载 dock 插槽插件的 iframe
   let extMsg = '';
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
@@ -3188,31 +3279,23 @@
   // 第三方（工作区来源 / user 来源 / 草稿）单独一组
   $: builtInExts = extList.filter((e) => e.source !== 'workspace' && e.origin !== 'user' && !e.draft);
   $: thirdPartyExts = extList.filter((e) => !builtInExts.includes(e));
-  // P21：声明了 dock 插槽的启用插件 → 右侧面板多一个页签（与「产物/预览/网页」并列）。
-  // 停用插件即从页签消失——插件自己决定要不要这个槽，宿主只认 manifest 声明。
-  $: rpPluginTabs = enabledExts.flatMap((e) =>
-    (e.ui || []).filter((u) => u.slot === 'dock').map((u) => ({ key: 'ext:' + e.name, name: e.name, title: u.title || e.title || e.name }))
-  );
-  function openDockPlugin(t) {
-    rpTab = t.key;
-    const ext = extList.find((e) => e.name === t.name);
-    if (ext) extCurrent = ext;
-  }
-  // 开机恢复 dock 页签：rpTab 存在 localStorage 里、extCurrent 不在。上次停在「用量」这类
-  // dock 页签时，插件清单（/api/plugins）还没拉回来，右侧面板已经照着 ext:xxx 渲染 → extCurrent
-  // 还是 null → 显示「插件未加载」，必须切到别的页签再点回来才好（openDockPlugin 才补 extCurrent）。
-  // 这里等清单一到就补上；插件被停用/删了则退回「产物」，别把用户留在死页签上。
-  // 只在插件面板没占屏时同步——extOpen 时 extCurrent 归那个面板的 iframe 用，别抢。
-  $: if (!extOpen && rpTab.startsWith('ext:')) {
-    const want = rpTab.slice(4);
-    const ext = enabledExts.find((e) => e.name === want);
-    if (ext && (!extCurrent || extCurrent.name !== want)) extCurrent = ext;
-    else if (!ext && extList.length && (!extCurrent || extCurrent.name !== want)) rpTab = 'artifacts';
-  }
-  // 声明了 toolbar 插槽的扩展 → 顶栏按钮
-  $: slotExts = enabledExts.flatMap((e) =>
-    (e.ui || []).filter((u) => u.slot === 'toolbar').map((u) => ({ ext: e, slot: u }))
-  );
+  // —— 右侧边栏标签：可见（开着的）+ 可添加（+ 号菜单 / 空态选择页）——
+  // 插件面板 = manifest 声明 dock（时间线/项目速览/用量）或旧 toolbar（视同面板并入这里，
+  // 顶栏不再放插件按钮——用户 2026-10-01 拍板）。停用插件的标签渲染时隐藏。
+  // 插件清单没到手（extList 空）时不判 ext 标签失效——那只是「还没加载」，不是「被停用」；
+  // 否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实锤）。
+  $: rpVisibleTabs = rpTabs.filter((t) => t.kind !== 'ext' || !extList.length || enabledExts.some((e) => e.name === t.name));
+  $: rpAddable = [
+    ...RP_BUILTIN,
+    ...enabledExts.flatMap((e) =>
+      (e.ui || [])
+        .filter((u) => u.slot === 'dock' || u.slot === 'toolbar')
+        .map((u) => ({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: u.title || e.title || e.name }))
+    ),
+  ].filter((p) => !rpTabs.some((t) => t.key === p.key));
+  // 激活标签掉出可见集合（插件被停用/标签被关）→ 退回第一个可见标签
+  $: if (rpVisibleTabs.length && !rpVisibleTabs.some((t) => t.key === rpTab)) rpTab = rpVisibleTabs[0].key;
+  $: if (!rpVisibleTabs.length && rpTab) rpTab = '';
   // 面板打开时待投递的插槽事件（iframe 还没 load 完就先排队）
   let extPendingMsgs = [];
 
@@ -3235,9 +3318,10 @@
 
   /// 面板 iframe 加载完成：登记元素 + 发 init + 补投排队中的插槽事件
   function onExtFrameLoad(name) {
-    // dock 页签里的 iframe 也要登记（postToName 靠 extFrameEls 找它）
-    if (dockExtFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = dockExtFrame;
-    // 面板那个 iframe 绑的是 extFrame，这里补登记：否则 postToName 找不到它，
+    // 右侧标签里的插件 iframe（bind:this 进 dockPaneFrames）也要登记：postToName 靠
+    // extFrameEls 找它（标签切换时 iframe 常驻不重载，状态不丢）
+    if (dockPaneFrames[name]) extFrameEls[name] = dockPaneFrames[name];
+    // 独立插件面板那个 iframe 绑的是 extFrame，这里补登记：否则 postToName 找不到它，
     // init / 插槽事件都投不进去（后台 iframe 此时已经卸载）
     if (extFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = extFrame;
     const ext = extList.find((e) => e.name === name);
@@ -3258,11 +3342,6 @@
     rightPanelOpen = false;
     terminalOpen = false;
     if (!wasOpenSame) extPendingMsgs.push({ name: e.name, msg: { type: 'agent:init', payload: extInitPayload(e) } });
-  }
-
-  /// 扩展插槽按钮点击：打开该扩展面板并把事件交给它（面板里自己决定做什么）
-  function clickSlot(entry) {
-    openExt(entry.ext, entry.slot);
   }
 
   /// 扩展启用/停用（P17）：写设置 + 刷新清单
@@ -3601,9 +3680,21 @@
         }
         // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
         // 只读信息类方法与 workspace.info 同级，不占权限白名单。
+        // 服务端只返回**当前工作区**的任务（session_id → 会话文件的 workspace 映射）；
+        // 当前会话可能还没落盘，把 id 带上兜底。
         case 'trace.recent': {
           const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
-          reply(true, await get(`/api/trace?limit=${limit}`));
+          const sid = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
+          reply(true, await get(`/api/trace?limit=${limit}${sid}`));
+          break;
+        }
+        // 在右侧边栏新开文件预览标签（「项目速览」点文件用）：纯界面动作，不占权限；
+        // 只读来源是 workspace.file，内容安全由它兜
+        case 'preview.open': {
+          const path = String(params.path || '').trim();
+          if (!path) return reply(false, '缺少 path');
+          openPreviewTab(path);
+          reply(true, { ok: true });
           break;
         }
         default:
@@ -3629,7 +3720,7 @@
   }
 </script>
 
-<svelte:window on:contextmenu={onMicroContext} />
+<svelte:window on:contextmenu={onMicroContext} on:click={() => (rpAddOpen = false)} />
 
 {#if wallpaper}
   <div class="wallpaper" style="background-image:url('{wallpaper}'); opacity:{wallpaperOpacity / 100}"></div>
@@ -3834,21 +3925,8 @@
         <div class="chat-title">{displayTitle}</div>
       </div>
       <div class="head-side">
-        <!-- P17：扩展声明的顶栏插槽（点击打开该扩展并把事件交给它）；图标与插件页同一张表 -->
-        {#each slotExts as s (s.ext.name + ':' + (s.slot.id || s.slot.slot))}
-          <button
-            class="head-btn"
-            class:active={extOpen && extCurrent && extCurrent.name === s.ext.name}
-            title={`插件：${s.slot.title || s.ext.title}`}
-            on:click={() => clickSlot(s)}
-          >
-            {#if extIcon(s.ext.name)}
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(s.ext.name)}</svg>
-            {:else}
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><path d="M14 17.5h7M17.5 14v7"/></svg>
-            {/if}
-          </button>
-        {/each}
+        <!-- 顶栏只留「终端 + 右侧边栏」（用户 2026-10-01 拍板）：插件面板（时间线/项目速览/
+             用量）不再放顶栏按钮，全在右侧边栏以标签页打开（标签栏 + 号添加）。 -->
         <button
           class="head-btn"
           class:active={terminalOpen}
@@ -3863,7 +3941,7 @@
         <button
           class="head-btn"
           class:active={rightPanelOpen}
-          title="产物与预览"
+          title="侧边面板（产物/网页/时间线/项目速览/用量…）"
           on:click={() => {
             rightPanelOpen = !rightPanelOpen;
             if (rightPanelOpen) {
@@ -4435,12 +4513,43 @@
     <aside class="right-panel" class:resizing={rpResizing} style="width:{rpWidth}px">
       <div class="rp-resize" title="拖拽调整宽度" on:mousedown={startRpResize}></div>
       <div class="rp-tabs">
-        <button class:active={rpTab === 'artifacts'} on:click={() => { rpTab = 'artifacts'; loadArtifacts(); }}>产物</button>
-        <button class:active={rpTab === 'preview'} on:click={() => { rpTab = 'preview'; if (!rpPreviewContent && rpFiles.length) previewFile(rpFiles[0]); }}>预览</button>
-        <button class:active={rpTab === 'web'} on:click={() => { rpTab = 'web'; loadWebState(); }}>网页</button>
-        {#each rpPluginTabs as t (t.key)}
-          <button class:active={rpTab === t.key} on:click={() => openDockPlugin(t)}>{t.title}</button>
-        {/each}
+        <!-- 标签条可横向滚动（标签多了不挤爆），+ 号固定在条外不被滚走 -->
+        <div class="rp-tabstrip">
+          {#each rpVisibleTabs as t (t.key)}
+            <button
+              class="rp-tab"
+              class:active={rpTab === t.key}
+              title={t.kind === 'file' ? t.path : t.kind === 'ext' ? rpExtTitle(t.name) : t.title}
+              on:click={() => activateRpTab(t.key)}
+            >
+              <span class="rp-tab-title">{t.kind === 'ext' ? rpExtTitle(t.name) : t.title}</span>
+              <!-- × 只在激活标签上（对齐 ZCode 参照实现）：五个标签也放得下，关别的先点它 -->
+              {#if rpTab === t.key}
+                <span class="rp-tab-x" title="关闭标签" role="button" tabindex="-1" on:click|stopPropagation={() => closeRpTab(t.key)}>×</span>
+              {/if}
+            </button>
+          {/each}
+        </div>
+        <span class="rp-add-wrap">
+          <button class="rp-add" title="添加标签页" on:click|stopPropagation={() => (rpAddOpen = !rpAddOpen)}>+</button>
+          {#if rpAddOpen}
+            <div class="rp-add-menu">
+              {#each rpAddable as p (p.key)}
+                <button on:click|stopPropagation={() => addRpTab(p)}>
+                  {#if p.kind === 'ext' && extIcon(p.name)}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(p.name)}</svg>
+                  {:else if p.kind === 'web'}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/></svg>
+                  {:else}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/></svg>
+                  {/if}
+                  <span>{p.title}</span>
+                </button>
+              {/each}
+              {#if !rpAddable.length}<div class="rp-add-empty">面板都开着了</div>{/if}
+            </div>
+          {/if}
+        </span>
         <span class="flex-sp"></span>
         {#if rpTab === 'artifacts'}
           <button class="rp-refresh" title="刷新产物清单" on:click={loadArtifacts}>↻</button>
@@ -4467,41 +4576,63 @@
         {/if}
       </div>
       <div class="rp-body">
-        {#if rpTab === 'artifacts'}
-          {#if rpLoading}
-            <div class="trace-empty">加载中…</div>
-          {:else if !rpFiles.length}
-            <div class="rp-empty">本任务还没有产物。<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
-          {:else}
-            {#each rpFiles as f (f)}
-              <button class="rp-file" class:sel={f === rpPreviewPath} title={f} on:click={() => previewFile(f)}>
-                {f}
-              </button>
-            {/each}
-          {/if}
-        {:else if rpTab === 'preview'}
-          {#if rpPreviewPath}
-            <div class="rp-preview-path">{rpPreviewPath}</div>
-            <pre class="rp-preview">{rpPreviewContent || '（空文件）'}</pre>
-          {:else}
-            <div class="rp-empty">从「产物」里点一个文件查看内容</div>
-          {/if}
-        {:else if rpTab.startsWith('ext:')}
-          <div class="web-wrap">
-            {#if extCurrent}
-              <iframe
-                class="ext-frame"
-                title={extCurrent.title}
-                sandbox="allow-scripts"
-                bind:this={dockExtFrame}
-                src={`/plugins/${encodeURIComponent(extCurrent.name)}/${extCurrent.entry || 'index.html'}`}
-                on:load={() => onExtFrameLoad(extCurrent.name)}
-              ></iframe>
-            {:else}
-              <div class="rp-empty">{extList.length || extMsg ? '插件未加载' : '加载中…'}</div>
-            {/if}
+        {#if !rpVisibleTabs.length}
+          <!-- 标签全关掉后的选择页（对齐 ZCode「打开标签页」）：点卡片即开该面板 -->
+          <div class="rp-open">
+            <div class="rp-open-title">打开标签页</div>
+            <div class="rp-open-sub">选择要在侧边面板中打开的标签。</div>
+            <div class="rp-open-grid">
+              {#each rpAddable as p (p.key)}
+                <button class="rp-open-card" on:click={() => addRpTab(p)}>
+                  {#if p.kind === 'ext' && extIcon(p.name)}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(p.name)}</svg>
+                  {:else if p.kind === 'web'}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/></svg>
+                  {:else}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/></svg>
+                  {/if}
+                  <span>{p.title}</span>
+                </button>
+              {/each}
+            </div>
           </div>
         {:else}
+          {#each rpVisibleTabs as t (t.key)}
+            <div class="rp-pane" class:hidden={t.key !== rpTab}>
+              {#if t.kind === 'artifacts'}
+                {#if rpLoading}
+                  <div class="trace-empty">加载中…</div>
+                {:else if !rpFiles.length}
+                  <div class="rp-empty">本任务还没有产物。<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
+                {:else}
+                  {#each rpFiles as f (f)}
+                    <button class="rp-file" class:sel={f === rpPreviewPath} title={f} on:click={() => openPreviewTab(f)}>
+                      {f}
+                    </button>
+                  {/each}
+                {/if}
+              {:else if t.kind === 'file'}
+                <div class="rp-preview-head">
+                  <span class="rp-preview-path" title={t.path}>{t.path}</span>
+                  <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
+                </div>
+                <pre class="rp-preview">{rpPreviewCache[t.path] && rpPreviewCache[t.path].loading ? '读取中…' : (rpPreviewCache[t.path] && rpPreviewCache[t.path].content) || '（空文件）'}</pre>
+              {:else if t.kind === 'ext'}
+                <div class="web-wrap">
+                  {#if enabledExts.find((e) => e.name === t.name)}
+                    <iframe
+                      class="ext-frame"
+                      title={rpExtTitle(t.name)}
+                      sandbox="allow-scripts"
+                      bind:this={dockPaneFrames[t.name]}
+                      src={`/plugins/${encodeURIComponent(t.name)}/${enabledExts.find((e) => e.name === t.name).entry || 'index.html'}`}
+                      on:load={() => onExtFrameLoad(t.name)}
+                    ></iframe>
+                  {:else}
+                    <div class="rp-empty">{extList.length || extMsg ? '插件未加载或已停用' : '加载中…'}</div>
+                  {/if}
+                </div>
+              {:else}
           <div class="web-wrap">
             {#if webTabs.length}
               <div class="web-tabbar">
@@ -4610,6 +4741,9 @@
               {/if}
             </div>
           </div>
+              {/if}
+            </div>
+          {/each}
         {/if}
       </div>
     </aside>
@@ -6697,6 +6831,177 @@
     background: var(--g2);
     color: var(--g7);
     font-weight: 600;
+  }
+  /* —— 右侧边栏：统一标签页（2026-10-01）—— */
+  .rp-tabstrip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    flex: 0 1 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .rp-tabstrip::-webkit-scrollbar {
+    display: none;
+  }
+  .rp-tab {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px 4px 10px !important;
+    max-width: 140px;
+    min-width: 0;
+    flex: 0 1 auto; /* 可收缩：五个标签也放得下，标题超长走省略号 */
+  }
+  .rp-tab .rp-tab-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .rp-tab .rp-tab-x {
+    color: var(--g4);
+    font-size: 13px;
+    line-height: 1;
+    padding: 1px 3px;
+    border-radius: 4px;
+  }
+  .rp-tab .rp-tab-x:hover {
+    color: var(--g7);
+    background: var(--g3);
+  }
+  .rp-add-wrap {
+    position: relative;
+    flex: none;
+    display: inline-flex;
+  }
+  .rp-add {
+    padding: 3px 10px !important;
+    font-size: 16px;
+    line-height: 1.2;
+  }
+  .rp-add-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 30;
+    min-width: 168px;
+    display: flex;
+    flex-direction: column;
+    padding: 4px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    box-shadow: 0 10px 26px rgb(0 0 0 / 45%);
+  }
+  .rp-add-menu button {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px !important;
+    border-radius: 6px;
+    color: var(--g6);
+    font-size: 12.5px;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .rp-add-menu button:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .rp-add-menu svg {
+    width: 15px;
+    height: 15px;
+    flex: none;
+  }
+  .rp-add-empty {
+    padding: 7px 10px;
+    color: var(--g5);
+    font-size: 12px;
+  }
+  /* 面板容器：一标签一 pane，隐藏的 display:none（iframe 常驻不重载，状态不丢） */
+  .rp-pane {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .rp-pane.hidden {
+    display: none;
+  }
+  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode） */
+  .rp-open {
+    margin: auto;
+    text-align: center;
+    padding: 0 8px;
+    max-width: 100%;
+  }
+  .rp-open-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--g7);
+    margin-bottom: 6px;
+  }
+  .rp-open-sub {
+    font-size: 12.5px;
+    color: var(--g5);
+    margin-bottom: 16px;
+  }
+  .rp-open-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .rp-open-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 18px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--g3);
+    background: var(--g1);
+    color: var(--g6);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .rp-open-card:hover {
+    background: var(--g2);
+    color: var(--g7);
+    border-color: var(--g4);
+  }
+  .rp-open-card svg {
+    width: 18px;
+    height: 18px;
+  }
+  /* 文件预览标签的头部（路径吸顶 + 重新读取） */
+  .rp-preview-head {
+    position: sticky;
+    top: -8px;
+    z-index: 2;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: -8px -8px 6px;
+    padding: 6px 6px 6px 10px;
+    background: var(--g0);
+    border-bottom: 1px solid var(--g3);
+  }
+  .rp-preview-head .rp-preview-path {
+    position: static;
+    top: auto;
+    z-index: auto;
+    margin: 0;
+    padding: 0;
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0;
   }
   .rp-refresh {
     background: transparent;

@@ -347,7 +347,9 @@ pub async fn run_task(
     // P21：任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
     let mut downgrade_noticed = false;
     // P10-A：任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
-    observability::event(EventType::State, json!({ "kind": "task.start" }));
+    // session 一并记上：时间线按工作区过滤要把任务归属回聊天会话——日志顶层 session_id
+    // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实锤过）
+    observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
     if plan_mode {
         observability::event(
             EventType::State,

@@ -51,6 +51,9 @@ pub struct TraceQuery {
     /// 最近任务数（1–50，默认 5）
     #[serde(default = "default_trace_limit")]
     pub limit: usize,
+    /// 当前会话 id（宿主带入兜底）：刚建的会话可能还没落盘，按工作区映射会漏掉它
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 fn default_trace_limit() -> usize {
@@ -72,15 +75,31 @@ pub(super) async fn get_version() -> Json<Value> {
 }
 
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
+/// **只展示当前工作区**的任务（用户 2026-10-01 要求）：日志行只有 session_id，
+/// 归属靠会话文件里的 workspace 映射；当前会话可能还没落盘，`session` 参数兜底。
 /// **只读解析** JSONL（payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；
 /// 坏行跳过；文件不存在/为空返回空 tasks 而非报错。
-pub(super) async fn get_trace(Query(q): Query<TraceQuery>) -> (StatusCode, Json<Value>) {
+pub(super) async fn get_trace(
+    State(state): State<AppState>,
+    Query(q): Query<TraceQuery>,
+) -> (StatusCode, Json<Value>) {
     let Some(path) = observability::log_path() else {
         return (StatusCode::OK, Json(json!({ "tasks": [], "note": "logger 未初始化" })));
     };
     let limit = q.limit.clamp(1, 50);
+    let cur_ws = crate::tools::workspace_root().display().to_string();
+    let mut allowed: std::collections::HashSet<String> = state
+        .session
+        .list()
+        .iter()
+        .filter(|m| super::workspace::same_workspace(&m.workspace, &cur_ws))
+        .map(|m| m.id.clone())
+        .collect();
+    if let Some(sid) = q.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        allowed.insert(sid.to_string());
+    }
     let path = path.to_path_buf();
-    let res = tokio::task::spawn_blocking(move || observability::read_tasks(&path, limit)).await;
+    let res = tokio::task::spawn_blocking(move || observability::read_tasks_scoped(&path, limit, Some(&allowed))).await;
     match res {
         Ok(Ok(tasks)) => {
             let list: Vec<Value> = tasks

@@ -2,14 +2,14 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "时间线",
-  "description": "最近任务的事件流时间线",
-  "version": "0.1.0",
+  "description": "当前工作区最近任务的事件流时间线",
+  "version": "0.2.0",
   "entry": "index.html",
   "ui": [
     {
-      "slot": "toolbar",
+      "slot": "dock",
       "id": "trace",
-      "title": "时间线（最近任务的事件流）"
+      "title": "时间线"
     }
   ],
   "permissions": []

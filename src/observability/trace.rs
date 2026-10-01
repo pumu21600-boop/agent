@@ -27,6 +27,11 @@ pub struct TraceEvent {
 pub struct TaskTrace {
     pub start_ts: String,
     pub end_ts: String,
+    /// 任务归属的**聊天会话** id：优先 task.start 的 `session`（新日志），
+    /// 回落任务内第一条 `session.saved` 的 `session`（旧日志）。空 = 推不出归属。
+    /// 注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），与工作区无关——
+    /// 归属必须走这里，别再拿顶层字段（真机实锤过：按顶层过滤 = 时间线全空）。
+    pub session: String,
     pub events: Vec<TraceEvent>,
 }
 
@@ -37,9 +42,16 @@ impl TaskTrace {
     }
 }
 
-/// 读取最近 `limit` 个任务（倒序返回：最新在前）。
-/// 坏行跳过不报错（崩不掉时间线面板）。
-pub fn read_tasks(path: &Path, limit: usize) -> anyhow::Result<Vec<TaskTrace>> {
+/// 读取最近 `limit` 个任务（倒序返回：最新在前）。坏行跳过不报错（崩不掉时间线面板）。
+/// `allowed` 为 Some 时只保留**归属这些聊天会话**的任务（「时间线只展示所处工作区」用：
+/// 工作区→会话映射由调用方从会话文件算好传进来）；`Some(空集)` = 该工作区还没有任何
+/// 会话 → 空时间线，不是报错。过滤发生在**截断之前**，所以拿到的是最近 limit 个
+/// 「命中」任务，而不是「最近 limit 个再看剩几个」。
+pub fn read_tasks_scoped(
+    path: &Path,
+    limit: usize,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> anyhow::Result<Vec<TaskTrace>> {
     let file = File::open(path).with_context(|| format!("打开 JSONL 失败: {}", path.display()))?;
     let reader = BufReader::new(file);
 
@@ -74,21 +86,31 @@ pub fn read_tasks(path: &Path, limit: usize) -> anyhow::Result<Vec<TaskTrace>> {
         // 任务收尾（旧日志兜底用）：loop.finish / cancel 后关闭任务，
         // 让下一个 step0 tool_call 正确开新任务
         let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel");
+        // 任务归属（时间线按工作区过滤用）：task.start 新带的 session 优先，
+        // 旧日志回落任务内第一条 session.saved 的 session（实测 46 个任务里 45 个可归属）
+        let ev_session = payload
+            .get("session")
+            .and_then(Value::as_str)
+            .filter(|_| is_task_start || kind == "session.saved")
+            .unwrap_or("")
+            .to_string();
 
         if is_task_start {
             if let Some(t) = cur.take() {
                 tasks.push(t);
             }
             if cur.is_none() {
-                cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), events: Vec::new() });
+                cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: ev_session.clone(), events: Vec::new() });
             }
         } else if is_step0_tool {
             // cur 此时必为 None（条件里已保证），直接开新任务
-            cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), events: Vec::new() });
+            cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: String::new(), events: Vec::new() });
         }
-
         if let Some(t) = cur.as_mut() {
             t.end_ts = ts.clone();
+            if t.session.is_empty() && !ev_session.is_empty() {
+                t.session = ev_session.clone();
+            }
             t.events.push(TraceEvent { ts: ts.clone(), etype, payload });
         }
         if is_task_end
@@ -101,6 +123,11 @@ pub fn read_tasks(path: &Path, limit: usize) -> anyhow::Result<Vec<TaskTrace>> {
         tasks.push(t);
     }
 
+    // 工作区过滤：按任务归属的聊天会话筛（先筛后截断——拿到的是最近 limit 个命中任务）；
+    // 推不出归属的任务（日志里没有会话线索）在过滤视图下一律不出现
+    if let Some(set) = allowed {
+        tasks.retain(|t| !t.session.is_empty() && set.contains(&t.session));
+    }
     // 尾部截断：最近 limit 个，倒序（最新在前）
     let start = tasks.len().saturating_sub(limit);
     let mut picked: Vec<TaskTrace> = tasks.drain(start..).collect();
@@ -179,6 +206,45 @@ mod tests {
         serde_json::json!({"ts": ts, "session_id": "s", "event_type": etype, "payload": payload}).to_string()
     }
 
+    fn rec_s(ts: &str, etype: &str, payload: serde_json::Value, sid: &str) -> String {
+        serde_json::json!({"ts": ts, "session_id": sid, "event_type": etype, "payload": payload}).to_string()
+    }
+
+    #[test]
+    fn scoped_read_keeps_only_allowed_sessions() {
+        // 任务归属走 payload.session（task.start 新字段 / 任务内 session.saved 旧日志）；
+        // 顶层 session_id（进程级日志会话）不参与过滤——按它过滤 = 时间线全空（真机实锤）
+        let lines = vec![
+            rec_s("2026-09-04T00:00:00Z", "state", serde_json::json!({"kind":"task.start","session":"sa"}), "proc-1"),
+            rec_s("2026-09-04T00:00:01Z", "thought", serde_json::json!({"text":"a"}), "proc-1"),
+            rec_s("2026-09-04T00:00:02Z", "state", serde_json::json!({"kind":"loop.finish"}), "proc-1"),
+            // 旧日志形态：task.start 不带 session，靠任务内 session.saved 归属
+            rec_s("2026-09-04T00:00:03Z", "state", serde_json::json!({"kind":"task.start"}), "proc-1"),
+            rec_s("2026-09-04T00:00:03.5Z", "state", serde_json::json!({"kind":"session.saved","session":"sb"}), "proc-1"),
+            rec_s("2026-09-04T00:00:04Z", "thought", serde_json::json!({"text":"b"}), "proc-1"),
+            rec_s("2026-09-04T00:00:05Z", "state", serde_json::json!({"kind":"loop.finish"}), "proc-1"),
+            // 推不出归属的任务：过滤视图下一律不出现
+            rec_s("2026-09-04T00:00:06Z", "state", serde_json::json!({"kind":"task.start"}), "proc-1"),
+            rec_s("2026-09-04T00:00:07Z", "state", serde_json::json!({"kind":"loop.finish"}), "proc-1"),
+        ];
+        let (_g, path) = write_tmp("scoped", &lines);
+
+        let only_a = std::collections::HashSet::from(["sa".to_string()]);
+        let t = read_tasks_scoped(&path, 10, Some(&only_a)).unwrap();
+        assert_eq!(t.len(), 1, "只留 sa 的任务");
+        assert_eq!(t[0].session, "sa");
+        assert_eq!(read_tasks_scoped(&path, 1, Some(&only_a)).unwrap().len(), 1, "先筛后截断：limit=1 也能拿到命中任务");
+
+        let only_b = std::collections::HashSet::from(["sb".to_string()]);
+        let t = read_tasks_scoped(&path, 10, Some(&only_b)).unwrap();
+        assert_eq!(t.len(), 1, "旧日志任务靠 session.saved 归属");
+        assert!(t[0].events.iter().any(|e| e.payload.get("text").and_then(|x| x.as_str()) == Some("b")));
+
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(read_tasks_scoped(&path, 10, Some(&empty)).unwrap().is_empty(), "空集 = 空时间线（工作区还没有会话）");
+        assert_eq!(read_tasks_scoped(&path, 10, None).unwrap().len(), 3, "None = 不过滤");
+    }
+
     #[test]
     fn splits_tasks_by_task_start_and_aggregates_chunks() {
         let lines = vec![
@@ -192,7 +258,7 @@ mod tests {
             rec("2026-09-04T00:00:10Z", "tool_call", serde_json::json!({"step":0,"name":"git","arguments":"status"})),
         ];
         let (_g, path) = write_tmp("splits", &lines);
-        let tasks = read_tasks(&path, 10).unwrap();
+        let tasks = read_tasks_scoped(&path, 10, None).unwrap();
         assert_eq!(tasks.len(), 2, "task.start 与 step0 兜底各切一个任务");
         let t1 = &tasks[0]; // 最新在前：第二个任务（step0 git）
         assert_eq!(t1.events.len(), 1);
@@ -214,7 +280,7 @@ mod tests {
             rec("2026-09-04T00:00:04Z", "state", serde_json::json!({"kind":"task.start"})),
         ];
         let (_g, path) = write_tmp("badlines", &lines);
-        let tasks = read_tasks(&path, 2).unwrap();
+        let tasks = read_tasks_scoped(&path, 2, None).unwrap();
         assert_eq!(tasks.len(), 2, "坏行跳过；limit=2 只留最近 2 个任务");
         assert_eq!(tasks[0].start_ts, "2026-09-04T00:00:04Z", "最新在前");
     }

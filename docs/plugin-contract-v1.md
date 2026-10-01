@@ -105,6 +105,21 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
 - `workspace.file`（只读，不占权限）→ 读工作区文本文件内容（`{path}`，沿用 read_file 的越界防护与 200KB 头尾压缩，读不到以 reject 回带人话）；
 - `clipboard.write`（写，须声明 `clipboard`）→ 宿主页代写剪贴板（`{text}`）。插件 iframe 是 sandbox 不透明源，`navigator.clipboard` 与 `execCommand` 都不归它使，复制一律由宿主页执行；用户右键触发，未声明权限的插件一律拒。
 
+## 五之四、右侧边栏统一标签页（2026-10-01 用户拍板）
+
+顶栏只留「终端 + 侧边面板」两个按钮；产物/网页/插件面板（时间线/项目速览/用量）/文件预览
+全在右侧边栏开**标签页**——标签可关（× 在激活标签上），尾部 `+` 加面板，关光显示
+「打开标签页」选择页。manifest 里 `ui.slot = "dock"` 的插件（内部把旧 `toolbar` 视同面板
+并入）出现在 `+` 菜单与选择页里，不再有顶栏插件按钮。每标签一份 iframe 常驻不重载
+（切走切回状态不丢）。
+
+- `preview.open`（只读，不占权限）→ 宿主在右侧边栏新开该文件的预览标签（`{path}`）；
+  项目速览点击文件即走它，「产物」列表点击同样开标签（不再是固定的「预览」页签）。
+- `trace.recent` 现在**只返回当前工作区**的任务：任务的聊天会话归属取 `task.start` 的
+  `session`（新日志）或任务内 `session.saved` 的 `session`（旧日志），工作区→会话映射
+  由服务端从会话文件算。注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），
+  与工作区无关，别拿它归属（踩过：按它过滤 = 时间线全空）。
+
 > **宿主侧回传纪律（2026-09-24 补，所有桥方法通用）**：`agent:response` 的 `result` 必须是
 > **解析后的普通 JSON 对象**。`fetch` 的 `Response` 过不了 `postMessage` 的结构化克隆，
 > 原样回传会让插件侧只看到 `Failed to execute 'postMessage' on 'Window': Response object

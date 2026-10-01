@@ -317,7 +317,7 @@
         const note = data.note || '';
         if (!tasks.length) {
           body.className = 'empty';
-          body.textContent = note || '还没有任务记录（跑一次对话后这里会出现事件流）';
+          body.textContent = note || '当前工作区还没有任务记录（跑一次对话后这里会出现事件流）';
           return;
         }
         let html = note ? `<div class="note">${esc(note)}</div>` : '';
