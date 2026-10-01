@@ -46,7 +46,7 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
 | settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它 |
 | ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量」插件） |
-| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）；**未声明的一律拒绝** |
+| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）；**未声明的一律拒绝** |
 | skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件或未过信任门的 user 插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
 
 **契约纪律**：解析器忽略未知字段（只增不删 = 天然向后兼容）；apiVersion 不匹配即拒载 +
@@ -97,6 +97,13 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
   - `usage.prices.save` / `usage.recompute`（写，须声明 `usage.prices`）→ 存价格表与币种 / 用当前价格重算全部历史账。
 - 价格表是**内核配置**（settings.json 的 `cost` 节），插件只是编辑器：停用插件不影响计价与硬闸。
 - 金额一律**美元**规范存储；人民币是展示层（`cost.currency` + `usd_cny_rate` 折算），切币种不动账。
+
+## 五之三、项目文件列表（board 面板重做的两口新桥）
+
+「项目速览」重做为工作区文件列表后新增两口桥（2026-10-01）：
+
+- `workspace.file`（只读，不占权限）→ 读工作区文本文件内容（`{path}`，沿用 read_file 的越界防护与 200KB 头尾压缩，读不到以 reject 回带人话）；
+- `clipboard.write`（写，须声明 `clipboard`）→ 宿主页代写剪贴板（`{text}`）。插件 iframe 是 sandbox 不透明源，`navigator.clipboard` 与 `execCommand` 都不归它使，复制一律由宿主页执行；用户右键触发，未声明权限的插件一律拒。
 
 > **宿主侧回传纪律（2026-09-24 补，所有桥方法通用）**：`agent:response` 的 `result` 必须是
 > **解析后的普通 JSON 对象**。`fetch` 的 `Response` 过不了 `postMessage` 的结构化克隆，

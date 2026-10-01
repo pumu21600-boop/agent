@@ -3364,6 +3364,28 @@
     if (el && el.contentWindow) el.contentWindow.postMessage(msg, '*');
   }
 
+  /// 写剪贴板：插件 iframe 是 sandbox 不透明源（非安全上下文），navigator.clipboard 与
+  /// execCommand 都不归它使——复制一律到宿主页执行（localhost 是真源）。用户右键触发，
+  /// 权限 clipboard 在 manifest 声明；navigator.clipboard 失败回落 execCommand。
+  async function putClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      /* 走回落 */
+    }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    if (!ok) throw new Error('浏览器拒绝了剪贴板写入');
+  }
+
   /// 扩展 → 宿主：只读白名单 + P17 写操作。写操作按 manifest 声明的 permissions 放行，
   /// 没声明一律拒；写工作区文件额外弹一次确认（宿主替扩展问）。
   async function onExtMessage(ev) {
@@ -3398,6 +3420,14 @@
         case 'workspace.files':
           reply(true, await get('/api/workspace/files'));
           break;
+        // 读工作区文本文件（「项目速览」文件预览用）：与 workspace.files 同为只读信息类，
+        // 不占权限白名单；读不到的（二进制/越界）以 reject 带回人话
+        case 'workspace.file': {
+          const path = String(params.path || '').trim();
+          if (!path) return reply(false, '缺少 path');
+          reply(true, await get(`/api/workspace/file?path=${encodeURIComponent(path)}`));
+          break;
+        }
         case 'git.status':
           reply(true, await get('/api/git/status'));
           break;
@@ -3469,6 +3499,16 @@
           });
           const j = await r.json().catch(() => ({}));
           reply(!!r.ok, r.ok ? { ok: true, path: j.path, bytes: j.bytes } : j.error || '写入失败');
+          break;
+        }
+        // 写剪贴板（插件右键「复制路径」用）：iframe 是不透明源，剪贴板 API 不归它使，
+        // 由宿主页代写；用户右键触发 + manifest 声明 clipboard 权限才放行
+        case 'clipboard.write': {
+          if (!perms.includes('clipboard')) return reply(false, '未声明权限 clipboard');
+          const text = String(params.text ?? '');
+          if (!text) return reply(false, '缺少 text');
+          await putClipboard(text);
+          reply(true, { ok: true });
           break;
         }
         // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——

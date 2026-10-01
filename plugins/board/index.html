@@ -12,41 +12,35 @@
       }
       body {
         margin: 0;
-        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
         font: 13px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif;
         background: #17181c;
         color: #d8dbe2;
       }
-      h2 {
-        margin: 0 0 10px;
+      .head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px 8px;
+        border-bottom: 1px solid #24272f;
+      }
+      .head b {
         font-size: 13px;
         font-weight: 600;
         color: #e8ebf2;
       }
-      .card {
-        border: 1px solid #2c2f38;
-        border-radius: 10px;
-        padding: 10px 12px;
-        margin-bottom: 10px;
-        background: #1c1e24;
-      }
-      .kv {
-        display: flex;
-        gap: 8px;
-        align-items: baseline;
-        margin: 2px 0;
-        word-break: break-all;
-      }
-      .k {
-        flex: none;
-        width: 62px;
+      .ws {
+        flex: 1;
+        min-width: 0;
+        font-size: 12px;
         color: #858b98;
-      }
-      .v {
-        color: #d8dbe2;
-      }
-      .muted {
-        color: #858b98;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        direction: rtl;
+        text-align: left;
       }
       button {
         padding: 5px 12px;
@@ -56,14 +50,21 @@
         color: #b9bfca;
         font-size: 12px;
         cursor: pointer;
-        margin-right: 6px;
+        flex: none;
       }
       button:hover {
         color: #fff;
         border-color: #3a3e49;
       }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 8px 12px;
+      }
       input {
         flex: 1;
+        min-width: 0;
         padding: 5px 9px;
         border-radius: 7px;
         border: 1px solid #2c2f38;
@@ -71,86 +72,210 @@
         color: #d8dbe2;
         font-size: 12px;
       }
+      .count {
+        flex: none;
+        font-size: 12px;
+        color: #858b98;
+        font-variant-numeric: tabular-nums;
+      }
+      .list {
+        flex: 1 1 46vh;
+        min-height: 120px;
+        overflow-y: auto;
+        border-top: 1px solid #24272f;
+      }
       .row {
         display: flex;
-        gap: 6px;
         align-items: center;
+        gap: 8px;
+        padding: 4px 12px;
+        cursor: default;
+        user-select: none;
       }
-      .hit {
-        border-top: 1px solid #24272f;
-        padding: 6px 0;
+      .row:hover {
+        background: #1c1e24;
       }
-      .hit b {
-        color: #e8ebf2;
+      .row.sel {
+        background: #22242c;
+      }
+      .ext {
+        flex: none;
+        width: 30px;
+        height: 20px;
+        border-radius: 4px;
+        display: grid;
+        place-items: center;
+        font-size: 10px;
         font-weight: 600;
-      }
-      code {
-        color: #9fd0ff;
-      }
-      #err {
-        color: #ff9b9b;
-        min-height: 18px;
-      }
-      ul {
-        margin: 4px 0 0;
-        padding-left: 18px;
+        letter-spacing: 0.2px;
+        background: #2c2f38;
         color: #b9bfca;
       }
-      li {
+      .ext.e-code {
+        background: #16301f;
+        color: #7fd6a4;
+      }
+      .ext.e-doc {
+        background: #3a3417;
+        color: #e8d47f;
+      }
+      .ext.e-cfg {
+        background: #1e2a3d;
+        color: #9fd0ff;
+      }
+      .ext.e-media {
+        background: #33204d;
+        color: #c9a6f5;
+      }
+      .path {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .path .dir {
+        color: #858b98;
+      }
+      .path .name {
+        color: #d8dbe2;
+      }
+      .preview {
+        flex: none;
+        height: 40vh;
+        display: flex;
+        flex-direction: column;
+        border-top: 1px solid #2c2f38;
+        background: #121317;
+        min-height: 0;
+      }
+      .preview.hidden,
+      .menu.hidden {
+        display: none;
+      }
+      .pv-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-bottom: 1px solid #24272f;
+        font-size: 12px;
+        color: #e8ebf2;
+      }
+      .pv-head .nm {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .pv-head button {
+        padding: 2px 8px;
+        font-size: 11px;
+      }
+      .pv-body {
+        flex: 1;
+        margin: 0;
+        padding: 8px 12px;
+        overflow: auto;
+        font: 12px/1.55 Consolas, "Cascadia Code", "Courier New", monospace;
+        color: #b9bfca;
+        white-space: pre-wrap;
         word-break: break-all;
+      }
+      .pv-note {
+        padding: 4px 12px 8px;
+        font-size: 11px;
+        color: #858b98;
+      }
+      .status {
+        flex: none;
+        min-height: 24px;
+        padding: 4px 12px;
+        font-size: 12px;
+        color: #7fd6a4;
+        border-top: 1px solid #24272f;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .status.err {
+        color: #ff9b9b;
+      }
+      .empty {
+        padding: 24px 12px;
+        text-align: center;
+        color: #858b98;
+        font-size: 12px;
+      }
+      .menu {
+        position: fixed;
+        z-index: 10;
+        min-width: 150px;
+        background: #1c1e24;
+        border: 1px solid #2c2f38;
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
+      }
+      .menu button {
+        display: block;
+        width: 100%;
+        text-align: left;
+        border: none;
+        background: transparent;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        color: #d8dbe2;
+      }
+      .menu button:hover {
+        background: #22242c;
+        color: #fff;
+      }
+      .menu .sep {
+        height: 1px;
+        margin: 4px 6px;
+        background: #2c2f38;
       }
     </style>
   </head>
   <body>
     <!--
-      组件总线 v0 参考扩展：本页跑在 sandbox="allow-scripts" 的 iframe 里（不透明源），
-      拿不到宿主 DOM / localStorage，也 fetch 不到 /api（跨源）。数据一律走 postMessage 白名单：
-      可用方法 = app.info / workspace.info / workspace.files / git.status / memory.search / session.info。
+      「项目速览」= 工作区文件列表（2026-10-01 按用户要求重做）：点文件预览内容，
+      右键复制路径 / 文件名 / 绝对路径，或把路径插进宿主输入框。
+      本页跑在 sandbox="allow-scripts" 的 iframe 里（不透明源）：fetch 不到 /api，
+      clipboard API 也不归它使——数据与剪贴板一律走 postMessage 白名单
+      （workspace.info / workspace.files / workspace.file / clipboard.write / composer.insert）。
     -->
-    <h2>项目速览</h2>
-
-    <div class="card">
-      <div class="kv"><span class="k">版本</span><span class="v" id="ver">…</span></div>
-      <div class="kv"><span class="k">运行根</span><span class="v" id="root">…</span></div>
-      <div class="kv"><span class="k">会话</span><span class="v" id="sess">…</span></div>
-      <div class="kv"><span class="k">工作区</span><span class="v" id="ws">…</span></div>
+    <div class="head">
+      <b>项目文件</b>
+      <span class="ws" id="ws" title="">…</span>
+      <button id="refresh" title="重新加载列表">↻</button>
     </div>
-
-    <div class="card">
-      <div class="row">
-        <button id="b-git">查 Git 状态</button>
-        <button id="b-files">列工作区文件</button>
-      </div>
-      <div id="out" class="muted">点上面的按钮取数据（每次都要走宿主桥）。</div>
+    <div class="toolbar">
+      <input id="filter" placeholder="过滤文件路径…" />
+      <span class="count" id="count"></span>
     </div>
-
-    <div class="card">
-      <div class="row">
-        <input id="q" placeholder="搜记忆，如「沙箱」「并行」" />
-        <button id="b-search">搜索</button>
+    <div id="list" class="list"><div class="empty">加载中…</div></div>
+    <div id="preview" class="preview hidden">
+      <div class="pv-head">
+        <span class="nm" id="pv-name"></span>
+        <button id="pv-close" title="关闭预览">✕</button>
       </div>
-      <div id="hits"></div>
+      <pre id="pv-body" class="pv-body"></pre>
+      <div id="pv-note" class="pv-note"></div>
     </div>
-
-    <div class="card">
-      <div class="muted">P17 写操作与扩展间通信（权限在 manifest.json 里声明）：</div>
-      <div class="row">
-        <button id="b-insert">往输入框插一句</button>
-        <button id="b-notify">发一条通知</button>
-        <button id="b-bus">广播 bus 事件</button>
-      </div>
-      <div class="row">
-        <input id="wpath" value="board-note.txt" />
-        <button id="b-write">写工作区文件</button>
-      </div>
-      <div id="wout" class="muted"></div>
-    </div>
-
-    <div id="err"></div>
+    <div id="status" class="status"></div>
+    <div id="menu" class="menu hidden"></div>
 
     <script>
       const pending = new Map();
       let seq = 0;
+      let wsPath = '';
+      let files = [];
+      let selected = ''; // 当前选中（预览中）的相对路径
+      const MAX_SHOW = 20000; // 预览渲染上限（超出截断展示，后端读取上限 200KB）
 
       function call(method, params) {
         return new Promise((resolve, reject) => {
@@ -165,22 +290,11 @@
           }, 8000);
         });
       }
-
       window.addEventListener('message', (ev) => {
         const d = ev.data || {};
+        // agent:init = 宿主已登记本 frame：此刻起桥调用才会被受理，初始拉数据挂这里
         if (d.type === 'agent:init') {
-          const p = d.payload || {};
-          document.getElementById('ver').textContent = 'v' + (p.version || '?');
-          document.getElementById('root').textContent = p.root || '(未知)';
-          document.getElementById('sess').textContent =
-            (p.title || '(未命名)') + (p.sessionId ? ' · ' + String(p.sessionId).slice(0, 8) : '');
-          call('workspace.info')
-            .then((w) => {
-              document.getElementById('ws').textContent = (w && w.current) || '(未知)';
-            })
-            .catch(() => {
-              document.getElementById('ws').textContent = '(未知)';
-            });
+          loadAll();
           return;
         }
         if (d.type === 'agent:response' && pending.has(d.id)) {
@@ -190,102 +304,198 @@
         }
       });
 
-      function fail(e) {
-        document.getElementById('err').textContent = String((e && e.message) || e);
+      function status(msg, isErr) {
+        const el = document.getElementById('status');
+        el.textContent = msg || '';
+        el.className = 'status' + (isErr ? ' err' : '');
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      }
+      function extOf(path) {
+        const i = path.lastIndexOf('.');
+        const e = i > 0 ? path.slice(i + 1).toLowerCase() : '';
+        return e.length > 4 ? e.slice(0, 4) : e;
+      }
+      const CODE = new Set(['rs', 'js', 'mjs', 'ts', 'svelte', 'html', 'css', 'wat', 'wasm', 'py', 'go', 'java', 'c', 'cpp', 'h', 'sh', 'sql', 'json', 'jsonl']);
+      const DOC = new Set(['md', 'txt', 'docx', 'pdf', 'doc', 'rtf']);
+      const CFG = new Set(['toml', 'yaml', 'yml', 'ini', 'conf', 'lock', 'cfg', 'env']);
+      const MEDIA = new Set(['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'mp3', 'wav', 'mp4', 'webm']);
+      function extClass(e) {
+        return CODE.has(e) ? 'e-code' : DOC.has(e) ? 'e-doc' : CFG.has(e) ? 'e-cfg' : MEDIA.has(e) ? 'e-media' : '';
+      }
+      function absPath(rel) {
+        if (!wsPath) return rel;
+        const sep = wsPath.includes('\\') ? '\\' : '/';
+        return wsPath.replace(/[\\/]+$/, '') + sep + rel.replace(/\//g, sep);
+      }
+      function nameOf(rel) {
+        const i = rel.lastIndexOf('/');
+        return i < 0 ? rel : rel.slice(i + 1);
       }
 
-      document.getElementById('b-git').onclick = () =>
-        call('git.status')
-          .then((g) => {
-            document.getElementById('err').textContent = '';
-            document.getElementById('out').innerHTML = g.is_repo
-              ? '<div>分支 <code>' + (g.branch || '?') + '</code> · 脏文件 ' + (g.dirty || 0) + ' · 领先 ' + (g.ahead || 0) + ' / 落后 ' + (g.behind || 0) + '</div>'
-              : '<div>当前工作区不是 Git 仓库</div>';
-          })
-          .catch(fail);
-
-      document.getElementById('b-files').onclick = () =>
-        call('workspace.files')
-          .then((r) => {
-            document.getElementById('err').textContent = '';
-            const files = (r && r.files) || [];
-            document.getElementById('out').innerHTML =
-              '<div>' + files.length + ' 个文件：</div><ul>' +
-              files.slice(0, 20).map((f) => '<li>' + f + '</li>').join('') +
-              '</ul>' + (files.length > 20 ? '<div class="muted">…还有 ' + (files.length - 20) + ' 个</div>' : '');
-          })
-          .catch(fail);
-
-      document.getElementById('b-search').onclick = () => {
-        const q = document.getElementById('q').value.trim();
-        if (!q) return;
-        call('memory.search', { query: q, top_k: 5 })
-          .then((r) => {
-            document.getElementById('err').textContent = '';
-            const hits = (r && r.results) || [];
-            document.getElementById('hits').innerHTML = hits.length
-              ? hits
-                  .map(
-                    (h) =>
-                      '<div class="hit"><b>' + (h.id || '?') + '</b>' +
-                      (h.score != null ? ' <span class="muted">score ' + Number(h.score).toFixed(3) + '</span>' : '') +
-                      (h.snippet ? '<div class="muted">' + h.snippet + '</div>' : '') +
-                      '</div>',
-                  )
-                  .join('') + (r.notice ? '<div class="muted">' + r.notice + '</div>' : '')
-              : '<div class="muted">没有命中' + (r && r.notice ? '（' + r.notice + '）' : '') + '</div>';
-          })
-          .catch(fail);
-      };
-
-      // —— P17 写操作 / 插槽 / 扩展间通信 ——
-      const wout = document.getElementById('wout');
-      document.getElementById('b-insert').onclick = () =>
-        call('composer.insert', { text: '（来自「项目速览」扩展）帮我看下工作区里最近改了什么' })
-          .then(() => {
-            wout.textContent = '已插入宿主输入框';
-          })
-          .catch(fail);
-
-      document.getElementById('b-notify').onclick = () =>
-        call('notify', { text: '扩展广播：我还在呢' })
-          .then(() => {
-            wout.textContent = '已发通知（聊天流里可见）';
-          })
-          .catch(fail);
-
-      document.getElementById('b-bus').onclick = () =>
-        call('bus.publish', { topic: 'board.ping', payload: { at: Date.now() } })
-          .then((r) => {
-            wout.textContent = 'bus 事件已投递给 ' + ((r && r.delivered) || 0) + ' 个扩展';
-          })
-          .catch(fail);
-
-      document.getElementById('b-write').onclick = () => {
-        const path = document.getElementById('wpath').value.trim();
-        if (!path) return;
-        call('workspace.write', { path, content: '由「项目速览」扩展写入：' + new Date().toISOString() + '\n' })
-          .then((r) => {
-            wout.textContent = '已写入 ' + ((r && r.path) || path) + '（' + ((r && r.bytes) || 0) + ' 字节）';
-          })
-          .catch(fail);
-      };
-
-      window.addEventListener('message', (ev) => {
-        const d = ev.data || {};
-        // 宿主转发的扩展间消息 / 顶栏插槽点击
-        if (d.type === 'bus.message') {
-          wout.textContent = '收到来自 ' + d.from + ' 的 bus 事件：' + d.topic;
+      // —— 列表渲染（过滤即时生效，选中行高亮）——
+      function renderList() {
+        const q = document.getElementById('filter').value.trim().toLowerCase();
+        const shown = q ? files.filter((f) => f.toLowerCase().includes(q)) : files;
+        const list = document.getElementById('list');
+        document.getElementById('count').textContent = q
+          ? `${shown.length} / ${files.length}`
+          : `${files.length} 个文件`;
+        if (!shown.length) {
+          list.innerHTML = `<div class="empty">${files.length ? '没有匹配的文件' : '工作区里没有文件'}</div>`;
+          return;
         }
-        if (d.type === 'agent:slot') {
-          // 顶栏插槽点击（P17）：扩展收到事件后自己决定做什么。这里演示「插一句 + 通知」。
-          wout.textContent = '顶栏插槽被点击：' + (d.title || d.slot);
-          call('composer.insert', { text: '（项目速览扩展）帮我看下工作区里最近改了什么' }).catch(fail);
-          call('notify', { text: '顶栏插槽被点了，我插了一句话到输入框' }).catch(fail);
+        list.innerHTML = shown
+          .map((f) => {
+            const e = extOf(f);
+            const i = f.lastIndexOf('/');
+            const dir = i < 0 ? '' : f.slice(0, i + 1);
+            const nm = i < 0 ? f : f.slice(i + 1);
+            return `<div class="row${f === selected ? ' sel' : ''}" data-f="${esc(f)}" title="${esc(f)}">
+              <span class="ext ${extClass(e)}">${esc(e || '·')}</span>
+              <span class="path"><span class="dir">${esc(dir)}</span><span class="name">${esc(nm)}</span></span>
+            </div>`;
+          })
+          .join('');
+        list.querySelectorAll('.row').forEach((el) => {
+          el.onclick = () => preview(el.dataset.f);
+          el.oncontextmenu = (ev) => {
+            ev.preventDefault();
+            selectRow(el.dataset.f, false);
+            openMenu(ev, el.dataset.f);
+          };
+        });
+      }
+
+      function selectRow(f, doPreview) {
+        selected = f;
+        document.querySelectorAll('.row').forEach((el) => el.classList.toggle('sel', el.dataset.f === f));
+        if (doPreview) preview(f);
+      }
+
+      // ——  Preview：宿主桥读工作区文本文件（read_file 同款越界防护与截断）——
+      async function preview(f) {
+        selectRow(f, false);
+        const box = document.getElementById('preview');
+        const nm = document.getElementById('pv-name');
+        const body = document.getElementById('pv-body');
+        const note = document.getElementById('pv-note');
+        box.classList.remove('hidden');
+        nm.textContent = f;
+        nm.title = absPath(f);
+        body.textContent = '读取中…';
+        note.textContent = '';
+        try {
+          const r = await call('workspace.file', { path: f });
+          const text = (r && r.content) || '';
+          // 后端 cap 是头尾压缩（context::compress），中间插 OMITTED_MARK「……[中间省略」——
+          // 文件超上限时内容变短且带这个标记，据此提示用户（不是文件真容）
+          const truncated = text.includes('……[中间省略');
+          body.textContent = text.length > MAX_SHOW ? text.slice(0, MAX_SHOW) + '\n…（预览只显示前 20000 字符，完整内容请直接打开文件）' : text;
+          note.textContent = truncated
+            ? '注意：文件超过读取上限，内容是头尾压缩后的（中间有省略）'
+            : `${text.length} 字符 · 右键可复制路径`;
+        } catch (e) {
+          body.textContent = '';
+          note.textContent = '读取失败: ' + (e.message || e);
+          status('读取失败: ' + (e.message || e), true);
         }
+      }
+      document.getElementById('pv-close').onclick = () => {
+        document.getElementById('preview').classList.add('hidden');
+        document.querySelectorAll('.row.sel').forEach((el) => el.classList.remove('sel'));
+        selected = '';
+      };
+      document.getElementById('filter').oninput = renderList;
+
+      // —— 右键菜单：复制路径 / 复制文件名 / 插入输入框 ——
+      const menu = document.getElementById('menu');
+      function openMenu(ev, f) {
+        const items = [
+          ['复制相对路径', () => copy(f, '相对路径')],
+          ['复制绝对路径', () => copy(absPath(f), '绝对路径')],
+          ['复制文件名', () => copy(nameOf(f), '文件名')],
+          ['sep'],
+          ['插入到输入框', () => insert(f)],
+          ['预览', () => preview(f)],
+        ];
+        menu.innerHTML = items
+          .map(([label, fn]) => (label === 'sep' ? '<div class="sep"></div>' : `<button data-a="${esc(label)}">${esc(label)}</button>`))
+          .join('');
+        menu.querySelectorAll('button').forEach((b, bi) => {
+          // querySelectorAll 只返回按钮（不含分隔线），与过滤掉 sep 的 items 同序；
+          // 取 [1] 才是处理函数——整个数组元素是 [label, fn]
+          const fn = items.filter((x) => x[0] !== 'sep')[bi][1];
+          b.onclick = () => {
+            menu.classList.add('hidden');
+            fn();
+          };
+        });
+        menu.classList.remove('hidden');
+        // 贴边收拢：菜单弹出后不允许溢出 iframe 视口
+        const w = menu.offsetWidth;
+        const h = menu.offsetHeight;
+        menu.style.left = Math.max(4, Math.min(ev.clientX, window.innerWidth - w - 4)) + 'px';
+        menu.style.top = Math.max(4, Math.min(ev.clientY, window.innerHeight - h - 4)) + 'px';
+      }
+      function closeMenu() {
+        menu.classList.add('hidden');
+      }
+      document.addEventListener('click', closeMenu);
+      document.addEventListener('scroll', closeMenu, true);
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeMenu();
       });
 
-      // 握手：宿主会回 agent:init
+      async function copy(text, what) {
+        try {
+          await call('clipboard.write', { text });
+          status(`已复制${what}：${text}`);
+        } catch (e) {
+          status('复制失败: ' + (e.message || e), true);
+        }
+      }
+      async function insert(f) {
+        try {
+          await call('composer.insert', { text: '@' + f + ' ' });
+          status('已插入输入框：@' + f);
+        } catch (e) {
+          status('插入失败: ' + (e.message || e), true);
+        }
+      }
+
+      // —— 初始加载：工作区信息 + 文件列表 ——
+      async function loadAll() {
+        status('');
+        try {
+          const w = await call('workspace.info');
+          wsPath = (w && w.current) || '';
+          const wsEl = document.getElementById('ws');
+          wsEl.textContent = wsPath || '(未知)';
+          wsEl.title = wsPath;
+        } catch {
+          wsPath = '';
+        }
+        try {
+          const r = await call('workspace.files');
+          files = (r && r.files) || [];
+          document.getElementById('count').textContent = `${files.length} 个文件`;
+          const list = document.getElementById('list');
+          if (!files.length) {
+            list.innerHTML = '<div class="empty">工作区里没有文件</div>';
+            return;
+          }
+          if (r && r.truncated) status('文件较多，列表只取了前 500 个');
+          renderList();
+        } catch (e) {
+          document.getElementById('list').innerHTML = '<div class="empty">读取失败: ' + esc(e.message || e) + '</div>';
+          status('读取失败: ' + (e.message || e), true);
+        }
+      }
+      document.getElementById('refresh').onclick = loadAll;
+
+      // 握手：宿主会回 agent:init，收到再拉数据（未登记时桥调用会被丢弃）
       parent.postMessage({ type: 'agent:hello' }, '*');
     </script>
   </body>

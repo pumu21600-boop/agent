@@ -87,7 +87,7 @@ pub struct UiExt {
     pub enabled: bool,
     /// P17：宿主界面插槽声明（manifest `ui: [{slot, title}]`；v1 支持 toolbar / composer）
     pub ui: Vec<Value>,
-    /// P17/P18：权限声明（composer.insert / workspace.write / bus.publish / notify / storage）
+    /// P17/P18：权限声明（composer.insert / workspace.write / bus.publish / notify / storage / clipboard）
     /// ——宿主只认这里声明过的动作，没声明的请求一律拒绝
     pub permissions: Vec<String>,
     /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
@@ -294,7 +294,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .filter(|p| {
                 matches!(
                     *p,
-                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices"
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard"
                 )
             })
             .map(str::to_string)

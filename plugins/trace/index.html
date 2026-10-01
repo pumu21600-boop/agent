@@ -165,6 +165,13 @@
         color: #e8d47f;
         font-variant-numeric: tabular-nums;
       }
+      .folded {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #858b98;
+        border-top: 1px solid #24272f;
+        padding-top: 6px;
+      }
     </style>
   </head>
   <body>
@@ -181,7 +188,9 @@
     <script>
       const pending = new Map();
       let seq = 0;
-      let expanded = null; // 当前展开的任务索引（一次一个）
+      // 展开态按 start_ts 认，不按数组下标：刷新后新任务会把索引整体挤位，按下标会把
+      // 「展开着的那个任务」悄悄换成另一个；时间戳是任务的稳定身份。
+      let expandedTs = null;
       let last = null; // 最近一次数据（展开切换时不重拉）
 
       function call(method, params) {
@@ -213,6 +222,26 @@
       });
       parent.postMessage({ type: 'agent:hello' }, '*');
 
+      // —— 内部 plumbing 事件：会话存储 / 网关握手 / 沙箱 spawn / 检查点跳过这类对
+      // 「任务发生了什么」没有信息量（一次「你好」就能刷出 14 条），折叠成一行计数——
+      // 但数量照实报，不许静默吞。未列入的 state kind 一律仍然展示。
+      const PLUMBING_KINDS = new Set([
+        'storage.write',
+        'session.saved',
+        'gateway.request',
+        'gateway.response',
+        'gateway.stream_end',
+        'gateway.max_tokens_inflated',
+        'sandbox.spawn',
+        'sandbox.exit',
+        'sandbox.tier.resolved',
+        'tools.parallel',
+        'checkpoint.skipped',
+      ]);
+      function isPlumbing(ev) {
+        return ev.etype === 'state' && PLUMBING_KINDS.has((ev.payload || {}).kind);
+      }
+
       // 事件摘要（一行）：按类型提取可读文本
       function summary(ev) {
         const p = ev.payload || {};
@@ -226,31 +255,60 @@
           default: return JSON.stringify(p).slice(0, 90);
         }
       }
-      // tool_call → 后续同名 tool_result 配对耗时（毫秒；配不上返回 null）
-      function pairMs(events, i) {
-        const c = events[i];
-        if (!c || c.etype !== 'tool_call') return null;
-        for (let j = i + 1; j < events.length; j++) {
-          const r = events[j];
-          if (r.etype === 'tool_result' && r.payload?.name === c.payload?.name) {
-            return r.offset_ms - c.offset_ms;
+      // tool_call → tool_result 配对耗时（毫秒）。
+      // **先按 id 配**：并行工具调用（tools.parallel）一次发出多个调用，各带不同 id，
+      // 旧实现「遇下一个 tool_call 就放弃」会把第一个调用的耗时整个丢掉（真机日志实锤：
+      // read_skill 与 shell 并行发出，read_skill 的耗时配不上）。id 缺失的老日志回落按
+      // name 排 FIFO。返回 Map：tool_call 的事件下标 → 耗时。
+      function pairDurations(events) {
+        const out = new Map();
+        const byId = new Map(); // call id → { i, offset }
+        const byName = new Map(); // name → [{ i, offset }]（FIFO）
+        events.forEach((ev, i) => {
+          const p = ev.payload || {};
+          if (ev.etype === 'tool_call') {
+            if (p.id) byId.set(p.id, { i, offset: ev.offset_ms });
+            const q = byName.get(p.name) || [];
+            q.push({ i, offset: ev.offset_ms });
+            byName.set(p.name, q);
+          } else if (ev.etype === 'tool_result') {
+            let hit = null;
+            if (p.id && byId.has(p.id)) {
+              hit = byId.get(p.id);
+              byId.delete(p.id);
+              // 同名 FIFO 队列里同步剔掉这条，避免回落匹配时串到别的调用
+              byName.set(p.name, (byName.get(p.name) || []).filter((c) => c.i !== hit.i));
+            } else {
+              const q = byName.get(p.name) || [];
+              hit = q.length ? q.shift() : null;
+            }
+            if (hit) out.set(hit.i, ev.offset_ms - hit.offset);
           }
-          if (r.etype === 'tool_call') return null;
-        }
-        return null;
+        });
+        return out;
       }
       function badge(ev) {
         return { state: 'st', tool_call: 'call', tool_result: (ev.payload?.ok === false ? 'fail' : 'res'), model_chunk: 'chunk', thought: 'th', error: 'err' }[ev.etype] || 'st';
       }
       function fmtClock(ts) {
         const d = new Date(ts);
-        return isNaN(d) ? ts : d.toLocaleTimeString('zh-CN', { hour12: false });
+        if (isNaN(d)) return ts;
+        const hm = d.toLocaleTimeString('zh-CN', { hour12: false });
+        // 跨天任务只显示时分秒会和今天的任务混在一起（最近任务常跨天），补日期
+        return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
       }
       function fmtDur(ms) {
         return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
       }
       function esc(s) {
         return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      }
+      // payload 原样进 title 属性会整个进 DOM：gateway.request 一条 payload 就 10KB+
+      // （整段请求体，长会话里更大），全量展开一个任务往页面里灌几十 KB。截断到 1KB，
+      // 尾部标省略——展开只为快速看一眼，完整数据在 logs/agent.jsonl。
+      function tip(ev) {
+        const s = JSON.stringify(ev.payload);
+        return s.length > 1000 ? s.slice(0, 1000) + ' …（已截断，完整见 logs/agent.jsonl）' : s;
       }
 
       function render(data) {
@@ -264,23 +322,31 @@
         }
         let html = note ? `<div class="note">${esc(note)}</div>` : '';
         tasks.forEach((task, ti) => {
-          html += `<div class="task"><button class="task-head" data-ti="${ti}">
-            <span class="idx">#${tasks.length - ti}</span>
+          // 后端倒序返回（最新在前）：最新任务 = #1
+          const open = expandedTs === task.start_ts;
+          const vis = task.events.map((ev, ei) => ({ ev, ei })).filter((x) => !isPlumbing(x.ev));
+          const hidden = task.events.length - vis.length;
+          const pairs = open ? pairDurations(task.events) : null;
+          html += `<div class="task"><button class="task-head" data-ts="${esc(task.start_ts)}">
+            <span class="idx">#${ti + 1}</span>
             <span class="time">${esc(fmtClock(task.start_ts))}</span>
-            <span class="meta">${esc(fmtDur(task.duration_ms))} · ${task.events.length} 事件</span>
-            <svg class="caret${expanded === ti ? ' open' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="m9 6 6 6-6 6"/></svg>
+            <span class="meta">${esc(fmtDur(task.duration_ms))} · ${vis.length} 事件${hidden ? ` · 折叠 ${hidden}` : ''}</span>
+            <svg class="caret${open ? ' open' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="m9 6 6 6-6 6"/></svg>
           </button>`;
-          if (expanded === ti) {
+          if (open) {
             html += '<div class="events">';
-            task.events.forEach((ev, ei) => {
-              const ms = pairMs(task.events, ei);
+            vis.forEach(({ ev, ei }) => {
+              const ms = pairs.get(ei);
               html += `<div class="ev">
                 <span class="offset">${(ev.offset_ms / 1000).toFixed(1)}s</span>
                 <span class="badge b-${badge(ev)}">${esc(ev.etype)}</span>
-                <span class="sum" title="${esc(JSON.stringify(ev.payload))}">${esc(summary(ev))}</span>
-                ${ms !== null ? `<span class="pair">${esc(fmtDur(ms))}</span>` : ''}
+                <span class="sum" title="${esc(tip(ev))}">${esc(summary(ev))}</span>
+                ${ms !== undefined ? `<span class="pair">${esc(fmtDur(ms))}</span>` : ''}
               </div>`;
             });
+            if (hidden) {
+              html += `<div class="folded">另有 ${hidden} 条内部事件已折叠（会话存储 / 网关握手 / 沙箱 spawn / 检查点跳过等，logs/agent.jsonl 里有全量）</div>`;
+            }
             html += '</div>';
           }
           html += '</div>';
@@ -289,8 +355,8 @@
         body.innerHTML = html;
         body.querySelectorAll('.task-head').forEach((el) => {
           el.onclick = () => {
-            const ti = Number(el.dataset.ti);
-            expanded = expanded === ti ? null : ti;
+            const ts = el.dataset.ts;
+            expandedTs = expandedTs === ts ? null : ts;
             render(last);
           };
         });
