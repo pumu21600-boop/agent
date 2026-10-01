@@ -4227,13 +4227,9 @@
                     <span class="ctx-label">平均缓存命中率</span>
                     <span class="ctx-val">{apiTotals.prompt ? ((apiTotals.cached / apiTotals.prompt) * 100).toFixed(1) + '%' : '—'}</span>
                   </div>
-                  <div class="ctx-row cache-row" title="渠道最近一次请求实报的占用 = 输入 token + 输出 token（与「本次对话用量」输入输出相加对得上）">
-                    <span class="ctx-label">最近一次实报（输入+输出）</span>
-                    <span class="ctx-val">{ctxUsage.pressure == null ? '—' : fmtTok(ctxUsage.pressure)}</span>
-                  </div>
                   <!-- 口径说清：分子是「下一次请求」的预估（渠道实报锚点 + 之后的上下文增减，
                        裁剪会让它当场回落）；构成行是估算值按圆环百分比分摊（加总 = 圆环） -->
-                  <div class="ctx-card-foot">占用 = 最近一次实报（输入+输出）+ 其后的上下文增减；构成行为估算分摊。超过预算自动归档旧工具结果并折叠早期对话</div>
+                  <div class="ctx-card-foot">占用 = 最近一次请求的渠道实报（输入+输出）+ 其后的上下文增减；构成行为估算分摊。超过预算自动归档旧工具结果并折叠早期对话</div>
                 </div>
               </div>
             {:else}
