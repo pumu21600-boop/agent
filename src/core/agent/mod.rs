@@ -328,6 +328,19 @@ pub async fn run_task(
     // 否则比真实用量少一大截（实测：估算 1866 vs 实际 4750，差额≈工具 Schema）
     let tools_schema_tokens =
         tools_def.as_ref().map(|d| context::estimate_tokens(&d.to_string())).unwrap_or(0);
+    // 估算/裁剪是否计入思考，跟随回放判定：DeepSeek/zai 契约与白名单模型每轮把思考
+    // 重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入（用户拍板
+    // 2026-10-01：切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
+    // 注：降级/备用渠道若契约不同会有偏差，以主渠道为准（裁剪本就是启发式）
+    let count_reasoning = {
+        let compat = crate::gateway::compat::resolve(
+            primary.params.provider_id.as_deref(),
+            Some(primary.base_url.trim()),
+            &primary.model,
+            primary.params.thinking_format,
+        );
+        crate::gateway::replay::should_preserve_replay(&primary.model, &compat)
+    };
     // 渠道上报的真实 prompt_tokens（上一次主循环请求）。圆环优先用它——启发式估算
     // 对 JSON 密度估不准（实测估算 5139 vs 渠道实报 4750），真实值才能和用量面板对上
     let mut last_real_tokens: u64 = 0;
@@ -365,7 +378,8 @@ pub async fn run_task(
         {
             // P7：摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
             msgs.retain(|m| !is_summary_msg(m));
-            let (mut compacted, stats) = context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens);
+            let (mut compacted, stats) =
+                context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens, count_reasoning);
             if stats.compacted {
                 // 实报值是裁剪前上下文的产物，裁剪后已失真——清零回落到估算口径
                 //（重新按当前消息算），否则圆环停在旧大数等下一次响应才刷新
@@ -407,7 +421,7 @@ pub async fn run_task(
             msgs = compacted;
         }
         // 圆环数据源：分类占比推给前端（裁剪后取最终值，与预算口径一致）
-        let mut breakdown = context::estimate_breakdown(&msgs);
+        let mut breakdown = context::estimate_breakdown(&msgs, count_reasoning);
         breakdown.tools_schema = tools_schema_tokens;
         let est_total = breakdown.total();
         // token 数优先用渠道实报的真实占用 + 上次回复的留存增量（正文+工具参数，回复

@@ -31,13 +31,19 @@ pub fn estimate_tokens(text: &str) -> u64 {
     cjk + other.div_ceil(2) + ascii.div_ceil(4)
 }
 
-/// 单条消息估算（role 开销 + content + tool_calls）。
-/// 思考内容（reasoning_content）**不计入**（用户拍板 2026-10-01）：回放时默认剥离、
-/// 不进下一次请求，占用的只是渠道当次的临时窗口，不是会话上下文。
-fn estimate_message(m: &Value) -> u64 {
+/// 单条消息估算（role 开销 + content + tool_calls；`count_reasoning` 时含 reasoning_content）。
+/// 思考是否计入**跟随回放判定**（should_preserve_replay）：DeepSeek/zai 契约与白名单
+/// 模型每轮把思考重发进 prompt，本地预算必须看见；剥离渠道思考不进上下文、不计入
+/// （用户拍板 2026-10-01：切勿对所有模型一律计入，否则剥离渠道会被过度裁剪）。
+fn estimate_message(m: &Value, count_reasoning: bool) -> u64 {
     let mut total: u64 = 4;
     if let Some(c) = m.get("content") {
         total += value_tokens(c);
+    }
+    if count_reasoning
+        && let Some(c) = m.get("reasoning_content").and_then(Value::as_str)
+    {
+        total += estimate_tokens(c);
     }
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -57,8 +63,8 @@ fn value_tokens(v: &Value) -> u64 {
     }
 }
 
-pub fn estimate_messages(messages: &[Value]) -> u64 {
-    messages.iter().map(estimate_message).sum()
+pub fn estimate_messages(messages: &[Value], count_reasoning: bool) -> u64 {
+    messages.iter().map(|m| estimate_message(m, count_reasoning)).sum()
 }
 
 /// 分类占比（前端「上下文容量」卡片用）：各分类之和 == estimate_messages。
@@ -83,23 +89,28 @@ impl Breakdown {
     }
 }
 
-pub fn estimate_breakdown(messages: &[Value]) -> Breakdown {
+pub fn estimate_breakdown(messages: &[Value], count_reasoning: bool) -> Breakdown {
     let mut b = Breakdown::default();
     for m in messages {
         match m.get("role").and_then(Value::as_str).unwrap_or("") {
-            "system" => b.system += estimate_message(m),
-            "tool" => b.tools += estimate_message(m),
-            "user" => b.messages += estimate_message(m),
+            "system" => b.system += estimate_message(m, false),
+            "tool" => b.tools += estimate_message(m, false),
+            "user" => b.messages += estimate_message(m, false),
             "assistant" => {
                 if let Some(c) = m.get("content") {
                     b.messages += value_tokens(c);
+                }
+                if count_reasoning
+                    && let Some(c) = m.get("reasoning_content").and_then(Value::as_str)
+                {
+                    b.messages += estimate_tokens(c);
                 }
                 if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
                     b.other += 8 * calls.len() as u64 + calls.iter().map(value_tokens).sum::<u64>();
                 }
                 b.other += 4;
             }
-            _ => b.other += estimate_message(m),
+            _ => b.other += estimate_message(m, false),
         }
     }
     b
@@ -137,13 +148,18 @@ pub struct CompactStats {
 /// 策略：① 归档旧工具结果（保留最近 N 个）② 仍超则按轮折叠旧消息。
 /// `tools_schema_tokens`：随每次请求发送的工具定义（渠道计入 prompt），不与消息
 /// 一起裁但占预算——不算它，裁剪时机被系统性推迟（实锤：估算 1866 vs 实际 4750）。
+/// `count_reasoning`：回放型渠道（DeepSeek/zai 契约、白名单模型）思考每轮重发，
+/// 预算要看见；剥离渠道传 false。
 pub fn compact_messages(
     messages: &[Value],
     cfg: &CompactConfig,
     tools_schema_tokens: u64,
+    count_reasoning: bool,
 ) -> (Vec<Value>, CompactStats) {
-    let mut stats =
-        CompactStats { tokens_before: estimate_messages(messages) + tools_schema_tokens, ..Default::default() };
+    let mut stats = CompactStats {
+        tokens_before: estimate_messages(messages, count_reasoning) + tools_schema_tokens,
+        ..Default::default()
+    };
     if messages.is_empty() || stats.tokens_before <= cfg.budget_tokens {
         stats.tokens_after = stats.tokens_before;
         return (messages.to_vec(), stats);
@@ -172,7 +188,7 @@ pub fn compact_messages(
 
     // ② 仍超 → 按「轮」折叠：轮 = user 开头到下一个 user 之前的相邻消息组，
     //    整组折叠保持 assistant(tool_calls)+tool 配对完整；最后一组（含最新 user）永不折。
-    let mut after = estimate_messages(&out) + tools_schema_tokens;
+    let mut after = estimate_messages(&out, count_reasoning) + tools_schema_tokens;
     if after > cfg.budget_tokens {
         let mut groups: Vec<(usize, usize)> = Vec::new(); // [start, end)
         let mut start = 1usize; // 0 是 system
@@ -203,7 +219,7 @@ pub fn compact_messages(
                 break;
             }
             for m in &out[gstart..gend] {
-                after -= estimate_message(m);
+                after -= estimate_message(m, count_reasoning);
                 stats.folded_messages += 1;
             }
             folded_ranges.push((gstart, gend));
@@ -228,7 +244,7 @@ pub fn compact_messages(
         }
     }
 
-    stats.tokens_after = estimate_messages(&out) + tools_schema_tokens;
+    stats.tokens_after = estimate_messages(&out, count_reasoning) + tools_schema_tokens;
     stats.compacted = stats.archived_tools > 0 || stats.folded_messages > 0;
     (out, stats)
 }
@@ -283,13 +299,13 @@ mod tests {
         messages.push(user_msg("最后问题"));
         let cfg = CompactConfig { budget_tokens: 100_000, recent_tool_results_kept: 6 };
         // 预算足够 → 不动
-        let (out, stats) = compact_messages(&messages, &cfg, 0);
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
         assert!(!stats.compacted);
         assert_eq!(out.len(), messages.len());
 
         // 预算紧张 → 旧工具结果归档，最近 6 个完整
         let cfg = CompactConfig { budget_tokens: 3000, recent_tool_results_kept: 6 };
-        let (out, stats) = compact_messages(&messages, &cfg, 0);
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
         assert!(stats.compacted && stats.archived_tools >= 4);
         let tools: Vec<&Value> =
             out.iter().filter(|m| m.get("role").and_then(Value::as_str) == Some("tool")).collect();
@@ -317,11 +333,28 @@ mod tests {
         }
         messages.push(user_msg("最后问题"));
         let cfg = CompactConfig { budget_tokens: 6_000, recent_tool_results_kept: 2 };
-        let (_, stats) = compact_messages(&messages, &cfg, 0);
+        let (_, stats) = compact_messages(&messages, &cfg, 0, false);
         assert!(!stats.compacted, "消息在预算内不该裁");
-        let (_, stats2) = compact_messages(&messages, &cfg, 1_500);
+        let (_, stats2) = compact_messages(&messages, &cfg, 1_500, false);
         assert!(stats2.compacted && stats2.archived_tools >= 2, "tools 计入后应触发归档");
         assert!(stats2.tokens_after <= stats2.tokens_before);
+    }
+
+    #[test]
+    fn reasoning_counts_only_when_replayed() {
+        // 思考计入与否跟随回放判定：回放渠道（DeepSeek/zai 契约、白名单）思考每轮
+        // 重发进 prompt，预算要看见；剥离渠道不计入，否则过度裁剪
+        let msgs = vec![json!({
+            "role": "assistant",
+            "content": "好的",
+            "reasoning_content": "思".repeat(100),
+        })];
+        let stripped = estimate_messages(&msgs, false);
+        let replayed = estimate_messages(&msgs, true);
+        assert_eq!(stripped, 4 + 2, "剥离渠道：只算 role 开销 + 正文");
+        assert_eq!(replayed, stripped + 100, "回放渠道：思考按 CJK 1 token/字计入");
+        assert_eq!(estimate_breakdown(&msgs, true).messages, 2 + 100, "breakdown 同口径");
+        assert_eq!(estimate_breakdown(&msgs, false).messages, 2);
     }
 
     #[test]
@@ -335,7 +368,7 @@ mod tests {
         messages.push(user_msg("最后问题"));
         // 预算极小：归档完工具结果也压不下来 → 折叠整轮
         let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 2 };
-        let (out, stats) = compact_messages(&messages, &cfg, 0);
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
         assert!(stats.compacted && stats.folded_messages > 0);
         assert_eq!(out[0]["content"], "sys");
         assert!(out
@@ -358,7 +391,7 @@ mod tests {
         }
         messages.push(user_msg("最后问题"));
         let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 2 };
-        let (out, stats) = compact_messages(&messages, &cfg, 0);
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
         assert!(stats.folded_messages > 0);
         assert!(!stats.folded.is_empty(), "折叠的原始消息必须带出");
         // 带出的内容含被折叠轮次的 user 消息原文
@@ -384,7 +417,7 @@ mod tests {
         }
         messages.push(user_msg("最后问题"));
         let cfg = CompactConfig { budget_tokens: 1500, recent_tool_results_kept: 1 };
-        let (out, _) = compact_messages(&messages, &cfg, 0);
+        let (out, _) = compact_messages(&messages, &cfg, 0, false);
         for (i, m) in out.iter().enumerate() {
             if m.get("role").and_then(Value::as_str) == Some("tool") {
                 let prev = &out[i - 1];

@@ -63,7 +63,9 @@ fn replay_model_id_candidates(model_id: &str) -> Vec<String> {
 }
 
 /// assistant 消息是否应保留 reasoning_content 回放（上游 shouldPreserveReasoningContentReplay）。
-fn should_preserve_replay(model_id: &str, compat: &Compat) -> bool {
+/// 核心循环的估算/裁剪也用它对齐口径：会回放思考的渠道思考每轮真发出去、本地预算必须
+/// 看见；剥离渠道思考不进下一次请求、不计入（用户拍板 2026-10-01）。
+pub(crate) fn should_preserve_replay(model_id: &str, compat: &Compat) -> bool {
     if compat.requires_reasoning_content_replay || compat.thinking_format == ThinkingFormat::Deepseek {
         return true;
     }
@@ -194,6 +196,14 @@ mod tests {
         let a = msgs.as_array().unwrap();
         assert!(a[1].get("reasoning_content").is_none(), "非契约端点应剥离 reasoning_content");
         assert_eq!(a[1]["content"], json!("hello"));
+    }
+
+    #[test]
+    fn replay_decision_matches_whitelist() {
+        // 估算/裁剪的思考口径跟着这个判定走：白名单/契约渠道计入，其余不计入
+        assert!(should_preserve_replay("deepseek-v4-flash", &openai_compat()), "白名单模型回放");
+        assert!(!should_preserve_replay("step-5-preview", &openai_compat()), "非白名单剥离");
+        assert!(!should_preserve_replay("qwen3.8-flash", &openai_compat()));
     }
 
     #[test]
