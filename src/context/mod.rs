@@ -31,16 +31,13 @@ pub fn estimate_tokens(text: &str) -> u64 {
     cjk + other.div_ceil(2) + ascii.div_ceil(4)
 }
 
-/// 单条消息估算（role 开销 + content + tool_calls + reasoning_content）。
-/// reasoning 随消息持久化（P6），DeepSeek 契约白名单渠道回放时会原样带回——
-/// 对剥离 reasoning 的渠道这是保守高估，与估算器「宁高勿低」的取向一致。
+/// 单条消息估算（role 开销 + content + tool_calls）。
+/// 思考内容（reasoning_content）**不计入**（用户拍板 2026-10-01）：回放时默认剥离、
+/// 不进下一次请求，占用的只是渠道当次的临时窗口，不是会话上下文。
 fn estimate_message(m: &Value) -> u64 {
     let mut total: u64 = 4;
     if let Some(c) = m.get("content") {
         total += value_tokens(c);
-    }
-    if let Some(c) = m.get("reasoning_content").and_then(Value::as_str) {
-        total += estimate_tokens(c);
     }
     if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -96,10 +93,6 @@ pub fn estimate_breakdown(messages: &[Value]) -> Breakdown {
             "assistant" => {
                 if let Some(c) = m.get("content") {
                     b.messages += value_tokens(c);
-                }
-                if let Some(c) = m.get("reasoning_content").and_then(Value::as_str) {
-                    // 思考随消息持久化（DeepSeek 契约渠道会回放），归进消息口径
-                    b.messages += estimate_tokens(c);
                 }
                 if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
                     b.other += 8 * calls.len() as u64 + calls.iter().map(value_tokens).sum::<u64>();

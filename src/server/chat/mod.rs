@@ -700,7 +700,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             }
                         }))
                     }
-                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens, completion_tokens } => {
+                    AgentEvent::ApiUsage { prompt_tokens, cached_tokens, added_tokens } => {
                         // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
                         // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
                         // P22-C：子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
@@ -717,12 +717,12 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         {
                             crate::hooks::notify_budget_exceeded(&session_id, total, budget);
                         }
-                        // 用量快照落盘（读-改-写）：tokens = 本次实报 prompt + 输出（回复
-                        // 已进上下文），主循环累计并入。重启后 /api/sessions/open 靠它恢复
-                        let completion = completion_tokens.unwrap_or(0);
+                        // 用量快照落盘（读-改-写）：tokens = 本次实报 prompt + 留存增量
+                        // （正文+工具参数，思考不计入），主循环累计并入。重启后
+                        // /api/sessions/open 靠它恢复圆环与缓存行
                         let snap = {
                             let mut u = usage_slot.lock().unwrap_or_else(|e| e.into_inner());
-                            u.tokens = prompt_tokens + completion;
+                            u.tokens = prompt_tokens + added_tokens;
                             u.api_prompt = u.api_prompt.saturating_add(prompt_tokens);
                             u.api_cached = u.api_cached.saturating_add(cached_tokens.unwrap_or(0));
                             u.clone()
@@ -730,7 +730,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         if let Err(e) = session.update_usage(&session_id, snap) {
                             observability::debug(&format!("用量快照落盘失败: {e}"));
                         }
-                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens, "completion_tokens": completion_tokens } }))
+                        send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens, "added_tokens": added_tokens } }))
                     }
                     // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                     AgentEvent::Snapshot { messages } => {
