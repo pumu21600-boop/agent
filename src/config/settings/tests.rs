@@ -182,3 +182,17 @@
             serde_json::from_str(r#"{"features":{"cancel_on_disconnect":true}}"#).unwrap();
         assert!(on.features.cancel_on_disconnect);
     }
+    #[test]
+    fn feature_set_roundtrip_and_unknown_key_errors() {
+        // 权限放开轮（2026-10-02）：插件开关 ↔ settings.features 联动。set 是唯一写入口，
+        // 未知键必须报错——serde 对未知字段静默丢弃，「开关写了却没生效」比报错更难查
+        let mut f = crate::config::settings::FeatureSettings::default();
+        for key in crate::plugin::ui::FEATURE_KEYS {
+            f.set(key, false).unwrap();
+            let back = serde_json::to_string(&f).unwrap();
+            assert!(!back.contains(&format!("\"{key}\":true")), "{key} 应被关掉: {back}");
+            f.set(key, true).unwrap();
+        }
+        let err = f.set("no_such_feature", true).unwrap_err();
+        assert!(err.contains("no_such_feature") && err.contains("roles"), "{err}");
+    }

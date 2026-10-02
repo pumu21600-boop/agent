@@ -38,6 +38,10 @@ use crate::plugin::trust;
 /// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "plugins";
 
+/// settings.features 的功能键全集（manifest `feature` 与 toggle_plugin 的联动只认这些）。
+/// 加减键时同步改 config/settings.rs 的 Features 结构体——两边不一致时以这边为准报错。
+pub const FEATURE_KEYS: &[&str] = &["roles", "css_tool", "galaxy", "cancel_on_disconnect"];
+
 /// 生态轮：停用名单的进程内副本。技能根扫描（skills::list → index_prompt）每轮对话都跑，
 /// 摸不到服务层的 settings 锁——与 wasm::set_disabled 同模式：启动（main）与启停端点两处灌入。
 static DISABLED: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
@@ -98,6 +102,10 @@ pub struct UiExt {
     /// P21：插件自带设置页（manifest settings_entry，如 prices.html）——
     /// 宿主在设置→插件卡片上渲染「设置」按钮，点了在插件面板里打开该页
     pub settings_entry: String,
+    /// 权限放开轮（用户 2026-10-02 拍板）：manifest `feature: "<settings.features 的键>"`——
+    /// 声明后插件的启用开关就是这个功能的总开关（host 侧 toggle_plugin 同步写
+    /// settings.features），一个能力只留一个开关，不搞「插件停用 + 功能关闭」双闸
+    pub feature: String,
     /// P21 红线3：验签键（`plugins:<name>`；draft 为空串）
     pub trust_key: String,
     /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
@@ -160,6 +168,7 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
             skills: Vec::new(),
             // draft 是模型自产隔离区：豁免验签
             settings_entry: String::new(),
+            feature: String::new(),
             trust_key: String::new(),
             digest: String::new(),
             trusted: true,
@@ -231,6 +240,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         tools: Vec::new(),
         skills: Vec::new(),
         settings_entry: String::new(),
+        feature: String::new(),
         trust_key: String::new(),
         digest: String::new(),
         trusted: true,
@@ -279,6 +289,21 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             _ => e.error = Some(format!("settings_entry {se} 不是插件目录内的文件")),
         }
     }
+    // 权限放开轮（用户 2026-10-02 拍板）：manifest feature 把插件开关绑到功能总开关。
+    // 只认 settings.features 里真实存在的键——写别的键 serde 反序列化会静默丢弃，
+    // 那种「开关明明在却没用」的假象比报错更难排查（错误不许静默）。
+    if let Some(f) = v.get("feature").and_then(Value::as_str) {
+        if FEATURE_KEYS.contains(&f) {
+            e.feature = f.to_string();
+        } else {
+            e.ok = false;
+            e.error = Some(format!(
+                "manifest feature「{f}」不是已知功能键（可选：{}）",
+                FEATURE_KEYS.join(" / ")
+            ));
+            return e;
+        }
+    }
     // P17：界面插槽与写操作权限（只认白名单里的插槽名与动作名）
     if let Some(ui) = v.get("ui").and_then(Value::as_array) {
         e.ui = ui
@@ -294,7 +319,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .filter(|p| {
                 matches!(
                     *p,
-                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard"
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard" | "settings.feature" | "action.run"
                 )
             })
             .map(str::to_string)
@@ -643,6 +668,35 @@ mod tests {
         assert!(content_type(Path::new("a/app.js")).starts_with("text/javascript"));
         assert!(content_type(Path::new("a/style.CSS")).starts_with("text/css"));
         assert_eq!(content_type(Path::new("a/data.bin")), "application/octet-stream");
+    }
+
+    #[test]
+    fn manifest_feature_key_binds_and_validates() {
+        // 权限放开轮（2026-10-02）：manifest feature 把插件开关绑到 settings.features
+        let root = tmpdir("feature");
+        let d = root.join("roles");
+        std::fs::create_dir_all(&d).unwrap();
+        // 合法键 + 新权限一起过
+        std::fs::write(
+            d.join("manifest.json"),
+            r#"{"apiVersion":1,"entry":"index.html","feature":"roles","permissions":["settings.feature","action.run"]}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("index.html"), "x").unwrap();
+        let e = load_one(&d, "roles", "app", &[]);
+        assert!(e.ok, "{:?}", e.error);
+        assert_eq!(e.feature, "roles");
+        assert!(e.permissions.contains(&"settings.feature".to_string()), "新权限要放行");
+        assert!(e.permissions.contains(&"action.run".to_string()));
+        // 未知键 = 明确报错（不静默丢：开关会变成假开关）
+        std::fs::write(d.join("manifest.json"), r#"{"apiVersion":1,"entry":"index.html","feature":"nope"}"#).unwrap();
+        let bad = load_one(&d, "roles", "app", &[]);
+        assert!(!bad.ok);
+        assert!(bad.error.as_deref().unwrap_or("").contains("不是已知功能键"), "{:?}", bad.error);
+        // 没声明 feature = 空串（普通插件，开关只管面板不影响功能）
+        std::fs::write(d.join("manifest.json"), r#"{"apiVersion":1,"entry":"index.html"}"#).unwrap();
+        assert!(load_one(&d, "roles", "app", &[]).feature.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

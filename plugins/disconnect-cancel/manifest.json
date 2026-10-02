@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"断线取消","description":"网页断开（关页面/断网/刷新）时取消本轮任务：开=不再继续烧 token，关=后台跑完、刷新回来能接着聊","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"disconnect-cancel","title":"断线取消"}],"feature":"cancel_on_disconnect","permissions":["settings.feature"]}

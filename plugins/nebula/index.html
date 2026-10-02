@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>星云</title>
+<style>
+  :root { scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
+  body {
+    --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31;
+    --hover: #26262b; --btn-line: #3a3a41; --warn: #e8a33d; --err: #e5534b; --link: #6ea8fe; --ok: #7bc96f;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    --hover: #f2f2f5; --btn-line: #d4d4da; --warn: #b25e09; --err: #cf222e; --link: #0b62d0; --ok: #1a7f37;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px 16px 20px; font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h3 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  .row .k { color: var(--dim); }
+  .row .v { text-align: right; font-variant-numeric: tabular-nums; }
+  .stats { display: flex; gap: 8px; margin-bottom: 10px; }
+  .stat { flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  .stat .n { font-size: 18px; font-weight: 680; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--dim); font-size: 12px; }
+  .search { display: flex; gap: 8px; margin-bottom: 10px; }
+  .search input { flex: 1; font: inherit; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--btn-line); background: var(--bg); color: var(--fg); }
+  button { font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer; border: 1px solid var(--btn-line); background: transparent; color: var(--fg); }
+  button:hover { background: var(--hover); }
+  .item { padding: 7px 0; border-bottom: 1px solid var(--line); }
+  .item:last-child { border-bottom: none; }
+  .item .t { font-weight: 600; }
+  .item .s { color: var(--dim); font-size: 12px; margin-top: 1px; }
+  .item .m { color: var(--dim); font-size: 11px; margin-top: 2px; display: flex; gap: 8px; }
+  .tag { border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-size: 11px; }
+  .tag.no { color: var(--warn); border-color: var(--warn); }
+  .dim { color: var(--dim); font-size: 12px; }
+  .err { color: var(--err); font-size: 12px; white-space: pre-wrap; }
+  .empty { color: var(--dim); font-size: 12px; padding: 18px 0; text-align: center; }
+</style>
+</head>
+<body>
+  <div id="body"><div class="empty">读取中…</div></div>
+
+<script>
+let seq = 0;
+const pending = new Map();
+let booted = false;
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const num = (n) => (n ?? 0).toLocaleString('zh-CN');
+
+async function boot() {
+  $('body').innerHTML = `
+    <h3>记忆库</h3>
+    <div class="stats" id="stats"></div>
+    <div class="search"><input id="q" placeholder="搜索记忆（语义 + 关键词）" /><button id="go">搜索</button><button id="all">全部</button></div>
+    <div class="card" id="list"><div class="empty">读取中…</div></div>
+    <div class="dim" id="notice" style="margin-top:8px"></div>`;
+  $('go').onclick = () => search($('q').value.trim());
+  $('q').onkeydown = (e) => { if (e.key === 'Enter') search($('q').value.trim()); };
+  $('all').onclick = () => loadAll();
+  await loadAll();
+}
+
+async function loadAll() {
+  try {
+    const lib = await req('memory.library', {});
+    const st = lib.stats || {};
+    $('stats').innerHTML = `
+      <div class="stat"><div class="n">${num(st.sessions)}</div><div class="l">会话</div></div>
+      <div class="stat"><div class="n">${num(st.projects)}</div><div class="l">项目</div></div>
+      <div class="stat"><div class="n">${num(st.indexed)}</div><div class="l">已索引</div></div>
+      <div class="stat"><div class="n">${num(st.pending)}</div><div class="l">待索引</div></div>`;
+    renderItems(lib.items || []);
+    const mode = st.mode === 'embed' ? '语义向量' : st.mode === 'hash' ? '本地哈希' : st.mode || '—';
+    $('notice').textContent = `检索模式：${mode}${st.model ? ' · ' + st.model : ''}${lib.notice ? ' · ' + lib.notice : ''}`;
+  } catch (e) {
+    $('list').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
+  }
+}
+
+async function search(q) {
+  if (!q) return loadAll();
+  try {
+    const r = await req('memory.search', { query: q, limit: 20 });
+    renderItems(r.items || r.results || []);
+    $('notice').textContent = `「${q}」的搜索结果（${(r.items || r.results || []).length} 条）`;
+  } catch (e) {
+    $('list').innerHTML = `<div class="err">搜索失败：${esc(e.message || e)}</div>`;
+  }
+}
+
+function renderItems(items) {
+  if (!items.length) { $('list').innerHTML = '<div class="empty">没有记忆条目。</div>'; return; }
+  $('list').innerHTML = items.slice(0, 50).map((it) => `
+    <div class="item">
+      <div class="t">${esc(it.title || it.id || '（无标题）')}</div>
+      ${it.snippet ? `<div class="s">${esc(it.snippet)}</div>` : ''}
+      <div class="m">
+        <span>${esc(it.project || '未分组')}</span>
+        <span>${num(it.count ?? 0)} 轮</span>
+        ${it.pinned ? '<span class="tag">置顶</span>' : ''}
+        <span class="tag ${it.indexed ? '' : 'no'}">${it.indexed ? '已索引' : '待索引'}</span>
+      </div>
+    </div>`).join('');
+}
+</script>
+</body>
+</html>

@@ -3531,14 +3531,6 @@
     if (k === 'galaxy' && !features.galaxy && galaxyOpen) galaxyOpen = false;
   }
 
-  // 沙箱 CPU 上限：空/非数字 = 回默认 80，越界钳回 0-100（0 = 不限）
-  function commitCpu(v) {
-    const raw = Number(v);
-    const n = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : 80;
-    sandboxCpu = n;
-    autoSave({ sandbox_cpu_percent: n }, 0);
-  }
-
   // 同上：技能/MCP/插件分区的数据原先只在 pickSettingsTab 的点击里拉，页签从 localStorage
   // 恢复时（上次停在「技能」再开机）打开设置看到的是空列表，点一下页签才有——照记忆分区补齐。
   $: if (settingsOpen && settingsTab === 'skills') loadSkills();
@@ -3568,9 +3560,8 @@
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
-  // 021：沙箱自检（真拉起受限进程跑探针套件）
+  // 021：沙箱自检（真拉起受限进程跑探针套件）——结果由沙箱插件的 action.run 桥拉走
   let sandboxProbe = null;
-  let sbRunning = false;
   // 021：应用版本（侧栏「关于」行）
   let appVersion = null;
   async function loadVersion() {
@@ -3581,13 +3572,11 @@
     }
   }
   async function runSandboxProbe() {
-    sbRunning = true;
     try {
       sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       sandboxProbe = { error: String(e.message || e) };
     }
-    sbRunning = false;
   }
   async function loadGitRuntime() {
     try {
@@ -3598,15 +3587,12 @@
   }
   // P20 沙箱档位（运行状态卡首卡）：配置档 / 生效档（含 AC→受限回退与原因）/ 探测链
   let sandboxInfo = null;
-  let sbInfoLoading = false;
   async function loadSandboxInfo(refresh) {
-    sbInfoLoading = true;
     try {
       sandboxInfo = await fetch(`/api/sandbox/info${refresh ? '?refresh=1' : ''}`, { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       sandboxInfo = null;
     }
-    sbInfoLoading = false;
   }
   async function loadMcp() {
     try {
@@ -3659,6 +3645,13 @@
     pdf: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 15.5c1.7 0 1.7-2.8 3.4-2.8s1.7 2.8 3.4 2.8"/>',
     presentations: '<path d="M3 3.5h18"/><path d="M20 3.5V13a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 13V3.5"/><path d="M12 14.8V18"/><path d="M8.5 21 12 18l3.5 3"/>',
     spreadsheets: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M4 10.2h16"/><path d="M10.2 5v14"/><path d="M4 15h16"/>',
+    // 权限放开轮插件化的 6 项内置能力（图标沿用原设置页特例行的标识，搬壳不换脸）
+    'git-panel': '<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/>',
+    'sandbox-panel': '<path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/>',
+    roles: '<circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="12" r="2.6"/><path d="M8.6 12h6.8M8.6 12l2.2-2.2M8.6 12l2.2 2.2M15.4 12l-2.2-2.2M15.4 12l-2.2 2.2"/>',
+    'css-ui': '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14.5 6.5l3 3"/>',
+    nebula: '<circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="8.4" ry="3.2" transform="rotate(-24 12 12)"/><circle cx="18.8" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="5.6" cy="14.8" r="0.9" fill="currentColor" stroke="none"/>',
+    'disconnect-cancel': '<path d="M10 13a4 4 0 0 0 5.7 0l2.3-2.3a4 4 0 0 0-5.7-5.7L11 6.3"/><path d="M14 11a4 4 0 0 0-5.7 0L6 13.3a4 4 0 0 0 5.7 5.7l1.3-1.3"/><path d="M4 4l16 16"/>',
   };
   // 未知（用户自建）插件的通用图标：插头。菜单里不回落首字——「/」菜单插件行
   // 曾经整列都是硬编码的「P」徽标（用户实锤），现在已知插件各画 SVG，未知的也画 SVG
@@ -4143,6 +4136,100 @@
           const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
           const sid = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
           reply(true, await get(`/api/trace?limit=${limit}${sid}`));
+          break;
+        }
+        // —— 权限放开轮（用户 2026-10-02 拍板）：功能类插件读自己的功能状态、改自己的
+        //    功能设置、触发宿主动作。三道口子都白名单化：能读的只有脱敏快照，能改的只有
+        //    settings.features / roles / 沙箱 CPU（密钥/渠道/审批档/对外发送永不开放），
+        //    能触发的只有下面 action.run 那几个枚举动作 ——
+        case 'features.get': {
+          reply(true, {
+            features,
+            roles: roles || {},
+            sandbox_cpu_percent: sandboxCpu,
+            // 只给渠道的 id/名字/模型——密钥、base_url 一个字节都不出这道门
+            configs: configs.map((c) => ({ id: c.id, label: configLabel(c), model: c.model || '' })),
+            git: gitRuntime,
+            sandbox: sandboxInfo,
+          });
+          break;
+        }
+        case 'features.set': {
+          if (!perms.includes('settings.feature')) return reply(false, '未声明权限 settings.feature');
+          const k = String(params.feature || '');
+          if (!['roles', 'css_tool', 'galaxy', 'cancel_on_disconnect'].includes(k)) return reply(false, `未知功能键 ${k}`);
+          const v = params.value !== false;
+          // toggleFeature 是「取反」语义：先比再翻，别翻两次
+          if ((features[k] || false) !== v) toggleFeature(k);
+          reply(true, { features });
+          break;
+        }
+        case 'settings.feature.save': {
+          if (!perms.includes('settings.feature')) return reply(false, '未声明权限 settings.feature');
+          const patch = {};
+          if (params.roles && typeof params.roles === 'object') {
+            // 白名单必须与 RolesSettings 的字段一一对应（summary/title/vision/video/audio/
+            // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
+            // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实锤）。
+            // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
+            const allow = ['summary', 'title', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
+            const next = { ...roles };
+            for (const k of allow) {
+              if (params.roles[k] === null) delete next[k];
+              else if (typeof params.roles[k] === 'string') next[k] = params.roles[k];
+            }
+            patch.roles = next;
+          }
+          if (params.sandbox_cpu_percent !== undefined) {
+            patch.sandbox_cpu_percent = Math.max(0, Math.min(100, Math.round(Number(params.sandbox_cpu_percent) || 80)));
+            sandboxCpu = patch.sandbox_cpu_percent;
+          }
+          if (!Object.keys(patch).length) return reply(false, '没有可写的字段');
+          autoSave(patch, 0);
+          reply(true, { roles: patch.roles ?? roles, sandbox_cpu_percent: patch.sandbox_cpu_percent ?? sandboxCpu });
+          break;
+        }
+        case 'action.run': {
+          if (!perms.includes('action.run')) return reply(false, '未声明权限 action.run');
+          const act = String(params.action || '');
+          // 白名单逐个放行：都是设置页上用户本人也能点的同款动作（探测/检测/刷新），
+          // 不新增任何宿主能力；沙箱探测会真拉受限进程，与点「检测」按钮等价
+          if (act === 'git.detect') {
+            await loadGitRuntime(true);
+            reply(true, { git: gitRuntime });
+          } else if (act === 'sandbox.detect') {
+            await loadSandboxInfo(true);
+            reply(true, { sandbox: sandboxInfo });
+          } else if (act === 'sandbox.probe') {
+            await runSandboxProbe();
+            reply(true, { probe: sandboxProbe });
+          } else if (act === 'skills.reload') {
+            await loadSkills();
+            reply(true, { ok: true });
+          } else if (act === 'ext.reload') {
+            await loadExt();
+            reply(true, { ok: true });
+          } else {
+            reply(false, `未知动作 ${act}（git.detect / sandbox.detect / sandbox.probe / skills.reload / ext.reload）`);
+          }
+          break;
+        }
+        // 记忆只读桥（星云插件用）：会话级口径，与用量面板同思路——插件拿不到别的会话
+        // 的也不该看。检索/清单位于 /api/memory/*，插件侧本来也够不着（不透明源）
+        case 'memory.search': {
+          const q = String(params.query || '').trim();
+          if (!q) return reply(false, '缺少 query');
+          const r = await fetch('/api/memory/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: q, limit: Math.min(Math.max(Number(params.limit) || 10, 1), 50) }),
+          });
+          const j = await r.json().catch(() => ({}));
+          reply(r.ok, r.ok ? j : j.error || '检索失败');
+          break;
+        }
+        case 'memory.library': {
+          reply(true, await get('/api/memory/library'));
           break;
         }
         // 在右侧边栏新开文件预览标签（「项目速览」点文件用）：纯界面动作，不占权限；
@@ -5978,80 +6065,10 @@
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
-        <!-- 计数必须说实话：这一组里 6 行是内置能力（Git/沙箱/功能桥接/css-ui注入/星云/断线取消，
-             不是插件、无启用开关），其余才是插件。曾经写死 5 且混在一起数，显示「内置 14」，
-             用户据此认为内置 14 个插件、菜单「少列了」——拆开计数，一眼看清几个是插件 -->
-        <div class="group-label">内置 {6 + builtInExts.length}（插件 {builtInExts.length} · 内置能力 6）</div>
-        <div class="plug-row" title={gitRuntime?.ok ? `版本 ${gitRuntime.version} · ${gitRuntime.path}` : (gitRuntime?.error || '')}>
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">Git</div>
-            <div class="plug-desc">{gitRuntime ? (gitRuntime.ok ? `版本控制运行时 · ${gitRuntime.version}` : `不可用 · ${gitRuntime.error}`) : '读取中…'}</div>
-          </div>
-          <span class="plug-chip" class:warn={gitRuntime && !gitRuntime.ok}>{gitRuntime?.ok ? (gitRuntime.source === 'system' ? '系统 Git' : gitRuntime.source === 'portable' ? '便携版' : '内置 Git') : gitRuntime ? '不可用' : '…'}</span>
-          <button class="btn ghost" on:click={loadGitRuntime}>检测</button>
-        </div>
-        <div class="plug-row" title={sandboxInfo ? `生效档 ${sandboxInfo.effective} · 配置档 ${sandboxInfo.mode_configured} · 直跑开关${sandboxInfo.allow_unsandboxed ? '已开启' : '未开启'}` : ''}>
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">沙箱</div>
-            <div class="plug-desc">{sandboxInfo ? `命令在受限进程树里跑${sandboxInfo.fallback_reason ? ` · ${sandboxInfo.fallback_reason}` : ''}` : '读取中…'}</div>
-          </div>
-          {#if sandboxProbe}
-            <span class="plug-chip" class:warn={sbRunning || !sandboxProbe.ok}>{sbRunning ? '检测中…' : sandboxProbe.ok ? '检测通过' : '检测有失败'}</span>
-          {/if}
-          <span class="plug-chip">{sandboxInfo ? sandboxInfo.label + (sandboxInfo.effective !== sandboxInfo.requested ? ' · 已回退' : '') : '…'}</span>
-          <label class="plug-cpu" title="沙箱命令可用的 CPU 上限（单核的百分比）；默认 80%，0 = 不限">
-            CPU <input type="number" min="0" max="100" value={sandboxCpu} on:change={(e) => commitCpu(e.currentTarget.value)} /> %
-          </label>
-          <!-- 检测 = 一次做完:刷新档位 + 真拉起受限进程跑探针（用户拍板:一行一个按钮） -->
-          <button class="btn ghost" on:click={() => { loadSandboxInfo(true); runSandboxProbe(); }} disabled={sbInfoLoading || sbRunning}>检测</button>
-        </div>
-        {#if sandboxProbe?.error}<div class="plug-sub">{sandboxProbe.error}</div>{/if}
-        {#if sandboxProbe?.results?.length}
-          <div class="probe-list">
-            {#each sandboxProbe.results as p}
-              <div class="probe-row">
-                <span class="dot" class:haskey={p.ok}></span>
-                <code>{p.name}</code>
-                <span class="probe-detail">{p.detail}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-
-        <div class="plug-row" title="给摘要/标题/嵌入/多模态/子代理/预算降级等辅助调用指定专用模型渠道（原「角色分工」）">
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="12" r="2.6"/><path d="M8.6 12h6.8M8.6 12l2.2-2.2M8.6 12l2.2 2.2M15.4 12l-2.2-2.2M15.4 12l-2.2 2.2"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">功能桥接</div>
-            <div class="plug-desc">辅助调用走专用渠道 · 关掉全部回主渠道（多模态附件退回占位文本）</div>
-          </div>
-          <button class="switch" class:on={features.roles} role="switch" aria-checked={features.roles} aria-label="功能桥接 启用/停用" on:click={() => toggleFeature('roles')}><span class="knob"></span></button>
-        </div>
-        <div class="plug-row" title="界面微调引擎（右击元素改样式）与手写 CSS 注入；已调好的样式不受开关影响，重开即恢复">
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14.5 6.5l3 3"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">css-ui注入</div>
-            <div class="plug-desc">界面微调与手写 CSS · 关掉只收工具，已调样式继续生效</div>
-          </div>
-          <button class="switch" class:on={features.css_tool} role="switch" aria-checked={features.css_tool} aria-label="css-ui注入 启用/停用" on:click={() => toggleFeature('css_tool')}><span class="knob"></span></button>
-        </div>
-        <div class="plug-row" title="记忆库可视化与语义检索入口；记忆功能本体不受开关影响">
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="8.4" ry="3.2" transform="rotate(-24 12 12)"/><circle cx="18.8" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="5.6" cy="14.8" r="0.9" fill="currentColor" stroke="none"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">星云</div>
-            <div class="plug-desc">记忆库可视化与检索入口 · 关掉不影响记忆功能</div>
-          </div>
-          <button class="switch" class:on={features.galaxy} role="switch" aria-checked={features.galaxy} aria-label="星云 启用/停用" on:click={() => toggleFeature('galaxy')}><span class="knob"></span></button>
-        </div>
-        <div class="plug-row" title="开 = 检测到网页断开（关页面/断网/刷新）就取消本轮任务，不再继续烧 token；关 = 任务在后台跑完，刷新页面回来能接着聊">
-          <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a4 4 0 0 0 5.7 0l2.3-2.3a4 4 0 0 0-5.7-5.7L11 6.3"/><path d="M14 11a4 4 0 0 0-5.7 0L6 13.3a4 4 0 0 0 5.7 5.7l1.3-1.3"/><path d="M4 4l16 16"/></svg></div>
-          <div class="plug-meta">
-            <div class="plug-title">断线取消</div>
-            <div class="plug-desc">网页断开即停本轮 · 关则后台跑完（刷新可续聊）</div>
-          </div>
-          <button class="switch" class:on={features.cancel_on_disconnect} role="switch" aria-checked={features.cancel_on_disconnect} aria-label="断线取消 启用/停用" on:click={() => toggleFeature('cancel_on_disconnect')}><span class="knob"></span></button>
-        </div>
+        <!-- 权限放开轮（用户 2026-10-02 拍板）：内置能力已全部插件化——Git/沙箱/功能桥接/
+             css-ui注入/星云/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
+             host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行 -->
+        <div class="group-label">插件 {builtInExts.length}</div>
 
         {#each builtInExts as e}
           <div class="plug-row" title={extTip(e)}>
@@ -7541,27 +7558,6 @@
   }
   .ext-panel .rp-tabs {
     flex-wrap: nowrap;
-  }
-  /* 沙箱自检结果行（插件分区） */
-  .probe-list {
-    margin: 6px 0 2px;
-  }
-  .probe-row {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 3px 0;
-    font-size: 12px;
-    color: var(--g6);
-  }
-  .probe-row code {
-    color: var(--g7);
-    flex: none;
-    min-width: 110px;
-  }
-  .probe-detail {
-    color: var(--g5);
-    word-break: break-all;
   }
   .side-version {
     flex: 0 0 100%;
@@ -9725,30 +9721,6 @@
   /* —— 插件页（用户 2026-09-30 指示：学 ZCode 紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
      plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（用户 2026-10-02 要求
      与插件页同形式）也在用，跨组件共用 */
-  .plug-cpu {
-    flex: none;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--g5);
-    white-space: nowrap;
-  }
-  .plug-cpu input {
-    width: 52px;
-    padding: 4px 6px;
-    font-size: 12px;
-    border: 1px solid var(--g3);
-    border-radius: 6px;
-    background: var(--g1);
-    color: var(--g7);
-    text-align: right;
-  }
-  .plug-cpu input::-webkit-outer-spin-button,
-  .plug-cpu input::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
 </style>
 
 

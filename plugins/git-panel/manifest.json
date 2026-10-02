@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"Git","description":"版本控制运行时状态（系统 Git / 便携版 / 内置）与自检；提交流程见 git-commit 技能","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"git-panel","title":"Git"}],"permissions":["action.run"]}

@@ -218,6 +218,18 @@ pub(super) async fn toggle_plugin(
     if !enabled {
         s.disabled_plugins.push(name.clone());
     }
+    // 权限放开轮（用户 2026-10-02 拍板）：manifest 声明了 feature 的插件，它的启用开关
+    // 就是那个功能的总开关——host 同步写 settings.features，一个能力只留一个开关
+    // （否则「插件停了但功能还在跑」或反过来，用户看到的和实际发生的对不上）。
+    let mut synced_feature = String::new();
+    if let Some(e) = crate::plugin::ui::scan_all(&s.disabled_plugins).into_iter().find(|e| e.name == name)
+        && !e.feature.is_empty()
+    {
+        synced_feature = e.feature.clone();
+        if let Err(err) = s.set_feature(&e.feature, enabled) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": err })));
+        }
+    }
     if let Err(e) = s.save() {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
@@ -227,7 +239,7 @@ pub(super) async fn toggle_plugin(
     crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：停用的插件不贡献技能
     observability::event(
         EventType::State,
-        json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled }),
+        json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled, "synced_feature": synced_feature }),
     );
     // P18 二合一：回包清单含工具插件
     let list = crate::plugin::ui::scan_all(&s.disabled_plugins);

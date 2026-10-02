@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"沙箱","description":"命令执行沙箱：隔离档位、CPU 上限、直跑开关与自检；墙的档位归内核执法，这里看状态","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"sandbox-panel","title":"沙箱"}],"permissions":["settings.feature","action.run"]}

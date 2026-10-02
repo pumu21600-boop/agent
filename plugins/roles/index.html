@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>功能桥接</title>
+<style>
+  :root { scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
+  body {
+    --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31;
+    --hover: #26262b; --btn-line: #3a3a41; --warn: #e8a33d; --err: #e5534b; --link: #6ea8fe;
+    --ok: #7bc96f;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    --hover: #f2f2f5; --btn-line: #d4d4da; --warn: #b25e09; --err: #cf222e; --link: #0b62d0;
+    --ok: #1a7f37;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px 16px 20px; font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .role { padding: 9px 0; border-bottom: 1px solid var(--line); }
+  .role:last-child { border-bottom: none; }
+  .role .k { font-weight: 600; }
+  .role .d { color: var(--dim); font-size: 12px; margin: 1px 0 6px; }
+  select {
+    font: inherit; width: 100%; padding: 5px 8px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--btn-line); background: var(--bg); color: var(--fg);
+  }
+  button { font: inherit; padding: 5px 12px; border-radius: 6px; cursor: pointer; border: 1px solid var(--btn-line); background: transparent; color: var(--fg); }
+  button:hover { background: var(--hover); }
+  .dim { color: var(--dim); font-size: 12px; }
+  .warn { color: var(--warn); font-size: 12px; margin-top: 8px; }
+  .err { color: var(--err); font-size: 12px; white-space: pre-wrap; }
+  .empty { color: var(--dim); font-size: 12px; padding: 18px 0; text-align: center; }
+  .saved { color: var(--ok); font-size: 12px; margin-left: 8px; }
+  .head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .head select { width: auto; flex: 1; }
+</style>
+</head>
+<body>
+  <div id="body"><div class="empty">读取中…</div></div>
+
+<script>
+// 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对
+let seq = 0;
+const pending = new Map();
+let booted = false;
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// 七类辅助调用：名字、管什么、关掉后怎么退化（退路是真事，不是文案）。
+// 字段名须与后端 RolesSettings 一一对应（含 vision/video/audio 多模态三路）
+const ROUTES = [
+  { key: 'summary', name: '摘要', desc: '滚动摘要：长对话压成记忆' },
+  { key: 'title', name: '标题', desc: '会话标题自动生成' },
+  { key: 'embedding', name: '嵌入', desc: '记忆库语义检索的向量；未配 = 退本地哈希向量' },
+  { key: 'vision', name: '图片理解', desc: '图片/截图附件走专用渠道；未配 = 附件退回占位文本' },
+  { key: 'video', name: '视频理解', desc: '视频附件；未配 = 退回占位文本' },
+  { key: 'audio', name: '音频理解', desc: '音频附件；未配 = 退回占位文本' },
+  { key: 'budget', name: '预算降级', desc: '单任务 token 超预算后，剩余步骤改走它' },
+  { key: 'subagent', name: '子代理', desc: '子代理专用渠道（主会话旗舰、子代理跑量）' },
+];
+
+async function boot() { await refresh(); }
+
+async function refresh() {
+  try {
+    const s = await req('features.get', {});
+    render(s);
+  } catch (e) {
+    $('body').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
+  }
+}
+
+function render(s) {
+  const configs = s.configs || [];
+  const roles = s.roles || {};
+  if (!configs.length) {
+    $('body').innerHTML = '<div class="empty">还没有配置任何渠道（去设置里配一个）。</div>';
+    return;
+  }
+  const opts = (sel) =>
+    `<option value="">未配置（回落主渠道）</option>` +
+    configs.map((c) => `<option value="${esc(c.id)}" ${c.id === sel ? 'selected' : ''}>${esc(c.label)}${c.model ? ' · ' + esc(c.model) : ''}</option>`).join('');
+  $('body').innerHTML = `
+    <div class="head"><h3>渠道路由</h3><span class="dim">解析顺序：这里设的 ＞ config.toml [roles] ＞ 回落主渠道</span></div>
+    <div class="card">
+      ${ROUTES.map((r) => `
+        <div class="role">
+          <div class="k">${r.name}</div>
+          <div class="d">${r.desc}</div>
+          <select data-role="${r.key}">${opts(roles[r.key])}</select>
+        </div>`).join('')}
+    </div>
+    <div class="warn">整功能关掉时（插件页停用本插件）：全部辅助调用回主渠道，嵌入退本地哈希向量，预算降级失效。</div>
+    <div id="msg"></div>`;
+  $('body').querySelectorAll('select[data-role]').forEach((sel) => {
+    sel.onchange = async () => {
+      try {
+        const patch = {};
+        patch[sel.dataset.role] = sel.value || null;
+        await req('settings.feature.save', { roles: patch });
+        $('msg').innerHTML = '<span class="saved">已保存</span>';
+        setTimeout(() => { $('msg').innerHTML = ''; }, 1500);
+      } catch (e) {
+        $('msg').innerHTML = `<div class="err">保存失败：${esc(e.message || e)}</div>`;
+      }
+    };
+  });
+}
+</script>
+</body>
+</html>

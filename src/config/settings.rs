@@ -127,6 +127,26 @@ impl Default for FeatureSettings {
     }
 }
 
+impl FeatureSettings {
+    /// 按键写开关。键名不在 `crate::plugin::ui::FEATURE_KEYS` 里 = 编程错误：
+    /// serde 对未知字段静默丢弃，那种「开关写了却没生效」比报错更难查，所以显式报错。
+    pub fn set(&mut self, key: &str, value: bool) -> Result<(), String> {
+        match key {
+            "roles" => self.roles = value,
+            "css_tool" => self.css_tool = value,
+            "galaxy" => self.galaxy = value,
+            "cancel_on_disconnect" => self.cancel_on_disconnect = value,
+            other => {
+                return Err(format!(
+                    "未知功能键 {other}（可选：{}）",
+                    crate::plugin::ui::FEATURE_KEYS.join(" / ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 成本台账设置（P21 插件化后由「用量」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
@@ -480,6 +500,12 @@ struct LegacyTopLevelFields {
 }
 
 impl Settings {
+    /// 写功能总开关（插件开关联动用，见 server::plugins::toggle_plugin）。
+    /// 未知键返回 Err（调用方落审计/报错，不静默）。
+    pub fn set_feature(&mut self, key: &str, value: bool) -> Result<(), String> {
+        self.features.set(key, value)
+    }
+
     /// 读取；不存在时用 config.toml 的 gateway 节做种子。
     /// 逐级迁移：旧版单 key / keys 映射 -> configs 专属 key。
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {

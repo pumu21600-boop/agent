@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"星云","description":"记忆库可视化与语义检索入口：会话光点、项目分布、关键词/语义搜索；记忆功能本体不受停用影响","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"nebula","title":"星云"}],"feature":"galaxy"}

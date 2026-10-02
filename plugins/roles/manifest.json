@@ -1,0 +1,1 @@
+{"apiVersion":1,"source":"built_in","title":"功能桥接","description":"六类辅助调用（摘要/标题/嵌入/预算降级/子代理）的专用渠道路由：各走各的渠道，关掉全部回主渠道","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"roles","title":"功能桥接"}],"feature":"roles","permissions":["settings.feature"]}
