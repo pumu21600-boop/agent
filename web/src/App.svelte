@@ -3660,8 +3660,16 @@
     presentations: '<path d="M3 3.5h18"/><path d="M20 3.5V13a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 13V3.5"/><path d="M12 14.8V18"/><path d="M8.5 21 12 18l3.5 3"/>',
     spreadsheets: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M4 10.2h16"/><path d="M10.2 5v14"/><path d="M4 15h16"/>',
   };
+  // 未知（用户自建）插件的通用图标：插头。菜单里不回落首字——「/」菜单插件行
+  // 曾经整列都是硬编码的「P」徽标（用户实锤），现在已知插件各画 SVG，未知的也画 SVG
+  const EXT_ICON_FALLBACK =
+    '<path d="M9 3.5v3.5M15 3.5v3.5"/><path d="M6.5 7h11v3.4a5.5 5.5 0 0 1-11 0z"/><path d="M12 15.9v4.6"/>';
   function extIcon(name) {
     return EXT_ICONS[name] || '';
+  }
+  // 菜单用的图标：已知插件各画各的，未知的回退插头（空串由调用方判）
+  function menuExtIcon(name) {
+    return EXT_ICONS[name] || EXT_ICON_FALLBACK;
   }
 
   async function loadExt() {
@@ -4776,7 +4784,8 @@
                   {#if !enabledExts.length}
                     <div class="menu-empty">暂无可用插件</div>
                   {/if}
-                  <!-- 全部插件平铺（不展开）：有技能的插件点击=引用其技能；纯面板插件点击=开右栏面板 -->
+                  <!-- 全部插件平铺（不展开）：有技能的插件点击=引用其技能；纯面板插件点击=开右栏面板。
+                       列表口径 = enabledExts（启用且清单合法），与应用插件目录一一对应，不筛子集 -->
                   {#each enabledExts as e (e.name)}
                     {@const sk = pluginSkillsOf(e.name)}
                     <button
@@ -4796,7 +4805,8 @@
                         }
                       }}
                     >
-                      <span class="menu-sym">P</span> {e.title || e.name}
+                      <span class="menu-sym menu-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html menuExtIcon(e.name)}</svg></span>
+                      {e.title || e.name}
                     </button>
                   {/each}
                 </div>
@@ -9229,6 +9239,18 @@
     font-size: 12px;
     font-weight: 650;
     margin-right: 8px;
+  }
+  /* 「/」菜单插件行图标：同一格子不画字母，画各插件自己的 SVG（图标集见 EXT_ICONS） */
+  .menu-sym.menu-ico {
+    background: transparent;
+    color: var(--g5);
+  }
+  .menu-sym.menu-ico svg {
+    width: 16px;
+    height: 16px;
+  }
+  .bar-item:hover .menu-sym.menu-ico {
+    color: var(--g7);
   }
   .ctx-modal {
     width: 620px;
