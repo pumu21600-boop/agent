@@ -7574,10 +7574,20 @@
     min-width: 0;
     flex: 0 1 auto; /* 条随内容收缩，+ 号贴着最后一个标签；标签多了内部横向滚动 */
     overflow-x: auto;
-    scrollbar-width: none;
   }
+  /* 标签挤出去时，这行下缘出现一根小滑杆（用户 2026-10-03）；没挤出时原生滚动条不渲染不占位 */
   .rp-tabstrip::-webkit-scrollbar {
-    display: none;
+    height: 4px;
+  }
+  .rp-tabstrip::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .rp-tabstrip::-webkit-scrollbar-thumb {
+    background: var(--g4);
+    border-radius: 2px;
+  }
+  .rp-tabstrip:hover::-webkit-scrollbar-thumb {
+    background: var(--g5);
   }
   .rp-tab {
     display: inline-flex !important;
