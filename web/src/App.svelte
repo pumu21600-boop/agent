@@ -5,6 +5,10 @@
   // docx 排版预览（2026-10-02 用户实锤「要能看排版，完全体」）：mammoth 把 docx
   // 容器转成 HTML 再沙箱 iframe 渲染（表格/列表/图片/标题层级全保留）
   import mammoth from 'mammoth/mammoth.browser.js';
+  // 文档类统一工具条（缩放/打印，对齐 PDF 查看器组件；docx/xlsx/pptx 共用）
+  import DocToolbar from './lib/DocToolbar.svelte';
+  // xlsx 表格渲染（SheetJS 前端库，走 raw 字节解析）
+  import * as XLSX from 'xlsx/dist/xlsx.full.min.js';
   import ImagePreview from './lib/ImagePreview.svelte';
   import RenameModal from './lib/RenameModal.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
@@ -1710,24 +1714,29 @@
     activateRpTab(key);
   }
   // —— 文件预览标签：文本可编辑保存；图片/PDF/音视频走 /api/workspace/raw 直出；
-  // docx 走 mammoth 转 HTML 渲染保留排版；pptx/xlsx/odf 走后端文本抽取（best-effort）——
+  // docx/xlsx/pptx/odf 各有渲染器（2026-10-02 第五轮统一文档工具条组件）——
   const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
   const RP_PDF_EXT = new Set(['pdf']);
   const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
-  // 文档容器：docx 走前端 mammoth 完整排版；其余先文本抽取，只求「能看内容」
+  // 文档容器：docx→mammoth 排版、xlsx→SheetJS 表格、pptx→分页文本（后端结构化）；
+  // ppt(旧版)/odf 走后端文本抽取
   const RP_DOCX_EXT = new Set(['docx']);
-  const RP_DOC_EXT = new Set(['pptx', 'xlsx', 'odt', 'ods', 'odp']);
+  const RP_XLSX_EXT = new Set(['xlsx']);
+  const RP_PPTX_EXT = new Set(['pptx']);
+  const RP_DOC_EXT = new Set(['ppt', 'odt', 'ods', 'odp']);
   function extOf(path) {
     const i = String(path).lastIndexOf('.');
     return i > 0 ? String(path).slice(i + 1).toLowerCase() : '';
   }
-  // 预览形态：image / pdf / media / docx(排版) / doc(文本) / text。非 text 都不提供编辑。
+  // 预览形态：image / pdf / media / docx / xlsx / pptx / doc / text
   function previewKind(path) {
     const e = extOf(path);
     if (RP_IMG_EXT.has(e)) return 'image';
     if (RP_PDF_EXT.has(e)) return 'pdf';
     if (RP_MEDIA_EXT.has(e)) return 'media';
     if (RP_DOCX_EXT.has(e)) return 'docx';
+    if (RP_XLSX_EXT.has(e)) return 'xlsx';
+    if (RP_PPTX_EXT.has(e)) return 'pptx';
     if (RP_DOC_EXT.has(e)) return 'doc';
     return 'text';
   }
@@ -1758,6 +1767,40 @@
       rpSet(path, { loading: false, content: '', error: `docx 渲染失败: ${e.message || e}` });
     }
   }
+  // xlsx → HTML 表格（SheetJS；每 sheet 一张表，工具条/缩放共用）
+  async function loadXlsxHtml(path) {
+    rpSet(path, { loading: true, error: '' });
+    try {
+      const buf = await fetch(`/api/workspace/raw?path=${encodeURIComponent(path)}`).then((r) => {
+        if (!r.ok) throw new Error(`读取失败: HTTP ${r.status}`);
+        return r.arrayBuffer();
+      });
+      const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
+      const sheets = wb.SheetNames.map((name) => {
+        const ws = wb.Sheets[name];
+        const html = XLSX.utils.sheet_to_html(ws, { editable: false });
+        return { name, rows: ws['!range'] ? ws['!range'].e.r : 0, html };
+      });
+      rpSet(path, { loading: false, content: JSON.stringify(sheets), error: '' });
+    } catch (e) {
+      rpSet(path, { loading: false, content: '', error: `xlsx 渲染失败: ${e.message || e}` });
+    }
+  }
+  // pptx → 分页 HTML（后端抽 slide 结构，slides:[{n,text}]）
+  async function loadPptxHtml(path) {
+    rpSet(path, { loading: true, error: '' });
+    try {
+      const r = await fetch(`/api/workspace/doc-slides?path=${encodeURIComponent(path)}`).then((r) => r.json());
+      if (!r.ok) throw new Error(r.error || '读取失败');
+      rpSet(path, { loading: false, content: JSON.stringify(r.slides || []), error: '' });
+    } catch (e) {
+      rpSet(path, { loading: false, content: '', error: `pptx 渲染失败: ${e.message || e}` });
+    }
+  }
+  // 文档缩放（工具条 emit）：存 rpPreviewCache.zoom，渲染区按它调字号
+  function setDocZoom(path, z) {
+    rpSet(path, { zoom: Math.max(50, Math.min(200, z)) });
+  }
   async function loadPreview(path, force) {
     const kind = previewKind(path);
     const hit = rpPreviewCache[path];
@@ -1773,6 +1816,16 @@
         // docx 拉原始字节走 mammoth（不走 doc 抽取端点）
         rpSet(path, { loading: false, content: undefined, error: '' });
         await loadDocxHtml(path);
+        return;
+      }
+      if (kind === 'xlsx') {
+        rpSet(path, { loading: false, content: undefined, error: '' });
+        await loadXlsxHtml(path);
+        return;
+      }
+      if (kind === 'pptx') {
+        rpSet(path, { loading: false, content: undefined, error: '' });
+        await loadPptxHtml(path);
         return;
       }
       // 文档容器走文本抽取端点，其余按文本读
@@ -4572,23 +4625,25 @@
             </span>
           </div>
           {#if cpFilesOpen && dockCp && dockCp.files > 0}
-            <!-- 展开的改动文件清单（ZCode 审查同款行：状态 + 路径 + 增删行 + 审查/打开） -->
+            <!-- 展开的改动文件清单（对齐 ZCode：条下方同宽、无重复头、状态图标、
+                 文件名粗体+目录暗色、增删行、审查/打开▾） -->
             <div class="git-pop cp-files-pop">
-              <div class="git-pop-head">
-                <b>{dockCp.files}</b> 个文件已更改
-                <span class="git-pop-hint">相对本任务起点</span>
-              </div>
               <div class="git-pop-list">
                 {#if cpFilesLoading}
                   <div class="git-pop-more">加载中…</div>
                 {:else}
                   {#each cpFiles as f (f.path)}
+                    {@const name = f.path.split('/').pop()}
+                    {@const dir = f.path.split('/').slice(0, -1).join('/')}
                     <div class="git-pop-row review-row">
-                      <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
-                      <span class="git-path" title={f.path}>{f.path}</span>
+                      <span class="git-st" class:added={f.status === 'A' || f.status === '?'} class:deleted={f.status === 'D'}>{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
+                      <span class="review-file">
+                        <b class="review-name" title={f.path}>{name}</b>
+                        {#if dir}<span class="review-dir" title={dir}>{dir}/</span>{/if}
+                      </span>
                       {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
                       <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(dockCp.id, f.path)}>审查</button>
-                      <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
+                      <button class="cp-commit review-open" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
                     </div>
                   {/each}
                 {/if}
@@ -4684,50 +4739,57 @@
                 </div>
               {/if}
               {#if abilityMenuOpen}
-                <!-- 用户 2026-10-02 第三轮实锤：技能组只列自己建的（源=非插件），插件技能归
-                     「插件」组——「只注册了一个测试技能，插件明明有很多」就是被插件技能
-                     混进技能组搞乱的 -->
+                <!-- 用户 2026-10-02 第五轮实锤：①三类平铺，插件全列、不许展开；
+                     ②引用前缀统一用「/」（技能/MCP/插件都 /，不再用 $） -->
                 <div class="bar-dropdown">
                   <div class="bar-group">技能</div>
                   {#if ownSkills.length}
                     {#each ownSkills as sk (sk.name)}
-                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
-                        <span class="menu-sym">$</span> {sk.name}
+                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/${sk.name} `); }}>
+                        <span class="menu-sym">/</span> {sk.name}
                       </button>
                     {/each}
                   {:else}
                     <div class="menu-empty">暂无技能</div>
                   {/if}
                   <div class="bar-group">MCP</div>
-                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length)}
+                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length) && !wasmPlugins.some((w) => (w.tools || []).length)}
                     <div class="menu-empty">暂无可用工具</div>
                   {/if}
                   {#each mcpServers as srv}
                     {#if srv.online !== false && srv.tools && srv.tools.length}
                       {#each srv.tools as t}
-                        <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$mcp__${srv.name}__${t.name} `); }}>
-                          <span class="menu-sym">M</span> {t.name}
+                        <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/mcp__${srv.name}__${t.name} `); }}>
+                          <span class="menu-sym">/</span> {t.name}
                         </button>
                       {/each}
                     {/if}
+                  {/each}
+                  {#each wasmPlugins as w}
+                    {#each w.tools || [] as t}
+                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/wasm__${w.stem}__${t.name} `); }}>
+                        <span class="menu-sym">/</span> {t.name}
+                      </button>
+                    {/each}
                   {/each}
                   <div class="bar-group">插件</div>
                   {#if !enabledExts.length}
                     <div class="menu-empty">暂无可用插件</div>
                   {/if}
+                  <!-- 全部插件平铺（不展开）：有技能的插件点击=引用其技能；纯面板插件点击=开右栏面板 -->
                   {#each enabledExts as e (e.name)}
                     {@const sk = pluginSkillsOf(e.name)}
                     <button
                       class="bar-item"
-                      class:active={pluginMenu === e.name}
-                      title={e.description || e.name}
+                      title={sk.length ? `${e.title || e.name}：引用技能 /${sk[0].name}` : (e.description || e.name)}
                       on:click={() => {
-                        pluginMenu = pluginMenu === e.name ? '' : e.name;
-                        if (!sk.length) {
-                          // 纯面板插件（时间线/项目文件/用量…）：在右栏开它的面板
+                        abilityMenuOpen = false;
+                        if (sk.length) {
+                          insertAtCursor(`/${sk[0].name} `);
+                        } else {
+                          // 纯面板插件（时间线/项目文件/用量/浏览器…）：在右栏开它的面板
                           const entry = (e.ui || []).find((u) => u.slot === 'dock' || u.slot === 'toolbar');
-                          if (entry && entry.open !== false) {
-                            abilityMenuOpen = false;
+                          if (entry) {
                             plusMenuOpen = false;
                             addRpTab({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: entry.title || e.title || e.name });
                           }
@@ -4735,15 +4797,7 @@
                       }}
                     >
                       <span class="menu-sym">P</span> {e.title || e.name}
-                      {#if sk.length}<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>{/if}
                     </button>
-                    {#if pluginMenu === e.name}
-                      {#each sk as s (s.name)}
-                        <button class="bar-item bar-item-sub" title={s.description || s.name} on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${s.name} `); }}>
-                          <span class="menu-sym">$</span> {s.name}
-                        </button>
-                      {/each}
-                    {/if}
                   {/each}
                 </div>
               {/if}
@@ -5084,20 +5138,29 @@
                 {/if}
               {:else if t.kind === 'review'}
                 <!-- 用户 2026-10-02：侧栏「审查」标签——本会话相对任务起点的全部改动，
-                     对着 ZCode 审查列表：状态/路径/增删行 + 审查(diff)/打开 -->
+                     完全套 ZCode 审查列表：头部「N 个文件已更改 +x -y」+「撤销」，
+                     行：状态图标 / 文件名粗体+目录暗 / 增删 / 审查 / 打开▾ -->
                 {#if rpLoading}
                   <div class="trace-empty">加载中…</div>
                 {:else if !rpFiles.length}
                   <div class="rp-empty">{rpArtifactsNote || '本会话还没有改动。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
                 {:else}
-                  <div class="review-head">共 {rpFiles.length} 个文件已更改 +{rpFiles.reduce((s, f) => s + (f.adds || 0), 0)} -{rpFiles.reduce((s, f) => s + (f.dels || 0), 0)}</div>
+                  <div class="review-head">
+                    <span><b>{rpFiles.length}</b> 个文件已更改 <span class="review-add">+{rpFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span> <span class="review-del">-{rpFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span></span>
+                    {#if dockCp}<button class="cp-undo" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>{/if}
+                  </div>
                   {#each rpFiles as f (f.path)}
+                    {@const name = f.path.split('/').pop()}
+                    {@const dir = f.path.split('/').slice(0, -1).join('/')}
                     <div class="review-row">
-                      <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
-                      <span class="git-path" title={`${f.path}${f.status === '?' ? '' : ` · ${f.path.split('/').slice(0, -1).join('/')}`}`}>{f.path}</span>
+                      <span class="git-st" class:added={f.status === 'A' || f.status === '?'} class:deleted={f.status === 'D'} title={gitStatusLabel(f.status === '?' ? '??' : f.status)}>{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
+                      <span class="review-file">
+                        <b class="review-name" title={f.path}>{name}</b>
+                        {#if dir}<span class="review-dir" title={dir}>{dir}/</span>{/if}
+                      </span>
                       {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
                       <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(rpReviewBaseline, f.path)}>审查</button>
-                      <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
+                      <button class="cp-commit review-open" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
                     </div>
                   {/each}
                 {/if}
@@ -5148,7 +5211,20 @@
                   <!-- PDF 内嵌（浏览器/WebView 自带查看器） -->
                   <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></iframe>
                 {:else if previewKind(t.path) === 'docx'}
-                  <!-- docx 排版渲染（mammoth HTML → 沙箱 iframe；纸张本色，看排版） -->
+                  <!-- docx：统一工具条 + mammoth 排版（纸张本色） -->
+                  <DocToolbar
+                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
+                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
+                    on:print={() => {
+                      const ifr = document.querySelector('.rp-pane:not(.hidden) iframe.rp-doc-paper');
+                      const w = ifr && ifr.contentWindow;
+                      if (w) {
+                        try { w.focus(); w.print(); } catch { /* 沙箱 iframe 打印可能拒，算了 */ }
+                      } else {
+                        window.print();
+                      }
+                    }}
+                  />
                   {#if (rpPreviewCache[t.path] || {}).loading}
                     <pre class="rp-preview">渲染中…</pre>
                   {:else if (rpPreviewCache[t.path] || {}).error}
@@ -5158,8 +5234,52 @@
                       class="rp-pdf rp-doc-paper"
                       title={t.path}
                       sandbox=""
+                      style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}
                       srcdoc={`<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:28px;margin:0;line-height:1.75;color:#24292f;background:#fff}img{max-width:100%}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 10px}h1,h2,h3{line-height:1.4}blockquote{border-left:3px solid #999;margin:0;padding-left:12px;color:#666}pre{background:#f3f4f6;padding:10px;border-radius:6px}</style></head><body>${((rpPreviewCache[t.path] || {}).content || '').replace(/<script/gi, '&lt;script')}</body></html>`}
                     ></iframe>
+                  {/if}
+                {:else if previewKind(t.path) === 'xlsx'}
+                  <!-- xlsx：统一工具条 + SheetJS 表格渲染 -->
+                  <DocToolbar
+                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
+                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
+                    on:print={() => window.print()}
+                  />
+                  {#if (rpPreviewCache[t.path] || {}).loading}
+                    <pre class="rp-preview">渲染中…</pre>
+                  {:else if (rpPreviewCache[t.path] || {}).error}
+                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
+                  {:else}
+                    <div class="rp-xlsx" style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}>
+                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sh}
+                        <div class="rp-xlsx-sheet">
+                          <div class="rp-xlsx-name">{sh.name}{sh.rows ? `（${sh.rows + 1} 行）` : ''}</div>
+                          <div class="rp-xlsx-body">{@html sh.html}</div>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                {:else if previewKind(t.path) === 'pptx'}
+                  <!-- pptx：统一工具条 + 分页渲染（每张幻灯片一块，页角标页码） -->
+                  <DocToolbar
+                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
+                    label={(() => { try { const a = JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); return `共 ${a.length} 页`; } catch { return ''; } })()}
+                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
+                    on:print={() => window.print()}
+                  />
+                  {#if (rpPreviewCache[t.path] || {}).loading}
+                    <pre class="rp-preview">渲染中…</pre>
+                  {:else if (rpPreviewCache[t.path] || {}).error}
+                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
+                  {:else}
+                    <div class="rp-pptx" style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}>
+                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sl, i}
+                        <div class="rp-slide">
+                          <div class="rp-slide-no">{sl.n || i + 1}</div>
+                          <pre class="rp-slide-text">{sl.text || '（空白页）'}</pre>
+                        </div>
+                      {/each}
+                    </div>
                   {/if}
                 {:else if previewKind(t.path) === 'media'}
                   <div class="rp-media-wrap">
@@ -5993,7 +6113,9 @@
             <div class="trace-empty">加载中…</div>
           {:else}
             {#each ctxSessions.filter((s) => !ctxQuery || (s.title || '').toLowerCase().includes(ctxQuery.toLowerCase())) as s (s.id)}
-              <button class="ctx-file" on:click={() => pickCtxSession(s)}>
+              <!-- 用户 2026-10-02 第五轮：上下两行结构（标题上、时间下）——行内 flex
+                   挤压问题反复踩，改成块级堆叠最稳，标题超长省略 -->
+              <button class="ctx-file ctx-file-conv" on:click={() => pickCtxSession(s)}>
                 <span class="ctx-conv-title">{s.title || s.id}</span>
                 <span class="ctx-conv-ts">{(s.updated_at || '').slice(0, 16).replace('T', ' ')}</span>
               </button>
@@ -7657,6 +7779,24 @@
   .rp-audio {
     width: 100%;
   }
+  /* xlsx 表格渲染区 */
+  .rp-xlsx {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    background: #fff;
+    color: #24292f;
+  }
+  .rp-xlsx-sheet { padding: 12px 16px 20px; }
+  .rp-xlsx-name { font-size: 12px; font-weight: 650; color: #555; padding: 4px 0 8px; }
+  .rp-xlsx-body :global(table) { border-collapse: collapse; }
+  .rp-xlsx-body :global(td), .rp-xlsx-body :global(th) { border: 1px solid #c8ccd4; padding: 3px 8px; font-size: 12px; white-space: nowrap; }
+  .rp-xlsx-body :global(tr:first-child) { background: #f1f3f6; font-weight: 600; }
+  /* pptx 分页渲染区 */
+  .rp-pptx { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding: 14px; background: var(--g1); }
+  .rp-slide { position: relative; background: #fff; color: #24292f; border-radius: 8px; padding: 26px 28px 26px 44px; min-height: 160px; box-shadow: 0 1px 4px var(--overlay); }
+  .rp-slide-no { position: absolute; left: 12px; top: 12px; font-size: 11px; color: #999; font-family: monospace; }
+  .rp-slide-text { margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.7; font-family: inherit; }
   /* docx 纸张预览：细边框把白纸和深色界面隔开 */
   .rp-doc-paper {
     border: 1px solid var(--g3);
@@ -8635,33 +8775,61 @@
     max-height: 240px;
     overflow-y: auto;
   }
-  /* 审查行：状态 + 路径 + 增删 + 审查/打开（ZCode 同款密度） */
+  /* 审查行（完全套 ZCode）：状态图标 / 文件名粗体+目录暗 / 增删 / 审查 / 打开▾ */
   .review-row {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 5px 10px;
+    gap: 10px;
+    padding: 6px 12px;
     border-radius: 6px;
-    font-size: 12px;
+    font-size: 12.5px;
     color: var(--g6);
   }
   .review-row:hover {
     background: var(--g2);
     color: var(--g7);
   }
-  .review-row .git-path {
+  .review-row .git-st {
+    flex: none;
+    font-weight: 700;
+    font-size: 11px;
+    width: 16px;
+    text-align: center;
+    color: var(--g5);
+  }
+  .review-row .git-st.added { color: var(--tint-green-fg); }
+  .review-row .git-st.deleted { color: var(--tint-red-fg); }
+  .review-file {
     flex: 1 1 auto;
     min-width: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    overflow: hidden;
+  }
+  .review-name {
+    font-weight: 650;
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .review-dir {
+    font-size: 11px;
+    color: var(--g5);
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    text-align: left;
   }
   .review-add {
+    flex: none;
     color: var(--tint-green-fg);
     font-family: monospace;
     font-size: 11.5px;
   }
   .review-del {
+    flex: none;
     color: var(--tint-red-fg);
     font-family: monospace;
     font-size: 11.5px;
@@ -8669,13 +8837,26 @@
   .review-row .cp-undo,
   .review-row .cp-commit {
     flex: none;
-    padding: 2px 8px;
+    padding: 3px 9px;
     font-size: 11.5px;
   }
+  .review-open {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .review-open .menu-caret {
+    width: 11px;
+    height: 11px;
+  }
   .review-head {
-    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 12px;
     font-size: 12px;
-    color: var(--g5);
+    color: var(--g6);
   }
   .review-modal {
     max-width: 860px;
@@ -8927,18 +9108,27 @@
     color: var(--g7);
     border-color: var(--g4);
   }
+  /* 对话行（用户 2026-10-02 第五轮）：块级上下两行——标题一行（超长省略），
+     时间一行小字。不再用行内 flex（挤压问题反复踩） */
+  .ctx-file-conv {
+    display: block;
+    padding: 7px 10px;
+    font-family: inherit;
+  }
   .ctx-conv-title {
-    /* flex 子项要 min-width:0 才不被时间戳挤成竖条（2026-10-02 实锤：
-       只给 max-width 不给 flex-basis，标题被压到 25px 一竖列） */
-    flex: 1 1 auto;
-    min-width: 0;
+    display: block;
+    width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-size: 12.5px;
+    line-height: 1.45;
   }
   .ctx-conv-ts {
-    flex: none;
+    display: block;
+    margin-top: 1px;
     font-size: 11px;
+    line-height: 1.3;
     color: var(--g5);
   }
   /* 用户气泡上的「对话 · 标题」引用标签 */
@@ -9068,29 +9258,23 @@
     gap: 2px;
   }
   .ctx-file {
+    display: block;
+    width: 100%;
     text-align: left;
-    padding: 6px 10px;
+    padding: 7px 10px;
     border: none;
     border-radius: 6px;
     background: transparent;
     color: var(--g6);
     font-family: Consolas, monospace;
     font-size: 12.5px;
+    line-height: 1.5;
     cursor: pointer;
-    /* 2026-10-02：对话页是「标题 + 时间」两行 span，flex 撑开别挤成一团 */
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 10px;
-    width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   /* 对话行用正文字体（列表是会话标题不是代码路径） */
-  .ctx-file:has(.ctx-conv-title) {
-    font-family: inherit;
-  }
   .ctx-file:hover {
     background: var(--g2);
     color: var(--g7);

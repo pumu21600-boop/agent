@@ -138,7 +138,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_skill",
-            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部技能；用户消息中出现 $技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
+            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部技能；用户消息中出现 /技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
             parameters: json!({
                 "type": "object",
                 "properties": {

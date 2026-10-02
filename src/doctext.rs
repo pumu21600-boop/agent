@@ -5,6 +5,7 @@
 //! 解压只补 flate2（纯 Rust miniz_oxide 后端），不引完整 zip 依赖。
 //! XML 只做「去标签 + 段落换行 + 实体解码」——要的是可读文本，不是保真排版。
 
+use serde_json::{json, Value};
 use std::io::Read;
 use std::path::Path;
 
@@ -25,11 +26,42 @@ pub fn extract(path: &Path) -> anyhow::Result<String> {
     match ext.as_str() {
         "docx" => xml_text_from(&bytes, &["word/document.xml"]),
         "xlsx" => xml_text_from(&bytes, &["xl/sharedStrings.xml"]),
-        // 幻灯片按文件名序（slide1 slide10 会字典序错位，按数字排）
         "pptx" => pptx_slides(&bytes),
         "odt" | "ods" | "odp" => xml_text_from(&bytes, &["content.xml"]),
         other => anyhow::bail!("不支持的文档类型: .{other}"),
     }
+}
+
+/// pptx 结构化（预览面板分页渲染用）：[{n, text}]，n=幻灯片页码。
+pub fn pptx_slides_json(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let mut names = zip_list(&bytes)?
+        .into_iter()
+        .filter(|n| {
+            n.starts_with("ppt/slides/slide") && n.ends_with(".xml") && !n.contains("Layout") && !n.contains("Master")
+        })
+        .collect::<Vec<_>>();
+    names.sort_by_key(|n| {
+        n.trim_start_matches("ppt/slides/slide")
+            .trim_end_matches(".xml")
+            .parse::<u32>()
+            .unwrap_or(u32::MAX)
+    });
+    let mut out = Vec::new();
+    for name in &names {
+        if let Some(data) = zip_read(&bytes, name)? {
+            let n = name
+                .trim_start_matches("ppt/slides/slide")
+                .trim_end_matches(".xml")
+                .parse::<u32>()
+                .unwrap_or(0);
+            out.push(json!({ "n": n, "text": xml_to_text(&data) }));
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("文档里没有幻灯片（可能是空演示文稿或加密文档）");
+    }
+    Ok(serde_json::to_string(&out).unwrap_or_else(|_| "[]".into()))
 }
 
 /// 依次抽取容器内列出的 XML 条目并转文本（条目缺失跳过，全缺报错）。

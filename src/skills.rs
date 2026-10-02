@@ -344,26 +344,35 @@ fn sync_desc(full: &str, desc: &str) -> String {
     if desc.is_empty() {
         return full.to_string();
     }
+    // 修（2026-10-02 实锤 git-commit/SKILL.md 被写出两行 description）：原实现
+    // 「name 行后立即补 desc」与「原 description 行替换」会同时生效 → 重复行。
+    // 改为 name 行后只记标记，**frontmatter 收尾（第二个 ---）时**若还从未写过
+    // description 才补——既有则替换、缺失则补收尾，两不撞。
     let mut out = String::with_capacity(full.len() + desc.len() + 16);
     let mut in_fm = false;
     let mut replaced = false;
+    let mut name_seen = false;
     for line in full.lines() {
         if line.trim() == "---" {
+            if in_fm && !replaced && name_seen {
+                out.push_str(&format!("description: {desc}\n")); // 收尾补
+            }
             in_fm = !in_fm;
             out.push_str(line);
             out.push('\n');
             continue;
         }
         if in_fm && line.trim_start().starts_with("description:") {
-            out.push_str(&format!("description: {desc}\n"));
-            replaced = true;
-            continue;
+            if !replaced {
+                out.push_str(&format!("description: {desc}\n"));
+                replaced = true;
+            }
+            continue; // 已有的其余 description 行一律吞掉（防重复）
         }
         out.push_str(line);
         out.push('\n');
-        if in_fm && !replaced && line.trim_start().starts_with("name:") {
-            out.push_str(&format!("description: {desc}\n"));
-            replaced = true;
+        if in_fm && line.trim_start().starts_with("name:") {
+            name_seen = true;
         }
     }
     out
@@ -419,7 +428,7 @@ pub fn index_prompt() -> String {
         return String::new();
     }
     let mut s = String::from("\n\n## 可用技能（Skills）\n");
-    s.push_str("以下是本环境可用的技能清单。当用户消息中出现 `$技能名`、或任务与某技能的描述明显相关时，先调用 read_skill 工具读取该技能全文，再严格按其步骤执行：\n");
+    s.push_str("以下是本环境可用的技能清单。当用户消息中出现 `/技能名`、或任务与某技能的描述明显相关时，先调用 read_skill 工具读取该技能全文，再严格按其步骤执行：\n");
     for sk in &skills {
         let desc = if sk.description.is_empty() {
             "（无描述）"
@@ -438,7 +447,7 @@ pub fn index_prompt() -> String {
         } else {
             format!("（插件 {}）", sk.plugin)
         };
-        s.push_str(&format!("- ${}{}: {}{}\n", sk.name, from, desc, refs_hint));
+        s.push_str(&format!("- /{}{}: {}{}\n", sk.name, from, desc, refs_hint));
     }
     s
 }
@@ -542,16 +551,20 @@ mod tests {
 
     #[test]
     fn sync_desc_updates_and_inserts() {
-        // frontmatter 缺 description → 补在 name 后
+        // frontmatter 缺 description → 补（收尾补，不再 name 后立即补）
         let fm = sync_desc("---\nname: a\n---\nbody", "新描述");
         assert!(fm.contains("description: 新描述"));
-        assert!(fm.contains("description: 新描述") && fm.lines().any(|l| l.trim() == "name: a"));
+        assert!(fm.lines().any(|l| l.trim() == "name: a"));
         // 已有 description → 替换
         let fm2 = sync_desc("---\nname: a\ndescription: old\n---\nbody", "新描述");
         assert!(fm2.contains("description: 新描述"));
         assert!(!fm2.contains("old"));
         // 多行描述已在 save 前压成单行（save 侧职责），这里确认 sync 不再引入换行
         assert!(!fm2.contains("description: 新\n"));
+        // 2026-10-02 实锤回归（git-commit/SKILL.md 被写坏成两行 description）：
+        // name 在前、description 在后的标准 frontmatter 保存，不许出现两行 description
+        let occ = fm2.matches("description:").count();
+        assert_eq!(occ, 1, "只允许一行 description: {fm2}");
     }
 
     #[test]

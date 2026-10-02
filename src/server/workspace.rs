@@ -259,6 +259,33 @@ pub(super) async fn write_workspace_docx(
     }
 }
 
+/// GET /api/workspace/doc-slides?path=xx —— pptx 结构化分页（预览面板逐页渲染用）。
+pub(super) async fn read_workspace_doc_slides(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = params.get("path").map(|s| s.trim()).unwrap_or("").to_string();
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
+    }
+    let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let full = crate::tools::resolve_workspace_path(&path).map_err(|e| e.to_string())?;
+        let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if ext != "pptx" {
+            return Err(format!("只支持 pptx（这是 .{ext}）"));
+        }
+        crate::doctext::pptx_slides_json(&full).map_err(|e| e.to_string())
+    })
+    .await;
+    match res {
+        Ok(Ok(slides)) => {
+            let v: Value = serde_json::from_str(&slides).unwrap_or_else(|_| json!([]));
+            Ok(Json(json!({ "ok": true, "slides": v })))
+        }
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ShellReq {
     pub command: String,
