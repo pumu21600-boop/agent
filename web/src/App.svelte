@@ -5946,7 +5946,10 @@
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
-        <div class="group-label">内置 {5 + builtInExts.length}</div>
+        <!-- 计数必须说实话：这一组里 6 行是内置能力（Git/沙箱/功能桥接/css-ui注入/星云/断线取消，
+             不是插件、无启用开关），其余才是插件。曾经写死 5 且混在一起数，显示「内置 14」，
+             用户据此认为内置 14 个插件、菜单「少列了」——拆开计数，一眼看清几个是插件 -->
+        <div class="group-label">内置 {6 + builtInExts.length}（插件 {builtInExts.length} · 内置能力 6）</div>
         <div class="plug-row" title={gitRuntime?.ok ? `版本 ${gitRuntime.version} · ${gitRuntime.path}` : (gitRuntime?.error || '')}>
           <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg></div>
           <div class="plug-meta">
