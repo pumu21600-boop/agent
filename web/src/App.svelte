@@ -5,8 +5,6 @@
   // docx 排版预览（2026-10-02 用户实锤「要能看排版，完全体」）：mammoth 把 docx
   // 容器转成 HTML 再沙箱 iframe 渲染（表格/列表/图片/标题层级全保留）
   import mammoth from 'mammoth/mammoth.browser.js';
-  // 文档类统一工具条（缩放/打印，对齐 PDF 查看器组件；docx/xlsx/pptx 共用）
-  import DocToolbar from './lib/DocToolbar.svelte';
   // xlsx 表格渲染（SheetJS 前端库，走 raw 字节解析）
   import * as XLSX from 'xlsx/dist/xlsx.full.min.js';
   import ImagePreview from './lib/ImagePreview.svelte';
@@ -1799,10 +1797,6 @@
     } catch (e) {
       rpSet(path, { loading: false, content: '', error: `pptx 渲染失败: ${e.message || e}` });
     }
-  }
-  // 文档缩放（工具条 emit）：存 rpPreviewCache.zoom，渲染区按它调字号
-  function setDocZoom(path, z) {
-    rpSet(path, { zoom: Math.max(50, Math.min(200, z)) });
   }
   async function loadPreview(path, force) {
     const kind = previewKind(path);
@@ -5331,20 +5325,7 @@
                   <!-- PDF 内嵌（WebView 自带查看器；#toolbar=0 藏掉查看器工具条，纯预览） -->
                   <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}#toolbar=0`}></iframe>
                 {:else if previewKind(t.path) === 'docx'}
-                  <!-- docx：统一工具条 + mammoth 排版（纸张本色） -->
-                  <DocToolbar
-                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
-                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
-                    on:print={() => {
-                      const ifr = document.querySelector('.rp-pane:not(.hidden) iframe.rp-doc-paper');
-                      const w = ifr && ifr.contentWindow;
-                      if (w) {
-                        try { w.focus(); w.print(); } catch { /* 沙箱 iframe 打印可能拒，算了 */ }
-                      } else {
-                        window.print();
-                      }
-                    }}
-                  />
+                  <!-- docx：mammoth 排版直出，纯预览（用户 2026-10-03：工具条也去，无缩放/打印） -->
                   {#if (rpPreviewCache[t.path] || {}).loading}
                     <pre class="rp-preview">渲染中…</pre>
                   {:else if (rpPreviewCache[t.path] || {}).error}
@@ -5354,7 +5335,6 @@
                       class="rp-pdf rp-doc-paper"
                       title={t.path}
                       sandbox=""
-                      style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}
                       srcdoc={`<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:28px;margin:0;line-height:1.75;color:#24292f;background:#fff}img{max-width:100%}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 10px}h1,h2,h3{line-height:1.4}blockquote{border-left:3px solid #999;margin:0;padding-left:12px;color:#666}pre{background:#f3f4f6;padding:10px;border-radius:6px}</style></head><body>${((rpPreviewCache[t.path] || {}).content || '').replace(/<script/gi, '&lt;script')}</body></html>`}
                     ></iframe>
                   {/if}
