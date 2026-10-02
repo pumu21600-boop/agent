@@ -138,7 +138,11 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
             String::new()
         }
     };
-    format!("{prompt}{agents_md}{workspace_hint}{project_brief}{}", crate::skills::index_prompt())
+    format!(
+        "{prompt}{agents_md}{workspace_hint}{project_brief}{}{}",
+        crate::skills::index_prompt(),
+        crate::plugin::ui::index_prompt()
+    )
 }
 
 /// 一轮对话的渠道组装结果（主渠道 + 角色渠道 + 降级链 + 预算降级）。

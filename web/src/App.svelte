@@ -870,13 +870,19 @@
     abilityMenuOpen = true;
   }
   // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
-  // 插件=**全部已启用插件**（第四轮实锤「只列了那几个，全都要呀」），
-  // 带技能的插件点开 ▾ 列出该插件的技能；纯面板插件（时间线/项目文件/用量）点开右栏面板
+  // 插件=**全部已启用插件**（第四轮实锤「只列了那几个，全都要呀」）。
+  // 点任意一行都往输入框插一个 /引用（带技能的插技能名，纯面板插件插插件标题；
+  // 用户 2026-10-02 实锤「很多插件点了不插入输入框」后统一）——面板归右侧栏「+」菜单。
   $: ownSkills = (skillsData || []).filter((sk) => sk.source !== 'plugin' && sk.enabled !== false);
   $: pluginSkills = (skillsData || []).filter((sk) => sk.source === 'plugin' && sk.enabled !== false);
   let pluginMenu = ''; // 展开中的插件名（/ 菜单）
   function pluginSkillsOf(name) {
     return pluginSkills.filter((sk) => sk.plugin === name);
+  }
+  // 插件引用键：标题去掉空白——「Word 文档」这类带空格的名字插进去会把 /引用 切断。
+  // 后端 index_prompt 用同一口径列「可用插件」，插进输入框的 /引用 在模型那儿才解得开。
+  function pluginRef(e) {
+    return (e.title || e.name || '').replace(/\s+/g, '');
   }
 
   // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
@@ -4903,25 +4909,20 @@
                   {#if !enabledExts.length}
                     <div class="menu-empty">暂无可用插件</div>
                   {/if}
-                  <!-- 全部插件平铺（不展开）：有技能的插件点击=引用其技能；纯面板插件点击=开右栏面板。
-                       列表口径 = enabledExts（启用且清单合法），与应用插件目录一一对应，不筛子集 -->
+                  <!-- 全部插件平铺（不展开）：点哪个都往输入框插一个 /引用——带技能的插件
+                       插它第一个技能名（模型按技能索引认得），纯面板插件插插件标题（模型按
+                       系统提示的「可用插件」索引认得）。面板不从这里开：右侧栏「+」菜单才是
+                       面板的家（同一能力只在一个管理面出现）。列表口径 = enabledExts（启用且
+                       清单合法），与应用插件目录一一对应，不筛子集 -->
                   {#each enabledExts as e (e.name)}
                     {@const sk = pluginSkillsOf(e.name)}
+                    {@const ref = sk.length ? sk[0].name : pluginRef(e)}
                     <button
                       class="bar-item"
-                      title={sk.length ? `${e.title || e.name}：引用技能 /${sk[0].name}` : (e.description || e.name)}
+                      title={sk.length ? `${e.title || e.name}：插入技能引用 /${ref}` : `${e.title || e.name}：插入插件引用 /${ref}`}
                       on:click={() => {
                         abilityMenuOpen = false;
-                        if (sk.length) {
-                          insertAtCursor(`/${sk[0].name} `);
-                        } else {
-                          // 纯面板插件（时间线/项目文件/用量/浏览器…）：在右栏开它的面板
-                          const entry = (e.ui || []).find((u) => u.slot === 'dock' || u.slot === 'toolbar');
-                          if (entry) {
-                            plusMenuOpen = false;
-                            addRpTab({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: entry.title || e.title || e.name });
-                          }
-                        }
+                        insertAtCursor(`/${ref} `);
                       }}
                     >
                       <span class="menu-sym menu-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html menuExtIcon(e.name)}</svg></span>
