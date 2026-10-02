@@ -3625,6 +3625,18 @@
   function menuExtIcon(name) {
     return EXT_ICONS[name] || EXT_ICON_FALLBACK;
   }
+  // 侧栏标签的内置类型图标（插件标签用各自己的，见 rpTabIcon）——文字左边要有对应符号（用户 2026-10-03）
+  const RP_TAB_ICONS = {
+    artifacts:
+      '<path d="M21 8.2 12 3.4 3 8.2v7.6l9 4.8 9-4.8z"/><path d="M3 8.2l9 4.8 9-4.8"/><path d="M12 13v7.6"/>',
+    review: '<circle cx="12" cy="12" r="8.4"/><path d="M8.4 12.3l2.5 2.5 4.7-5.6"/>',
+    web: '<circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/>',
+    file: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/>',
+    diff: '<rect x="3.5" y="4.5" width="7" height="15" rx="1.2"/><rect x="13.5" y="4.5" width="7" height="15" rx="1.2"/><path d="M5.3 12h3.4"/><path d="M15.3 12h3.4M17 10.3v3.4"/>',
+  };
+  function rpTabIcon(t) {
+    return t.kind === 'ext' ? menuExtIcon(t.name) : RP_TAB_ICONS[t.kind] || RP_TAB_ICONS.file;
+  }
 
   async function loadExt() {
     try {
@@ -5171,8 +5183,9 @@
               title={t.kind === 'file' ? t.path : t.kind === 'ext' ? rpExtTitle(t.name) : t.title}
               on:click={() => activateRpTab(t.key)}
             >
+              <svg class="rp-tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{@html rpTabIcon(t)}</svg>
               <span class="rp-tab-title">{t.kind === 'ext' ? rpExtTitle(t.name) : t.title}</span>
-              <!-- × 只在激活标签上（对齐 ZCode 参照实现）：五个标签也放得下，关别的先点它 -->
+              <!-- × 只在激活标签上且顶到标签最右（对齐 ZCode 参照实现）：五个标签也放得下，关别的先点它 -->
               {#if rpTab === t.key}
                 <span class="rp-tab-x" title="关闭标签" role="button" tabindex="-1" on:click|stopPropagation={() => closeRpTab(t.key)}>×</span>
               {/if}
@@ -7559,7 +7572,7 @@
     align-items: center;
     gap: 4px;
     min-width: 0;
-    flex: 0 1 auto;
+    flex: 1 1 auto; /* 吃满 + 号左侧整行，标签才好均分等宽 */
     overflow-x: auto;
     scrollbar-width: none;
   }
@@ -7573,9 +7586,15 @@
     padding: 4px 6px 4px 10px !important;
     max-width: 150px;
     min-width: 54px; /* 标签多时也保持可读宽度，超出交给标签条横向滚动（用户：别挤成一团） */
-    flex: 0 1 auto;
+    flex: 1 1 0; /* 等宽均分：宽度只跟面板宽和标签个数走，不跟字数走（用户拍板） */
+  }
+  .rp-tab .rp-tab-ico {
+    width: 13px;
+    height: 13px;
+    flex: none;
   }
   .rp-tab .rp-tab-title {
+    flex: 1 1 auto; /* 吃掉余量，把激活标签的 × 顶到标签最右（用户：别靠在文字边上） */
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
