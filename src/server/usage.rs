@@ -115,11 +115,20 @@ pub(super) async fn put_usage_prices(
     }
     crate::usage::install_prices(&s.cost.prices);
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // 2026-10-02：保存价格即全量重算历史——用户实锤「设了价，历史消耗还是 0/未计价」
+    // （必须再手动点一次重算按钮，没人知道要点）。全表价格按新价覆盖历史记录的费用，
+    // 个别 host+model 没配价的仍按未计价计。
+    let recompute = crate::usage::recompute().ok();
     observability::event(
         EventType::State,
-        json!({ "kind": "usage.prices_saved", "rows": prices.len(), "currency": s.cost.currency }),
+        json!({ "kind": "usage.prices_saved", "rows": prices.len(), "currency": s.cost.currency,
+               "recomputed": recompute.as_ref().map(|(n, u)| json!({ "records": n, "unpriced": u })) }),
     );
-    (StatusCode::OK, Json(json!({ "ok": true, "prices": prices })))
+    (StatusCode::OK, Json(json!({
+        "ok": true,
+        "prices": prices,
+        "recomputed": recompute.as_ref().map(|(n, u)| json!({ "records": n, "unpriced": u })),
+    })))
 }
 
 /// POST /api/usage/recompute —— 用当前价格表重算全部历史记录的费用（配错价后的显式补救）。

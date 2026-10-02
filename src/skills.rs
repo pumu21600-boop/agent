@@ -22,6 +22,9 @@ pub struct Skill {
     pub refs: Vec<String>,
     /// 生态轮：贡献这个技能的插件名（非插件技能为空串）
     pub plugin: String,
+    /// 2026-10-02：启停开关（settings.disabled_skills 的取反，供设置页行内 switch）
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// 技能根目录：(路径, 来源)。项目级在前，同名时项目覆盖全局。
@@ -29,6 +32,40 @@ pub fn roots() -> Vec<(PathBuf, &'static str)> {
     let mut v = vec![(crate::tools::workspace_root().join("skills"), "project")];
     v.push((crate::memory::global_dir().join("skills"), "global"));
     v
+}
+
+// —— 启停名单（对照插件模式 plugin::ui::set_disabled）：skills::list 每轮对话都跑，
+// 摸不到服务层的 settings 锁，用进程内副本。启动（main）与 toggle 端点两处灌入。 ——
+static DISABLED: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> = std::sync::OnceLock::new();
+
+pub fn set_disabled(list: &[String]) {
+    DISABLED
+        .get_or_init(|| std::sync::RwLock::new(Vec::new()))
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone_from(&list.to_vec());
+}
+
+pub fn disabled() -> Vec<String> {
+    DISABLED
+        .get_or_init(|| std::sync::RwLock::new(Vec::new()))
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 供 UI/索引使用：带启用位的技能列表（停用的排在后面，一眼能看出被关掉的）。
+pub fn list_ui() -> Vec<Skill> {
+    let dis = disabled();
+    let mut out: Vec<Skill> = list()
+        .into_iter()
+        .map(|mut s| {
+            s.enabled = !dis.contains(&s.name);
+            s
+        })
+        .collect();
+    out.sort_by_key(|s| !s.enabled);
+    out
 }
 
 /// 解析 `---` 围栏 frontmatter，返回 (name, description, 正文)。
@@ -116,6 +153,7 @@ fn load_skill(dir: &Path, source: &str) -> Option<Skill> {
         name,
         refs: list_refs(dir),
         plugin: String::new(),
+        enabled: true,
     })
 }
 
@@ -275,7 +313,15 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     } else {
         format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, desc, body)
     };
-    let dir = crate::tools::workspace_root().join("skills").join(name);
+    // 用户 2026-10-02：新建技能保存到**全局**（~/.agent/skills/）——技能是整个 agent
+    // 体系的资产，不该跟工作区走。已存在的技能写回原位（项目级项目级、全局全局），
+    // 编辑老技能不会偷偷把它搬家。
+    let ws_root = crate::tools::workspace_root().join("skills").join(name);
+    let dir = if ws_root.join("SKILL.md").is_file() {
+        ws_root
+    } else {
+        crate::memory::global_dir().join("skills").join(name)
+    };
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     crate::fsx::write_atomic_str(&dir.join("SKILL.md"), &full).map_err(|e| format!("写入失败: {e}"))?;
     Ok(dir.to_string_lossy().to_string())
@@ -355,7 +401,8 @@ pub fn delete(name: &str) -> Result<(), String> {
 
 /// system 提示注入的技能索引；无技能时返回空串（不占上下文）。
 pub fn index_prompt() -> String {
-    let skills = list();
+    let dis = disabled();
+    let skills = list().into_iter().filter(|s| !dis.contains(&s.name)).collect::<Vec<_>>();
     if skills.is_empty() {
         return String::new();
     }
@@ -428,11 +475,13 @@ mod tests {
     #[test]
     fn refs_listing_and_read_ref() {
         let name = "zz-test-skill-ref";
-        save(name, "带参考资料的技能", "步骤一").expect("save 失败");
-        let dir = crate::tools::workspace_root().join("skills").join(name);
+        // 2026-10-02：save 默认落全局根（~/.agent/skills）——references 也建在返回的真实目录里
+        let dir = save(name, "带参考资料的技能", "步骤一").expect("save 失败");
+        let dir = std::path::PathBuf::from(dir);
         fs::create_dir_all(dir.join("references")).unwrap();
         fs::write(dir.join("references/r1.md"), "参考正文A").unwrap();
         let listed = list().into_iter().find(|s| s.name == name).expect("应列出");
+        assert_eq!(listed.source, "global", "新建技能应落全局: {}", listed.dir);
         assert_eq!(listed.refs, vec!["r1.md".to_string()], "references 文件应进清单");
         assert_eq!(read_ref(name, "r1.md").unwrap(), "参考正文A");
         assert!(read_ref(name, "../SKILL.md").is_err(), "穿越名必须拒");
@@ -526,6 +575,7 @@ mod tests {
             content: "项目正文".into(),
             refs: vec![],
             plugin: String::new(),
+            enabled: true,
         }];
         merge_plugin_skills(&mut out, &[(sd, "documents".to_string())]);
         let docx = out.iter().find(|s| s.name == "docx").expect("插件技能应并入");
@@ -549,6 +599,7 @@ mod tests {
             content: String::new(),
             refs: vec![],
             plugin: plugin.into(),
+            enabled: true,
         };
         let err = plugin_delete_error(&mk("docx", "plugin", "documents")).unwrap();
         assert!(err.contains("documents") && err.contains("不能在这里删除") && err.contains("同名技能"), "{err}");

@@ -2,6 +2,9 @@
   import { onMount, afterUpdate, onDestroy, tick } from 'svelte';
   import Select from './Select.svelte';
   import Galaxy from './Galaxy.svelte';
+  // docx 排版预览（2026-10-02 用户实锤「要能看排版，完全体」）：mammoth 把 docx
+  // 容器转成 HTML 再沙箱 iframe 渲染（表格/列表/图片/标题层级全保留）
+  import mammoth from 'mammoth/mammoth.browser.js';
   import ImagePreview from './lib/ImagePreview.svelte';
   import RenameModal from './lib/RenameModal.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
@@ -83,13 +86,6 @@
   let ctxQuery = '';
   let ctxMsg = '';
   let composerInputEl;
-  const ABILITY_TEMPLATES = [
-    { cmd: '解释', text: '请解释这段代码的作用与关键逻辑：\n' },
-    { cmd: '审查', text: '请审查以下改动，指出 bug、风险与改进建议：\n' },
-    { cmd: '测试', text: '请为下面的功能设计测试用例并写出代码：\n' },
-    { cmd: '优化', text: '请优化以下代码的性能与可读性，给出改写版本：\n' },
-    { cmd: '总结', text: '请总结以下内容的要点：\n' },
-  ];
 
   // —— 对话（027：按会话隔离）——
   // 每个会话各有自己的消息缓冲与运行流：A 会话在跑不影响切到 B 会话发消息，
@@ -917,6 +913,8 @@
   })();
   let rpAddOpen = false; // 标签栏 + 号的添加菜单
   let rpFiles = [];
+  // 「产物」空态/失败的原因（resolveBaseline 没基线、读取出错）——空也要说人话
+  let rpArtifactsNote = '';
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
   let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, saving, savedAt }（标签切换不重拉）
@@ -1569,35 +1567,42 @@
     return '';
   }
 
-  /// 产物基线（用户实锤 bug：有产物不显示——cp 消息不落盘，刷新后消息流里没有基线，
-  /// 「产物」整列空；改动条早有兜底，两处统一到这里）：
-  /// 本会话消息流里的检查点 → 本会话自己的检查点 → 全局最新检查点。
+  /// 产物基线：本会话消息流里的检查点 → 本会话自己的检查点（mine）。
+  /// **不再兜底「全局最新」**（2026-10-02 实锤）：别的会话的任务起点当基线，本会话
+  /// 早于该起点的改动（如上一轮会话造的 test.pdf）全被算成「基线里已有的」——
+  /// 产物面板假空。会话确实没有检查点（早于 2026-10-02 非 git 工作区修复前跑的）
+  /// 就明说没有基线，别拿别人的起点充数。
   async function resolveBaseline() {
     const inStream = currentBaseline();
-    if (inStream) return inStream;
+    if (inStream) return { id: inStream, note: '' };
     try {
       const q = currentSessionId ? `?session=${encodeURIComponent(currentSessionId)}` : '';
       const r = await fetch(`/api/checkpoints${q}`).then((r) => r.json());
-      const latest = (r.mine || [])[0] || (r.checkpoints || [])[0];
-      return latest ? latest.id : '';
-    } catch {
-      return '';
+      const mine = (r.mine || [])[0];
+      if (mine) return { id: mine.id, note: '' };
+      return { id: '', note: currentSessionId ? '该会话运行时还没有检查点（产物归因需要任务起点快照）' : '新会话还没有任务记录' };
+    } catch (e) {
+      return { id: '', note: `读取检查点失败: ${e.message || e}` };
     }
   }
 
   async function loadArtifacts() {
     rpLoading = true;
-    const baseline = await resolveBaseline();
+    const { id: baseline, note } = await resolveBaseline();
     if (!baseline) {
       rpFiles = [];
+      rpArtifactsNote = note || '本任务还没有产物。';
       rpLoading = false;
       return;
     }
+    rpArtifactsNote = '';
     try {
       const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((r) => r.json());
       rpFiles = r.files || [];
+      if (r.error) rpArtifactsNote = `读取失败: ${r.error}`;
     } catch (e) {
       rpFiles = [];
+      rpArtifactsNote = `读取失败: ${e.message || e}`;
     }
     rpLoading = false;
   }
@@ -1645,22 +1650,24 @@
     activateRpTab(key);
   }
   // —— 文件预览标签：文本可编辑保存；图片/PDF/音视频走 /api/workspace/raw 直出；
-  // docx/pptx/xlsx/odf 走 /api/workspace/doc 文本抽取（best-effort）——
+  // docx 走 mammoth 转 HTML 渲染保留排版；pptx/xlsx/odf 走后端文本抽取（best-effort）——
   const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
   const RP_PDF_EXT = new Set(['pdf']);
   const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
-  // 文档容器（zip+xml）：后端抽正文文本，只求「能看内容」，不给编辑
-  const RP_DOC_EXT = new Set(['docx', 'pptx', 'xlsx', 'odt', 'ods', 'odp']);
+  // 文档容器：docx 走前端 mammoth 完整排版；其余先文本抽取，只求「能看内容」
+  const RP_DOCX_EXT = new Set(['docx']);
+  const RP_DOC_EXT = new Set(['pptx', 'xlsx', 'odt', 'ods', 'odp']);
   function extOf(path) {
     const i = String(path).lastIndexOf('.');
     return i > 0 ? String(path).slice(i + 1).toLowerCase() : '';
   }
-  // 预览形态：image / pdf / media / doc / text。doc 与媒体都不提供编辑。
+  // 预览形态：image / pdf / media / docx(排版) / doc(文本) / text。非 text 都不提供编辑。
   function previewKind(path) {
     const e = extOf(path);
     if (RP_IMG_EXT.has(e)) return 'image';
     if (RP_PDF_EXT.has(e)) return 'pdf';
     if (RP_MEDIA_EXT.has(e)) return 'media';
+    if (RP_DOCX_EXT.has(e)) return 'docx';
     if (RP_DOC_EXT.has(e)) return 'doc';
     return 'text';
   }
@@ -1671,6 +1678,25 @@
   }
   function rpSet(path, patch) {
     rpPreviewCache = { ...rpPreviewCache, [path]: { ...(rpPreviewCache[path] || {}), ...patch } };
+  }
+  // docx → HTML：mammoth 转出完整排版（标题层级/表格/列表/加粗/图片 data URI）
+  async function loadDocxHtml(path) {
+    rpSet(path, { loading: true, error: '' });
+    try {
+      const buf = await fetch(`/api/workspace/raw?path=${encodeURIComponent(path)}`).then((r) => {
+        if (!r.ok) throw new Error(`读取失败: HTTP ${r.status}`);
+        return r.arrayBuffer();
+      });
+      const res = await mammoth.convertToHtml(
+        { arrayBuffer: buf },
+        {
+          convertImage: mammoth.images.imgElement((image) => image.read('base64').then((b64) => ({ src: `data:${image.contentType};base64,${b64}` }))),
+        }
+      );
+      rpSet(path, { loading: false, content: res.value, error: '' });
+    } catch (e) {
+      rpSet(path, { loading: false, content: '', error: `docx 渲染失败: ${e.message || e}` });
+    }
   }
   async function loadPreview(path, force) {
     const kind = previewKind(path);
@@ -1683,6 +1709,12 @@
       return;
     }
     try {
+      if (kind === 'docx') {
+        // docx 拉原始字节走 mammoth（不走 doc 抽取端点）
+        rpSet(path, { loading: false, content: undefined, error: '' });
+        await loadDocxHtml(path);
+        return;
+      }
       // 文档容器走文本抽取端点，其余按文本读
       const url = kind === 'doc' ? `/api/workspace/doc?path=${encodeURIComponent(path)}` : `/api/workspace/file?path=${encodeURIComponent(path)}`;
       const r = await fetch(url).then((r) => r.json());
@@ -1813,7 +1845,7 @@
     }
     // 消息流里没有检查点（cp 不落盘，刷新后就没有）→ 走 resolveBaseline 同一套兜底，
     // 与「产物」标签共用（分叉过一次：产物列空而改动条有数，用户实锤）
-    const baseline = await resolveBaseline();
+    const { id: baseline } = await resolveBaseline();
     if (!baseline) {
       dockCp = null;
       return;
@@ -4529,17 +4561,11 @@
                 </div>
               {/if}
               {#if abilityMenuOpen}
-                <!-- 用户 2026-10-02：技能/插件/MCP 统一收进「/」——模板、技能、MCP 工具、插件工具一个菜单分组列 -->
+                <!-- 用户 2026-10-02："/"= 能力菜单只分三大类——技能 / MCP / 插件（模板整组不要） -->
                 <div class="bar-dropdown">
-                  <div class="bar-group">能力</div>
-                  {#each ABILITY_TEMPLATES as t}
-                    <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(t.text); }}>
-                      <span class="menu-sym">/</span> {t.cmd}
-                    </button>
-                  {/each}
                   <div class="bar-group">技能</div>
-                  {#if skillsData.length}
-                    {#each skillsData as sk (sk.name)}
+                  {#if skillsData.filter((sk) => sk.enabled !== false).length}
+                    {#each skillsData.filter((sk) => sk.enabled !== false) as sk (sk.name)}
                       <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
                         <span class="menu-sym">$</span> {sk.name}
                       </button>
@@ -4547,8 +4573,8 @@
                   {:else}
                     <div class="menu-empty">暂无技能</div>
                   {/if}
-                  <div class="bar-group">MCP · 插件</div>
-                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length) && !wasmPlugins.some((w) => (w.tools || []).length)}
+                  <div class="bar-group">MCP</div>
+                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length)}
                     <div class="menu-empty">暂无可用工具</div>
                   {/if}
                   {#each mcpServers as srv}
@@ -4560,10 +4586,14 @@
                       {/each}
                     {/if}
                   {/each}
+                  <div class="bar-group">插件</div>
+                  {#if !wasmPlugins.some((w) => (w.tools || []).length)}
+                    <div class="menu-empty">暂无可用工具</div>
+                  {/if}
                   {#each wasmPlugins as w}
                     {#each w.tools || [] as t}
                       <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$wasm__${w.stem}__${t.name} `); }}>
-                        <span class="menu-sym">W</span> wasm__{w.stem}__{t.name}
+                        <span class="menu-sym">P</span> {t.name}
                       </button>
                     {/each}
                   {/each}
@@ -4896,7 +4926,7 @@
                 {#if rpLoading}
                   <div class="trace-empty">加载中…</div>
                 {:else if !rpFiles.length}
-                  <div class="rp-empty">本任务还没有产物。<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
+                  <div class="rp-empty">{rpArtifactsNote || '本任务还没有产物。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
                 {:else}
                   {#each rpFiles as f (f)}
                     <button class="rp-file" class:sel={f === rpPreviewPath} title={f} on:click={() => openPreviewTab(f)}>
@@ -4929,6 +4959,20 @@
                 {:else if previewKind(t.path) === 'pdf'}
                   <!-- PDF 内嵌（浏览器/WebView 自带查看器） -->
                   <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></iframe>
+                {:else if previewKind(t.path) === 'docx'}
+                  <!-- docx 排版渲染（mammoth HTML → 沙箱 iframe；纸张本色，看排版） -->
+                  {#if (rpPreviewCache[t.path] || {}).loading}
+                    <pre class="rp-preview">渲染中…</pre>
+                  {:else if (rpPreviewCache[t.path] || {}).error}
+                    <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
+                  {:else}
+                    <iframe
+                      class="rp-pdf rp-doc-paper"
+                      title={t.path}
+                      sandbox=""
+                      srcdoc={`<!doctype html><html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;padding:28px;margin:0;line-height:1.75;color:#24292f;background:#fff}img{max-width:100%}table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 10px}h1,h2,h3{line-height:1.4}blockquote{border-left:3px solid #999;margin:0;padding-left:12px;color:#666}pre{background:#f3f4f6;padding:10px;border-radius:6px}</style></head><body>${((rpPreviewCache[t.path] || {}).content || '').replace(/<script/gi, '&lt;script')}</body></html>`}
+                    ></iframe>
+                  {/if}
                 {:else if previewKind(t.path) === 'media'}
                   <div class="rp-media-wrap">
                     {#if ['mp4', 'm4v', 'webm', 'mov'].includes(extOf(t.path))}
@@ -5486,7 +5530,7 @@
         <label>功能桥接</label>
         <div class="roles-grid">
           <div class="role-item">
-            <span class="role-name">会话摘要 (Summary)</span>
+            <span class="role-name">会话摘要</span>
             <Select
               value={roles.summary ?? null}
               title="会话摘要角色"
@@ -5501,7 +5545,7 @@
             />
           </div>
           <div class="role-item">
-            <span class="role-name">标题生成 (Title)</span>
+            <span class="role-name">标题生成</span>
             <Select
               value={roles.title ?? null}
               title="标题生成角色"
@@ -5516,7 +5560,7 @@
             />
           </div>
           <div class="role-item">
-            <span class="role-name">向量嵌入 (Embedding)</span>
+            <span class="role-name">向量嵌入</span>
             <Select
               value={roles.embedding ?? null}
               title="向量嵌入角色（记忆库语义检索用）"
@@ -5531,7 +5575,7 @@
             />
           </div>
           <div class="role-item">
-            <span class="role-name">图片理解专家 (Vision)</span>
+            <span class="role-name">图片理解</span>
             <Select
               value={roles.vision ?? null}
               title="图片理解专家"
@@ -5548,7 +5592,7 @@
             />
           </div>
           <div class="role-item">
-            <span class="role-name">视频理解专家 (Video)</span>
+            <span class="role-name">视频理解</span>
             <Select
               value={roles.video ?? null}
               title="视频理解专家"
@@ -5565,7 +5609,7 @@
             />
           </div>
           <div class="role-item">
-            <span class="role-name">音频理解专家 (Audio)</span>
+            <span class="role-name">音频理解</span>
             <Select
               value={roles.audio ?? null}
               title="音频理解专家"
@@ -7426,6 +7470,11 @@
   }
   .rp-audio {
     width: 100%;
+  }
+  /* docx 纸张预览：细边框把白纸和深色界面隔开 */
+  .rp-doc-paper {
+    border: 1px solid var(--g3);
+    border-radius: 6px;
   }
   .rp-edit {
     flex: 1;

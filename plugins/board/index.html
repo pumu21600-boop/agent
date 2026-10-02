@@ -5,6 +5,8 @@
     <title>项目文件</title>
     <style>
 :root {
+        /* 2026-10-02：iframe 独立文档，不吃主界面 scrollbar-color——深色下默认白滑杆 */
+        scrollbar-color: var(--line2, #3a3e49) transparent;
         --bg: #17181c;
         --fg: #d8dbe2;
         --strong: #e8ebf2;
@@ -34,7 +36,9 @@
         --t-gray-bg: #2c2f38;
         --t-gray-fg: #b9bfca;
       }
+            /* 跟随主界面：滑杆颜色随主题切（用户实锤深色白滑杆） */
       body.light {
+        scrollbar-color: var(--line2, #b3bac4) transparent;
         --bg: #f6f7f9;
         --fg: #1f2328;
         --strong: #0d1117;

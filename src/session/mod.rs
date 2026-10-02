@@ -296,6 +296,9 @@ impl SessionManager {
     }
 
     /// 全部会话元信息：置顶优先，其余按更新时间新→旧（归档项一并返回，由前端过滤）。
+    /// 标题兜底（2026-10-02 用户实锤「@对话列表全显示新会话」）：标题模型没跑成的
+    /// 会话 title 停在占位「新会话」，列表里一片同名不可辨。占位/空标题时回落首条
+    /// 用户消息前 20 字；一条消息都没有的显示「空会话」。
     pub fn list(&self) -> Vec<SessionMeta> {
         let mut metas: Vec<SessionMeta> = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -308,9 +311,14 @@ impl SessionManager {
             }
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
             let Ok(f) = serde_json::from_str::<SessionFile>(&text) else { continue };
+            let title = if !f.title.trim().is_empty() && f.title != "新会话" {
+                f.title
+            } else {
+                first_user_title(&f.messages)
+            };
             metas.push(SessionMeta {
                 id: f.id,
-                title: f.title,
+                title,
                 created_at: f.created_at,
                 updated_at: f.updated_at,
                 count: f.messages.len(),
@@ -604,7 +612,7 @@ mod tests {
         let list = m.list();
         assert_eq!(list.len(), 1, "空会话也要进列表（侧栏立即可见）");
         assert_eq!(list[0].count, 0);
-        assert_eq!(list[0].title, "新会话");
+        assert_eq!(list[0].title, "新对话", "空会话回落首条消息兜底（无消息=新对话）");
 
         // 同工作区再次新建 → 复用同一条，连点不堆空会话
         let f2 = m.create_empty(ws, "新会话").unwrap();

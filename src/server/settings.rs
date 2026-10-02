@@ -304,6 +304,7 @@ pub(super) async fn manage_configs(
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::skills::set_disabled(&s.disabled_skills); // 2026-10-02：技能启停名单贯通
     observability::event(
         EventType::State,
         json!({ "kind": "config.changed", "action": req.action, "provider_id": pid, "model": model }),

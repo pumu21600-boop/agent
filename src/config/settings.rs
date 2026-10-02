@@ -344,6 +344,11 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_plugins: Vec<String>,
 
+    /// 2026-10-02：停用的技能名单（技能名；停用的不进系统提示索引与 composer 菜单）。
+    /// 与 disabled_plugins 同族，skills::set_disabled 进程内副本由启动与 toggle 端点灌入。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_skills: Vec<String>,
+
     /// P21 红线3（第三方插件验签）：已 pin 的内容指纹表。
     /// 键 = `plugins:<name>`（P28 目录合并后唯一 kind；旧 `ui-ext:<name>` 键读入时自动迁移），
     /// 值 = canonical digest（sha256）。

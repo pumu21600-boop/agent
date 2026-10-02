@@ -7,14 +7,18 @@
 <style>
   /* 主题变量：浅色靠 body.light 整体切换（此前写 .light body 永远匹配不上——
      主题类切在 body 自己身上，面板一直没真正换过肤，用户实锤） */
-  :root { color-scheme: dark; }
+  :root {
+        /* 2026-10-02：iframe 独立文档，不吃主界面 scrollbar-color——深色下默认白滑杆 */
+        scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
   body {
     --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31;
     --hover: #26262b; --btn-line: #3a3a41; --warn: #e8a33d;
     --err: #e5534b; --link: #6ea8fe;
     color-scheme: dark;
   }
-  body.light {
+        /* 跟随主界面：滑杆颜色随主题切（用户实锤深色白滑杆） */
+      body.light {
+        scrollbar-color: var(--line2, #b3bac4) transparent;
     --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
     --hover: #f2f2f5; --btn-line: #d4d4da; --warn: #b25e09;
     --err: #cf222e; --link: #0b62d0;
@@ -93,10 +97,10 @@ parent.postMessage({ type: 'agent:hello' }, '*');
 const $ = (id) => document.getElementById(id);
 const num = (n) => (n ?? 0).toLocaleString('zh-CN');
 function money(usd) {
+  // 2026-10-02：费用统一 4 位小数（用户实锤：小会话几分钱的成本显示 ¥0.00 等于没有）
   const v = usd ?? 0;
-  if (currency === 'CNY') return '¥' + (v * rate).toFixed(v * rate < 100 ? 2 : 0);
-  if (v > 0 && v < 0.01) return '<$0.01';
-  return '$' + v.toFixed(v < 100 ? 4 : 2);
+  if (currency === 'CNY') return '¥' + (v * rate).toFixed(4);
+  return '$' + v.toFixed(4);
 }
 
 async function boot() {

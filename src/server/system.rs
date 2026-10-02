@@ -4,20 +4,25 @@ use super::*;
 
 /// GET /api/skills —— 技能列表（项目级 + 全局，含全文供编辑器回显）
 pub(super) async fn list_skills() -> Json<Value> {
-    Json(json!({ "skills": crate::skills::list() }))
+    Json(json!({ "skills": crate::skills::list_ui() })) // list_ui：带启用位（设置页行内 switch）
 }
 
 #[derive(Deserialize)]
 pub struct SkillReq {
-    /// "save" | "delete" | "read"
+    /// "save" | "delete" | "read" | "toggle"
     pub action: String,
     pub name: Option<String>,
     pub description: Option<String>,
     pub content: Option<String>,
+    /// toggle：目标启用位（true=启用 / false=停用）
+    pub enabled: Option<bool>,
 }
 
-/// POST /api/skills —— 技能保存 / 删除 / 读取
-pub(super) async fn post_skills(Json(req): Json<SkillReq>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+/// POST /api/skills —— 技能保存 / 删除 / 读取 / 启停
+pub(super) async fn post_skills(
+    State(state): State<AppState>,
+    Json(req): Json<SkillReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
     match req.action.as_str() {
         "save" => {
@@ -41,6 +46,31 @@ pub(super) async fn post_skills(Json(req): Json<SkillReq>) -> Result<Json<Value>
                 Ok(content) => Ok(Json(json!({ "ok": true, "content": content }))),
                 Err(e) => Err(err(e)),
             }
+        }
+        // 启停：写 settings.disabled_skills 并即时重灌进程内名单（索引/菜单下一轮即生效）
+        "toggle" => {
+            let name = req.name.clone().unwrap_or_default();
+            let enabled = req.enabled.unwrap_or(true);
+            if name.trim().is_empty() {
+                return Err(err("缺少技能名".into()));
+            }
+            let now = {
+                let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
+                s.disabled_skills.retain(|n| n != &name);
+                if !enabled {
+                    s.disabled_skills.push(name.clone());
+                }
+                if let Err(e) = s.save() {
+                    return Err(err(e.to_string()));
+                }
+                s.disabled_skills.clone()
+            };
+            crate::skills::set_disabled(&now);
+            observability::event(
+                EventType::State,
+                json!({ "kind": "skill.toggled", "skill": name, "enabled": enabled }),
+            );
+            Ok(Json(json!({ "ok": true, "enabled": enabled })))
         }
         other => Err(err(format!("未知 action: {other}"))),
     }

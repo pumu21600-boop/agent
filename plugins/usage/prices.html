@@ -5,14 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>模型价格</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+        /* 2026-10-02：iframe 独立文档，不吃主界面 scrollbar-color——深色下默认白滑杆 */
+        scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
   body {
     --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31; --line2: #3a3a41;
     --input-bg: #1f1f24; --hover: #26262b; --on: #2f2f36; --link: #6ea8fe;
     --ok: #4bb543; --err: #e5534b;
     color-scheme: dark;
   }
-  body.light {
+        /* 跟随主界面：滑杆颜色随主题切（用户实锤深色白滑杆） */
+      body.light {
+        scrollbar-color: var(--line2, #b3bac4) transparent;
     --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8; --line2: #d4d4da;
     --input-bg: #ffffff; --hover: #f2f2f5; --on: #ededf2; --link: #0b62d0;
     --ok: #1a7f37; --err: #cf222e;
@@ -197,12 +201,13 @@ async function save() {
   const bad = rows.find((r) => !r.provider.trim() || !r.model.trim());
   if (bad) { say('有行的渠道或模型 id 是空的——补上或删掉该行', false); return; }
   try {
-    await req('usage.prices.save', {
+    const r = await req('usage.prices.save', {
       prices: rows.map((r) => ({ provider: r.provider.trim(), model: r.model.trim(), prompt: r.prompt, cached: r.cached, completion: r.completion })),
       currency,
       usd_cny_rate: rate,
     });
-    say('已保存（之后的请求按新价计价，历史账不变）', true);
+    // 2026-10-02：保存价格即自动重算全部历史（后端 recompute），不用再手动点
+    say(r.recomputed ? `已保存，历史 ${r.recomputed.records} 条已按新价重算（仍有 ${r.recomputed.unpriced} 条未匹配到价格）` : '已保存', true);
   } catch (e) {
     say(String(e.message || e), false);
   }
@@ -211,7 +216,7 @@ async function save() {
 async function recompute() {
   try {
     const r = await req('usage.recompute', {});
-    say(`已重算 ${r.records} 条（仍未计价 ${r.unpriced} 条），累计 ${r.spend_total_usd}`, true);
+    say(`已重算 ${r.records} 条（仍未计价 ${r.unpriced} 条），累计 ${Number(r.spend_total_usd).toFixed(4)} 美元`, true);
   } catch (e) {
     say(String(e.message || e), false);
   }
