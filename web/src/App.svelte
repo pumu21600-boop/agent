@@ -7572,7 +7572,7 @@
     align-items: center;
     gap: 4px;
     min-width: 0;
-    flex: 1 1 auto; /* 吃满 + 号左侧整行，标签才好均分等宽 */
+    flex: 0 1 auto; /* 条随内容收缩，+ 号贴着最后一个标签；标签多了内部横向滚动 */
     overflow-x: auto;
     scrollbar-width: none;
   }
@@ -7584,9 +7584,8 @@
     align-items: center;
     gap: 4px;
     padding: 4px 6px 4px 10px !important;
-    max-width: 150px;
-    min-width: 54px; /* 标签多时也保持可读宽度，超出交给标签条横向滚动（用户：别挤成一团） */
-    flex: 1 1 0; /* 等宽均分：宽度只跟面板宽和标签个数走，不跟字数走（用户拍板） */
+    width: 120px;
+    flex: none; /* 固定宽：不随标签个数/面板宽/字数变（用户 2026-10-03 拍板「就一直不变」），120px 连激活态带 × 也放得下 4 个汉字不省略 */
   }
   .rp-tab .rp-tab-ico {
     width: 13px;
