@@ -1720,8 +1720,8 @@
     terminalOpen = false;
     activateRpTab(key);
   }
-  // —— 文件预览标签：文本可编辑保存；图片/PDF/音视频走 /api/workspace/raw 直出；
-  // docx/xlsx/pptx/odf 各有渲染器（2026-10-02 第五轮统一文档工具条组件）——
+  // —— 文件预览标签：文本可编辑保存；文档类（docx/xlsx/pptx/pdf）只能预览不能编辑，
+  // xlsx/pptx/pdf 连预览组件也不留、内容直出（用户 2026-10-03）——
   const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
   const RP_PDF_EXT = new Set(['pdf']);
   const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
@@ -1774,7 +1774,7 @@
       rpSet(path, { loading: false, content: '', error: `docx 渲染失败: ${e.message || e}` });
     }
   }
-  // xlsx → HTML 表格（SheetJS；每 sheet 一张表，工具条/缩放共用）
+  // xlsx → HTML 表格（SheetJS；每 sheet 一张表，纯预览无标注）
   async function loadXlsxHtml(path) {
     rpSet(path, { loading: true, error: '' });
     try {
@@ -1783,11 +1783,7 @@
         return r.arrayBuffer();
       });
       const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
-      const sheets = wb.SheetNames.map((name) => {
-        const ws = wb.Sheets[name];
-        const html = XLSX.utils.sheet_to_html(ws, { editable: false });
-        return { name, rows: ws['!range'] ? ws['!range'].e.r : 0, html };
-      });
+      const sheets = wb.SheetNames.map((name) => XLSX.utils.sheet_to_html(wb.Sheets[name], { editable: false }));
       rpSet(path, { loading: false, content: JSON.stringify(sheets), error: '' });
     } catch (e) {
       rpSet(path, { loading: false, content: '', error: `xlsx 渲染失败: ${e.message || e}` });
@@ -1847,43 +1843,7 @@
     rpSet(path, { editing: true, draft: (rpPreviewCache[path] || {}).content || '', error: '' });
   }
   function cancelEditPreview(path) {
-    rpSet(path, { editing: false, draft: '', docxDraftLoading: false });
-  }
-  // docx「编辑」：底稿 = 后端抽出的纯文本（重建时排版简化，编辑区会写明）
-  async function startEditDocx(path) {
-    const hit = rpPreviewCache[path] || {};
-    if (hit.editing) return;
-    rpSet(path, { editing: true, docxDraftLoading: true, draft: hit.draft || '', error: '' });
-    try {
-      const r = await fetch(`/api/workspace/doc?path=${encodeURIComponent(path)}`).then((r) => r.json());
-      if (!r.ok) {
-        rpSet(path, { editing: false, error: `读取正文失败: ${r.error || ''}` });
-        return;
-      }
-      rpSet(path, { editing: true, docxDraftLoading: false, draft: r.text || '' });
-    } catch (e) {
-      rpSet(path, { editing: false, error: e.message || String(e) });
-    }
-  }
-  async function saveDocx(path) {
-    const hit = rpPreviewCache[path] || {};
-    if (hit.saving) return;
-    rpSet(path, { saving: true, error: '' });
-    try {
-      const r = await fetch('/api/workspace/docx-save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path, text: hit.draft || '' }),
-      }).then((r) => r.json());
-      if (!r.ok) {
-        rpSet(path, { saving: false, error: `保存失败: ${r.error || ''}` });
-        return;
-      }
-      rpSet(path, { saving: false, editing: false, draft: '', content: undefined, savedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
-      await loadDocxHtml(path); // 重新按排版渲染新内容
-    } catch (e) {
-      rpSet(path, { saving: false, error: `保存失败: ${e.message || e}` });
-    }
+    rpSet(path, { editing: false, draft: '' });
   }
   async function savePreview(path) {
     const hit = rpPreviewCache[path] || {};
@@ -5346,40 +5306,30 @@
                       class="rp-btn"
                       title="保存（写回工作区文件）"
                       disabled={(rpPreviewCache[t.path] || {}).saving}
-                      on:click={() => (previewKind(t.path) === 'docx' ? saveDocx(t.path) : savePreview(t.path))}
+                      on:click={() => savePreview(t.path)}
                     >
                       {(rpPreviewCache[t.path] || {}).saving ? '保存中…' : '保存'}
                     </button>
                     <button class="rp-btn" title="取消编辑（丢弃改动）" on:click={() => cancelEditPreview(t.path)}>取消</button>
                   {:else if previewKind(t.path) === 'text' && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
                     <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
-                  {:else if previewKind(t.path) === 'docx'}
-                    <!-- docx 也要能编辑（用户 2026-10-02 第四轮）：底稿=抽取正文，保存按段落重建 -->
-                    <button class="rp-btn" title="编辑文档正文" on:click={() => startEditDocx(t.path)}>编辑</button>
                   {/if}
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
                 {#if (rpPreviewCache[t.path] || {}).editing}
-                  {#if previewKind(t.path) === 'docx'}
-                    <div class="rp-note">编辑的是文档正文（空行分段）。保存会按这份正文重建 docx——原文档的字体/表格/图片不保留；仅改文字建议这样，要保排版请用 Word 改。</div>
-                  {/if}
-                  {#if (rpPreviewCache[t.path] || {}).docxDraftLoading}
-                    <pre class="rp-preview">读取正文…</pre>
-                  {:else}
-                    <textarea
-                      class="rp-edit"
-                      spellcheck="false"
-                      value={(rpPreviewCache[t.path] || {}).draft || ''}
-                      on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
-                    ></textarea>
-                  {/if}
+                  <textarea
+                    class="rp-edit"
+                    spellcheck="false"
+                    value={(rpPreviewCache[t.path] || {}).draft || ''}
+                    on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
+                  ></textarea>
                 {:else if previewKind(t.path) === 'image'}
                   <div class="rp-image-wrap">
                     <img class="rp-image" src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} alt={t.path} />
                   </div>
                 {:else if previewKind(t.path) === 'pdf'}
-                  <!-- PDF 内嵌（浏览器/WebView 自带查看器） -->
-                  <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></iframe>
+                  <!-- PDF 内嵌（WebView 自带查看器；#toolbar=0 藏掉查看器工具条，纯预览） -->
+                  <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}#toolbar=0`}></iframe>
                 {:else if previewKind(t.path) === 'docx'}
                   <!-- docx：统一工具条 + mammoth 排版（纸张本色） -->
                   <DocToolbar
@@ -5409,45 +5359,28 @@
                     ></iframe>
                   {/if}
                 {:else if previewKind(t.path) === 'xlsx'}
-                  <!-- xlsx：统一工具条 + SheetJS 表格渲染 -->
-                  <DocToolbar
-                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
-                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
-                    on:print={() => window.print()}
-                  />
+                  <!-- xlsx：SheetJS 表格直出，纯预览（用户 2026-10-03：组件全去，无工具条/缩放/表名标注） -->
                   {#if (rpPreviewCache[t.path] || {}).loading}
                     <pre class="rp-preview">渲染中…</pre>
                   {:else if (rpPreviewCache[t.path] || {}).error}
                     <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
                   {:else}
-                    <div class="rp-xlsx" style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}>
+                    <div class="rp-xlsx">
                       {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sh}
-                        <div class="rp-xlsx-sheet">
-                          <div class="rp-xlsx-name">{sh.name}{sh.rows ? `（${sh.rows + 1} 行）` : ''}</div>
-                          <div class="rp-xlsx-body">{@html sh.html}</div>
-                        </div>
+                        <div class="rp-xlsx-sheet"><div class="rp-xlsx-body">{@html sh}</div></div>
                       {/each}
                     </div>
                   {/if}
                 {:else if previewKind(t.path) === 'pptx'}
-                  <!-- pptx：统一工具条 + 分页渲染（每张幻灯片一块，页角标页码） -->
-                  <DocToolbar
-                    zoom={(rpPreviewCache[t.path] || {}).zoom || 100}
-                    label={(() => { try { const a = JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); return `共 ${a.length} 页`; } catch { return ''; } })()}
-                    on:zoom={(e) => setDocZoom(t.path, e.detail)}
-                    on:print={() => window.print()}
-                  />
+                  <!-- pptx：后端分页文本直出，纯预览（用户 2026-10-03：组件全去，无工具条/缩放/页码） -->
                   {#if (rpPreviewCache[t.path] || {}).loading}
                     <pre class="rp-preview">渲染中…</pre>
                   {:else if (rpPreviewCache[t.path] || {}).error}
                     <pre class="rp-preview">{`渲染失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
                   {:else}
-                    <div class="rp-pptx" style={`zoom: ${(rpPreviewCache[t.path] || {}).zoom || 100}%`}>
-                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sl, i}
-                        <div class="rp-slide">
-                          <div class="rp-slide-no">{sl.n || i + 1}</div>
-                          <pre class="rp-slide-text">{sl.text || '（空白页）'}</pre>
-                        </div>
+                    <div class="rp-pptx">
+                      {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sl}
+                        <div class="rp-slide"><pre class="rp-slide-text">{sl.text || '（空白页）'}</pre></div>
                       {/each}
                     </div>
                   {/if}
@@ -7898,14 +7831,12 @@
     color: #24292f;
   }
   .rp-xlsx-sheet { padding: 12px 16px 20px; }
-  .rp-xlsx-name { font-size: 12px; font-weight: 650; color: #555; padding: 4px 0 8px; }
   .rp-xlsx-body :global(table) { border-collapse: collapse; }
   .rp-xlsx-body :global(td), .rp-xlsx-body :global(th) { border: 1px solid #c8ccd4; padding: 3px 8px; font-size: 12px; white-space: nowrap; }
   .rp-xlsx-body :global(tr:first-child) { background: #f1f3f6; font-weight: 600; }
   /* pptx 分页渲染区 */
   .rp-pptx { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding: 14px; background: var(--g1); }
-  .rp-slide { position: relative; background: #fff; color: #24292f; border-radius: 8px; padding: 26px 28px 26px 44px; min-height: 160px; box-shadow: 0 1px 4px var(--overlay); }
-  .rp-slide-no { position: absolute; left: 12px; top: 12px; font-size: 11px; color: #999; font-family: monospace; }
+  .rp-slide { background: #fff; color: #24292f; border-radius: 8px; padding: 26px 28px; min-height: 160px; box-shadow: 0 1px 4px var(--overlay); }
   .rp-slide-text { margin: 0; white-space: pre-wrap; font-size: 13px; line-height: 1.7; font-family: inherit; }
   /* docx 纸张预览：细边框把白纸和深色界面隔开 */
   .rp-doc-paper {

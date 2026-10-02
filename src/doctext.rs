@@ -5,7 +5,7 @@
 //! 解压只补 flate2（纯 Rust miniz_oxide 后端），不引完整 zip 依赖。
 //! XML 只做「去标签 + 段落换行 + 实体解码」——要的是可读文本，不是保真排版。
 
-use serde_json::{json, Value};
+use serde_json::json;
 use std::io::Read;
 use std::path::Path;
 

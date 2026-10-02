@@ -181,7 +181,6 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         // P18 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
         .route("/api/plugin/data", get(read_plugin_data).put(write_plugin_data).delete(delete_plugin_data))
         .route("/api/workspace/file", post(write_workspace_file))
-        .route("/api/workspace/docx-save", post(write_workspace_docx))
         // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
         // 尾斜杠那条约等于目录首页：不带它请求会掉进 SPA 兜底，把整个应用套进 iframe
         .route("/plugins/{name}", get(plugin_entry))
