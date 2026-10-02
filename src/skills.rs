@@ -28,9 +28,16 @@ pub struct Skill {
 }
 
 /// 技能根目录：(路径, 来源)。项目级在前，同名时项目覆盖全局。
+/// 「全局」= **agent 应用目录**下的 `skills/`（app_root，与 plugins/prompts 同级）——
+/// 用户 2026-10-02 实锤纠正：「应该保存到我们这个 agent 的 skill 目录，不是整个电脑的」。
+/// 打包形态 app_root = exe 同级，开发形态 = 源码目录。
+pub fn global_skills_root() -> PathBuf {
+    crate::config::app_root().join("skills")
+}
+
 pub fn roots() -> Vec<(PathBuf, &'static str)> {
     let mut v = vec![(crate::tools::workspace_root().join("skills"), "project")];
-    v.push((crate::memory::global_dir().join("skills"), "global"));
+    v.push((global_skills_root(), "global"));
     v
 }
 
@@ -313,15 +320,21 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     } else {
         format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, desc, body)
     };
-    // 用户 2026-10-02（第二轮实锤「还是保存到项目里面」）：技能一律落**全局**
-    // （~/.agent/skills/，agent 体系资产不跟工作区走）。项目级旧副本写完全局后
-    // 顺手搬走——否则 list() 的项目级覆盖规则会让它继续顶着全局版，chip 还显示项目级。
-    let dir = crate::memory::global_dir().join("skills").join(name);
+    // 用户 2026-10-02（第四轮实锤）：技能落**agent 应用目录** skills/（app_root，
+    // 与 plugins/prompts 同级；「不是整个电脑的」）。项目级旧副本写完全局后顺手搬走
+    // ——否则 list() 的项目级覆盖规则会让它继续顶着全局版，chip 还显示项目级。
+    let dir = global_skills_root().join(name);
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     crate::fsx::write_atomic_str(&dir.join("SKILL.md"), &full).map_err(|e| format!("写入失败: {e}"))?;
     let stale = crate::tools::workspace_root().join("skills").join(name);
-    if stale.is_dir() {
+    // 守卫：工作区根与应用根同目录时（开发形态跑在工作区上）stale==dir，别把刚写的删了
+    if stale != dir && stale.is_dir() {
         let _ = fs::remove_dir_all(&stale);
+    }
+    // 旧「全局」根（~/.agent/skills）遗留同名副本也清掉（换根后别留双份）
+    let legacy = crate::memory::global_dir().join("skills").join(name);
+    if legacy != dir && legacy.is_dir() {
+        let _ = fs::remove_dir_all(&legacy);
     }
     Ok(dir.to_string_lossy().to_string())
 }

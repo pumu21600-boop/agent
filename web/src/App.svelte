@@ -865,10 +865,15 @@
     if (!mcpServers.length && !wasmPlugins.length) loadMcp();
     abilityMenuOpen = true;
   }
-  // 「/」菜单分组（用户 2026-10-02 第三轮）：技能=自己建的非插件技能；插件=插件自带技能
-  // （混在技能组里就是「明明只注册了一个技能却列了七个」的原因）
+  // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
+  // 插件=**全部已启用插件**（第四轮实锤「只列了那几个，全都要呀」），
+  // 带技能的插件点开 ▾ 列出该插件的技能；纯面板插件（时间线/项目文件/用量）点开右栏面板
   $: ownSkills = (skillsData || []).filter((sk) => sk.source !== 'plugin' && sk.enabled !== false);
   $: pluginSkills = (skillsData || []).filter((sk) => sk.source === 'plugin' && sk.enabled !== false);
+  let pluginMenu = ''; // 展开中的插件名（/ 菜单）
+  function pluginSkillsOf(name) {
+    return pluginSkills.filter((sk) => sk.plugin === name);
+  }
 
   // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
   let terminalOpen = false;
@@ -927,7 +932,9 @@
   let cpFiles = [];
   let cpFilesLoading = false;
   // 审查 diff 弹窗（对着 ZCode 审查：逐文件看 diff）
-  let reviewDiffModal = null; // { baseline, path, loading, text, error }
+  // 审查 diff（用户 2026-10-02 第四轮：diff 开在**右侧栏**跟 ZCode 一致，不要弹窗）
+  // ——以「标签」形式开：kind='diff'，激活时按需拉 /api/review/diff。
+  let diffCache = {}; // path → { loading, text, error }
   async function loadCpFiles() {
     if (!dockCp || !dockCp.id) return;
     cpFilesLoading = true;
@@ -943,16 +950,27 @@
     cpFilesOpen = !cpFilesOpen;
     if (cpFilesOpen && !cpFiles.length) loadCpFiles();
   }
-  async function openReviewDiff(baseline, path) {
+  function openDiffTab(baseline, path) {
     if (!baseline) return;
-    reviewDiffModal = { baseline, path, loading: true, text: '', error: '' };
+    const key = 'diff:' + path;
+    if (!rpTabs.some((t) => t.key === key)) {
+      rpTabs = [...rpTabs, { key, kind: 'diff', path, baseline, title: path.split('/').pop() || path }];
+    }
+    rpPreviewPath = path;
+    rightPanelOpen = true;
+    terminalOpen = false;
+    activateRpTab(key);
+  }
+  async function loadDiff(t) {
+    if (!t || t.kind !== 'diff') return;
+    const hit = diffCache[t.path] || {};
+    if (hit.loading || (hit.text !== undefined && !hit.error)) return;
+    diffCache = { ...diffCache, [t.path]: { loading: true } };
     try {
-      const r = await fetch(`/api/review/diff?baseline=${encodeURIComponent(baseline)}${path ? `&path=${encodeURIComponent(path)}` : ''}`).then((r) => r.json());
-      reviewDiffModal = r.ok
-        ? { baseline, path, loading: false, text: r.diff || '', error: '' }
-        : { baseline, path, loading: false, text: '', error: r.error || '读取失败' };
+      const r = await fetch(`/api/review/diff?baseline=${encodeURIComponent(t.baseline || '')}&path=${encodeURIComponent(t.path)}`).then((r) => r.json());
+      diffCache = { ...diffCache, [t.path]: r.ok ? { loading: false, text: r.diff || '', error: '' } : { loading: false, text: '', error: r.error || '读取失败' } };
     } catch (e) {
-      reviewDiffModal = { baseline, path, loading: false, text: '', error: e.message || String(e) };
+      diffCache = { ...diffCache, [t.path]: { loading: false, text: '', error: e.message || String(e) } };
     }
   }
   let rpLoading = false;
@@ -1655,6 +1673,7 @@
     const t = rpTabs.find((x) => x.key === key);
     if (!t) return;
     if (t.kind === 'artifacts' || t.kind === 'review') loadArtifacts();
+    if (t.kind === 'diff') loadDiff(t);
     if (t.kind === 'web') loadWebState();
     if (t.kind === 'file') loadPreview(t.path);
   }
@@ -1768,7 +1787,43 @@
     rpSet(path, { editing: true, draft: (rpPreviewCache[path] || {}).content || '', error: '' });
   }
   function cancelEditPreview(path) {
-    rpSet(path, { editing: false, draft: '' });
+    rpSet(path, { editing: false, draft: '', docxDraftLoading: false });
+  }
+  // docx「编辑」：底稿 = 后端抽出的纯文本（重建时排版简化，编辑区会写明）
+  async function startEditDocx(path) {
+    const hit = rpPreviewCache[path] || {};
+    if (hit.editing) return;
+    rpSet(path, { editing: true, docxDraftLoading: true, draft: hit.draft || '', error: '' });
+    try {
+      const r = await fetch(`/api/workspace/doc?path=${encodeURIComponent(path)}`).then((r) => r.json());
+      if (!r.ok) {
+        rpSet(path, { editing: false, error: `读取正文失败: ${r.error || ''}` });
+        return;
+      }
+      rpSet(path, { editing: true, docxDraftLoading: false, draft: r.text || '' });
+    } catch (e) {
+      rpSet(path, { editing: false, error: e.message || String(e) });
+    }
+  }
+  async function saveDocx(path) {
+    const hit = rpPreviewCache[path] || {};
+    if (hit.saving) return;
+    rpSet(path, { saving: true, error: '' });
+    try {
+      const r = await fetch('/api/workspace/docx-save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, text: hit.draft || '' }),
+      }).then((r) => r.json());
+      if (!r.ok) {
+        rpSet(path, { saving: false, error: `保存失败: ${r.error || ''}` });
+        return;
+      }
+      rpSet(path, { saving: false, editing: false, draft: '', content: undefined, savedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }) });
+      await loadDocxHtml(path); // 重新按排版渲染新内容
+    } catch (e) {
+      rpSet(path, { saving: false, error: `保存失败: ${e.message || e}` });
+    }
   }
   async function savePreview(path) {
     const hit = rpPreviewCache[path] || {};
@@ -4532,7 +4587,7 @@
                       <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
                       <span class="git-path" title={f.path}>{f.path}</span>
                       {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
-                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openReviewDiff(dockCp.id, f.path)}>审查</button>
+                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(dockCp.id, f.path)}>审查</button>
                       <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
                     </div>
                   {/each}
@@ -4657,13 +4712,38 @@
                     {/if}
                   {/each}
                   <div class="bar-group">插件</div>
-                  {#if !pluginSkills.length}
-                    <div class="menu-empty">暂无可用插件技能</div>
+                  {#if !enabledExts.length}
+                    <div class="menu-empty">暂无可用插件</div>
                   {/if}
-                  {#each pluginSkills as sk (sk.name)}
-                    <button class="bar-item" title={`插件 ${sk.plugin || ''} 自带的技能${sk.description ? '：' + sk.description : ''}`} on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
-                      <span class="menu-sym">P</span> {sk.name}
+                  {#each enabledExts as e (e.name)}
+                    {@const sk = pluginSkillsOf(e.name)}
+                    <button
+                      class="bar-item"
+                      class:active={pluginMenu === e.name}
+                      title={e.description || e.name}
+                      on:click={() => {
+                        pluginMenu = pluginMenu === e.name ? '' : e.name;
+                        if (!sk.length) {
+                          // 纯面板插件（时间线/项目文件/用量…）：在右栏开它的面板
+                          const entry = (e.ui || []).find((u) => u.slot === 'dock' || u.slot === 'toolbar');
+                          if (entry && entry.open !== false) {
+                            abilityMenuOpen = false;
+                            plusMenuOpen = false;
+                            addRpTab({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: entry.title || e.title || e.name });
+                          }
+                        }
+                      }}
+                    >
+                      <span class="menu-sym">P</span> {e.title || e.name}
+                      {#if sk.length}<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>{/if}
                     </button>
+                    {#if pluginMenu === e.name}
+                      {#each sk as s (s.name)}
+                        <button class="bar-item bar-item-sub" title={s.description || s.name} on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${s.name} `); }}>
+                          <span class="menu-sym">$</span> {s.name}
+                        </button>
+                      {/each}
+                    {/if}
                   {/each}
                 </div>
               {/if}
@@ -5016,7 +5096,7 @@
                       <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
                       <span class="git-path" title={`${f.path}${f.status === '?' ? '' : ` · ${f.path.split('/').slice(0, -1).join('/')}`}`}>{f.path}</span>
                       {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
-                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openReviewDiff(rpReviewBaseline, f.path)}>审查</button>
+                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(rpReviewBaseline, f.path)}>审查</button>
                       <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
                     </div>
                   {/each}
@@ -5029,19 +5109,38 @@
                     <span class="rp-saved">已保存 {(rpPreviewCache[t.path] || {}).savedAt}</span>
                   {/if}
                   {#if (rpPreviewCache[t.path] || {}).editing}
-                    <button class="rp-btn" title="保存（写回工作区文件）" disabled={(rpPreviewCache[t.path] || {}).saving} on:click={() => savePreview(t.path)}>
+                    <button
+                      class="rp-btn"
+                      title="保存（写回工作区文件）"
+                      disabled={(rpPreviewCache[t.path] || {}).saving}
+                      on:click={() => (previewKind(t.path) === 'docx' ? saveDocx(t.path) : savePreview(t.path))}
+                    >
                       {(rpPreviewCache[t.path] || {}).saving ? '保存中…' : '保存'}
                     </button>
                     <button class="rp-btn" title="取消编辑（丢弃改动）" on:click={() => cancelEditPreview(t.path)}>取消</button>
                   {:else if previewKind(t.path) === 'text' && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
-                    <!-- 只有纯文本可编辑：文档抽取/媒体/PDF 不是原文件字节，编辑会写坏 -->
                     <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
+                  {:else if previewKind(t.path) === 'docx'}
+                    <!-- docx 也要能编辑（用户 2026-10-02 第四轮）：底稿=抽取正文，保存按段落重建 -->
+                    <button class="rp-btn" title="编辑文档正文" on:click={() => startEditDocx(t.path)}>编辑</button>
                   {/if}
-                  <!-- 下载原文件（2026-10-02：PDF/docx 等预览类型都挂一个，别让「打开/下载」只此一家有） -->
-                  <a class="rp-btn" href={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} download={t.path.split('/').pop()} title="下载原文件">下载</a>
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
-                {#if previewKind(t.path) === 'image'}
+                {#if (rpPreviewCache[t.path] || {}).editing}
+                  {#if previewKind(t.path) === 'docx'}
+                    <div class="rp-note">编辑的是文档正文（空行分段）。保存会按这份正文重建 docx——原文档的字体/表格/图片不保留；仅改文字建议这样，要保排版请用 Word 改。</div>
+                  {/if}
+                  {#if (rpPreviewCache[t.path] || {}).docxDraftLoading}
+                    <pre class="rp-preview">读取正文…</pre>
+                  {:else}
+                    <textarea
+                      class="rp-edit"
+                      spellcheck="false"
+                      value={(rpPreviewCache[t.path] || {}).draft || ''}
+                      on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
+                    ></textarea>
+                  {/if}
+                {:else if previewKind(t.path) === 'image'}
                   <div class="rp-image-wrap">
                     <img class="rp-image" src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} alt={t.path} />
                   </div>
@@ -5076,13 +5175,6 @@
                   <pre class="rp-preview">读取中…</pre>
                 {:else if (rpPreviewCache[t.path] || {}).error}
                   <pre class="rp-preview">{`读取失败: ${(rpPreviewCache[t.path] || {}).error}`}</pre>
-                {:else if (rpPreviewCache[t.path] || {}).editing}
-                  <textarea
-                    class="rp-edit"
-                    spellcheck="false"
-                    value={(rpPreviewCache[t.path] || {}).draft || ''}
-                    on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
-                  ></textarea>
                 {:else}
                   {#if previewKind(t.path) === 'doc'}
                     <div class="rp-note">文档类预览：这里是抽取出来的文本（排版与图表不在其中），不提供编辑</div>
@@ -5958,28 +6050,6 @@
   />
 
 <ImagePreview src={previewImageModal} on:close={() => (previewImageModal = null)} />
-
-{#if reviewDiffModal}
-  <!-- 审查 diff 弹窗（用户 2026-10-02，对齐 ZCode 审查：逐文件看具体改动） -->
-  <div class="modal-backdrop" on:click={() => (reviewDiffModal = null)}>
-    <div class="modal review-modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <b>审查{reviewDiffModal.path ? `：${reviewDiffModal.path}` : '（全部改动）'}</b>
-        <span class="hint">相对本任务起点</span>
-        <button class="btn ghost" on:click={() => (reviewDiffModal = null)}>关闭</button>
-      </div>
-      {#if reviewDiffModal.loading}
-        <div class="trace-empty">加载中…</div>
-      {:else if reviewDiffModal.error}
-        <pre class="rp-preview">{`读取失败: ${reviewDiffModal.error}`}</pre>
-      {:else if !reviewDiffModal.text}
-        <div class="trace-empty">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
-      {:else}
-        <pre class="review-diff">{reviewDiffModal.text}</pre>
-      {/if}
-    </div>
-  </div>
-{/if}
 
 {#if galaxyOpen}
   <!-- 记忆库星云：光点 = 会话；搜索 = 向量检索过滤 -->
@@ -8553,11 +8623,13 @@
     color: var(--g7);
   }
   /* 展开的改动文件清单浮层（贴着变更条向上弹出，和 git-pop 同规矩；限高可滚） */
+  /* ZCode 是展开在变更条下面（用户 2026-10-02 第四轮实锤「要在下面」）；限高可滚 */
   .cp-files-pop {
-    bottom: calc(100% + 6px);
+    top: calc(100% + 4px);
+    bottom: auto;
     left: 0;
     right: 0;
-    max-height: 300px;
+    max-height: 320px;
   }
   .cp-files-pop .git-pop-list {
     max-height: 240px;
@@ -8856,12 +8928,16 @@
     border-color: var(--g4);
   }
   .ctx-conv-title {
+    /* flex 子项要 min-width:0 才不被时间戳挤成竖条（2026-10-02 实锤：
+       只给 max-width 不给 flex-basis，标题被压到 25px 一竖列） */
+    flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 340px;
   }
   .ctx-conv-ts {
+    flex: none;
     font-size: 11px;
     color: var(--g5);
   }
@@ -8891,6 +8967,21 @@
   }
   .bar-dropdown.compact {
     min-width: 90px;
+  }
+  /* 插件行 ▾ 箭头 + 展开后的技能子项（2026-10-02） */
+  .menu-caret {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    align-self: center;
+    color: var(--g5);
+    transition: transform 0.12s;
+  }
+  .bar-item.active .menu-caret {
+    transform: rotate(90deg);
+  }
+  .bar-item-sub {
+    padding-left: 28px;
   }
   .bar-dropdown.compact .bar-item {
     justify-content: center;

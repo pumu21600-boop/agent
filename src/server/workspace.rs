@@ -204,6 +204,61 @@ pub(super) async fn read_workspace_raw(
     }
 }
 
+/// POST /api/workspace/docx-save {path, text} —— docx「编辑 → 保存」：把编辑后的纯文本
+/// 按段落重建 docx 写回工作区（scripts/docx-rebuild.mjs，docx 库与 documents 插件同源）。
+/// 语义如实：排版简化（统一正文样式，原字体/表格/图片不保留）——预览编辑区会写明。
+pub(super) async fn write_workspace_docx(
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let path = req.get("path").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let text = req.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
+    }
+    let res = tokio::task::spawn_blocking(move || -> Result<(String, usize), String> {
+        let full = crate::tools::resolve_workspace_path(&path).map_err(|e| e.to_string())?;
+        let ext = full.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if ext != "docx" {
+            return Err(format!("只支持 docx（这是 .{ext}）"));
+        }
+        // 文档必须在工作区内且不超 50MB
+        let meta = std::fs::metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
+        if meta.len() > 50 * 1024 * 1024 {
+            return Err("文件过大（>50MB）".into());
+        }
+        let script = crate::config::app_root().join("scripts").join("docx-rebuild.mjs");
+        if !script.is_file() {
+            return Err(format!("重建脚本缺失: {}", script.display()));
+        }
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let node = "node";
+        let mut child = Command::new(node)
+            .arg(&script)
+            .current_dir(crate::config::app_root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("启动 node 失败: {e}"))?;
+        let payload = json!({ "out": full.to_string_lossy(), "text": text }).to_string();
+        child.stdin.as_mut().ok_or("stdin 未开")?.write_all(payload.as_bytes()).map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let v: Value = serde_json::from_str(&s).map_err(|e| format!("重建进程输出异常: {e}（{s}）"))?;
+        if v.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(v.get("error").and_then(Value::as_str).unwrap_or("重建失败").to_string());
+        }
+        Ok((path, v.get("paragraphs").and_then(Value::as_u64).unwrap_or(0) as usize))
+    })
+    .await;
+    match res {
+        Ok(Ok((path, paragraphs))) => Ok(Json(json!({ "ok": true, "path": path, "paragraphs": paragraphs }))),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ShellReq {
     pub command: String,
