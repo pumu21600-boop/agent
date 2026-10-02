@@ -301,6 +301,7 @@
     <script>
       const pending = new Map();
       let seq = 0;
+      let booted = false; // 主题切换会重发 init：换肤照做，boot 只跑一次（别把浏览状态冲掉）
       let wsPath = '';
       let root = ''; // 当前浏览根（工作区相对路径，'' = 工作区根）
       let expanded = new Set(); // 展开的目录（相对路径）
@@ -328,7 +329,7 @@
         if (d.type === 'agent:init') {
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
-          loadAll();
+          if (!booted) { booted = true; loadAll(); }
           return;
         }
         if (d.type === 'agent:response' && pending.has(d.id)) {

@@ -246,6 +246,7 @@
     <script>
       const pending = new Map();
       let seq = 0;
+      let booted = false; // 主题切换会重发 init：换肤照做，boot 只跑一次（别把浏览状态冲掉）
       // 展开态按 start_ts 认，不按数组下标：刷新后新任务会把索引整体挤位，按下标会把
       // 「展开着的那个任务」悄悄换成另一个；时间戳是任务的稳定身份。
       let expandedTs = null;
@@ -271,7 +272,7 @@
         if (d.type === 'agent:init') {
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
-          load();
+          if (!booted) { booted = true; load(); }
           return;
         }
         if (d.type === 'agent:response' && pending.has(d.id)) {
