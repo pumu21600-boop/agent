@@ -865,6 +865,10 @@
     if (!mcpServers.length && !wasmPlugins.length) loadMcp();
     abilityMenuOpen = true;
   }
+  // 「/」菜单分组（用户 2026-10-02 第三轮）：技能=自己建的非插件技能；插件=插件自带技能
+  // （混在技能组里就是「明明只注册了一个技能却列了七个」的原因）
+  $: ownSkills = (skillsData || []).filter((sk) => sk.source !== 'plugin' && sk.enabled !== false);
+  $: pluginSkills = (skillsData || []).filter((sk) => sk.source === 'plugin' && sk.enabled !== false);
 
   // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
   let terminalOpen = false;
@@ -881,6 +885,7 @@
   // （插件没启用的话渲染时自然消失）。持久化：rpTabs（开着哪些）+ rpTab（激活 key）。
   const RP_BUILTIN = [
     { key: 'artifacts', kind: 'artifacts', title: '产物' },
+    { key: 'review', kind: 'review', title: '审查' },
     { key: 'web', kind: 'web', title: '网页' },
   ];
   function rpDefaultTabs() {
@@ -915,6 +920,41 @@
   let rpFiles = [];
   // 「产物」空态/失败的原因（resolveBaseline 没基线、读取出错）——空也要说人话
   let rpArtifactsNote = '';
+  // 「审查」标签用的基线（与产物同源：本会话任务起点）
+  let rpReviewBaseline = '';
+  // 变更条展开的文件清单（用户 2026-10-02：「N 个文件已更改」要能展开看到文件）
+  let cpFilesOpen = false;
+  let cpFiles = [];
+  let cpFilesLoading = false;
+  // 审查 diff 弹窗（对着 ZCode 审查：逐文件看 diff）
+  let reviewDiffModal = null; // { baseline, path, loading, text, error }
+  async function loadCpFiles() {
+    if (!dockCp || !dockCp.id) return;
+    cpFilesLoading = true;
+    try {
+      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(dockCp.id)}`).then((r) => r.json());
+      cpFiles = r.ok ? r.files || [] : [];
+    } catch (e) {
+      cpFiles = [];
+    }
+    cpFilesLoading = false;
+  }
+  function toggleCpFiles() {
+    cpFilesOpen = !cpFilesOpen;
+    if (cpFilesOpen && !cpFiles.length) loadCpFiles();
+  }
+  async function openReviewDiff(baseline, path) {
+    if (!baseline) return;
+    reviewDiffModal = { baseline, path, loading: true, text: '', error: '' };
+    try {
+      const r = await fetch(`/api/review/diff?baseline=${encodeURIComponent(baseline)}${path ? `&path=${encodeURIComponent(path)}` : ''}`).then((r) => r.json());
+      reviewDiffModal = r.ok
+        ? { baseline, path, loading: false, text: r.diff || '', error: '' }
+        : { baseline, path, loading: false, text: '', error: r.error || '读取失败' };
+    } catch (e) {
+      reviewDiffModal = { baseline, path, loading: false, text: '', error: e.message || String(e) };
+    }
+  }
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
   let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, saving, savedAt }（标签切换不重拉）
@@ -1596,6 +1636,7 @@
       return;
     }
     rpArtifactsNote = '';
+    rpReviewBaseline = baseline;
     try {
       const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((r) => r.json());
       rpFiles = r.files || [];
@@ -1613,7 +1654,7 @@
     rpAddOpen = false;
     const t = rpTabs.find((x) => x.key === key);
     if (!t) return;
-    if (t.kind === 'artifacts') loadArtifacts();
+    if (t.kind === 'artifacts' || t.kind === 'review') loadArtifacts();
     if (t.kind === 'web') loadWebState();
     if (t.kind === 'file') loadPreview(t.path);
   }
@@ -4457,7 +4498,10 @@
               {/if}
             {/if}
             {#if dockCp && dockCp.files > 0}
-              <span class="cp-sum">› <b>{dockCp.files}</b> 个文件已更改</span>
+              <!-- 用户 2026-10-02：点「N 个文件已更改」展开文件清单（审查/打开），别再只给个数 -->
+              <button class="cp-sum" class:on={cpFilesOpen} title="展开改动文件清单" on:click={toggleCpFiles}>
+                {cpFilesOpen ? '▾' : '›'} <b>{dockCp.files}</b> 个文件已更改
+              </button>
               {#if dockCp.additions != null}
                 <span class="cp-add">+{dockCp.additions}</span>
                 <span class="cp-del">-{dockCp.deletions}</span>
@@ -4472,6 +4516,30 @@
               {/if}
             </span>
           </div>
+          {#if cpFilesOpen && dockCp && dockCp.files > 0}
+            <!-- 展开的改动文件清单（ZCode 审查同款行：状态 + 路径 + 增删行 + 审查/打开） -->
+            <div class="git-pop cp-files-pop">
+              <div class="git-pop-head">
+                <b>{dockCp.files}</b> 个文件已更改
+                <span class="git-pop-hint">相对本任务起点</span>
+              </div>
+              <div class="git-pop-list">
+                {#if cpFilesLoading}
+                  <div class="git-pop-more">加载中…</div>
+                {:else}
+                  {#each cpFiles as f (f.path)}
+                    <div class="git-pop-row review-row">
+                      <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
+                      <span class="git-path" title={f.path}>{f.path}</span>
+                      {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
+                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openReviewDiff(dockCp.id, f.path)}>审查</button>
+                      <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+            </div>
+          {/if}
           {#if gitPopOpen && gitInfo && gitInfo.is_repo}
             <div class="git-pop">
               <div class="git-pop-head">
@@ -4561,11 +4629,13 @@
                 </div>
               {/if}
               {#if abilityMenuOpen}
-                <!-- 用户 2026-10-02："/"= 能力菜单只分三大类——技能 / MCP / 插件（模板整组不要） -->
+                <!-- 用户 2026-10-02 第三轮实锤：技能组只列自己建的（源=非插件），插件技能归
+                     「插件」组——「只注册了一个测试技能，插件明明有很多」就是被插件技能
+                     混进技能组搞乱的 -->
                 <div class="bar-dropdown">
                   <div class="bar-group">技能</div>
-                  {#if skillsData.filter((sk) => sk.enabled !== false).length}
-                    {#each skillsData.filter((sk) => sk.enabled !== false) as sk (sk.name)}
+                  {#if ownSkills.length}
+                    {#each ownSkills as sk (sk.name)}
                       <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
                         <span class="menu-sym">$</span> {sk.name}
                       </button>
@@ -4587,15 +4657,13 @@
                     {/if}
                   {/each}
                   <div class="bar-group">插件</div>
-                  {#if !wasmPlugins.some((w) => (w.tools || []).length)}
-                    <div class="menu-empty">暂无可用工具</div>
+                  {#if !pluginSkills.length}
+                    <div class="menu-empty">暂无可用插件技能</div>
                   {/if}
-                  {#each wasmPlugins as w}
-                    {#each w.tools || [] as t}
-                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$wasm__${w.stem}__${t.name} `); }}>
-                        <span class="menu-sym">P</span> {t.name}
-                      </button>
-                    {/each}
+                  {#each pluginSkills as sk (sk.name)}
+                    <button class="bar-item" title={`插件 ${sk.plugin || ''} 自带的技能${sk.description ? '：' + sk.description : ''}`} on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
+                      <span class="menu-sym">P</span> {sk.name}
+                    </button>
                   {/each}
                 </div>
               {/if}
@@ -4928,10 +4996,29 @@
                 {:else if !rpFiles.length}
                   <div class="rp-empty">{rpArtifactsNote || '本任务还没有产物。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
                 {:else}
-                  {#each rpFiles as f (f)}
-                    <button class="rp-file" class:sel={f === rpPreviewPath} title={f} on:click={() => openPreviewTab(f)}>
-                      {f}
+                  {#each rpFiles as f (f.path)}
+                    <button class="rp-file" class:sel={f.path === rpPreviewPath} title={f.path} on:click={() => openPreviewTab(f.path)}>
+                      {f.path}
                     </button>
+                  {/each}
+                {/if}
+              {:else if t.kind === 'review'}
+                <!-- 用户 2026-10-02：侧栏「审查」标签——本会话相对任务起点的全部改动，
+                     对着 ZCode 审查列表：状态/路径/增删行 + 审查(diff)/打开 -->
+                {#if rpLoading}
+                  <div class="trace-empty">加载中…</div>
+                {:else if !rpFiles.length}
+                  <div class="rp-empty">{rpArtifactsNote || '本会话还没有改动。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
+                {:else}
+                  <div class="review-head">共 {rpFiles.length} 个文件已更改 +{rpFiles.reduce((s, f) => s + (f.adds || 0), 0)} -{rpFiles.reduce((s, f) => s + (f.dels || 0), 0)}</div>
+                  {#each rpFiles as f (f.path)}
+                    <div class="review-row">
+                      <span class="git-st">{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
+                      <span class="git-path" title={`${f.path}${f.status === '?' ? '' : ` · ${f.path.split('/').slice(0, -1).join('/')}`}`}>{f.path}</span>
+                      {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
+                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openReviewDiff(rpReviewBaseline, f.path)}>审查</button>
+                      <button class="cp-commit" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开</button>
+                    </div>
                   {/each}
                 {/if}
               {:else if t.kind === 'file'}
@@ -4950,6 +5037,8 @@
                     <!-- 只有纯文本可编辑：文档抽取/媒体/PDF 不是原文件字节，编辑会写坏 -->
                     <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
                   {/if}
+                  <!-- 下载原文件（2026-10-02：PDF/docx 等预览类型都挂一个，别让「打开/下载」只此一家有） -->
+                  <a class="rp-btn" href={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} download={t.path.split('/').pop()} title="下载原文件">下载</a>
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
                 {#if previewKind(t.path) === 'image'}
@@ -5869,6 +5958,28 @@
   />
 
 <ImagePreview src={previewImageModal} on:close={() => (previewImageModal = null)} />
+
+{#if reviewDiffModal}
+  <!-- 审查 diff 弹窗（用户 2026-10-02，对齐 ZCode 审查：逐文件看具体改动） -->
+  <div class="modal-backdrop" on:click={() => (reviewDiffModal = null)}>
+    <div class="modal review-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>审查{reviewDiffModal.path ? `：${reviewDiffModal.path}` : '（全部改动）'}</b>
+        <span class="hint">相对本任务起点</span>
+        <button class="btn ghost" on:click={() => (reviewDiffModal = null)}>关闭</button>
+      </div>
+      {#if reviewDiffModal.loading}
+        <div class="trace-empty">加载中…</div>
+      {:else if reviewDiffModal.error}
+        <pre class="rp-preview">{`读取失败: ${reviewDiffModal.error}`}</pre>
+      {:else if !reviewDiffModal.text}
+        <div class="trace-empty">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
+      {:else}
+        <pre class="review-diff">{reviewDiffModal.text}</pre>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 {#if galaxyOpen}
   <!-- 记忆库星云：光点 = 会话；搜索 = 向量检索过滤 -->
@@ -7411,6 +7522,11 @@
     font-size: 12px;
     cursor: pointer;
   }
+  /* 下载按钮是 <a>：去掉下划线、行高对齐 */
+  a.rp-btn {
+    text-decoration: none;
+    line-height: 1.6;
+  }
   .rp-btn:hover {
     color: var(--g7);
     border-color: var(--g4);
@@ -8424,6 +8540,87 @@
   .cp-bar .cp-sum {
     margin-left: 4px;
   }
+  /* 「N 个文件已更改」是可点按钮（展开清单，2026-10-02）——去掉按钮默认外观 */
+  button.cp-sum {
+    background: none;
+    border: none;
+    padding: 0 2px;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  button.cp-sum:hover {
+    color: var(--g7);
+  }
+  /* 展开的改动文件清单浮层（贴着变更条向上弹出，和 git-pop 同规矩；限高可滚） */
+  .cp-files-pop {
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 300px;
+  }
+  .cp-files-pop .git-pop-list {
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  /* 审查行：状态 + 路径 + 增删 + 审查/打开（ZCode 同款密度） */
+  .review-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: var(--g6);
+  }
+  .review-row:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .review-row .git-path {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .review-add {
+    color: var(--tint-green-fg);
+    font-family: monospace;
+    font-size: 11.5px;
+  }
+  .review-del {
+    color: var(--tint-red-fg);
+    font-family: monospace;
+    font-size: 11.5px;
+  }
+  .review-row .cp-undo,
+  .review-row .cp-commit {
+    flex: none;
+    padding: 2px 8px;
+    font-size: 11.5px;
+  }
+  .review-head {
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--g5);
+  }
+  .review-modal {
+    max-width: 860px;
+    width: 92%;
+  }
+  .review-diff {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    margin: 0;
+    padding: 12px;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre;
+    tab-size: 4;
+  }
   .tool-head {
     display: flex;
     gap: 8px;
@@ -8789,9 +8986,19 @@
     font-family: Consolas, monospace;
     font-size: 12.5px;
     cursor: pointer;
+    /* 2026-10-02：对话页是「标题 + 时间」两行 span，flex 撑开别挤成一团 */
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* 对话行用正文字体（列表是会话标题不是代码路径） */
+  .ctx-file:has(.ctx-conv-title) {
+    font-family: inherit;
   }
   .ctx-file:hover {
     background: var(--g2);

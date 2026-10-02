@@ -90,7 +90,8 @@
         <!-- 用户 2026-10-02：编辑器开着时不出现下方技能列表（编辑态只留编辑器） -->
         {#if skillEditor}
           <div class="field">
-            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}{skillEditor.source === 'global' ? '（全局技能）' : ''}</label>
+            <!-- 用户 2026-10-02：技能统一归全局（保存时项目级旧副本自动搬走），标签直说全局 -->
+            <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}（全局技能）</label>
             <div class="sub-row">
               <input placeholder="技能名" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
               <input placeholder="一句话描述" bind:value={skillEditor.description} />

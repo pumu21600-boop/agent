@@ -313,17 +313,16 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     } else {
         format!("---\nname: {}\ndescription: {}\n---\n\n{}", name, desc, body)
     };
-    // 用户 2026-10-02：新建技能保存到**全局**（~/.agent/skills/）——技能是整个 agent
-    // 体系的资产，不该跟工作区走。已存在的技能写回原位（项目级项目级、全局全局），
-    // 编辑老技能不会偷偷把它搬家。
-    let ws_root = crate::tools::workspace_root().join("skills").join(name);
-    let dir = if ws_root.join("SKILL.md").is_file() {
-        ws_root
-    } else {
-        crate::memory::global_dir().join("skills").join(name)
-    };
+    // 用户 2026-10-02（第二轮实锤「还是保存到项目里面」）：技能一律落**全局**
+    // （~/.agent/skills/，agent 体系资产不跟工作区走）。项目级旧副本写完全局后
+    // 顺手搬走——否则 list() 的项目级覆盖规则会让它继续顶着全局版，chip 还显示项目级。
+    let dir = crate::memory::global_dir().join("skills").join(name);
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     crate::fsx::write_atomic_str(&dir.join("SKILL.md"), &full).map_err(|e| format!("写入失败: {e}"))?;
+    let stale = crate::tools::workspace_root().join("skills").join(name);
+    if stale.is_dir() {
+        let _ = fs::remove_dir_all(&stale);
+    }
     Ok(dir.to_string_lossy().to_string())
 }
 

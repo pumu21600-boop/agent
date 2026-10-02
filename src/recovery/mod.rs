@@ -445,7 +445,39 @@ pub fn head_id(ws: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// 工作树相对基线 commit 的改动统计：(文件数, 增行, 删行)。
+/// 工作树相对基线 commit 的统一 diff 文本（审查面板逐文件看改动用）。
+/// 上限 512KB，防长会话 diff 把面板撑爆；超限尾部标省略。
+pub fn diff_text(ws: &Path, baseline: &str, path: Option<&str>) -> anyhow::Result<String> {
+    if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
+        bail!("非法基线 id: {baseline}");
+    }
+    let bin = git_bin()?;
+    let gitdir = shadow_gitdir(ws);
+    if !gitdir.exists() {
+        bail!("影子仓库不存在");
+    }
+    let mut args = vec!["diff".to_string(), baseline.to_string()];
+    if let Some(p) = path {
+        // 只做形态校验，**不 resolve 到磁盘**——已删除的文件（技能迁移/agent 删的）
+        // 工作树里已不存在，但 diff 照样要能出「删除」段（真机实锤：os error 3）。
+        // 禁止绝对路径/盘符/.. 穿越。
+        let p = p.trim();
+        if p.is_empty() || Path::new(p).is_absolute() || p.contains(':') || p.split(['/', '\\']).any(|s| s == "..") {
+            bail!("非法路径: {p}");
+        }
+        args.push("--".to_string());
+        args.push(p.replace('\\', "/"));
+    }
+    let out = git_ok(&bin, Some(&gitdir), ws, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    const MAX: usize = 512 * 1024;
+    if out.len() > MAX {
+        Ok(format!("{}…（diff 超过 512KB 已截断）", &out[..MAX]))
+    } else {
+        Ok(out)
+    }
+}
+
+/// 改动统计（保留原样）：工作树相对基线 commit 的 (文件数, 增行, 删行)。
 /// 用 `diff --numstat`（覆盖暂存+未暂存，即当前工作树全量相对基线）。
 pub fn diff_stat(ws: &Path, baseline: &str) -> anyhow::Result<(usize, u64, u64)> {
     if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
@@ -472,11 +504,24 @@ pub fn diff_stat(ws: &Path, baseline: &str) -> anyhow::Result<(usize, u64, u64)>
     Ok((files, adds, dels))
 }
 
-/// 工作树相对基线 commit 的改动文件清单（`diff --numstat` 第三列）。
+/// 一个改动文件（2026-10-02 审查面板/展开列表用，改动条原来只有计数）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangedFile {
+    /// 工作区相对路径
+    pub path: String,
+    /// git 两字状态码首字母：M 改 / A 增 / D 删；未跟踪为 '?'
+    pub status: char,
+    /// 新增行数（二进制/未跟踪为 0）
+    pub adds: u64,
+    /// 删除行数（二进制/未跟踪为 0）
+    pub dels: u64,
+}
+
+/// 工作树相对基线 commit 的改动文件清单（`diff --numstat` + `--name-status` 合并）。
 /// **追加未跟踪文件**（`ls-files --others`）：任务里新建的文件不入 git diff
 /// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实锤根因——
 /// agent 造出的新文件必须原样出现在清单里。排除目录/大文件与检查点同一套规则。
-pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
+pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<ChangedFile>> {
     if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
         bail!("非法基线 id: {baseline}");
     }
@@ -485,13 +530,29 @@ pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
     if !gitdir.exists() {
         bail!("影子仓库不存在");
     }
-    let out = git_ok(&bin, Some(&gitdir), ws, &["diff", "--numstat", baseline])?;
-    let mut files = Vec::new();
-    for line in out.lines() {
+    // numstat：每行 "adds\tdels\tpath"
+    let numstat = git_ok(&bin, Some(&gitdir), ws, &["diff", "--numstat", baseline])?;
+    // name-status：每行 "M\tpath"（未跟踪不在此列）
+    let status = git_ok(&bin, Some(&gitdir), ws, &["diff", "--name-status", baseline])?;
+    let mut status_of = std::collections::HashMap::new();
+    for line in status.lines() {
+        let mut it = line.splitn(2, '\t');
+        if let (Some(s), Some(p)) = (it.next(), it.next()) {
+            status_of.insert(p.to_string(), s.chars().next().unwrap_or('M'));
+        }
+    }
+    let mut out: Vec<ChangedFile> = Vec::new();
+    for line in numstat.lines() {
         let mut it = line.splitn(3, '\t');
-        let (_a, _d) = (it.next(), it.next());
+        let a = it.next().unwrap_or("0");
+        let d = it.next().unwrap_or("0");
         if let Some(p) = it.next() {
-            files.push(p.to_string());
+            out.push(ChangedFile {
+                path: p.to_string(),
+                status: status_of.get(p).copied().unwrap_or('M'),
+                adds: a.parse().unwrap_or(0),
+                dels: d.parse().unwrap_or(0),
+            });
         }
     }
     // 未跟踪：--directory 让整个被排除目录折叠成一条（不逐个走进 node_modules 之类的深渊）；
@@ -512,7 +573,7 @@ pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
             continue;
         }
         let rel = entry.trim_end_matches('/');
-        if rel.is_empty() || files.iter().any(|f| f == rel) {
+        if rel.is_empty() || out.iter().any(|f| f.path == rel) {
             continue;
         }
         let path = PathBuf::from(rel);
@@ -525,10 +586,15 @@ pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
         }
         let Ok(meta) = std::fs::metadata(ws.join(&path)) else { continue };
         if meta.is_file() && meta.len() <= MAX_FILE_BYTES {
-            files.push(rel.replace('\\', "/"));
+            out.push(ChangedFile {
+                path: rel.replace('\\', "/"),
+                status: '?',
+                adds: 0,
+                dels: 0,
+            });
         }
     }
-    Ok(files)
+    Ok(out)
 }
 
 /// 测试与排障用：影子仓库当前跟踪的文件清单。
@@ -702,8 +768,8 @@ mod tests {
         std::fs::write(w.join("doc.txt"), "v2\n").unwrap();
         std::fs::write(w.join("made-by-agent.txt"), "new\n").unwrap();
         let files = changed_files(w, &cp1.id).unwrap();
-        assert!(files.contains(&"doc.txt".to_string()), "修改的文件要列出: {files:?}");
-        assert!(files.contains(&"made-by-agent.txt".to_string()), "新建文件要列出: {files:?}");
+        assert!(files.iter().any(|f| f.path == "doc.txt"), "修改的文件要列出: {files:?}");
+        assert!(files.iter().any(|f| f.path == "made-by-agent.txt"), "新建文件要列出: {files:?}");
 
         // 收尾检查点（真实流程里任务结束会再拍一张），restore 才有「检查点之后」的提交可回退
         let cp2 = checkpoint(w, "普通目录收尾", "sess-plain").unwrap().expect("有变更应有检查点");

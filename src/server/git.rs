@@ -2,7 +2,8 @@
 
 use super::*;
 
-/// GET /api/changes?baseline=xx —— 本任务相对基线的改动文件清单（「产物」标签数据源）
+/// GET /api/changes?baseline=xx —— 本任务相对基线的改动文件清单（「产物」/「审查」标签数据源）
+/// files: [{ path, status, adds, dels }]；未跟踪文件也在内（agent 新建的文件必现）。
 pub(super) async fn list_changes(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -15,6 +16,26 @@ pub(super) async fn list_changes(
     let baseline = baseline.to_string();
     match tokio::task::spawn_blocking(move || crate::recovery::changed_files(&ws, &baseline)).await {
         Ok(Ok(files)) => Ok(Json(json!({ "ok": true, "files": files }))),
+        Ok(Err(e)) => Err(err(e.to_string())),
+        Err(e) => Err(err(e.to_string())),
+    }
+}
+
+/// GET /api/review/diff?baseline=xx[&path=xx] —— 相对基线的统一 diff 文本（审查面板
+/// 「审查」按钮逐文件看具体改动用；path 缺省 = 全量）。
+pub(super) async fn review_diff(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let err = |e: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+    let baseline = params.get("baseline").map(|s| s.trim()).unwrap_or("");
+    if baseline.is_empty() {
+        return Err(err("缺少 baseline".into()));
+    }
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let baseline = baseline.to_string();
+    let path = params.get("path").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    match tokio::task::spawn_blocking(move || crate::recovery::diff_text(&ws, &baseline, path.as_deref())).await {
+        Ok(Ok(text)) => Ok(Json(json!({ "ok": true, "diff": text }))),
         Ok(Err(e)) => Err(err(e.to_string())),
         Err(e) => Err(err(e.to_string())),
     }

@@ -215,6 +215,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace/raw", get(read_workspace_raw))
         .route("/api/workspace/doc", get(read_workspace_doc))
         .route("/api/changes", get(list_changes))
+        .route("/api/review/diff", get(review_diff))
         .route("/api/shell", post(run_shell))
         .route("/api/skills", get(list_skills).post(post_skills))
         .route("/api/health", get(|| async { "ok" }))
