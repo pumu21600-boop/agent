@@ -9270,6 +9270,9 @@
     font-size: 12.5px;
     line-height: 1.5;
     cursor: pointer;
+    /* flex 列容器里 overflow:hidden 的子项自动最小尺寸归零，会把行压成一条
+       横切片（标题与时间戳糊成乱码、且列表滚不动）；不参与压缩才保持原高 */
+    flex-shrink: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
