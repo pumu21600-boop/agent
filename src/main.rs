@@ -6,6 +6,7 @@ mod browser;
 mod config;
 mod context;
 mod core;
+mod doctext;
 mod fsx;
 mod gateway;
 mod hooks;

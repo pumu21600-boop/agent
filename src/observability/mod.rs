@@ -254,7 +254,7 @@ pub fn log_path() -> Option<&'static Path> {
 }
 
 pub mod trace;
-pub use trace::read_tasks_scoped;
+pub use trace::read_tasks_scoped_multi;
 
 /// 全局控制台调试输出。
 pub fn debug(msg: &str) {

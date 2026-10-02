@@ -9,14 +9,9 @@
 
   let skillMsg = '';
   let skillEditor = null; // { isNew, name, description, content, source }
+  // 用户 2026-10-02：新建输入框不再预填模板（正文自己写；name/description 由保存时回填校验）
   function newSkill() {
-    skillEditor = {
-      isNew: true,
-      name: '',
-      description: '',
-      content: '---\nname: \ndescription: \n---\n\n1. 步骤一\n2. 步骤二\n',
-      source: 'project',
-    };
+    skillEditor = { isNew: true, name: '', description: '', content: '', source: 'project' };
   }
   function editSkill(s) {
     skillEditor = {
@@ -72,11 +67,10 @@
 </script>
 
       {#if tab === 'skills'}
-        <div class="param-hint">消息里写 $技能名 指定；插件自带的技能在「插件」页启停</div>
         <div class="sub-row">
           <button class="btn primary" on:click={newSkill}>新建技能</button>
           <button class="btn" on:click={() => dispatch('reload')}>刷新</button>
-          <span class="hint">{skillMsg}</span>
+          {#if skillMsg}<span class="hint">{skillMsg}</span>{/if}
         </div>
         {#if skillEditor}
           <div class="field">
@@ -96,31 +90,26 @@
           <div class="trace-empty">加载中…</div>
         {:else}
           <!-- 用户拍板（2026-09-30）：插件自带的技能不在这里列出（引导住在插件里，去插件页看），
-               这页只管自己建的技能；数据不过滤——composer 的 $ 技能选择菜单仍含插件技能 -->
+               这页只管自己建的技能；数据不过滤——composer 的 $ 技能选择菜单仍含插件技能。
+               形式对齐插件页 plug-row（2026-10-02）：图标 + 名字 + 一句话描述 + 行内操作 -->
           {#each skills.filter((s) => s.source !== 'plugin') as s (s.name)}
-            <div class="mcp-card">
-              <div class="mcp-head">
-                <b>${s.name}</b>
-                <span class="mcp-status">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>
-                <span class="flex-sp"></span>
-                <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
-                <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
+            <div class="plug-row">
+              <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5z"/></svg></div>
+              <div class="plug-meta">
+                <div class="plug-title">${s.name}</div>
+                <div class="plug-desc">{s.description || '（无描述）'}</div>
               </div>
-              <div class="mcp-cmd">{s.description || '（无描述）'}</div>
+              <span class="plug-chip">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>
+              <span class="flex-sp"></span>
+              <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
+              <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
             </div>
-          {:else}
-            <div class="menu-empty">还没有技能：点「新建技能」，或在 skills/ 目录放 &lt;名字&gt;/SKILL.md</div>
           {/each}
         {/if}
       {/if}
 
 
 <style>
-  .menu-empty {
-    color: var(--g5);
-    font-size: 12px;
-    padding: 8px 10px;
-  }
   .agents-editor {
     width: 100%;
     box-sizing: border-box;
@@ -138,27 +127,9 @@
     outline: none;
     border-color: var(--g4);
   }
-  .mcp-card {
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    padding: 10px 12px;
-  }
-  .mcp-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    color: var(--g7);
-  }
-  .mcp-status {
-    font-size: 11px;
+  .menu-empty {
     color: var(--g5);
-  }
-  .mcp-cmd {
-    font-family: Consolas, monospace;
-    font-size: 11px;
-    color: var(--g5);
-    margin: 6px 0;
-    word-break: break-all;
+    font-size: 12px;
+    padding: 8px 10px;
   }
 </style>

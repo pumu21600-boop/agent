@@ -98,8 +98,22 @@ pub(super) async fn get_trace(
     if let Some(sid) = q.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         allowed.insert(sid.to_string());
     }
-    let path = path.to_path_buf();
-    let res = tokio::task::spawn_blocking(move || observability::read_tasks_scoped(&path, limit, Some(&allowed))).await;
+    // 日志按体积轮转（<file>.1 最新 … <file>.N 最旧）：长对话的 task.start 落在归档、
+    // 后续事件落在当前文件是真机常态——只读当前文件会把跨文件任务撕成孤儿事件
+    // （时间线「怎么都刷不出来」的实锤根因）。按时间正序（最旧在前）喂给解析器，
+    // 归属状态跨文件延续；上限探 32 份归档，缺的跳过。
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for i in (1..=32usize).rev() {
+        let rot = std::path::PathBuf::from(format!("{}.{}", path.display(), i));
+        if rot.is_file() {
+            files.push(rot);
+        }
+    }
+    files.push(path.to_path_buf());
+    let res = tokio::task::spawn_blocking(move || {
+        observability::read_tasks_scoped_multi(files.iter().map(|p| p.as_path()), limit, Some(&allowed))
+    })
+    .await;
     match res {
         Ok(Ok(tasks)) => {
             let list: Vec<Value> = tasks

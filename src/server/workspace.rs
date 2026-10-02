@@ -178,6 +178,16 @@ pub(super) async fn read_workspace_raw(
             "bmp" => "image/bmp",
             "ico" => "image/x-icon",
             "avif" => "image/avif",
+            // 文档与媒体直出（预览面板内嵌渲染：PDF 走浏览器自带查看器、音视频走原生标签）
+            "pdf" => "application/pdf",
+            "mp4" | "m4v" => "video/mp4",
+            "webm" => "video/webm",
+            "mov" => "video/quicktime",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "m4a" => "audio/mp4",
+            "flac" => "audio/flac",
             _ => "application/octet-stream",
         };
         Ok((bytes, ct.to_string()))
@@ -197,6 +207,36 @@ pub(super) async fn read_workspace_raw(
 #[derive(Deserialize)]
 pub struct ShellReq {
     pub command: String,
+}
+
+/// GET /api/workspace/doc?path=xx —— Office 文档文本抽取（预览面板用）。
+/// docx/pptx/xlsx/odt/ods/odp → 可读文本（doctext.rs，best-effort 去标签）；
+/// 工作区边界与 raw 同一套硬拦，单文件上限 50MB（文档容器可以很大）。
+pub(super) async fn read_workspace_doc(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    const MAX_BYTES: u64 = 50 * 1024 * 1024;
+    let path = params.get("path").map(|s| s.trim()).unwrap_or("").to_string();
+    if path.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
+    }
+    let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let full = crate::tools::resolve_workspace_path(&path).map_err(|e| e.to_string())?;
+        let meta = std::fs::metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("不是文件: {path}"));
+        }
+        if meta.len() > MAX_BYTES {
+            return Err(format!("文件过大（{} 字节，上限 50MB）", meta.len()));
+        }
+        crate::doctext::extract(&full).map_err(|e| e.to_string())
+    })
+    .await;
+    match res {
+        Ok(Ok(text)) => Ok(Json(json!({ "ok": true, "text": text }))),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
 }
 
 /// POST /api/shell —— 终端面板：在沙箱内执行一条用户输入的命令（复用 shell 工具的沙箱与超时）

@@ -10,7 +10,6 @@
 
 use std::{fs::File, io::{BufRead, BufReader}, path::Path};
 
-use anyhow::Context;
 use serde_json::{json, Value};
 
 /// 单条时间线事件：payload 原样透传（不改写不删字段），附加展平的元信息。
@@ -47,77 +46,105 @@ impl TaskTrace {
 /// 工作区→会话映射由调用方从会话文件算好传进来）；`Some(空集)` = 该工作区还没有任何
 /// 会话 → 空时间线，不是报错。过滤发生在**截断之前**，所以拿到的是最近 limit 个
 /// 「命中」任务，而不是「最近 limit 个再看剩几个」。
+/// 单文件便捷入口（现仅测试用；服务端走 multi 版本读全量轮转）。
+#[cfg(test)]
 pub fn read_tasks_scoped(
     path: &Path,
     limit: usize,
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<Vec<TaskTrace>> {
-    let file = File::open(path).with_context(|| format!("打开 JSONL 失败: {}", path.display()))?;
-    let reader = BufReader::new(file);
+    read_tasks_scoped_multi(std::iter::once(path), limit, allowed)
+}
 
+/// 多文件版本：日志会按体积轮转成 `<file>.1`（最新）… `<file>.N`（最旧），
+/// **task.start 落在被轮转走的归档里、工具事件落在当前文件里**是真机实锤的常态
+/// （20MB 上限，一轮长对话就能跨文件）。单文件读法会把跨文件任务撕成
+/// 「归档里一个完整任务 + 当前文件里一群没头没尾的孤儿事件（全部丢弃）」，
+/// 时间线看起来就是「怎么都刷不出来」。调用方按**时间正序**（最旧文件在前）
+/// 传入，归属状态跨文件延续。
+pub fn read_tasks_scoped_multi<'a, I>(
+    paths: I,
+    limit: usize,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> anyhow::Result<Vec<TaskTrace>>
+where
+    I: IntoIterator<Item = &'a Path>,
+{
     let mut tasks: Vec<TaskTrace> = Vec::new();
     let mut cur: Option<TaskTrace> = None;
+    let mut any = false;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue, // IO 抖动行跳过
+    for path in paths {
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue, // 归档缺失（keep=0/被清）不算错，跳过
         };
+        any = true;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue, // IO 抖动行跳过
+            };
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let record: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue, // 损坏行跳过
-        };
-        let ts = record.get("ts").and_then(Value::as_str).unwrap_or("").to_string();
-        let etype = record.get("event_type").and_then(Value::as_str).unwrap_or("").to_string();
-        let payload = record.get("payload").cloned().unwrap_or(Value::Null);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let record: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue, // 损坏行跳过
+            };
+            let ts = record.get("ts").and_then(Value::as_str).unwrap_or("").to_string();
+            let etype = record.get("event_type").and_then(Value::as_str).unwrap_or("").to_string();
+            let payload = record.get("payload").cloned().unwrap_or(Value::Null);
 
-        let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
-        // 任务边界 1（正规）：state kind:"task.start"
-        let is_task_start = etype == "state" && kind == "task.start";
-        // 任务边界 2（旧日志兜底）：tool_call 且 step==0，且当前无任务
-        // （task.start 已开任务时不再切，避免每个任务双切）
-        let is_step0_tool = etype == "tool_call"
-            && payload.get("step").and_then(Value::as_u64) == Some(0)
-            && cur.is_none();
-        // 任务收尾（旧日志兜底用）：loop.finish / cancel 后关闭任务，
-        // 让下一个 step0 tool_call 正确开新任务
-        let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel");
-        // 任务归属（时间线按工作区过滤用）：task.start 新带的 session 优先，
-        // 旧日志回落任务内第一条 session.saved 的 session（实测 46 个任务里 45 个可归属）
-        let ev_session = payload
-            .get("session")
-            .and_then(Value::as_str)
-            .filter(|_| is_task_start || kind == "session.saved")
-            .unwrap_or("")
-            .to_string();
+            let kind = payload.get("kind").and_then(Value::as_str).unwrap_or("");
+            // 任务边界 1（正规）：state kind:"task.start"
+            let is_task_start = etype == "state" && kind == "task.start";
+            // 任务边界 2（旧日志兜底）：tool_call 且 step==0，且当前无任务
+            // （task.start 已开任务时不再切，避免每个任务双切）
+            let is_step0_tool = etype == "tool_call"
+                && payload.get("step").and_then(Value::as_u64) == Some(0)
+                && cur.is_none();
+            // 任务收尾（旧日志兜底用）：loop.finish / cancel 后关闭任务，
+            // 让下一个 step0 tool_call 正确开新任务
+            let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel");
+            // 任务归属（时间线按工作区过滤用）：task.start 新带的 session 优先，
+            // 旧日志回落任务内第一条 session.saved 的 session（实测 46 个任务里 45 个可归属）
+            let ev_session = payload
+                .get("session")
+                .and_then(Value::as_str)
+                .filter(|_| is_task_start || kind == "session.saved")
+                .unwrap_or("")
+                .to_string();
 
-        if is_task_start {
-            if let Some(t) = cur.take() {
-                tasks.push(t);
+            if is_task_start {
+                if let Some(t) = cur.take() {
+                    tasks.push(t);
+                }
+                if cur.is_none() {
+                    cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: ev_session.clone(), events: Vec::new() });
+                }
+            } else if is_step0_tool {
+                // cur 此时必为 None（条件里已保证），直接开新任务
+                cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: String::new(), events: Vec::new() });
             }
-            if cur.is_none() {
-                cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: ev_session.clone(), events: Vec::new() });
+            if let Some(t) = cur.as_mut() {
+                t.end_ts = ts.clone();
+                if t.session.is_empty() && !ev_session.is_empty() {
+                    t.session = ev_session.clone();
+                }
+                t.events.push(TraceEvent { ts: ts.clone(), etype, payload });
             }
-        } else if is_step0_tool {
-            // cur 此时必为 None（条件里已保证），直接开新任务
-            cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: String::new(), events: Vec::new() });
+            if is_task_end
+                && let Some(t) = cur.take() {
+                    tasks.push(t);
+                }
+            // 边界之前的孤儿事件（首个文件开头处：进程启动/config.changed 等）不归属任何任务，丢弃
         }
-        if let Some(t) = cur.as_mut() {
-            t.end_ts = ts.clone();
-            if t.session.is_empty() && !ev_session.is_empty() {
-                t.session = ev_session.clone();
-            }
-            t.events.push(TraceEvent { ts: ts.clone(), etype, payload });
-        }
-        if is_task_end
-            && let Some(t) = cur.take() {
-                tasks.push(t);
-            }
-        // 边界之前的孤儿事件（进程启动/config.changed 等）不归属任何任务，丢弃
+    }
+    if !any {
+        anyhow::bail!("打开 JSONL 失败: 无可用日志文件（当前与归档都不存在）");
     }
     if let Some(t) = cur.take() {
         tasks.push(t);
@@ -283,5 +310,34 @@ mod tests {
         let tasks = read_tasks_scoped(&path, 2, None).unwrap();
         assert_eq!(tasks.len(), 2, "坏行跳过；limit=2 只留最近 2 个任务");
         assert_eq!(tasks[0].start_ts, "2026-09-04T00:00:04Z", "最新在前");
+    }
+
+    #[test]
+    fn task_spanning_rotated_files_stays_whole() {
+        // 真机实锤（2026-10-02）：task.start 写进归档 <file>.1，工具事件写在当前文件——
+        // 只读当前文件时这些事件成了孤儿被丢弃，时间线「怎么都刷不出来」。
+        let (_g, old) = write_tmp(
+            "span-old",
+            &[rec_s(
+                "2026-10-02T04:55:28Z",
+                "state",
+                serde_json::json!({"kind":"task.start","session":"sa"}),
+                "proc-1",
+            )],
+        );
+        let (_g2, cur) = write_tmp(
+            "span-cur",
+            &[
+                rec_s("2026-10-02T04:55:40Z", "tool_call", serde_json::json!({"step":1,"name":"shell"}), "proc-1"),
+                rec_s("2026-10-02T04:55:50Z", "state", serde_json::json!({"kind":"loop.finish"}), "proc-1"),
+            ],
+        );
+        // 顺序 = 时间正序（最旧在前）：归档在先、当前文件在后
+        let only_a = std::collections::HashSet::from(["sa".to_string()]);
+        let tasks = read_tasks_scoped_multi([&old, &cur].iter().map(|p| p.as_path()), 10, Some(&only_a)).unwrap();
+        assert_eq!(tasks.len(), 1, "跨文件是一个任务，不是 0 个或 2 个");
+        assert_eq!(tasks[0].session, "sa", "归属跟着 task.start 走");
+        assert_eq!(tasks[0].events.len(), 3, "task.start + tool_call + loop.finish 拼全");
+        assert!(tasks[0].duration_ms() >= 22_000, "时长跨文件累计：{}", tasks[0].duration_ms());
     }
 }

@@ -583,7 +583,8 @@
       async function copy(text, what) {
         try {
           await call('clipboard.write', { text });
-          status(`已复制${what}：${text}`);
+          // 用户 2026-10-02：任何操作都不弹成功提示（错误照旧报），别在面板上刷「已复制…」
+          status('');
         } catch (e) {
           status('复制失败: ' + (e.message || e), true);
         }

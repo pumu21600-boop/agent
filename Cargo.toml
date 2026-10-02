@@ -17,6 +17,9 @@ rand = "0.8"
 # lock 里本就经 wasmtime 传递依赖存在，不新增下载面）
 sha2 = "0.10"
 hex = "0.4"
+# 预览面板文档抽取（doctext.rs）：docx/pptx/xlsx = zip 容器 + deflate 流，zip 目录
+# 手写解析、只补一个纯 Rust inflate（miniz_oxide 后端，无 C 工具链依赖）
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # P20 浏览器内核：CDP 走 ws://127.0.0.1（环回、无 TLS），仅默认 handshake+connect 特性
 tokio-tungstenite = "0.24"
 serde = { version = "1", features = ["derive"] }

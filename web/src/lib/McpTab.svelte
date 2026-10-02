@@ -78,96 +78,95 @@
 </script>
 
       {#if tab === 'mcp'}
-        <div class="param-hint">工具调用名：mcp__服务__工具</div>
         {#each servers as sv}
-          <div class="field mcp-card">
-            <div class="mcp-head">
-              <span class="dot" class:haskey={sv.online}></span>
-              <b>{sv.name}</b>
-              <span class="mcp-status">{sv.online ? '在线' : '离线'}</span>
-              <span class="mcp-risk">{sv.risk === 'dangerous' ? '高危档' : '常规档'}{sv.confirmed ? '' : ' · 待确认'}</span>
-              <span class="flex-sp"></span>
-              <button class="btn ghost" on:click={() => mcpAction('toggle', sv.name)}>{sv.enabled ? '停用' : '启用'}</button>
-              <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
-              <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
-            </div>
-            <div class="mcp-cmd">
-              {sv.transport === 'stdio'
-                ? `${sv.command} ${(sv.args || []).join(' ')}`
-                : `${sv.transport.toUpperCase()} · ${sv.url}`}
-            </div>
-            {#if sv.oauth}
-              <div class="sub-row">
-                <span class="mcp-status">
-                  {#if sv.oauth_status?.status === 'pending'}授权中…
-                  {:else if sv.oauth_status?.status === 'error'}授权失败
-                  {:else if sv.oauth_status?.oauth?.state === 'authorized'}已授权
-                  {:else if sv.oauth_status?.oauth?.state === 'expiring'}即将过期（自动续）
-                  {:else}未授权{/if}
-                </span>
-                <button class="btn ghost" on:click={() => mcpAction('oauth_authorize', sv.name)}>
-                  {sv.oauth_status?.oauth?.state === 'none' || !sv.oauth_status?.oauth ? '授权' : '重新授权'}
-                </button>
-                {#if sv.oauth_status?.oauth && sv.oauth_status.oauth.state !== 'none'}
-                  <button class="btn ghost danger" on:click={() => mcpAction('oauth_revoke', sv.name)}>撤销</button>
-                {/if}
+          <div class="plug-row">
+            <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="7" rx="2"/><rect x="4" y="13" width="16" height="7" rx="2"/><circle cx="8" cy="7.5" r="0.9" fill="currentColor" stroke="none"/><circle cx="8" cy="16.5" r="0.9" fill="currentColor" stroke="none"/></svg></div>
+            <div class="plug-meta">
+              <div class="plug-title">{sv.name}</div>
+              <div class="plug-desc">
+                {sv.transport === 'stdio' ? `${sv.command} ${(sv.args || []).join(' ')}` : `${sv.transport.toUpperCase()} · ${sv.url}`}
               </div>
+            </div>
+            <span class="plug-chip" class:warn={!sv.online}>{sv.online ? '在线' : '离线'}</span>
+            <span class="plug-chip" class:warn={sv.risk === 'dangerous'}>{sv.risk === 'dangerous' ? '高危档' : '常规档'}{sv.confirmed ? '' : ' · 待确认'}</span>
+            <span class="flex-sp"></span>
+            <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
+            <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
+            <button class="switch" class:on={sv.enabled} role="switch" aria-checked={sv.enabled} aria-label="{sv.name} 启用/停用" on:click={() => mcpAction('toggle', sv.name)}><span class="knob"></span></button>
+          </div>
+          {#if sv.oauth}
+            <div class="sub-row mcp-oauth">
+              <span class="mcp-status">
+                {#if sv.oauth_status?.status === 'pending'}授权中…
+                {:else if sv.oauth_status?.status === 'error'}授权失败
+                {:else if sv.oauth_status?.oauth?.state === 'authorized'}已授权
+                {:else if sv.oauth_status?.oauth?.state === 'expiring'}即将过期（自动续）
+                {:else}未授权{/if}
+              </span>
+              <button class="btn ghost" on:click={() => mcpAction('oauth_authorize', sv.name)}>
+                {sv.oauth_status?.oauth?.state === 'none' || !sv.oauth_status?.oauth ? '授权' : '重新授权'}
+              </button>
+              {#if sv.oauth_status?.oauth && sv.oauth_status.oauth.state !== 'none'}
+                <button class="btn ghost danger" on:click={() => mcpAction('oauth_revoke', sv.name)}>撤销</button>
+              {/if}
               {#if sv.oauth_status?.status === 'pending' && sv.oauth_status?.authorization_url}
-                <div class="param-hint">
-                  浏览器没自动打开？<a href={sv.oauth_status.authorization_url} target="_blank" rel="noreferrer">点这里完成授权</a>
-                </div>
+                <a href={sv.oauth_status.authorization_url} target="_blank" rel="noreferrer">点这里完成授权</a>
               {/if}
               {#if sv.oauth_status?.status === 'error'}
-                <div class="param-hint" style="color: var(--tint-red-fg, #e5484d)">{sv.oauth_status.message}</div>
+                <span class="mcp-status" style="color: var(--tint-red-fg, #e5484d)">{sv.oauth_status.message}</span>
               {/if}
-            {/if}
-            {#if !sv.confirmed}
-              <div class="mcp-confirm">
-                {#if sv.tools.length}
-                  <div class="mcp-tools-list">
-                    <b>发现 {sv.tools.length} 个工具，请确认后启用：</b>
-                    {#each sv.tools as t}
-                      <div class="mcp-tool-item"><code>{t.name}</code> {t.desc}</div>
-                    {/each}
-                  </div>
-                  <div class="sub-row">
-                    <label class="mcp-risk-label">审批档：</label>
-                    <Select
-                      value={mcpRiskChoice}
-                      title="MCP 调用审批档"
-                      options={[
-                        { value: 'normal', label: '常规（auto 档自动放行）' },
-                        { value: 'dangerous', label: '高危（每次调用都弹窗）' },
-                      ]}
-                      on:change={(e) => (mcpRiskChoice = e.detail)}
-                    />
-                    <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
-                  </div>
-                {:else}
-                  <button class="btn primary" on:click={() => mcpAction('refresh', sv.name)}>连接并获取工具清单</button>
-                {/if}
-              </div>
-            {:else}
-              <div class="mcp-tools-list">
-                {#each sv.tools as t}
-                  <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
+            </div>
+          {/if}
+          {#if !sv.confirmed}
+            <!-- 首次接入确认：工具清单 + 审批档（安全功能，不是说明小字） -->
+            <div class="mcp-confirm">
+              {#if sv.tools.length}
+                <div class="mcp-tools-list">
+                  <b>发现 {sv.tools.length} 个工具，请确认后启用：</b>
+                  {#each sv.tools as t}
+                    <div class="mcp-tool-item"><code>{t.name}</code> {t.desc}</div>
+                  {/each}
+                </div>
+                <div class="sub-row">
+                  <label class="mcp-risk-label">审批档：</label>
+                  <Select
+                    value={mcpRiskChoice}
+                    title="MCP 调用审批档"
+                    options={[
+                      { value: 'normal', label: '常规（auto 档自动放行）' },
+                      { value: 'dangerous', label: '高危（每次调用都弹窗）' },
+                    ]}
+                    on:change={(e) => (mcpRiskChoice = e.detail)}
+                  />
+                  <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
+                </div>
+              {:else}
+                <div class="sub-row mcp-oauth">
+                  <span class="mcp-status">未发现工具</span>
+                  <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>连接并获取工具清单</button>
+                </div>
+              {/if}
+            </div>
+          {:else}
+            <div class="mcp-tools-list">
+              {#each sv.tools as t}
+                <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
+              {/each}
+              {#if !sv.tools.length}<span class="mcp-status">未发现工具——点「重连」尝试</span>{/if}
+              {#if sv.resources && sv.resources.length}
+                <div class="mcp-tool-item"><b>资源 {sv.resources.length}</b>（模型可用 list_resources / read_resource 读取）</div>
+                {#each sv.resources.slice(0, 8) as r}
+                  <div class="mcp-tool-item"><code>{r}</code></div>
                 {/each}
-                {#if !sv.tools.length}<span class="hint">（未发现工具——点「重连」尝试）</span>{/if}
-                {#if sv.resources && sv.resources.length}
-                  <div class="mcp-tool-item"><b>资源 {sv.resources.length}</b>（模型可用 list_resources / read_resource 读取）</div>
-                  {#each sv.resources.slice(0, 8) as r}
-                    <div class="mcp-tool-item"><code>{r}</code></div>
-                  {/each}
-                {/if}
-                {#if sv.prompts && sv.prompts.length}
-                  <div class="mcp-tool-item"><b>提示词模板 {sv.prompts.length}</b>（模型可用 list_prompts / get_prompt 取用）</div>
-                  {#each sv.prompts.slice(0, 8) as p}
-                    <div class="mcp-tool-item"><code>{p}</code></div>
-                  {/each}
-                {/if}
-              </div>
-            {/if}
-          </div>
+              {/if}
+              {#if sv.prompts && sv.prompts.length}
+                <div class="mcp-tool-item"><b>提示词模板 {sv.prompts.length}</b>（模型可用 list_prompts / get_prompt 取用）</div>
+                {#each sv.prompts.slice(0, 8) as p}
+                  <div class="mcp-tool-item"><code>{p}</code></div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
         {/each}
         <div class="field">
           <label>添加 MCP server</label>
@@ -224,46 +223,18 @@
                 {/if}
                 <input placeholder="scope（可选）" bind:value={mcpForm.oauth_scope} style="max-width:160px" />
               </div>
-              <div class="param-hint">
-                授权码流程会打开浏览器登录（动态注册自动办 client_id）；token 自动续期，过期重授权即可。
-              </div>
             {/if}
-          {:else}
-            <div class="param-hint">例：npx -y @modelcontextprotocol/server-filesystem &lt;目录&gt;</div>
           {/if}
         </div>
       {/if}
 
 <style>
-  .mcp-card {
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    padding: 10px 12px;
-  }
-  .mcp-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-    color: var(--g7);
+  .mcp-oauth {
+    margin: -2px 4px 8px 46px;
   }
   .mcp-status {
     font-size: 11px;
     color: var(--g5);
-  }
-  .mcp-risk {
-    font-size: 11px;
-    color: var(--tint-yellow-fg);
-    background: var(--tint-yellow-bg);
-    border-radius: 4px;
-    padding: 1px 6px;
-  }
-  .mcp-cmd {
-    font-family: Consolas, monospace;
-    font-size: 11px;
-    color: var(--g5);
-    margin: 6px 0;
-    word-break: break-all;
   }
   .mcp-tools-list {
     font-size: 12px;
@@ -271,7 +242,7 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
-    margin: 6px 0;
+    margin: 6px 0 8px 46px;
   }
   .mcp-tool-item code {
     background: var(--g2);
@@ -287,17 +258,5 @@
   .mcp-risk-label {
     font-size: 12px;
     color: var(--g6);
-  }
-  .dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    margin-right: 6px;
-    background: var(--g4);
-    vertical-align: middle;
-  }
-  .dot.haskey {
-    background: var(--tint-green-fg);
   }
 </style>

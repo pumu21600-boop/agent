@@ -4,12 +4,101 @@ use super::*;
 use super::workspace::{apply_workspace, canon_workspace, same_workspace};
 
 /// GET /api/sessions —— 会话列表（新→旧）+ 项目名（P6.1 多会话）。
-pub(super) async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
+/// `?scope=workspace` 只返回当前工作区的会话（composer @ 上下文「选对话加入」用；
+/// 工作区比对与时间线同一把尺子 same_workspace，别在前端拿裸字符串比）。
+pub(super) async fn list_sessions(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
     let project = crate::tools::workspace_root()
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    Json(json!({ "project": project, "sessions": state.session.list() }))
+    let scope_workspace = q.get("scope").map(|s| s == "workspace").unwrap_or(false);
+    let list = if scope_workspace {
+        let cur = crate::tools::workspace_root().display().to_string();
+        state
+            .session
+            .list()
+            .into_iter()
+            .filter(|m| same_workspace(&m.workspace, &cur))
+            .collect::<Vec<_>>()
+    } else {
+        state.session.list()
+    };
+    Json(json!({ "project": project, "sessions": list }))
+}
+
+/// GET /api/sessions/transcript?id=xx —— 只读转写（composer @ 上下文「选对话加入」用）。
+/// 不切当前会话、不带工具事件，只取 user/assistant 正文；总量超预算从**最早**的消息
+/// 开始丢（保尾部——引用对话时最近的往来信息量最大），丢了就带 omitted=true。
+pub(super) async fn session_transcript(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<Value>) {
+    const MAX_TOTAL: usize = 16_000;
+    const MAX_MSG: usize = 2_500;
+    let Some(id) = q.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
+    };
+    let Some(f) = state.session.get(&id) else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "会话不存在" })));
+    };
+    let mut msgs: Vec<(String, String)> = Vec::new();
+    for m in &f.messages {
+        let Some(role) = m.get("role").and_then(Value::as_str) else { continue };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let text = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| {
+                    if p.get("type").and_then(Value::as_str) == Some("text") {
+                        p.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut text = text.to_string();
+        if text.chars().count() > MAX_MSG {
+            text = format!("{}…", text.chars().take(MAX_MSG).collect::<String>());
+        }
+        msgs.push((role.to_string(), text));
+    }
+    // 预算：从尾部往前收，装不下的早期消息丢弃
+    let mut used = 0usize;
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for (role, text) in msgs.into_iter().rev() {
+        let cost = text.chars().count() + 8;
+        if used + cost > MAX_TOTAL {
+            break;
+        }
+        used += cost;
+        kept.push((role, text));
+    }
+    kept.reverse();
+    let omitted = kept.len() < f.messages.len();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "id": f.id,
+            "title": f.title,
+            "updated_at": f.updated_at,
+            "omitted": omitted,
+            "messages": kept.iter().map(|(r, t)| json!({ "role": r, "content": t })).collect::<Vec<_>>(),
+        })),
+    )
 }
 
 #[derive(Debug, Deserialize)]

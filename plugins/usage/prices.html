@@ -56,7 +56,6 @@
 </head>
 <body>
   <h3>模型价格</h3>
-  <div class="sub">单价 = <span id="unit">美元</span> / 百万 token · 键 = 渠道 host + 模型 id</div>
 
   <div class="bar">
     <span class="seg">
@@ -73,8 +72,6 @@
     </thead>
     <tbody id="rows"></tbody>
   </table>
-
-  <div class="hint">* = 通配兜底；人民币只换显示，不改已记的账</div>
 
   <div class="foot">
     <button class="primary" onclick="save()">保存</button>
@@ -135,7 +132,6 @@ function setCurrency(c) {
   currency = c;
   $('curUsd').classList.toggle('on', c === 'USD');
   $('curCny').classList.toggle('on', c === 'CNY');
-  $('unit').textContent = c === 'CNY' ? '元' : '美元';
   drawRows();
 }
 
@@ -156,8 +152,7 @@ async function load() {
 
 function channelModels(host) {
   const c = channels.find((x) => x.host === host);
-  const list = (c && c.models) || [];
-  return [...new Set([...list, '*'])]; // 去重 + 通配兜底放最后
+  return (c && c.models) || []; // 用户 2026-10-02：不再往建议里塞「*」通配引导
 }
 
 function drawRows() {
@@ -168,7 +163,7 @@ function drawRows() {
     const models = channelModels(r.provider);
     const dl = `mdl-${i}`;
     const extra = r.model && !models.includes(r.model) ? `<option value="${r.model}"></option>` : '';
-    return `<input list="${dl}" value="${r.model}" onchange="setModel(${i}, this.value)" placeholder="模型 id 或 *" />
+    return `<input list="${dl}" value="${r.model}" onchange="setModel(${i}, this.value)" placeholder="模型 id" />
       <datalist id="${dl}">${extra}${models.map((m) => `<option value="${m}"></option>`).join('')}</datalist>`;
   };
   $('rows').innerHTML = rows

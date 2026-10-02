@@ -72,14 +72,16 @@
   // —— 模型快选（输入栏）——
   let modelMenuOpen = false;
   let menuExpandedCfg = ''; // 模型快选菜单里展开的配置组（默认展开当前配置）
-  // —— ZCode 式加号菜单：@ 上下文 / 能力 / 技能 ——
+  // —— ZCode 式加号菜单（用户 2026-10-02 改版：只剩 @ 与 / 两个入口）——
+  // @ = 上下文（对话 + 文件，见 openCtxPicker）；/ = 能力（模板 + 技能 + MCP/插件工具，
+  // 一个菜单分组列出，$ 技能菜单并进来不再单列）
   let plusMenuOpen = false;
   let abilityMenuOpen = false;
-  let skillMenuOpen = false;
   let ctxPickerOpen = false;
   let ctxFiles = [];
   let ctxLoading = false;
   let ctxQuery = '';
+  let ctxMsg = '';
   let composerInputEl;
   const ABILITY_TEMPLATES = [
     { cmd: '解释', text: '请解释这段代码的作用与关键逻辑：\n' },
@@ -794,11 +796,20 @@
     resetComposerHeight();
   }
 
+  // @ 上下文选择（用户 2026-10-02 改版：@ = 上下文，可挑**对话**加入、也可挑文件）：
+  // 文件走老路插 @相对路径（模型自己读）；对话走 /api/sessions/transcript 拉只读转写，
+  // 发送时整块拼在消息正文后面（同 @文件「界面短引用、模型拿全文」的口径）。
+  let ctxTab = 'files'; // 'conv' | 'files'
+  let ctxSessions = [];
+  let ctxSessionsLoading = false;
+  let pendingConvs = []; // 待发送的引用对话 [{ id, title, text }]
   async function openCtxPicker() {
     plusMenuOpen = false;
     ctxPickerOpen = true;
     ctxQuery = '';
     ctxLoading = true;
+    ctxTab = 'files';
+    loadCtxSessions();
     try {
       const r = await fetch('/api/workspace/files').then((r) => r.json());
       ctxFiles = r.files || [];
@@ -807,22 +818,56 @@
     }
     ctxLoading = false;
   }
-
+  async function loadCtxSessions() {
+    ctxSessionsLoading = true;
+    try {
+      const r = await fetch('/api/sessions?scope=workspace').then((r) => r.json());
+      ctxSessions = (r.sessions || []).filter((s) => s.id !== currentSessionId);
+    } catch (e) {
+      ctxSessions = [];
+    }
+    ctxSessionsLoading = false;
+  }
   function pickCtxFile(rel) {
     ctxPickerOpen = false;
     insertAtCursor(`@${rel} `);
   }
+  async function pickCtxSession(s) {
+    ctxPickerOpen = false;
+    try {
+      const r = await fetch(`/api/sessions/transcript?id=${encodeURIComponent(s.id)}`).then((r) => r.json());
+      const lines = (r.messages || []).map((m) => `${m.role === 'user' ? '用户' : '助手'}: ${m.content}`);
+      const text = lines.join('\n\n');
+      pendingConvs = [
+        ...pendingConvs.filter((c) => c.id !== s.id),
+        { id: s.id, title: r.title || s.title || s.id, text, omitted: !!r.omitted },
+      ];
+    } catch (e) {
+      ctxMsg = `读取对话失败: ${e.message || e}`;
+    }
+  }
+  function removePendingConv(id) {
+    pendingConvs = pendingConvs.filter((c) => c.id !== id);
+  }
+  /// 引用对话块：拼在发送正文之后（放进 message 与本地 history，模型与界面同一份）
+  function convBlocks(convs) {
+    if (!convs || !convs.length) return '';
+    return (
+      '\n\n' +
+      convs
+        .map(
+          (c) =>
+            `【引用对话：${c.title}】\n${c.text}${c.omitted ? '\n（该对话较长，此处只保留了最近部分）' : ''}\n【引用对话结束】`
+        )
+        .join('\n\n')
+    );
+  }
 
   function openAbilityMenu() {
     plusMenuOpen = false;
-    abilityMenuOpen = true;
-  }
-
-  async function openSkillMenu() {
-    plusMenuOpen = false;
     if (!skillsData.length) loadSkills();
-    if (!mcpServers.length && !wasmPlugins.length) await loadMcp();
-    skillMenuOpen = true;
+    if (!mcpServers.length && !wasmPlugins.length) loadMcp();
+    abilityMenuOpen = true;
   }
 
   // —— 顶栏右侧：终端面板 + 产物/预览右侧栏 ——
@@ -891,6 +936,26 @@
   // 「思考 · 持续了 N 秒」（reasoning 分片的时间差累加，间隔 >5s 的按 5s 计）。
   let thinkFollowMap = {}; // 消息 id → 是否跟随（false 时显示「回到底部」）
   let thinkBoxEls = {}; // 消息 id → 思考滚动容器（bind:this）
+  // 工具卡折叠（`${msgId}:${idx}` → true=收起）：轮收尾自动全收（用户 2026-10-02：
+  // 「跑完之后自动收起所有工具调用留下结尾语」），点卡片头可再展开；未定义时
+  // 默认「跑的时候展开、收尾后收起」。恢复的历史消息没有收尾钩子，天然走默认收起。
+  let toolFold = {};
+  function toolIsOpen(msgId, idx, streaming) {
+    const v = toolFold[`${msgId}:${idx}`];
+    return v !== undefined ? !v : !!streaming;
+  }
+  function toggleToolFold(msgId, idx, currentlyOpen) {
+    // 直接把「当前有效状态」写进折叠表：true=收起 / false=展开（模板传 open 进来，
+    // 别在函数里用 streaming 参数重算——显式展开过的卡会取反成同一个值，点不回去）
+    const k = `${msgId}:${idx}`;
+    toolFold = { ...toolFold, [k]: !!currentlyOpen };
+  }
+  function foldAllTools(m) {
+    if (!m || !m.tools || !m.tools.length) return;
+    const patch = {};
+    m.tools.forEach((_, i) => (patch[`${m.id}:${i}`] = true));
+    toolFold = { ...toolFold, ...patch };
+  }
   let nowTick = Date.now(); // 实时计时滴答（流式期间每秒更新）
   let tickTimer = null;
   $: anyStreaming = Object.values(sessionMsgs).some((arr) => arr.some((m) => m.role === 'assistant' && m.streaming));
@@ -899,8 +964,9 @@
     clearInterval(tickTimer);
     tickTimer = null;
   }
-  /// 轮收尾：停表（工作用时冻结；还开着的思考阶段也关表累加）
+  /// 轮收尾：停表（工作用时冻结；还开着的思考阶段也关表累加），工具卡全收、留结尾语
   function endTurn(m) {
+    foldAllTools(m);
     const closed = m.thinkPhaseStart ? Date.now() - m.thinkPhaseStart : 0;
     return {
       ...m,
@@ -1578,11 +1644,25 @@
     terminalOpen = false;
     activateRpTab(key);
   }
-  // —— 文件预览标签：文本可编辑保存；图片走 /api/workspace/raw 直出 ——
+  // —— 文件预览标签：文本可编辑保存；图片/PDF/音视频走 /api/workspace/raw 直出；
+  // docx/pptx/xlsx/odf 走 /api/workspace/doc 文本抽取（best-effort）——
   const RP_IMG_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']);
-  function previewIsImage(path) {
+  const RP_PDF_EXT = new Set(['pdf']);
+  const RP_MEDIA_EXT = new Set(['mp4', 'm4v', 'webm', 'mov', 'mp3', 'wav', 'ogg', 'm4a', 'flac']);
+  // 文档容器（zip+xml）：后端抽正文文本，只求「能看内容」，不给编辑
+  const RP_DOC_EXT = new Set(['docx', 'pptx', 'xlsx', 'odt', 'ods', 'odp']);
+  function extOf(path) {
     const i = String(path).lastIndexOf('.');
-    return i > 0 && RP_IMG_EXT.has(String(path).slice(i + 1).toLowerCase());
+    return i > 0 ? String(path).slice(i + 1).toLowerCase() : '';
+  }
+  // 预览形态：image / pdf / media / doc / text。doc 与媒体都不提供编辑。
+  function previewKind(path) {
+    const e = extOf(path);
+    if (RP_IMG_EXT.has(e)) return 'image';
+    if (RP_PDF_EXT.has(e)) return 'pdf';
+    if (RP_MEDIA_EXT.has(e)) return 'media';
+    if (RP_DOC_EXT.has(e)) return 'doc';
+    return 'text';
   }
   // 后端 200KB 头尾压缩标记（context::OMITTED_MARK）：压缩过的内容拿去保存会把中间
   // 省略掉的部分整段写没——这类文件不给编辑，宁可不让改也不许写坏文件
@@ -1593,17 +1673,20 @@
     rpPreviewCache = { ...rpPreviewCache, [path]: { ...(rpPreviewCache[path] || {}), ...patch } };
   }
   async function loadPreview(path, force) {
+    const kind = previewKind(path);
     const hit = rpPreviewCache[path];
     if (hit && !hit.loading && !hit.error && hit.content !== undefined && !force) return;
     rpSet(path, { loading: true, error: '', editing: false, draft: '', savedAt: '' });
-    // 图片走 /api/workspace/raw 直出渲染，不去拉文本（拉了必 400，白留一条控制台报错）
-    if (previewIsImage(path)) {
+    // 图片/PDF/音视频走 /api/workspace/raw 直出渲染，不去拉文本（拉了必 400，白留一条控制台报错）
+    if (kind === 'image' || kind === 'pdf' || kind === 'media') {
       rpSet(path, { loading: false, content: '', error: '' });
       return;
     }
     try {
-      const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(path)}`).then((r) => r.json());
-      rpSet(path, { loading: false, content: r.ok ? r.content : '', error: r.ok ? '' : r.error || '读取失败' });
+      // 文档容器走文本抽取端点，其余按文本读
+      const url = kind === 'doc' ? `/api/workspace/doc?path=${encodeURIComponent(path)}` : `/api/workspace/file?path=${encodeURIComponent(path)}`;
+      const r = await fetch(url).then((r) => r.json());
+      rpSet(path, { loading: false, content: r.ok ? (kind === 'doc' ? r.text : r.content) : '', error: r.ok ? '' : r.error || '读取失败' });
     } catch (e) {
       rpSet(path, { loading: false, content: '', error: e.message || String(e) });
     }
@@ -2240,45 +2323,49 @@
   async function send() {
     const msg = input.trim();
     const atts = [...pendingAttachments];
-    if (!msg && atts.length === 0) return;
+    const convs = [...pendingConvs];
+    if (!msg && atts.length === 0 && convs.length === 0) return;
     const key = curKey();
     input = '';
     resetComposerHeight(); // F4：发送后清空是程序化赋值，不触发 input 事件，高度得手动回收
     pendingAttachments = [];
+    pendingConvs = [];
     if (streams[key]) {
-      queueOut(key, msg, atts);
+      queueOut(key, msg, atts, convs);
       return;
     }
-    await deliver(key, msg, atts);
+    await deliver(key, msg, atts, { convs });
   }
 
   // 排队：先显示成「排队中」气泡，当前这一轮结束后自动按序发出
-  function queueOut(key, text, atts) {
-    const item = { id: nextId(), text, atts };
+  function queueOut(key, text, atts, convs = []) {
+    const item = { id: nextId(), text, atts, convs };
     outbox = { ...outbox, [key]: [...(outbox[key] || []), item] };
-    pushMsg(key, { id: item.id, role: 'user', content: text, attachments: atts, queued: true });
+    pushMsg(key, { id: item.id, role: 'user', content: text, attachments: atts, convs, queued: true });
   }
 
   // 把「已经上屏的那条用户气泡」转成排队（服务端说这个会话在跑时用；不新增气泡）
-  function markQueued(key, text, atts) {
+  function markQueued(key, text, atts, convs = []) {
     const arr = sessionMsgs[key] || [];
     const hit = [...arr].reverse().find((m) => m.role === 'user' && m.content === text && !m.queued);
     const id = hit ? hit.id : nextId();
     updMsgs(key, (a) =>
-      hit ? a.map((m) => (m.id === id ? { ...m, queued: true } : m)) : [...a, { id, role: 'user', content: text, attachments: atts, queued: true }]
+      hit ? a.map((m) => (m.id === id ? { ...m, queued: true } : m)) : [...a, { id, role: 'user', content: text, attachments: atts, convs, queued: true }]
     );
-    outbox = { ...outbox, [key]: [...(outbox[key] || []), { id, text, atts }] };
+    outbox = { ...outbox, [key]: [...(outbox[key] || []), { id, text, atts, convs }] };
     return id;
   }
 
   // 真正发一轮（key 会话；调用时该会话没在跑）。返回 false = 这条没送进服务端。
   async function deliver(key, text, atts, opts = {}) {
-    const effectiveMsg = text || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
+    const convs = opts.convs || [];
+    // 引用对话块只在发送侧拼（模型拿全文），用户气泡保持「我打的那句 + 引用 chip」
+    const fullMsg = (text || '') + convBlocks(convs);
+    const effectiveMsg = fullMsg.trim() || (atts.length > 0 ? '请查看分析附带的媒体文件' : '');
     if (!effectiveMsg) return true;
     // 发送时收起所有输入区菜单
     plusMenuOpen = false;
     abilityMenuOpen = false;
-    skillMenuOpen = false;
     modelMenuOpen = false;
     // 新会话：顶栏标题即时取首条消息（与后端初始标题一致），不等标题生成
     if (!currentSessionId && effectiveMsg) currentTitle = effectiveMsg.slice(0, 50);
@@ -2291,7 +2378,7 @@
     const hasBubble = opts.bubbleId && (sessionMsgs[key] || []).some((m) => m.id === opts.bubbleId);
     updMsgs(key, (a) => [
       ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer } : m)),
-      ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: effectiveMsg, attachments: atts }]),
+      ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: text, attachments: atts, convs }]),
       { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() },
     ]);
     const ac = new AbortController();
@@ -2529,7 +2616,7 @@
         if (q.length > 0 && !streams[skey]) {
           const [item, ...rest] = q;
           outbox = { ...outbox, [skey]: rest };
-          deliver(skey, item.text, item.atts, { bubbleId: item.id });
+          deliver(skey, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
         }
       }
     }
@@ -2550,7 +2637,11 @@
     outbox = { ...outbox, [key]: (outbox[key] || []).filter((x) => x.id !== itemId) };
     if (!streams[key]) {
       // 这一轮已经跑完了：按正常一轮发出去
-      await deliver(key, item.text, item.atts, { bubbleId: item.id });
+      await deliver(key, item.text, item.atts, { bubbleId: item.id, convs: item.convs });
+      return;
+    }
+    if (item.convs && item.convs.length) {
+      pushMsg(key, { id: nextId(), role: 'error', content: '「立即发送」暂不支持带引用对话的消息：这一轮结束后会自动发出去。' });
       return;
     }
     localSteers.push(item.text);
@@ -4170,6 +4261,14 @@
               {#if m.content}
                 <div class="user-text">{m.content}</div>
               {/if}
+              {#if m.convs && m.convs.length}
+                <!-- 引用对话只在气泡上挂 chip（正文发送时已整块拼给模型，不上屏刷屏） -->
+                <div class="msg-convs">
+                  {#each m.convs as cv}
+                    <span class="conv-tag" title={`已把对话「${cv.title}」作为上下文发给模型`}>对话 · {cv.title}</span>
+                  {/each}
+                </div>
+              {/if}
               {#if m.queued}
                 <div class="queued-row">
                   <span class="queued-badge">排队中 · 这一轮结束后自动发送</span>
@@ -4258,14 +4357,25 @@
                 </div>
               {/if}
               {#if m.tools && m.tools.length}
-                {#each m.tools as t}
+                {#each m.tools as t, ti}
+                  <!-- open 直接在模板里读 toolFold（Svelte 模板只对直接引用的变量做响应式，
+                       包进函数就收不到 toolFold 的变更——真机实锤过） -->
+                  {@const foldKey = `${m.id}:${ti}`}
+                  {@const open = toolFold[foldKey] !== undefined ? !toolFold[foldKey] : !!m.streaming}
                   <div class="tool-card">
-                    <div class="tool-head">
+                    <div
+                      class="tool-head"
+                      role="button"
+                      tabindex="-1"
+                      title={open ? '收起详情' : '展开详情'}
+                      on:click={() => toggleToolFold(m.id, ti, open)}
+                    >
                       <span class="tool-badge {t.status}">{t.status === 'running' ? '执行中' : t.status === 'ok' ? '完成' : '失败'}</span>
                       <span class="tool-name">{t.name}</span>
                       <span class="tool-args" title={t.args}>{t.args}</span>
+                      <svg class="tool-caret" class:open={open} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
                     </div>
-                    {#if t.preview}
+                    {#if t.preview && open}
                       <pre class="tool-preview">{t.preview}</pre>
                     {/if}
                   </div>
@@ -4372,6 +4482,17 @@
             {/each}
           </div>
         {/if}
+        {#if pendingConvs.length > 0}
+          <div class="composer-attachments">
+            {#each pendingConvs as cv}
+              <div class="att-chip conv-chip" title={`引用对话：${cv.title}（发送时拼进消息正文${cv.omitted ? '，只保留最近部分' : ''}）`}>
+                <svg class="att-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.9 8.9 0 0 1-3.8-.8L3 21l1.9-4.6a8.4 8.4 0 1 1 16.1-4.9"/><path d="M8.5 10.5h7M8.5 14h4.5"/></svg>
+                <span class="att-name">{cv.title}</span>
+                <button class="att-del" on:click={() => removePendingConv(cv.id)} title="移除" aria-label="移除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+              </div>
+            {/each}
+          </div>
+        {/if}
         <textarea
           class="composer-input"
           rows="1"
@@ -4391,58 +4512,58 @@
             <div class="bar-menu">
               <button
                 class="icon-btn"
-                title="添加上下文 / 能力 / 技能"
+                title="添加上下文 / 选择能力"
                 on:click={() => {
                   plusMenuOpen = !plusMenuOpen;
                   abilityMenuOpen = false;
-                  skillMenuOpen = false;
                 }}
               ><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
               {#if plusMenuOpen}
                 <div class="bar-dropdown">
                   <button class="bar-item" on:click={openCtxPicker}>
-                    <span class="menu-sym">@</span> 使用 @ 添加上下文
+                    <span class="menu-sym">@</span> 添加上下文
                   </button>
                   <button class="bar-item" on:click={openAbilityMenu}>
-                    <span class="menu-sym">/</span> 使用 / 选择能力
-                  </button>
-                  <button class="bar-item" on:click={openSkillMenu}>
-                    <span class="menu-sym">$</span> 使用 $ 选择技能
+                    <span class="menu-sym">/</span> 选择能力
                   </button>
                 </div>
               {/if}
               {#if abilityMenuOpen}
+                <!-- 用户 2026-10-02：技能/插件/MCP 统一收进「/」——模板、技能、MCP 工具、插件工具一个菜单分组列 -->
                 <div class="bar-dropdown">
+                  <div class="bar-group">能力</div>
                   {#each ABILITY_TEMPLATES as t}
                     <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(t.text); }}>
                       <span class="menu-sym">/</span> {t.cmd}
                     </button>
                   {/each}
-                </div>
-              {/if}
-              {#if skillMenuOpen}
-                <div class="bar-dropdown">
-                  {#if !skillsData.length && !mcpServers.length && !wasmPlugins.length}
-                    <div class="menu-empty">暂无技能：可在「设置 → 技能」创建，或添加 MCP/WASM 插件</div>
+                  <div class="bar-group">技能</div>
+                  {#if skillsData.length}
+                    {#each skillsData as sk (sk.name)}
+                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
+                        <span class="menu-sym">$</span> {sk.name}
+                      </button>
+                    {/each}
+                  {:else}
+                    <div class="menu-empty">暂无技能</div>
                   {/if}
-                  {#each skillsData as sk (sk.name)}
-                    <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$${sk.name} `); }}>
-                      <span class="menu-sym">$</span> {sk.name}
-                    </button>
-                  {/each}
+                  <div class="bar-group">MCP · 插件</div>
+                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length) && !wasmPlugins.some((w) => (w.tools || []).length)}
+                    <div class="menu-empty">暂无可用工具</div>
+                  {/if}
                   {#each mcpServers as srv}
                     {#if srv.online !== false && srv.tools && srv.tools.length}
                       {#each srv.tools as t}
-                        <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$mcp__${srv.name}__${t.name} `); }}>
-                          <span class="menu-sym">$</span> {t.name}
+                        <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$mcp__${srv.name}__${t.name} `); }}>
+                          <span class="menu-sym">M</span> {t.name}
                         </button>
                       {/each}
                     {/if}
                   {/each}
                   {#each wasmPlugins as w}
                     {#each w.tools || [] as t}
-                      <button class="bar-item" on:click={() => { skillMenuOpen = false; insertAtCursor(`$wasm__${w.stem}__${t.name} `); }}>
-                        <span class="menu-sym">$</span> wasm__{w.stem}__{t.name}
+                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`$wasm__${w.stem}__${t.name} `); }}>
+                        <span class="menu-sym">W</span> wasm__{w.stem}__{t.name}
                       </button>
                     {/each}
                   {/each}
@@ -4520,7 +4641,6 @@
                   </div>
                   <!-- 口径说清：分子是「下一次请求」的预估（渠道实报锚点 + 之后的上下文增减，
                        裁剪会让它当场回落）；构成行是估算值按圆环百分比分摊（加总 = 圆环） -->
-                  <div class="ctx-card-foot">占用 = 最近一次请求的渠道实报（输入+输出）+ 其后的上下文增减；构成行为估算分摊。超过预算自动归档旧工具结果并折叠早期对话</div>
                 </div>
               </div>
             {:else}
@@ -4796,14 +4916,28 @@
                       {(rpPreviewCache[t.path] || {}).saving ? '保存中…' : '保存'}
                     </button>
                     <button class="rp-btn" title="取消编辑（丢弃改动）" on:click={() => cancelEditPreview(t.path)}>取消</button>
-                  {:else if !previewIsImage(t.path) && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
+                  {:else if previewKind(t.path) === 'text' && (rpPreviewCache[t.path] || {}).content && !previewTruncated((rpPreviewCache[t.path] || {}).content)}
+                    <!-- 只有纯文本可编辑：文档抽取/媒体/PDF 不是原文件字节，编辑会写坏 -->
                     <button class="rp-btn" title="编辑内容" on:click={() => startEditPreview(t.path)}>编辑</button>
                   {/if}
                   <button class="rp-refresh" title="重新读取" on:click={() => loadPreview(t.path, true)}>↻</button>
                 </div>
-                {#if previewIsImage(t.path)}
+                {#if previewKind(t.path) === 'image'}
                   <div class="rp-image-wrap">
                     <img class="rp-image" src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`} alt={t.path} />
+                  </div>
+                {:else if previewKind(t.path) === 'pdf'}
+                  <!-- PDF 内嵌（浏览器/WebView 自带查看器） -->
+                  <iframe class="rp-pdf" title={t.path} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></iframe>
+                {:else if previewKind(t.path) === 'media'}
+                  <div class="rp-media-wrap">
+                    {#if ['mp4', 'm4v', 'webm', 'mov'].includes(extOf(t.path))}
+                      <video class="rp-media" controls autoplay={false} src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}>
+                        <track kind="captions" />
+                      </video>
+                    {:else}
+                      <audio class="rp-media rp-audio" controls src={`/api/workspace/raw?path=${encodeURIComponent(t.path)}`}></audio>
+                    {/if}
                   </div>
                 {:else if (rpPreviewCache[t.path] || {}).loading}
                   <pre class="rp-preview">读取中…</pre>
@@ -4817,7 +4951,9 @@
                     on:input={(e) => rpSet(t.path, { draft: e.currentTarget.value })}
                   ></textarea>
                 {:else}
-                  {#if previewTruncated((rpPreviewCache[t.path] || {}).content)}
+                  {#if previewKind(t.path) === 'doc'}
+                    <div class="rp-note">文档类预览：这里是抽取出来的文本（排版与图表不在其中），不提供编辑</div>
+                  {:else if previewTruncated((rpPreviewCache[t.path] || {}).content)}
                     <div class="rp-note">文件较大，预览是头尾压缩过的（中间省略）——为避免把省略部分写没，不提供编辑</div>
                   {/if}
                   <pre class="rp-preview">{((rpPreviewCache[t.path] || {}).content) || '（空文件）'}</pre>
@@ -5445,20 +5581,7 @@
               }}
             />
           </div>
-          <div class="role-item">
-            <span class="role-name">降级备用渠道 (Fallbacks)</span>
-            <input
-              placeholder="逗号分隔配置名/id；留空用 config.toml [gateway].fallback_configs"
-              value={(roles.fallbacks || []).join(', ')}
-              title="主渠道当轮调用失败时按序切换重试；每次切换发 Notice"
-              on:change={(e) => {
-                roles.fallbacks = e.target.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
         </div>
-        <div class="param-hint">留空 = 自动兜底</div>
       </div>
       {/if}
       <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
@@ -5630,22 +5753,45 @@
   <div class="modal-backdrop" on:click={() => (ctxPickerOpen = false)}>
     <div class="modal ctx-modal" on:click|stopPropagation>
       <div class="modal-head">
-        <b>使用 @ 添加上下文</b>
-        <span class="hint">插入 @相对路径（模型自行读取）</span>
+        <b>添加上下文</b>
+        <span class="hint">{ctxTab === 'conv' ? '把对话内容作为上下文发给模型' : '插入 @相对路径（模型自行读取）'}</span>
         <button class="btn ghost" on:click={() => (ctxPickerOpen = false)}>关闭</button>
       </div>
-      <input class="ctx-search" placeholder="搜索文件…" bind:value={ctxQuery} />
-      <div class="ctx-file-list">
-        {#if ctxLoading}
-          <div class="trace-empty">加载中…</div>
-        {:else}
-          {#each ctxFiles.filter((f) => !ctxQuery || f.toLowerCase().includes(ctxQuery.toLowerCase())) as f (f)}
-            <button class="ctx-file" on:click={() => pickCtxFile(f)}>{f}</button>
-          {:else}
-            <div class="menu-empty">没有匹配的文件</div>
-          {/each}
-        {/if}
+      <div class="ctx-tabs">
+        <button class="ctx-tab" class:active={ctxTab === 'conv'} on:click={() => { ctxTab = 'conv'; loadCtxSessions(); }}>对话</button>
+        <button class="ctx-tab" class:active={ctxTab === 'files'} on:click={() => (ctxTab = 'files')}>文件</button>
       </div>
+      {#if ctxTab === 'conv'}
+        <input class="ctx-search" placeholder="搜索对话标题…" bind:value={ctxQuery} />
+        <div class="ctx-file-list">
+          {#if ctxSessionsLoading}
+            <div class="trace-empty">加载中…</div>
+          {:else}
+            {#each ctxSessions.filter((s) => !ctxQuery || (s.title || '').toLowerCase().includes(ctxQuery.toLowerCase())) as s (s.id)}
+              <button class="ctx-file" on:click={() => pickCtxSession(s)}>
+                <span class="ctx-conv-title">{s.title || s.id}</span>
+                <span class="ctx-conv-ts">{(s.updated_at || '').slice(0, 16).replace('T', ' ')}</span>
+              </button>
+            {:else}
+              <div class="menu-empty">{ctxQuery ? '没有匹配的对话' : '当前工作区还没有别的对话'}</div>
+            {/each}
+          {/if}
+        </div>
+      {:else}
+        <input class="ctx-search" placeholder="搜索文件…" bind:value={ctxQuery} />
+        <div class="ctx-file-list">
+          {#if ctxLoading}
+            <div class="trace-empty">加载中…</div>
+          {:else}
+            {#each ctxFiles.filter((f) => !ctxQuery || f.toLowerCase().includes(ctxQuery.toLowerCase())) as f (f)}
+              <button class="ctx-file" on:click={() => pickCtxFile(f)}>{f}</button>
+            {:else}
+              <div class="menu-empty">没有匹配的文件</div>
+            {/each}
+          {/if}
+        </div>
+      {/if}
+      {#if ctxMsg}<div class="menu-empty">{ctxMsg}</div>{/if}
     </div>
   </div>
 {/if}
@@ -7257,6 +7403,30 @@
     border-radius: 6px;
     background: var(--g1);
   }
+  /* PDF 内嵌查看器与音视频播放器 */
+  .rp-pdf {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    border: none;
+    background: var(--g1);
+  }
+  .rp-media-wrap {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    padding: 10px;
+  }
+  .rp-media {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 8px;
+    background: var(--g1);
+  }
+  .rp-audio {
+    width: 100%;
+  }
   .rp-edit {
     flex: 1;
     min-height: 0;
@@ -8210,6 +8380,20 @@
     gap: 8px;
     align-items: center;
     font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tool-caret {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    margin-left: auto;
+    color: var(--g5);
+    transition: transform 0.12s;
+    transform: rotate(0deg);
+  }
+  .tool-caret.open {
+    transform: rotate(90deg);
   }
   .tool-badge {
     padding: 1px 6px;
@@ -8397,6 +8581,67 @@
   .bar-dropdown.right {
     left: auto;
     right: 0;
+  }
+  /* 「/」统一能力菜单的分组标签（能力/技能/MCP·插件） */
+  .bar-group {
+    padding: 7px 10px 3px;
+    font-size: 11px;
+    color: var(--g5);
+    user-select: none;
+  }
+  /* @ 弹窗的 对话/文件 页签 */
+  .ctx-tabs {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .ctx-tab {
+    border: 1px solid var(--g3);
+    background: transparent;
+    color: var(--g6);
+    border-radius: 999px;
+    padding: 4px 14px;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  .ctx-tab.active {
+    background: var(--g3);
+    color: var(--g7);
+    border-color: var(--g4);
+  }
+  .ctx-conv-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 340px;
+  }
+  .ctx-conv-ts {
+    font-size: 11px;
+    color: var(--g5);
+  }
+  /* 用户气泡上的「对话 · 标题」引用标签 */
+  .msg-convs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .conv-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11.5px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--g4);
+    color: var(--g6);
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conv-chip .att-name {
+    max-width: 200px;
   }
   .bar-dropdown.compact {
     min-width: 90px;
@@ -8873,80 +9118,9 @@
     font-size: 12px;
     padding: 6px 8px;
   }
-  /* —— 插件页（用户 2026-09-30 指示：学 ZCode 紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） —— */
-  .group-label {
-    margin: 16px 2px 8px;
-    font-size: 12px;
-    color: var(--g5);
-  }
-  .plug-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 12px;
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    margin-bottom: 6px;
-    background: var(--g2);
-  }
-  .plug-ico {
-    flex: none;
-    width: 34px;
-    height: 34px;
-    border-radius: 9px;
-    background: var(--veil);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 700;
-    font-size: 15px;
-    color: var(--g6);
-  }
-  .plug-ico svg {
-    width: 18px;
-    height: 18px;
-  }
-  .plug-meta {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-  .plug-title {
-    font-weight: 650;
-    font-size: 13.5px;
-  }
-  .plug-desc {
-    font-size: 12px;
-    color: var(--g5);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .plug-chip {
-    flex: none;
-    font-size: 11px;
-    line-height: 1;
-    padding: 4px 9px;
-    border-radius: 999px;
-    border: 1px dashed var(--g4);
-    color: var(--g5);
-    white-space: nowrap;
-  }
-  .plug-chip.warn {
-    color: var(--tint-orange-fg);
-    border-color: currentColor;
-    border-style: solid;
-  }
-  .plug-sub {
-    font-size: 12px;
-    color: var(--tint-orange-fg);
-    margin: -2px 4px 8px 46px;
-    word-break: break-all;
-  }
-  .plug-row .btn {
-    flex: none;
-    padding: 4px 10px;
-    font-size: 12px;
-  }
+  /* —— 插件页（用户 2026-09-30 指示：学 ZCode 紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
+     plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（用户 2026-10-02 要求
+     与插件页同形式）也在用，跨组件共用 */
   .plug-cpu {
     flex: none;
     display: flex;
@@ -8970,34 +9144,6 @@
   .plug-cpu input::-webkit-inner-spin-button {
     -webkit-appearance: none;
     margin: 0;
-  }
-  .switch {
-    flex: none;
-    position: relative;
-    width: 36px;
-    height: 20px;
-    border-radius: 999px;
-    border: none;
-    background: var(--g4);
-    cursor: pointer;
-    padding: 0;
-    transition: background 0.15s;
-  }
-  .switch .knob {
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: #fff;
-    transition: left 0.15s;
-  }
-  .switch.on {
-    background: var(--brand);
-  }
-  .switch.on .knob {
-    left: 18px;
   }
 </style>
 

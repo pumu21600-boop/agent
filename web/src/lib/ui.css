@@ -241,3 +241,107 @@ select option:checked {
 .flex-sp {
   flex: 1;
 }
+
+/* —— 插件页紧凑行（2026-09-30 用户拍板）+ 开关：从 App.svelte 作用域下沉为全局，
+   技能页 / MCP 页（2026-10-02 用户要求与插件页同形式）跨组件共用 —— */
+.group-label {
+  margin: 16px 2px 8px;
+  font-size: 12px;
+  color: var(--g5);
+}
+.plug-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--g3);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  background: var(--g2);
+}
+.plug-ico {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--veil);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--g6);
+}
+.plug-ico svg {
+  width: 18px;
+  height: 18px;
+}
+.plug-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.plug-title {
+  font-weight: 650;
+  font-size: 13.5px;
+}
+.plug-desc {
+  font-size: 12px;
+  color: var(--g5);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plug-chip {
+  flex: none;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px dashed var(--g4);
+  color: var(--g5);
+  white-space: nowrap;
+}
+.plug-chip.warn {
+  color: var(--tint-orange-fg);
+  border-color: currentColor;
+  border-style: solid;
+}
+.plug-sub {
+  font-size: 12px;
+  color: var(--tint-orange-fg);
+  margin: -2px 4px 8px 46px;
+  word-break: break-all;
+}
+.plug-row .btn {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.switch {
+  flex: none;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  border-radius: 999px;
+  border: none;
+  background: var(--g4);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s;
+}
+.switch .knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+.switch.on {
+  background: var(--brand);
+}
+.switch.on .knob {
+  left: 18px;
+}

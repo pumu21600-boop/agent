@@ -1,9 +1,10 @@
 //! 错误恢复 —— 总架构 §14 / 施工单 007（P6）
 //!
 //! 「假设一定会崩，把能恢复做成默认」：
-//! - checkpoint：文件改动前把真仓库已跟踪文件提交进影子仓库 `<workspace>/.agent/shadow`
-//!   （独立 git dir，work-tree 指向 workspace），只跟踪真仓库 `git ls-files` 的文件
-//!   加排除规则，防 IO 爆炸；失败只记日志，绝不阻断工具执行。
+//! - checkpoint：把工作区文件提交进影子仓库 `<workspace>/.agent/shadow`
+//!   （独立 git dir，work-tree 指向 workspace）。git 工作区只跟踪真仓库 `git ls-files`
+//!   的文件；非 git 工作区整目录扫描兜底（2026-10-02 产物面板实锤后加），均套排除规则，
+//!   防 IO 爆炸；失败只记日志，绝不阻断工具执行。
 //! - restore：影子仓库 `reset --hard` 回指定检查点（含删除其后新建的已跟踪文件）；
 //!   shell 副作用不可回滚，靠沙箱兜底。
 //! - HANDOFF：交接文档落 `<workspace>/HANDOFF.md`，头部强制项目名/remote/commit/时间戳。
@@ -47,7 +48,8 @@ fn shadow_gitdir(ws: &Path) -> PathBuf {
 }
 
 /// 排除目录：影子仓库永不跟踪（真仓库 ls-files 之外的第二道防线，防 IO 爆炸）。
-const EXCLUDED_DIRS: &[&str] = &["node_modules", "target", "dist", "logs", ".agent", ".git"];
+/// .attachments 是粘贴媒体的中转目录（turn.rs 会把它写进 .gitignore），同样不进影子仓库。
+const EXCLUDED_DIRS: &[&str] = &["node_modules", "target", "dist", "logs", ".agent", ".git", ".attachments"];
 /// 单文件体积上限，超过直接跳过（大二进制不走影子仓库）。
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -108,8 +110,17 @@ fn ensure_shadow(bin: &Path, ws: &Path) -> anyhow::Result<PathBuf> {
     Ok(gitdir)
 }
 
-/// 真仓库已跟踪文件（workspace 相对路径），套排除规则与体积上限。
+/// 影子仓库要跟踪的文件清单。真仓库是 git 仓库时沿用它的 ls-files（老语义：
+/// untracked 文件不属于影子仓库，restore 不动它）；工作区**不是 git 仓库**时
+/// git ls-files 无从谈起，退化为目录扫描（排除目录 + 体积上限）——产物/检查点
+/// 的真机实锤：普通文件夹（Desktop\th 这类）不是 git 仓库，检查点永远拍不出来，
+/// 「产物」面板就没有基线可看。两种来源都套同一套排除与体积规则。
 fn tracked_files(bin: &Path, ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let probe = git(bin, None, ws, &["rev-parse", "--is-inside-work-tree"]);
+    let is_git_ws = matches!(&probe, Ok(out) if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true");
+    if !is_git_ws {
+        return walk_files(ws);
+    }
     let out = git(bin, None, ws, &["ls-files", "-z"])?;
     if !out.status.success() {
         bail!("ls-files 失败: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -137,9 +148,43 @@ fn tracked_files(bin: &Path, ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// 非 git 工作区的兜底清单：整棵扫（软链接不进，防环；单文件 >10MB 跳过；
+/// 排除目录整枝剪掉）。文件数硬上限 20000——普通项目目录远够，失控目录不拖死检查点。
+fn walk_files(ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(rel) = stack.pop() {
+        if files.len() >= 20_000 {
+            bail!("工作区文件数超过 20000，影子仓库拒收（用 git 仓库或清理目录后重试）");
+        }
+        let full = ws.join(&rel);
+        let Ok(rd) = std::fs::read_dir(&full) else { continue };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let child = rel.join(&*name);
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                if EXCLUDED_DIRS.contains(&name.as_ref()) || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(child);
+            } else if meta.is_file() && meta.len() <= MAX_FILE_BYTES {
+                files.push(child);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// 拍检查点：add + 有变更才 commit。返回 None 表示没有需要落的变化。
 /// 任何失败都由调用方决定降级（核心循环只记日志不阻断）。
 /// `session_id` 写进提交正文的 trailer，供改动条/撤销按会话对齐。
+/// 跟踪范围：git 工作区沿用真仓库 ls-files；非 git 工作区整目录扫（见 tracked_files）。
 pub fn checkpoint(ws: &Path, reason: &str, session_id: &str) -> anyhow::Result<Option<Checkpoint>> {
     let bin = git_bin()?;
     let gitdir = ensure_shadow(&bin, ws)?;
@@ -428,6 +473,9 @@ pub fn diff_stat(ws: &Path, baseline: &str) -> anyhow::Result<(usize, u64, u64)>
 }
 
 /// 工作树相对基线 commit 的改动文件清单（`diff --numstat` 第三列）。
+/// **追加未跟踪文件**（`ls-files --others`）：任务里新建的文件不入 git diff
+/// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实锤根因——
+/// agent 造出的新文件必须原样出现在清单里。排除目录/大文件与检查点同一套规则。
 pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
     if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
         bail!("非法基线 id: {baseline}");
@@ -444,6 +492,40 @@ pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<String>> {
         let (_a, _d) = (it.next(), it.next());
         if let Some(p) = it.next() {
             files.push(p.to_string());
+        }
+    }
+    // 未跟踪：--directory 让整个被排除目录折叠成一条（不逐个走进 node_modules 之类的深渊）；
+    // --exclude 与 EXCLUDED_DIRS 同源，非 git 工作区没有 .gitignore，全靠它兜
+    let mut others_cmd = vec![
+        "ls-files".to_string(),
+        "--others".to_string(),
+        "-z".to_string(),
+        "--directory".to_string(),
+        "--exclude-standard".to_string(),
+    ];
+    for dir in EXCLUDED_DIRS {
+        others_cmd.push(format!("--exclude={dir}"));
+    }
+    let others = git_ok(&bin, Some(&gitdir), ws, &others_cmd.iter().map(String::as_str).collect::<Vec<_>>())?;
+    for entry in others.split('\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        let rel = entry.trim_end_matches('/');
+        if rel.is_empty() || files.iter().any(|f| f == rel) {
+            continue;
+        }
+        let path = PathBuf::from(rel);
+        let excluded = path.components().any(|c| {
+            matches!(c, std::path::Component::Normal(_))
+                && EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())
+        });
+        if excluded {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(ws.join(&path)) else { continue };
+        if meta.is_file() && meta.len() <= MAX_FILE_BYTES {
+            files.push(rel.replace('\\', "/"));
         }
     }
     Ok(files)
@@ -471,7 +553,6 @@ fn one_line(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     fn git_have() -> bool {
         crate::tools::git_exe().is_ok()
@@ -600,6 +681,36 @@ mod tests {
         assert!(checkpoint(w, "大文件前", "sess-test").unwrap().is_none(), "被排除的大文件不应触发检查点");
         let files = shadow_files(w);
         assert!(!files.iter().any(|f| f == "huge.bin"), "超 10MB 文件不进影子仓库: {files:?}");
+    }
+
+    #[test]
+    fn plain_directory_workspace_gets_checkpoints_and_artifacts() {
+        // 产物面板实锤（2026-10-02）：用户工作区 Desktop\th 不是 git 仓库，
+        // ls-files 无从谈起 → 检查点永远拍不出来 → 产物永远空。非 git 工作区
+        // 现在走目录扫描兜底；agent 新建（未跟踪）文件也必须进 changed_files。
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("plain");
+        let w = ws.path();
+        // 故意不 git init——普通文件夹
+        std::fs::write(w.join("doc.txt"), "v1\n").unwrap();
+        let cp1 = checkpoint(w, "普通目录基线", "sess-plain")
+            .unwrap()
+            .expect("非 git 工作区也应有检查点");
+
+        std::fs::write(w.join("doc.txt"), "v2\n").unwrap();
+        std::fs::write(w.join("made-by-agent.txt"), "new\n").unwrap();
+        let files = changed_files(w, &cp1.id).unwrap();
+        assert!(files.contains(&"doc.txt".to_string()), "修改的文件要列出: {files:?}");
+        assert!(files.contains(&"made-by-agent.txt".to_string()), "新建文件要列出: {files:?}");
+
+        // 收尾检查点（真实流程里任务结束会再拍一张），restore 才有「检查点之后」的提交可回退
+        let cp2 = checkpoint(w, "普通目录收尾", "sess-plain").unwrap().expect("有变更应有检查点");
+        assert_ne!(cp1.id, cp2.id);
+        restore(w, &cp1.id).unwrap();
+        assert_eq!(std::fs::read_to_string(w.join("doc.txt")).unwrap(), "v1\n");
+        assert!(!w.join("made-by-agent.txt").exists(), "检查点后新建的文件已被影子仓库跟踪，回滚应删除");
     }
 
     #[test]
