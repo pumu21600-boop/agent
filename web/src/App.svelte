@@ -3816,18 +3816,50 @@
   }
 
   // P21 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
+  // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查，blocker 后端直接拒；审核报告按插件名缓存
+  let extReviews = {}; // name -> report（{verdict, findings, files_scanned, bytes_scanned}）
+  async function reviewExt(e) {
+    if (!e.trust_key) {
+      extMsg = `「${e.title || e.name}」没有验签键（内置/draft 不审）`;
+      return;
+    }
+    try {
+      const r = await fetch('/api/plugins/review', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: e.trust_key }),
+      }).then((r) => r.json());
+      if (r.error) {
+        extMsg = `审核失败: ${r.error}`;
+        return;
+      }
+      extReviews = { ...extReviews, [e.name]: r.report };
+      const n = r.report.findings.length;
+      extMsg =
+        r.report.verdict === 'blocked'
+          ? `「${e.title || e.name}」审核未通过（${n} 条问题）`
+          : `「${e.title || e.name}」审核通过${n ? `（${n} 条警告）` : ''}`;
+    } catch (err) {
+      extMsg = `审核失败: ${err.message || err}`;
+    }
+  }
   async function trustExt(e, action) {
     const key = e.trust_key;
     if (!key) return;
     const verb = action === 'pin' ? '信任' : '取消信任';
-    if (action === 'pin' && !(await confirmAsk(`信任插件「${e.title || e.name}」？\n\n将记录它当前的内容指纹，之后每次加载都比对；文件被改动后会再次要求重新信任。`))) return;
+    if (action === 'pin' && !(await confirmAsk(`信任插件「${e.title || e.name}」？\n\n会先做静态审核（manifest 合规/外联白名单/动态执行/体积），通过后才记录内容指纹；文件被改动后会再次要求重新审核并信任。`))) return;
     try {
       const r = await fetch('/api/plugins/trust', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, action }),
       }).then((r) => r.json());
-      if (r.error) extMsg = `${verb}失败: ${r.error}`;
+      if (r.error) {
+        extMsg = `${verb}失败: ${r.error}`;
+        // 审核被拒：把逐条理由摊开（红字那份在卡片里，这里给人话索引）
+        if (Array.isArray(r.review_blocked) && r.report) extReviews = { ...extReviews, [e.name]: r.report };
+        if (Array.isArray(r.review_blocked)) extMsg += `\n${r.review_blocked.join('\n')}`;
+      }
       else extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
       if (r.plugins) extList = r.plugins;
     } catch (err) {
@@ -6080,6 +6112,7 @@
                   {#if e.trusted}
                     <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
                   {:else}
+                    <button class="btn ghost" on:click={() => reviewExt(e)} title="静态审查：manifest 合规/外联白名单/动态执行/体积">审核</button>
                     <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
                   {/if}
                 {/if}
@@ -6089,6 +6122,18 @@
               {/if}
             </div>
             {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
+            {#if extReviews[e.name]}
+              {@const rv = extReviews[e.name]}
+              <div class="plug-sub" class:block={rv.verdict === 'blocked'}>
+                {rv.verdict === 'blocked' ? '✕ 审核未通过' : (rv.findings.length ? '✓ 审核通过（有警告）' : '✓ 审核通过')}
+                · 扫了 {rv.files_scanned} 个文件 / {rv.bytes_scanned} 字节{rv.digest ? ' · 指纹已绑定' : ''}
+              </div>
+              {#each rv.findings as f}
+                <div class="plug-sub" class:block={f.severity === 'blocker'}>
+                  {f.severity === 'blocker' ? '✕' : '!'} [{f.rule}] {f.file}{f.line ? ':' + f.line : ''} — {f.message}
+                </div>
+              {/each}
+            {/if}
           {/each}
         {:else if !extList.length}
           <div class="menu-empty">

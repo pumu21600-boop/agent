@@ -6,6 +6,7 @@
 
 pub mod contract;
 pub mod draft;
+pub mod review;
 pub mod trust;
 pub mod ui;
 pub mod wasm;

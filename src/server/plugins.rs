@@ -307,7 +307,11 @@ pub(super) async fn promote_draft(
 }
 
 /// POST /api/plugins/trust {key, action} —— 第三方插件验签的 pin / unpin（P21 红线3）。
-/// key 形如 `plugins:<name>` / `plugins:<name>`；pin 时按当前位置重算 digest。
+/// key 形如 `plugins:<name>`；pin 时按当前位置重算 digest。
+///
+/// **准入审核（用户 2026-10-02 拍板）**：pin 是加载的前置条件，所以 pin 前必须先过
+/// 静态审核——有 blocker 直接拒 pin（审核不过 → 装不进来 → 跑不起来）。pin 表记的是
+/// 内容指纹，天然把「放行」绑定到「审过的这一份」：内容一变 → 验签打回 → 重新走审核。
 pub(super) async fn trust_plugin(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -324,10 +328,34 @@ pub(super) async fn trust_plugin(
             let Some(path) = crate::plugin::trust::resolve(&key) else {
                 return err(format!("找不到插件 {key}（目录不存在或名字非法）"));
             };
-            let digest = match crate::plugin::trust::digest_of_path(&path) {
-                Ok(d) => d,
+            if !path.is_dir() {
+                return err(format!("{key} 不是目录形态（裸文件旧形态不支持审核，请改用插件目录）"));
+            }
+            // 准入审核：blocker 一律拒 pin；warn 放行但随响应带回亮旗
+            let report = match crate::plugin::review::review_key(&key) {
+                Ok(r) => r,
                 Err(e) => return err(e),
             };
+            if report.verdict == crate::plugin::review::Verdict::Blocked {
+                let reasons = crate::plugin::review::block_reasons(&report);
+                observability::event(
+                    EventType::State,
+                    json!({ "kind": "plugin.review_blocked", "key": key, "reasons": reasons }),
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "审核未通过，不能信任：",
+                        "review_blocked": reasons,
+                        "report": report,
+                    })),
+                );
+            }
+            observability::event(
+                EventType::State,
+                json!({ "kind": "plugin.review_passed", "key": key, "warns": report.findings.len() }),
+            );
+            let digest = report.digest.unwrap_or_default();
             s.trusted_plugins.insert(key.clone(), digest.clone());
             crate::plugin::trust::audit_pinned(&key, &digest, "user");
         }
@@ -350,6 +378,19 @@ pub(super) async fn trust_plugin(
     let disabled = s.disabled_plugins.clone();
     let list = crate::plugin::ui::scan_all(&disabled);
     (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
+}
+
+/// POST /api/plugins/review {key} —— 只审不信（界面「审核」按钮用）：跑静态审查，
+/// 返回完整报告（结论 + 逐条发现）。不落任何状态——放行只在 pin 时发生一次。
+pub(super) async fn review_plugin(Json(req): Json<Value>) -> (StatusCode, Json<Value>) {
+    let key = req.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if key.is_empty() || !key.contains(':') {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 plugins:<name>）" })));
+    }
+    match crate::plugin::review::review_key(&key) {
+        Ok(report) => (StatusCode::OK, Json(json!({ "ok": true, "report": report }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    }
 }
 
 /// DELETE /api/plugins/draft?name= —— 丢弃 draft（内存即清，WASM 注册表同步回收）。
