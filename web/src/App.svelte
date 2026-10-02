@@ -3680,6 +3680,41 @@
   // 激活标签掉出可见集合（插件被停用/标签被关）→ 退回第一个可见标签
   $: if (rpVisibleTabs.length && !rpVisibleTabs.some((t) => t.key === rpTab)) rpTab = rpVisibleTabs[0].key;
   $: if (!rpVisibleTabs.length && rpTab) rpTab = '';
+  // —— 标签条溢出滑杆（用户 2026-10-03：分隔线中间加根很细的，别占布局顶起标签）——
+  // 原生滚动条藏掉（占布局），自绘一根压在下边框线上；没溢出不出杆
+  let rpStripEl = null;
+  let rpStripBar = null; // { track, w, x } px；null = 没溢出
+  function rpStripSync() {
+    const el = rpStripEl;
+    if (!el || el.scrollWidth <= el.clientWidth + 1) {
+      if (rpStripBar) rpStripBar = null;
+      return;
+    }
+    const track = el.clientWidth;
+    const w = Math.max(24, Math.round((track * track) / el.scrollWidth));
+    const x = Math.round(((track - w) * el.scrollLeft) / (el.scrollWidth - track));
+    rpStripBar = { track, w, x };
+  }
+  afterUpdate(rpStripSync); // 标签增删/面板拖宽都会触发组件更新，顺带重算；拖动中由 on:scroll 补
+  let rpStripDrag = null; // { x0, s0 } 按下时指针 x 与 scrollLeft
+  function rpStripDown(e) {
+    const el = rpStripEl;
+    if (!el || !rpStripBar) return;
+    const r = el.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - r.left - rpStripBar.w / 2) / (rpStripBar.track - rpStripBar.w)));
+    el.scrollLeft = ratio * (el.scrollWidth - rpStripBar.track);
+    rpStripDrag = { x0: e.clientX, s0: el.scrollLeft };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function rpStripMove(e) {
+    const el = rpStripEl;
+    if (!el || !rpStripDrag || !rpStripBar) return;
+    const span = Math.max(1, rpStripBar.track - rpStripBar.w);
+    el.scrollLeft = rpStripDrag.s0 + ((e.clientX - rpStripDrag.x0) * (el.scrollWidth - el.clientWidth)) / span;
+  }
+  function rpStripUp() {
+    rpStripDrag = null;
+  }
   // 面板打开时待投递的插槽事件（iframe 还没 load 完就先排队）
   let extPendingMsgs = [];
 
@@ -5175,7 +5210,7 @@
       <div class="rp-resize" title="拖拽调整宽度" on:mousedown={startRpResize}></div>
       <div class="rp-tabs">
         <!-- 标签条可横向滚动（标签多了不挤爆），+ 号固定在条外不被滚走 -->
-        <div class="rp-tabstrip">
+        <div class="rp-tabstrip" bind:this={rpStripEl} on:scroll={rpStripSync}>
           {#each rpVisibleTabs as t (t.key)}
             <button
               class="rp-tab"
@@ -5192,6 +5227,19 @@
             </button>
           {/each}
         </div>
+        {#if rpStripBar}
+          <!-- 溢出滑杆：压在 .rp-tabs 下边框线上，不占布局（用户拍板「就在那条线中间加很细的」） -->
+          <i
+            class="rp-strip-track"
+            style="width:{rpStripBar.track}px"
+            on:pointerdown={rpStripDown}
+            on:pointermove={rpStripMove}
+            on:pointerup={rpStripUp}
+            on:pointercancel={rpStripUp}
+          >
+            <i class="rp-strip-thumb" style="width:{rpStripBar.w}px; transform:translateX({rpStripBar.x}px)"></i>
+          </i>
+        {/if}
         <span class="rp-add-wrap">
           <button class="rp-add" title="添加标签页" on:click|stopPropagation={() => (rpAddOpen = !rpAddOpen)}>+</button>
           {#if rpAddOpen}
@@ -7247,6 +7295,7 @@
     gap: 4px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--g3);
+    position: relative; /* 溢出滑杆的锚点 */
   }
   /* P17：常驻后台的扩展 iframe（扩展间通信要用；不显示但保持运行） */
   .ext-hidden {
@@ -7574,20 +7623,29 @@
     min-width: 0;
     flex: 0 1 auto; /* 条随内容收缩，+ 号贴着最后一个标签；标签多了内部横向滚动 */
     overflow-x: auto;
+    scrollbar-width: none; /* 原生滚动条藏掉：它占布局会把标签顶起来；溢出指示用自绘滑杆压在边框线上 */
   }
-  /* 标签挤出去时，这行下缘出现一根小滑杆（用户 2026-10-03）；没挤出时原生滚动条不渲染不占位 */
   .rp-tabstrip::-webkit-scrollbar {
-    height: 4px;
+    display: none;
   }
-  .rp-tabstrip::-webkit-scrollbar-track {
-    background: transparent;
+  /* 自绘滑杆（用户 2026-10-03：就在分隔线中间加根很细的，别把标签顶上去）：2px 视觉细条骑在 1px 下边框上，7px 命中区 */
+  .rp-strip-track {
+    position: absolute;
+    left: 10px; /* 对齐 .rp-tabs 左 padding；宽度由测量写入 */
+    bottom: -3px;
+    height: 7px;
+    z-index: 2;
+    cursor: pointer;
   }
-  .rp-tabstrip::-webkit-scrollbar-thumb {
+  .rp-strip-thumb {
+    display: block;
+    height: 2px;
+    margin-top: 2.5px;
+    border-radius: 1px;
     background: var(--g4);
-    border-radius: 2px;
   }
-  .rp-tabstrip:hover::-webkit-scrollbar-thumb {
-    background: var(--g5);
+  .rp-strip-track:hover .rp-strip-thumb {
+    background: var(--g6);
   }
   .rp-tab {
     display: inline-flex !important;
