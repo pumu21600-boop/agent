@@ -17,6 +17,7 @@
   import MemoryTab from './lib/MemoryTab.svelte';
   import SkillsTab from './lib/SkillsTab.svelte';
   import McpTab from './lib/McpTab.svelte';
+  import ReviewModal from './lib/ReviewModal.svelte';
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
   import { parseCssColor, rgbToHex, rgbAlpha, hexWithAlpha, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
@@ -3676,6 +3677,7 @@
       const r = await fetch('/api/plugins', { cache: 'no-store' }).then((r) => r.json());
       extList = r.plugins || [];
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
+      autoReviewThirdParty();
     } catch (e) {
       extList = [];
       extMsg = `读取插件失败: ${e.message || e}`;
@@ -3817,29 +3819,62 @@
   // P21 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
   // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查，blocker 后端直接拒；审核报告按插件名缓存
   let extReviews = {}; // name -> report（{verdict, findings, files_scanned, bytes_scanned}）
-  async function reviewExt(e) {
+  let reviewModal = null; // 打开中的审查报告：{ ext, report }（用户要「可视化界面，还要简洁」）
+  let reviewBusy = false;
+  // 拉一份报告并缓存；open=true 时同步弹开报告弹窗（按钮/自动预审共用）
+  async function fetchReview(e) {
+    const r = await fetch('/api/plugins/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: e.trust_key }),
+    }).then((r) => r.json());
+    if (r.error) {
+      extMsg = `审核失败: ${r.error}`;
+      return null;
+    }
+    extReviews = { ...extReviews, [e.name]: r.report };
+    return r.report;
+  }
+  async function reviewExt(e, open = true) {
     if (!e.trust_key) {
       extMsg = `「${e.title || e.name}」没有验签键（内置/draft 不审）`;
       return;
     }
     try {
-      const r = await fetch('/api/plugins/review', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: e.trust_key }),
-      }).then((r) => r.json());
-      if (r.error) {
-        extMsg = `审核失败: ${r.error}`;
-        return;
+      const report = await fetchReview(e);
+      if (!report) return;
+      // 弹窗前从最新清单里取一份（trust 改的是 extList，缓存的那份 trusted 态可能过期）
+      const fresh = extList.find((x) => x.name === e.name) || e;
+      if (open) {
+        reviewModal = { ext: fresh, report };
+      } else {
+        const n = report.findings.length;
+        extMsg =
+          report.verdict === 'blocked'
+            ? `「${fresh.title || fresh.name}」审核未通过（${n} 条问题）`
+            : `「${fresh.title || fresh.name}」审核通过${n ? `（${n} 条警告）` : ''}`;
       }
-      extReviews = { ...extReviews, [e.name]: r.report };
-      const n = r.report.findings.length;
-      extMsg =
-        r.report.verdict === 'blocked'
-          ? `「${e.title || e.name}」审核未通过（${n} 条问题）`
-          : `「${e.title || e.name}」审核通过${n ? `（${n} 条警告）` : ''}`;
     } catch (err) {
       extMsg = `审核失败: ${err.message || err}`;
+    }
+  }
+  // 行内状态 chip：未审过 →「未审核」（点了就审）；审过 → 结论 chip（点了看报告）
+  function reviewChip(e) {
+    const rv = extReviews[e.name];
+    if (!rv) return { text: '未审核', cls: 'warn', tip: '点一下跑静态审查（清单/外联/动态执行/体积）' };
+    if (rv.verdict === 'blocked') return { text: `审核未通过 ${rv.findings.length}`, cls: 'warn', tip: '有阻断项：点开看报告' };
+    return { text: rv.findings.length ? `审核通过 · ${rv.findings.length} 警告` : '审核通过', cls: '', tip: '点开看审查报告' };
+  }
+  // 自动预审：清单到手后，把还没验签的第三方插件都静默审一遍——审查状态进得来就看见，
+  // 不用逐个点「审核」（本地静态扫描，无外呼）。失败不打扰，留「未审核」chip 让人手动点。
+  async function autoReviewThirdParty() {
+    const pending = extList.filter((e) => e.origin === 'user' && !e.trusted && e.trust_key && !extReviews[e.name]);
+    for (const e of pending) {
+      try {
+        await reviewExt(e, false);
+      } catch {
+        /* 单个失败不打断其余 */
+      }
     }
   }
   async function trustExt(e, action) {
@@ -3855,11 +3890,16 @@
       }).then((r) => r.json());
       if (r.error) {
         extMsg = `${verb}失败: ${r.error}`;
-        // 审核被拒：把逐条理由摊开（红字那份在卡片里，这里给人话索引）
-        if (Array.isArray(r.review_blocked) && r.report) extReviews = { ...extReviews, [e.name]: r.report };
-        if (Array.isArray(r.review_blocked)) extMsg += `\n${r.review_blocked.join('\n')}`;
+        // 审核被拒：直接把完整报告弹开（人话索引留在 extMsg，逐条理由看弹窗）
+        if (Array.isArray(r.review_blocked) && r.report) {
+          extReviews = { ...extReviews, [e.name]: r.report };
+          reviewModal = { ext: e, report: r.report };
+        }
       }
-      else extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
+      else {
+        extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
+        if (action === 'pin') reviewModal = null;
+      }
       if (r.plugins) extList = r.plugins;
     } catch (err) {
       extMsg = `${verb}失败: ${err.message || err}`;
@@ -6118,7 +6158,10 @@
               </div>
               {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
               {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
-              {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
+              {#if e.origin === 'user' && !e.trusted}
+                <button class="plug-chip warn btnish" title={reviewChip(e).tip} on:click={() => (extReviews[e.name] ? (reviewModal = { ext: e, report: extReviews[e.name] }) : reviewExt(e))}>{reviewChip(e).text}</button>
+              {/if}
+              {#if e.origin === 'user' && e.trusted}<span class="plug-chip" title="已记录内容指纹：文件被改动后会要求重新审核">已验签</span>{/if}
               {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
               {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
               <span class="flex-sp"></span>
@@ -6140,18 +6183,6 @@
               {/if}
             </div>
             {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
-            {#if extReviews[e.name]}
-              {@const rv = extReviews[e.name]}
-              <div class="plug-sub" class:block={rv.verdict === 'blocked'}>
-                {rv.verdict === 'blocked' ? '✕ 审核未通过' : (rv.findings.length ? '✓ 审核通过（有警告）' : '✓ 审核通过')}
-                · 扫了 {rv.files_scanned} 个文件 / {rv.bytes_scanned} 字节{rv.digest ? ' · 指纹已绑定' : ''}
-              </div>
-              {#each rv.findings as f}
-                <div class="plug-sub" class:block={f.severity === 'blocker'}>
-                  {f.severity === 'blocker' ? '✕' : '!'} [{f.rule}] {f.file}{f.line ? ':' + f.line : ''} — {f.message}
-                </div>
-              {/each}
-            {/if}
           {/each}
         {:else if !extList.length}
           <div class="menu-empty">
@@ -6234,6 +6265,30 @@
     const resolve = confirmModal && confirmModal.resolve;
     confirmModal = null;
     if (resolve) resolve(e.detail);
+  }}
+/>
+
+<!-- 插件审查报告（准入审核关的可视化界面）：只审不信的预审、信任被拒的逐条理由都弹它 -->
+<ReviewModal
+  ext={reviewModal?.ext ?? null}
+  report={reviewModal?.report ?? null}
+  busy={reviewBusy}
+  on:close={() => (reviewModal = null)}
+  on:review={async () => {
+    if (!reviewModal || reviewBusy) return;
+    reviewBusy = true;
+    try {
+      const r = await fetchReview(reviewModal.ext);
+      if (r) reviewModal = { ext: extList.find((x) => x.name === reviewModal.ext.name) || reviewModal.ext, report: r };
+    } finally {
+      reviewBusy = false;
+    }
+  }}
+  on:trust={async () => {
+    if (!reviewModal) return;
+    const target = reviewModal.ext;
+    reviewModal = null;
+    await trustExt(target, 'pin');
   }}
 />
 

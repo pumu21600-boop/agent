@@ -306,6 +306,17 @@ select option:checked {
   border-color: currentColor;
   border-style: solid;
 }
+/* chip 当按钮用（审查状态行内点开）：按钮默认样式清掉，其余沿用 plug-chip */
+button.plug-chip {
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: center;
+}
+button.plug-chip:hover {
+  border-color: var(--g6);
+  color: var(--g7);
+}
 .plug-sub {
   font-size: 12px;
   color: var(--tint-orange-fg);
