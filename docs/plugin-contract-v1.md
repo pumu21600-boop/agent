@@ -42,9 +42,9 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | apiVersion | 否 | 缺失按 v1 读入（老目录自动迁移）；写了但不等于 1 → **拒载并提示升级**，不做 shim |
 | source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；**未声明按位置默认：只有应用根 `ui-ext/` 默认 built_in，其余位置（工作区 ui-ext、plugins/ 自装位）一律默认 user**（P21：不声明不能成为绕过第三方验签的后门） |
 | title / description / version | 否 | 展示元数据；目录形态工具插件未写时用目录名 |
-| entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写 |
+| entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写。dock/toolbar 面板插件的 entry 不再在设置→插件卡上给「打开」按钮（面板归侧边栏，用户 2026-10-03 拍板） |
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
-| settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它 |
+| settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它。dock 面板插件不给「设置」按钮——设置从侧边栏面板内进（如用量的价格表在面板里有入口） |
 | ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量」插件） |
 | permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）；**未声明的一律拒绝** |
 | skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件或未过信任门的 user 插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
@@ -170,7 +170,7 @@ timeout_ms = 5000
 | --- | --- | --- |
 | trace 时间线 | 纯面板（entry + 只读桥） | 现有字段**够用**；P19 拆 App.svelte 时把 trace 面板拆成独立组件顺势插件化 |
 | web_search | 纯工具 | 现有字段**够用**：以目录形态落 plugins/（或内置注册表直挂）即可，无需新契约字段 |
-| 用量台账（P21 插件化） | dock 面板 + 插件自带设置页 | **要加两口**：`ui` 插槽新值 `dock`（右侧面板页签）+ manifest `settings_entry`（插件设置页，宿主在插件卡上渲染「设置」按钮）；数据走新增桥 `usage.session` / `usage.prices`（写要 `usage.prices` 权限）。内核（台账/计价/硬闸）不插件化 |
+| 用量台账（P21 插件化） | dock 面板 + 插件自带设置页 | **要加两口**：`ui` 插槽新值 `dock`（右侧面板页签）+ manifest `settings_entry`（插件设置页，宿主在插件卡上渲染「设置」按钮；2026-10-03 起 dock 插件不再给「设置」按钮，价格表从侧边栏用量面板进）；数据走新增桥 `usage.session` / `usage.prices`（写要 `usage.prices` 权限）。内核（台账/计价/硬闸）不插件化 |
 
 试点的意义：自己吃自己的狗粮——内置功能装得进插件壳，契约就够结实；装不进就说明契约
 有缺陷，开源前赶紧改。**执法者（审批门 / 存储 / 并发控制）永不插件化**（裁判不下场）。

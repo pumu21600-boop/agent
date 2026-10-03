@@ -306,6 +306,11 @@ select option:checked {
   border-color: currentColor;
   border-style: solid;
 }
+.plug-chip.ok {
+  color: var(--tint-green-fg);
+  border-color: currentColor;
+  border-style: solid;
+}
 /* chip 当按钮用（审查状态行内点开）：按钮默认样式清掉，其余沿用 plug-chip */
 button.plug-chip {
   background: none;

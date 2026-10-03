@@ -3524,8 +3524,10 @@
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
   let gitRuntime = null;
-  // 021：沙箱自检（真拉起受限进程跑探针套件）——结果由沙箱插件的 action.run 桥拉走
+  // 021：沙箱自检（真拉起受限进程跑探针套件）——结果由沙箱插件的 action.run 桥拉走；
+  // 插件页沙箱行的「检测」按钮也走这里（插件页不再给沙箱面板，用户 2026-10-03）
   let sandboxProbe = null;
+  let sandboxProbeBusy = false;
   // 021：应用版本（侧栏「关于」行）
   let appVersion = null;
   async function loadVersion() {
@@ -3536,11 +3538,13 @@
     }
   }
   async function runSandboxProbe() {
+    sandboxProbeBusy = true;
     try {
       sandboxProbe = await fetch('/api/sandbox/selftest', { cache: 'no-store' }).then((r) => r.json());
     } catch (e) {
       sandboxProbe = { error: String(e.message || e) };
     }
+    sandboxProbeBusy = false;
   }
   async function loadGitRuntime() {
     try {
@@ -3778,6 +3782,14 @@
     if (e.permissions?.length) parts.push(`权限: ${e.permissions.join('、')}`);
     if (e.ui?.length) parts.push(`界面: ${e.ui.map((u) => u.slot).join('、')}`);
     return parts.join('\n');
+  }
+  // dock/toolbar 面板插件（时间线/项目文件/用量 + 其余面板插件）：插件页不再给「打开/设置」
+  // 入口——面板归侧边栏，不在这重复给一份界面（用户 2026-10-03 拍板）
+  function isDockExt(e) {
+    return (e.ui || []).some((u) => u.slot === 'dock' || u.slot === 'toolbar');
+  }
+  function sandboxProbeTip(p) {
+    return (p.results || []).map((r) => `${r.ok ? '✓' : '✗'} ${r.name}${r.detail ? '：' + r.detail : ''}`).join('\n');
   }
 
   async function toggleExt(e) {
@@ -6116,8 +6128,19 @@
                   <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
                 {/if}
               {/if}
-              {#if e.settings_entry}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-              {#if e.entry}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+              {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
+              {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+              {#if e.name === 'sandbox-panel'}
+                <!-- 用户 2026-10-03：沙箱不给界面了，行上就一个「检测」——真拉受限进程跑探针，结果落在本行 chip -->
+                <button class="btn ghost" disabled={sandboxProbeBusy || !e.ok || e.enabled === false} on:click={runSandboxProbe} title="真拉起受限进程跑探针套件">{sandboxProbeBusy ? '检测中…' : '检测'}</button>
+                {#if sandboxProbe}
+                  {#if sandboxProbe.error}
+                    <span class="plug-chip warn" title={sandboxProbe.error}>检测失败</span>
+                  {:else}
+                    <span class="plug-chip" class:ok={sandboxProbe.ok} class:warn={!sandboxProbe.ok} title={sandboxProbeTip(sandboxProbe)}>{sandboxProbe.ok ? '通过' : '有失败'}</span>
+                  {/if}
+                {/if}
+              {/if}
               <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
             {/if}
           </div>
@@ -6156,8 +6179,8 @@
                     <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
                   {/if}
                 {/if}
-                {#if e.settings_entry}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-                {#if e.entry}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+                {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
+                {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
                 <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
               {/if}
             </div>
