@@ -3693,6 +3693,8 @@
           theme: themeMode,
           tabs_open: rpTabs.length,
           active_tab: rpTab || '',
+          // 用户手写 CSS（agent inject_css 前先读，才能做保留式追加）
+          custom_css: customCss,
           seq,
         }),
       });
@@ -3784,6 +3786,13 @@
         }
       } else if (m.kind === 'close_tab') {
         if (m.key) closeRpTab(m.key);
+      } else if (m.kind === 'css_inject') {
+        // agent 的 ui inject_css：与用户粘进 CSS 注入框同一条路（applyCustomCss 里
+        // 有 escalate/转义与 localStorage 落盘；css-ui 插件只是编辑器，应用端在宿主）
+        if (typeof m.css === 'string') {
+          customCss = m.append ? `${customCss}\n${m.css}` : m.css;
+          applyCustomCss();
+        }
       }
     };
   } catch {}

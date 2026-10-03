@@ -170,8 +170,34 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             crate::server::ui_events::emit(json!({ "kind": "open_memory" }));
             Ok("已打开记忆库（星云视图）".into())
         }
+        // CSS 注入：和用户在设置页「CSS 注入框」粘贴完全同一条路（同转义/同落盘，
+        // 不依赖 css-ui 插件开没开——注入框只是编辑器，应用端在宿主）。append=true 追加
+        // 在原有规则后；默认覆盖。要保留原有规则先 method=state 读 custom_css。
+        "inject_css" => {
+            super::selfmod_gate()?;
+            let css = v.get("css").and_then(|x| x.as_str()).unwrap_or("");
+            let append = v.get("append").and_then(|x| x.as_bool()).unwrap_or(false);
+            let clear = v.get("clear").and_then(|x| x.as_bool()).unwrap_or(false);
+            // 空 css 一律拒（真机实锤：模型只传 method 不传 css，工具不能把「什么都没说」
+            // 当覆盖成功照单全收——那是又一种假完成）。要清空走显式 clear=true。
+            if !clear && css.trim().is_empty() {
+                return Err("缺少 css（要注入的 CSS 内容；要清空手写规则请显式传 clear=true）".into());
+            }
+            if clear && append {
+                return Err("clear=true 时不能同时 append=true".into());
+            }
+            let css = if clear { "" } else { css };
+            crate::server::ui_events::emit(json!({ "kind": "css_inject", "css": css, "append": append }));
+            if clear {
+                Ok("已清空用户手写 CSS（微调规则不受影响）".into())
+            } else if append {
+                Ok("已在用户 CSS 末尾追加这段规则并即时生效（重开也在）".into())
+            } else {
+                Ok("已按注入框同款路径写入这段 CSS 并即时生效（覆盖原有手写规则；重开也在）".into())
+            }
+        }
         other => Err(format!(
-            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar / open_terminal / close_terminal / open_settings / close_settings / set_theme / open_tab / close_tab / state；会话管理用 session 工具）"
+            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar / open_terminal / close_terminal / open_settings / close_settings / set_theme / open_tab / close_tab / state / inject_css；会话管理用 session 工具）"
         )),
     }
 }
