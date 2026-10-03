@@ -139,9 +139,36 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
         }
     };
     format!(
-        "{prompt}{agents_md}{workspace_hint}{project_brief}{}{}",
+        "{prompt}{agents_md}{workspace_hint}{project_brief}{}{}{}",
         crate::skills::index_prompt(),
-        crate::plugin::ui::index_prompt()
+        crate::plugin::ui::index_prompt(),
+        selfop_policy(state),
+    )
+}
+
+/// 自我管理与探索纪律（2026-10-03 用户拍板，与 core/rules 的红线/闸门同一套语义）：
+/// 真机实锤过翻车——用户关着「自改」插件让改审批档位，agent 不知道这属于自身修改、
+/// 更不知道审批档位根本没有它的通道，于是 dir/findstr 翻十六步撞上限被砍。这块就堵
+/// 这个：先认领请求类型，再查闸/认红线，没有合法通道就直接说，不许自己造路绕。
+fn selfop_policy(state: &AppState) -> String {
+    let self_on = state.settings.read().map(|s| s.features.self_mod).unwrap_or(false);
+    format!(
+        "\n\n## 自我管理与探索纪律\n\
+        - 改自身（设置/渠道/插件技能启停/定时任务/会话/侧栏面板/边栏/主题/终端/设置弹窗）\
+         由「自改」插件管着：它现在{state}。没开时只回一句引导（去 设置→插件 打开「自改」），\
+         不要翻文件系统找替代路径、不要试绕；开了才动手，红线照旧先问。\n\
+        - 红线（agent 没有任何通道可改，说了也做不到）：审批档位（read-only/sandbox/auto/\
+         full-access——用户手动在输入框上方的档位菜单里切）、花费上限与价格表、脱沙箱\
+         总开关、API key。用户让你改这些，直接告诉他去哪弄，别翻 config.toml、别用 shell 试。\n\
+        - 探索纪律：翻目录/search 找东西，同一目标两三次找不到就停下来汇报已知情况，\
+         禁止反复 dir/findstr 扫全盘；本环境没有的能力直接说没有，列用户可走的路。\n\
+        - 步数：本轮没有步数上限（用户拍的），失控有取消键/重复调用保护/花费硬闸管着；\
+         长任务按「做实事」分批推进，别把一步拆成十步、别为验证已确认的事反复调工具。\n",
+        state = if self_on {
+            "【开着】——按当前审批档位正常放行"
+        } else {
+            "【关着】——任何改自身动作先一句引导用户去开，不许绕路"
+        },
     )
 }
 

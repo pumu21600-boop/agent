@@ -2712,7 +2712,7 @@
                 if (skey === curKey()) apiTotals = api;
               } else if (d.step_limit) {
                 patch(endTurn);
-                pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，循环终止` });
+                pushMsg(skey, { id: nextId(), role: 'error', content: `已达步数上限 ${d.step_limit}，本轮先停在这（进度都在，重启不丢）——回复「继续」我会接着跑；想一次跑完更多，去 config.toml 把 max_steps 调大或设 0（不限）` });
               } else if (d.error) {
                 patch(endTurn);
                 pushMsg(skey, { id: nextId(), role: 'error', content: d.error });

@@ -171,7 +171,8 @@ impl Default for RecoveryConfig {
 /// 核心循环参数（施工单 003 / 005）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// 单次任务最大循环步数（防失控）
+    /// 单次任务模型决策步数上限（0 = 不限：2026-10-03 用户拍板，大项目 100+ 次工具
+    /// 调用是常态；失控由取消标志/相同调用护栏/花费硬闸管，不由步数砍任务）
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
     /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
@@ -319,9 +320,9 @@ fn default_log_max_mb() -> u64 {
     20
 }
 fn default_max_steps() -> u32 {
-    // 16：8 步在「读文件 → 改文件 → 跑测试 → 修 → 再跑」这类真实工程任务上会撞顶中断
-    // （施工单 022 采纳审查建议上调；config.toml 里显式值优先）
-    16
+    // 0 = 不限（2026-10-03 用户拍板：大项目 100+ 次工具调用是常态；失控由取消标志/
+    // 相同调用护栏/花费硬闸三道缰绳管，不由步数把长任务拦腰砍断）
+    0
 }
 fn default_tool_result_max_chars() -> usize {
     8000

@@ -1,7 +1,8 @@
 //! 核心循环 v1（施工单 003）
 //!
 //! 任务消息 → 模型（带 tools）→ 若返回 tool_calls 则执行回填继续；纯文本则终止。
-//! 硬约束：步数上限（cfg.max_steps）；每步开始与每个流式分片前查取消标志。
+//! 步数上限 cfg.max_steps：0 = 不限（2026-10-03 用户拍板）；失控由取消标志/相同调用
+//! 护栏/花费硬闸三道缰绳管。每步开始与每个流式分片前查取消标志。
 //! thought / tool_call / tool_result 全量落 JSONL；on_event 把结构化事件转给前端。
 
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -416,7 +417,13 @@ pub async fn run_task(
     // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
     let mut prev_all_failed = false;
 
-    for step in 0..cfg.max_steps {
+    // 步数上限：0 = 不限（2026-10-03 用户拍板——大项目 100+ 次工具调用是常态，步数
+    // 上限本只该防死循环，而防死循环有取消标志/相同调用护栏/花费硬闸三道缰绳，不该由它
+    // 把长任务拦腰砍断）。非 0 时是硬上限：撞顶即止并抛 StepLimit（前端提示可回「继续」）。
+    for step in 0usize.. {
+        if cfg.max_steps > 0 && step >= cfg.max_steps as usize {
+            break; // 撞上限：收尾事件在循环外发（能走到这只可能是撞顶——自然完成早已 return）
+        }
         // 每轮模型决策前查取消标志（核心循环刚性检查点）
         if cancel.is_set() {
             observability::event(EventType::State, json!({ "kind": "cancel", "phase": "loop", "step": step }));
@@ -535,7 +542,7 @@ pub async fn run_task(
             tools_def.as_ref(),
             cancel,
             &usage_ctx,
-            step,
+            step as u32,
             &on_event,
         )
         .await;
