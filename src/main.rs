@@ -152,7 +152,12 @@ async fn main() -> anyhow::Result<()> {
         gateway,
         cancel,
         steer,
-        settings: Arc::new(std::sync::RwLock::new(user_settings)),
+        settings: {
+            // 2026-10-03 agent 自改设置轮：与 settings 工具共用同一份 Arc（工具层不持 AppState）
+            let shared = Arc::new(std::sync::RwLock::new(user_settings));
+            config::settings::install_shared_settings(shared.clone());
+            shared
+        },
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),
         context_cfg: Arc::new(config.context),

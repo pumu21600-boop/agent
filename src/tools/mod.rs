@@ -17,6 +17,7 @@ use crate::config::SandboxConfig;
 mod fs;
 mod git;
 mod search;
+mod settings;
 mod shell;
 mod web;
 
@@ -266,6 +267,19 @@ fn builtin_tools() -> Vec<ToolSpec> {
             }),
             danger_level: 1,
         },
+        ToolSpec {
+            name: "settings",
+            description: "读取或修改本应用自身的运行时设置（settings.json）。action=get 返回全部可改设置快照（API key 只给尾号提示）；action=set 携带 patch 只列要改的键，改完保存并即时生效，无需重启。普通键：thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles（角色路由）、features（功能开关）、sandbox_cpu_percent、mcp_servers（整表替换，先 get 再改；新 server 或改配置会回到「未确认」等用户确认）、disabled_plugins/disabled_skills（整表替换）、schedules（整表替换，新增 id 留空）。红线键：base_url/model/provider_id/active_config_id（渠道指向 = 换自己的大脑）——每次都会弹卡等用户确认，任何审批档位都不静默，改 base_url 会清空模型与模型列表。范围外：api_key/工作区/价格表/信任插件（本工具不收）；config.toml 里的花费上限/审批默认档/钩子等要改文件且需重启（同样属红线必问）。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["get", "set"], "description": "get=读当前设置快照；set=按 patch 合并写入" },
+                    "patch": { "type": "object", "description": "set 时必填：要改的键与新值（只列要改的键；未知键会报错；mcp_servers/schedules/disabled_* 为整表替换，务必先 get 拿现状再改）" }
+                },
+                "required": ["action"]
+            }),
+            danger_level: 0,
+        },
     ]
 }
 
@@ -335,6 +349,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         // Chromium 自带站点隔离即边界，不进 Windows 沙箱；审批门按 method 分级
         // （只读 Safe / 页面操作 Normal，见 core/rules.rs）。
         "browser" => crate::browser::command(args, cfg.max_chars).await,
+        // 2026-10-03 agent 自改设置：读/改 settings.json（分级与红线见 core/rules.rs）
+        "settings" => settings::run(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }

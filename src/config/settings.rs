@@ -399,6 +399,21 @@ pub struct Settings {
     pub key_cipher: Option<String>,
 }
 
+/// 进程级共享句柄：`AppState.settings` 与 agent 的 settings 工具用**同一个 Arc**，
+/// 两边看到并写的是同一份状态（工具层不持 AppState，经此取；main 启动时装一次）。
+static SHARED_SETTINGS: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Settings>>> =
+    std::sync::OnceLock::new();
+
+/// main 启动时安装共享句柄（传入的 Arc 必须与 `AppState.settings` 同源）。
+pub fn install_shared_settings(handle: std::sync::Arc<std::sync::RwLock<Settings>>) {
+    let _ = SHARED_SETTINGS.set(handle);
+}
+
+/// 取共享设置句柄；未安装（测试/极早调用）返回 None。
+pub(crate) fn shared_settings() -> Option<std::sync::Arc<std::sync::RwLock<Settings>>> {
+    SHARED_SETTINGS.get().cloned()
+}
+
 
 /// MCP OAuth 配置（P24，形状对齐 ZCode McpOAuthConfig）：
 /// authorization_code=浏览器授权码流程（远程托管 MCP 服务登录）；

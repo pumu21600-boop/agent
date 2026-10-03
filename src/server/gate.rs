@@ -70,6 +70,12 @@ impl agent::ApprovalGate for ChatGate {
         let mode = self.effective_mode();
         let ws = crate::tools::workspace_root();
         let val: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
+        // 红线（2026-10-03 agent 自改设置轮）：任何档位（含完全访问全免审）必问——
+        // 换渠道指向 = 换大脑；直写 settings.json/config.toml 等应用自身配置 =
+        // 动 key、动花费上限、动审批默认档。红线凌驾于档位之上。
+        if crate::core::rules::red_line_hold(tool, &val, &ws) {
+            return true;
+        }
         let (risk, _reason) = crate::core::rules::evaluate_risk(tool, &val, &ws);
         if (mode == "full-access" || mode == "local") && self.unsandboxed_approval {
             return risk >= crate::core::rules::RiskLevel::Dangerous;
@@ -120,6 +126,14 @@ impl agent::ApprovalGate for ChatGate {
                 "沙箱档只允许在沙箱内执行，不修改工作区和电脑上的任何文件（要写文件请切「自动」或「完全访问」档）"
                     .into(),
             )
+        } else if tool == "settings"
+            && serde_json::from_str::<Value>(args_json)
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s.to_string()))
+                .as_deref()
+                == Some("set")
+        {
+            Some("沙箱档不修改应用设置（只可读取；要改设置请切「自动」或「完全访问」档）".into())
         } else {
             None
         }
@@ -355,6 +369,56 @@ mod tests {
         let r = gate("sess-r", "read-only");
         assert!(r.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_none());
         assert!(!r.file_tools_unconfined());
+    }
+
+    /// 2026-10-03 agent 自改设置轮：红线凌驾于档位——完全访问档下 settings 红线键
+    /// 与应用配置文件直写仍必问；普通键照旧免审；sandbox 档 settings set 硬拦。
+    #[test]
+    fn red_line_asks_even_in_full_access() {
+        let def = Arc::new(std::sync::RwLock::new("auto".to_string()));
+        let modes = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let gate = |sid: &str, tier: &str| {
+            modes
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sid.to_string(), tier.to_string());
+            ChatGate {
+                mode: def.clone(),
+                session_modes: modes.clone(),
+                allow_unsandboxed: true,
+                unsandboxed_approval: false,
+                pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                session_id: sid.to_string(),
+                meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                approved: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                plan_mode: false,
+                tx: tx.clone(),
+                cancel: Arc::new(CancelFlag::new()),
+                steer: Arc::new(crate::core::steer::SteerQueue::new()),
+            }
+        };
+        // 完全访问档：红线键与应用配置文件直写仍必问；普通键免审
+        let f = gate("sess-f", "full-access");
+        assert!(
+            f.needs_approval_for("settings", r#"{"action":"set","patch":{"base_url":"https://x/v1"}}"#),
+            "完全访问档下渠道指向仍属红线必问"
+        );
+        assert!(
+            f.needs_approval_for("write_file", r#"{"path":"config.toml","content":"x"}"#),
+            "完全访问档下直写 config.toml 仍必问（花费上限/审批默认档在里面）"
+        );
+        assert!(!f.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
+        assert!(!f.needs_approval_for("settings", r#"{"action":"get"}"#));
+        assert!(!f.needs_approval_for("write_file", r#"{"path":"src/main.rs","content":"x"}"#));
+        // auto 档：红线走 Dangerous 必问
+        let a = gate("sess-a", "auto");
+        assert!(a.needs_approval_for("settings", r#"{"action":"set","patch":{"model":"glm-5.3-flash"}}"#));
+        assert!(!a.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
+        // sandbox 档：set 档位硬拦（不进审批弹窗），get 放行
+        let s = gate("sess-s", "sandbox");
+        assert!(s.tier_block_reason("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#).is_some());
+        assert!(s.tier_block_reason("settings", r#"{"action":"get"}"#).is_none());
     }
 
 }

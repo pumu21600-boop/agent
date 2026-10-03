@@ -52,7 +52,7 @@ mod headless;
 pub(crate) mod memory;
 mod schedule;
 mod sessions;
-mod settings;
+pub(crate) mod settings; // settings 工具（tools/settings.rs）复用 apply_settings_update / sync_runtime
 mod subagent;
 mod system;
 mod usage;

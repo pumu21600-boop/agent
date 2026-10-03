@@ -104,9 +104,10 @@ pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     Json(v)
 }
 
-/// 把 SettingsUpdate 应用到当前激活配置（put_settings 的主体逻辑，独立成纯函数便于单测）。
+/// 把 SettingsUpdate 应用到当前激活配置（put_settings 的主体逻辑，独立成纯函数便于单测；
+/// pub(crate)：agent 的 settings 工具复用同一套字段语义，见 tools/settings.rs）。
 /// 返回 (url_changed, provider_id, effective_model)。
-fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, String, String) {
+pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (bool, String, String) {
     s.ensure_active_config();
 
     if let Some(v) = &req.name {
@@ -220,16 +221,25 @@ pub(super) async fn put_settings(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
-    // P21：设置里若带了价格表（外部编辑 settings.json 的 cost.prices），同步刷新内存价格表
-    crate::usage::install_prices(&s.cost.prices);
+    sync_runtime(&s);
     observability::event(
         EventType::State,
         json!({ "kind": "settings.updated", "provider_id": pid, "model": eff_model }),
     );
     (StatusCode::OK, Json(config_state_json(&s)))
+}
+
+/// settings.json 变更后的运行时同步（幂等）：settings 落盘后把停用名单/MCP 配置/
+/// 价格表灌回各子系统。HTTP 端点（put_settings / manage_configs / post_mcp）与
+/// agent 的 settings 工具共用这一道，保证「改设置即生效」只有一条路。
+pub(crate) fn sync_runtime(s: &Settings) {
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：同名单贯通插件技能根
+    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::skills::set_disabled(&s.disabled_skills); // 2026-10-02：技能启停名单贯通
+    // P21：价格表同步刷新内存副本
+    crate::usage::install_prices(&s.cost.prices);
 }
 
 /// 拉取渠道模型列表。请求里没给 base_url/key 就用已保存设置。
@@ -301,10 +311,7 @@ pub(super) async fn manage_configs(
     let pid = s.provider_id();
     let model = s.effective_model();
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
-    crate::skills::set_disabled(&s.disabled_skills); // 2026-10-02：技能启停名单贯通
+    sync_runtime(&s);
     observability::event(
         EventType::State,
         json!({ "kind": "config.changed", "action": req.action, "provider_id": pid, "model": model }),

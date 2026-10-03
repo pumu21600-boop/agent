@@ -56,6 +56,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "browser",
     // P22-C 子代理派发（核心循环拦截，实现见 server/subagent.rs）
     "subagent_spawn",
+    // 2026-10-03 agent 自改设置（get/set；分级与红线见 risk_settings / red_line_hold）
+    "settings",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -113,6 +115,24 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "id_rsa",
     "id_ed25519",
     ".keystore",
+    // 2026-10-03 agent 自改设置轮：应用自身配置收进敏感面（此前 auto 档可静默改写
+    // config.toml / prompts/system.md，是绕开审批的后门）。settings.json 早已在列。
+    "config.toml",
+    "providers.json",
+    "prompts/system.md",
+];
+
+/// settings 工具 set 动作的红线键（改渠道指向 = 换自己的大脑）：命中即 Dangerous，
+/// 且经 `red_line_hold` 在任何审批档位强制弹卡。与 tools/settings.rs 的补丁字段对应。
+pub const SETTINGS_REDLINE_KEYS: &[&str] = &["base_url", "model", "provider_id", "active_config_id"];
+
+/// 应用自身配置文件（红线面：key、花费上限、审批默认档、脱沙箱总开关、系统提示词
+/// 的藏身处）——文件工具或 shell 直写它们都算红线，任何档位必问。
+const APP_CONFIG_FILES: &[&str] = &[
+    "settings.json",
+    "config.toml",
+    "providers.json",
+    "prompts/system.md",
 ];
 
 /// write_file 敏感后缀（密钥/证书类）。
@@ -169,6 +189,9 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         // P22-C 子代理派发：自身只发起一次独立会话（花销与隔离由服务层并发度/审批策略管），
         // 按常规处理；子代理自己那轮的工具有它自己的审批门（无人值守默认拒绝高危）
         "subagent_spawn" => (RiskLevel::Normal, "派发子代理任务".into()),
+
+        // 2026-10-03 agent 自改设置：get 只读；set 按补丁键分级（红线键见 SETTINGS_REDLINE_KEYS）
+        "settings" => risk_settings(args),
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
         "write_file" | "edit_file" => risk_write_file(args, workspace_root),
@@ -230,6 +253,80 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
             }
 
     (RiskLevel::Normal, format!("项目工作区文件改写: {path_str}"))
+}
+
+/// settings 工具风险分级（2026-10-03 agent 自改设置轮）：
+/// get 只读 Safe；set 普通键常规改动（auto 档静默），红线键（渠道指向） Dangerous；
+/// 「任何档位都必问」的兜底在 `red_line_hold`（needs_approval_for 开头调用）。
+fn risk_settings(args: &Value) -> (RiskLevel, String) {
+    match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
+        "get" => (RiskLevel::Safe, "读取应用设置（只读快照，key 只给尾号）".into()),
+        "set" => {
+            let keys: Vec<&str> = args
+                .get("patch")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            let hit: Vec<&str> =
+                keys.iter().copied().filter(|k| SETTINGS_REDLINE_KEYS.contains(k)).collect();
+            if !hit.is_empty() {
+                (
+                    RiskLevel::Dangerous,
+                    format!("试图修改红线配置（渠道指向: {}，等于给 agent 换大脑）", hit.join("/")),
+                )
+            } else if keys.is_empty() {
+                (RiskLevel::Dangerous, "settings set 缺少 patch".into())
+            } else {
+                (RiskLevel::Normal, format!("修改应用常规设置: {}", keys.join("/")))
+            }
+        }
+        _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action（get/set）".into()),
+    }
+}
+
+/// 红线判定（2026-10-03 agent 自改设置轮）：命中即**无论审批档位**（含完全访问/全免审）
+/// 都必须弹卡由用户确认。审批判定单点 `ApprovalGate::needs_approval_for` 在最开头调用
+/// 本函数——红线凌驾于档位之上，是「agent 自我提权/换大脑/动钱袋」的最后一道闸。
+///
+/// 覆盖三条路：
+/// 1. settings 工具 set 带红线键（base_url/model/provider_id/active_config_id）；
+/// 2. 文件工具直写应用自身配置（settings.json / config.toml / providers.json /
+///    prompts/system.md——key、花费上限、审批默认档、allow_unsandboxed、系统提示词）；
+/// 3. shell 命令写到这些文件（命令点到文件名且整体不是纯只读形态；`type config.toml`
+///    这类纯读不拦）。注意沙箱并不按路径拦工作区外写入，这里补的就是那条缝。
+pub fn red_line_hold(tool_name: &str, args: &Value, workspace_root: &Path) -> bool {
+    match tool_name {
+        "settings" => {
+            matches!(args.get("action").and_then(|v| v.as_str()), Some("set"))
+                && args
+                    .get("patch")
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().any(|k| SETTINGS_REDLINE_KEYS.contains(&k.as_str())))
+                    .unwrap_or(false)
+        }
+        "write_file" | "edit_file" => {
+            let p = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase()
+                .replace('\\', "/");
+            APP_CONFIG_FILES.iter().any(|f| p.contains(f))
+        }
+        "shell" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let lower = cmd.to_lowercase();
+            if !APP_CONFIG_FILES.iter().any(|f| lower.contains(f)) {
+                return false;
+            }
+            // 纯只读形态（dir/type/echo 等安全程序且无写重定向）不拦；其余只要点到
+            // 配置文件名就必问——`copy x settings.json`、`echo ... > config.toml`
+            // 这类写法没有统一形状，宁可多问一次
+            let (risk, _) = risk_shell(cmd, workspace_root);
+            risk != RiskLevel::Safe
+        }
+        _ => false,
+    }
 }
 
 /// 剥掉 git 全局参数，取出真正的子命令与其后的参数。
@@ -627,6 +724,17 @@ pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String 
                 .to_lowercase();
             format!("git:{tag}:{sub}")
         }
+        // settings：按补丁键归类（read-only 档下「放行改 thinking」不代表放行改 roles）；
+        // Dangerous（红线键）本就不参与会话内记忆，这里只影响普通键
+        "settings" => {
+            let mut keys: Vec<String> = args
+                .get("patch")
+                .and_then(|p| p.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            keys.sort();
+            format!("settings:{tag}:{}", keys.join(","))
+        }
         other => format!("{other}:{tag}"),
     }
 }
@@ -826,6 +934,61 @@ mod tests {
         }
         // 普通文件不受影响
         assert_eq!(evaluate_risk("write_file", &json!({"path": "src/env_util.rs", "content": "x"}), &ws()).0, RiskLevel::Normal);
+    }
+
+    // —— 2026-10-03 agent 自改设置轮：settings 工具分级 ——
+    #[test]
+    fn test_settings_tool_risk() {
+        // get 只读
+        assert_eq!(evaluate_risk("settings", &json!({"action": "get"}), &ws()).0, RiskLevel::Safe);
+        // 普通键常规改动（auto 档静默放行）
+        let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "high"}}), &ws());
+        assert_eq!(r, RiskLevel::Normal, "{why}");
+        // 红线键（渠道指向）高危
+        for k in ["base_url", "model", "provider_id", "active_config_id"] {
+            let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {k: "x"}}), &ws());
+            assert_eq!(r, RiskLevel::Dangerous, "{k} 应判红线: {why}");
+        }
+        // 混合补丁沾红线即高危
+        let (r, _) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "high", "model": "x"}}), &ws());
+        assert_eq!(r, RiskLevel::Dangerous);
+        // 非法 action / 缺 patch：宁可多问不静默
+        assert_eq!(evaluate_risk("settings", &json!({"action": "delete"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— 2026-10-03：红线判定（任何档位必问，含完全访问）——
+    #[test]
+    fn test_red_line_hold() {
+        // settings 红线键必问；普通键不拦（交给档位判定）
+        assert!(red_line_hold("settings", &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}), &ws()));
+        assert!(red_line_hold("settings", &json!({"action": "set", "patch": {"thinking": "on", "active_config_id": "cfg-b"}}), &ws()));
+        assert!(!red_line_hold("settings", &json!({"action": "set", "patch": {"thinking": "high"}}), &ws()));
+        assert!(!red_line_hold("settings", &json!({"action": "get"}), &ws()));
+        // 文件工具直写应用自身配置
+        for p in ["config.toml", "settings.json", "providers.json", "prompts/system.md", ".cargo/config.toml"] {
+            assert!(
+                red_line_hold("write_file", &json!({"path": p, "content": "x"}), &ws()),
+                "{p} 直写必须红线必问"
+            );
+        }
+        assert!(!red_line_hold("write_file", &json!({"path": "src/main.rs", "content": "x"}), &ws()));
+        // Windows 反斜杠路径同样命中
+        assert!(red_line_hold("edit_file", &json!({"path": "prompts\\system.md", "old_string": "a", "new_string": "b"}), &ws()));
+        // shell：写语义且点到配置文件名 = 必问；纯读与不相干命令不拦
+        assert!(red_line_hold("shell", &json!({"command": "echo key=xxx > config.toml"}), &ws()));
+        assert!(red_line_hold("shell", &json!({"command": "copy evil.json settings.json"}), &ws()));
+        assert!(!red_line_hold("shell", &json!({"command": "type config.toml"}), &ws()));
+        assert!(!red_line_hold("shell", &json!({"command": "cargo build"}), &ws()));
+    }
+
+    // —— 2026-10-03：settings 的同类允许粒度按键区分 ——
+    #[test]
+    fn test_settings_approval_scope_by_keys() {
+        let n = RiskLevel::Normal;
+        let scope = |patch| approval_scope("settings", &json!({"action": "set", "patch": patch}), n);
+        assert_eq!(scope(json!({"thinking": "high"})), scope(json!({"thinking": "low"})), "同键不同值 = 同类");
+        assert_ne!(scope(json!({"thinking": "high"})), scope(json!({"roles": {}})), "不同键不得归为同类");
     }
 
     // —— v1 修复 7：Windows 路径大小写差异不得造成越界误判 ——
