@@ -289,11 +289,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。自改纪律：除 list_panels（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。面板：method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态；面板插件被停用时 open_panel 拒绝并指路 settings 工具。文件：method=open_file 配 path（工作区路径），在侧边栏打开预览标签。记忆库：method=open_memory 打开星云视图（星云入口关着会拒绝并指路 settings 开 features.galaxy）。边栏：method=open_sidebar/close_sidebar 配 side（left=左侧会话列表边栏，right=右侧面板边栏）。会话管理用 session 工具。",
+            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。面板：method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态；面板插件被停用时 open_panel 拒绝并指路 settings 工具。文件：method=open_file 配 path（工作区路径），在侧边栏打开预览标签。记忆库：method=open_memory 打开星云视图（星云入口关着会拒绝并指路 settings 开 features.galaxy）。边栏：method=open_sidebar/close_sidebar 配 side（left=左侧会话列表边栏，right=右侧面板边栏）——「打开/展开」=让侧栏显示，「收起/关闭/隐藏」=让侧栏隐藏，两者都是状态设置，不是按一下开关的切换语义，别混。状态：method=state 读最近一次界面状态上报（边栏开合等）。语义含糊（没说哪侧/没说开还是收）时先问用户，别猜：猜错方向比多问一句严重。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "open_file", "open_memory", "open_sidebar", "close_sidebar"], "description": "open_panel/close_panel/open_sidebar/close_sidebar 配 name/side；open_file 配 path；list_panels/open_memory 不需要额外参数" },
+                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "open_file", "open_memory", "open_sidebar", "close_sidebar", "state"], "description": "open_panel/close_panel/open_sidebar/close_sidebar 配 name/side；open_file 配 path；list_panels/state/open_memory 不需要额外参数" },
                     "name": { "type": "string", "enum": ["trace", "board", "usage"], "description": "面板插件 id：trace=时间线、board=项目文件、usage=用量" },
                     "side": { "type": "string", "enum": ["left", "right"], "description": "open_sidebar/close_sidebar：left=左侧会话列表边栏，right=右侧面板边栏" },
                     "path": { "type": "string", "description": "open_file：要预览的文件路径（工作区相对或绝对）" }

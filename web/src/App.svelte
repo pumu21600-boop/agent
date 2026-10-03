@@ -3677,6 +3677,26 @@
     rightPanelOpen = true;
     if (terminalOpen) terminalOpen = false;
   }
+  // 界面状态上报（agent 的 ui state 读它；open/close 识别 no-op）：边栏开合一变就报——
+  // reactive 覆盖所有变更源（顶栏手点、恢复钮、agent 事件），多窗口后上报者覆盖前上报者
+  let uiStateSeq = 0;
+  async function reportUiState() {
+    const seq = ++uiStateSeq;
+    try {
+      await fetch('/api/ui/state', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sidebars: { left: !sidebarCollapsed, right: rightPanelOpen },
+          tabs_open: rpTabs.length,
+          active_tab: rpTab || '',
+          seq,
+        }),
+      });
+    } catch {}
+  }
+  $: reportUiState(sidebarCollapsed, rightPanelOpen, rpTabs);
+
   try {
     const uiEventsSrc = new EventSource('/api/ui/events');
     uiEventsSrc.onmessage = async (ev) => {

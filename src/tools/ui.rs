@@ -15,7 +15,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("");
     match method {
-        // —— 只读，不受闸 ——
+        // —— 只读，不受闸（界面上有什么/什么开着，看 ≠ 改） ——
         "list_panels" => {
             let disabled = current_disabled();
             let list: Vec<Value> = PANELS
@@ -30,6 +30,11 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             })
             .to_string())
         }
+        // 界面状态（侧栏开合等）：读前端最近一次上报；没有页面报过 = 没人开着界面
+        "state" => match crate::server::ui_events::last_state() {
+            Some(s) => Ok(s.to_string()),
+            None => Err("界面状态未知：没有活跃页面在报（页面关着/壳没开时没法看界面）；界面动作对无人看的界面照样会播，但你看不到结果。".into()),
+        },
         // —— 改动类，全部受自改闸 ——
         "open_panel" | "close_panel" => {
             super::selfmod_gate()?;
@@ -70,9 +75,18 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
                 other => return Err(format!("未知 side: {other:?}（left / right）")),
             };
             let open = method == "open_sidebar";
+            // no-op 识别：界面最近一次上报的状态已经是目标态就别再报「已完成」骗用户——
+            // 真机上 agent 在目标态下照样报「已收起」是最扎眼的假完成
+            let already = ui_state_side(side)
+                .map(|cur| cur == open)
+                .unwrap_or(false);
             crate::server::ui_events::emit(json!({ "kind": "sidebar", "side": side, "open": open }));
             let which = if side == "left" { "左侧边栏" } else { "右侧边栏" };
-            Ok(if open { format!("已打开{which}") } else { format!("已收起{which}") })
+            let mut out = if open { format!("已打开{which}") } else { format!("已收起{which}") };
+            if already {
+                out.push_str("（界面本来就是目标态，这次没有实际变化——如实告知用户）");
+            }
+            Ok(out)
         }
         "open_memory" => {
             super::selfmod_gate()?;
@@ -96,4 +110,12 @@ fn current_disabled() -> Vec<String> {
     crate::config::settings::shared_settings()
         .and_then(|h| h.read().ok().map(|s| s.disabled_plugins.clone()))
         .unwrap_or_default()
+}
+
+/// 从界面最近一次上报里读某侧边栏的开合态（right/left → bool 是否开着）。
+fn ui_state_side(side: &str) -> Option<bool> {
+    let st = crate::server::ui_events::last_state()?;
+    st.get("sidebars")
+        .and_then(|s| s.get(side))
+        .and_then(|b| b.as_bool())
 }

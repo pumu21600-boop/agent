@@ -185,6 +185,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/plugins/toggle", post(toggle_plugin))
         // 2026-10-03：服务端→前端 UI 事件流（ui 工具开/关侧栏面板、settings 变更即时刷新）
         .route("/api/ui/events", get(crate::server::ui_events::ui_events_stream))
+        // 反向：前端上报界面状态（ui 工具 state 方法读它；open/close 识别 no-op）
+        .route("/api/ui/state", post(crate::server::ui_events::ui_state_post))
         // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
         .route("/api/plugins/draft", post(submit_draft).delete(discard_draft))
         .route("/api/plugins/promote", post(promote_draft))
