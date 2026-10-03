@@ -3676,6 +3676,216 @@
     rightPanelOpen = true;
     if (terminalOpen) terminalOpen = false;
   }
+
+  // —— UI_OPS 注册表（2026-10-03 重构轮）：界面动作的自描述清单 ——
+  // 原先是 SSE 里逐 kind 的 if/else 长链 + 插件桥逐 method 的 switch，两套手写分支。
+  // 现在收成一张表：每项 { kind, title, risk, args: 参数说明, run(m) }。
+  // ① 新增界面能力 = 本表加一行（run 闭包里调既有函数），不再改后端白名单/长分支；
+  // ② 表可序列化（剥掉 run）成 ops 清单随 /api/ui/state 上报给后端，模型可读「界面
+  //    能干什么、参数什么形状」——用应用自报家门代替枚举硬编码；
+  // ③ 破坏类（delete_session/undo_checkpoint）risk 标 destructive：后端 denylist 永不
+  //    收进通用 fire_event，必须走具名方法保分级——前端清单说了不算（见 tools/ui.rs）。
+  // risk 口径：safe=无持久破坏面（纯界面态）；normal=有持久副作用但可逆/常规；
+  // destructive=不可逆，任何档位必问。settings_changed 是后端→前端内部同步，标 internal。
+  const UI_OPS = {
+    open_panel: {
+      kind: 'open_panel', title: '打开右侧边栏面板', risk: 'safe', internal: false,
+      args: 'name: 面板插件 id（trace=时间线/board=项目文件/usage=用量）',
+      run(m) { rpOpenExtByName(m.name); },
+    },
+    close_panel: {
+      kind: 'close_panel', title: '关闭右侧边栏面板', risk: 'safe', internal: false,
+      args: 'name: 面板插件 id',
+      run(m) { closeRpTab('ext:' + m.name); },
+    },
+    sidebar: {
+      kind: 'sidebar', title: '开合左右侧边栏', risk: 'safe', internal: false,
+      args: 'side: left=左侧会话列表 / right=右侧面板栏；open: true=显示 false=收起',
+      run(m) {
+        if (m.side === 'right') {
+          if (m.open) {
+            terminalOpen = false;
+            rightPanelOpen = true;
+            openRightPanel();
+          } else {
+            rightPanelOpen = false;
+          }
+        } else if (m.side === 'left') {
+          sidebarCollapsed = !m.open;
+        }
+      },
+    },
+    terminal: {
+      kind: 'terminal', title: '开合终端面板', risk: 'safe', internal: false,
+      args: 'open: true=弹终端并收起右侧面板 false=收起终端',
+      run(m) {
+        if (m.open) {
+          terminalOpen = true;
+          rightPanelOpen = false;
+        } else {
+          terminalOpen = false;
+        }
+      },
+    },
+    settings: {
+      kind: 'settings', title: '开关设置弹窗', risk: 'safe', internal: false,
+      args: 'open: true/false；tab 可选（appearance/model/roles/memory/skills/mcp/ext/schedule）',
+      run(m) {
+        if (m.open) {
+          settingsOpen = true;
+          if (m.tab) settingsTab = m.tab;
+        } else {
+          settingsOpen = false;
+        }
+      },
+    },
+    theme: {
+      kind: 'theme', title: '切换主题', risk: 'safe', internal: false,
+      args: 'mode: dark（深色）/light（浅色）/system（跟随系统）',
+      run(m) {
+        if (['dark', 'light', 'system'].includes(m.mode)) applyThemeMode(m.mode);
+      },
+    },
+    open_tab: {
+      kind: 'open_tab', title: '打开内置标签页', risk: 'safe', internal: false,
+      args: 'key: artifacts=产物/review=审查/web=网页（白名单 RP_BUILTIN，别开乱七八糟的标签）',
+      run(m) {
+        const b = RP_BUILTIN.find((x) => x.key === m.key);
+        if (b) {
+          addRpTab(b);
+          rightPanelOpen = true;
+          if (terminalOpen) terminalOpen = false;
+        }
+      },
+    },
+    close_tab: {
+      kind: 'close_tab', title: '关闭标签页', risk: 'safe', internal: false,
+      args: 'key: artifacts/review/web/ext:usage/file:<路径>',
+      run(m) { if (m.key) closeRpTab(m.key); },
+    },
+    open_file: {
+      kind: 'open_file', title: '打开文件预览标签', risk: 'safe', internal: false,
+      args: 'path: 工作区相对或绝对路径',
+      run(m) { if (m.path) openPreviewTab(String(m.path)); },
+    },
+    open_memory: {
+      kind: 'open_memory', title: '打开记忆库（星云视图）', risk: 'safe', internal: false,
+      args: '无（入口关着时前端不收）',
+      run() { if (features.galaxy) galaxyOpen = true; },
+    },
+    css_inject: {
+      kind: 'css_inject', title: '注入自定义 CSS', risk: 'normal', internal: false,
+      args: 'css: CSS 内容（空内容报错，清空走 clear）；append: true=追加在原有手写规则后；clear: true=清空手写规则',
+      run(m) {
+        // 与用户粘进 CSS 注入框同一条路（applyCustomCss 里有 escalate/转义与
+        // localStorage 落盘；css-ui 插件只是编辑器，应用端在宿主）
+        if (typeof m.css === 'string') {
+          customCss = m.append ? `${customCss}\n${m.css}` : m.css;
+          applyCustomCss();
+        }
+      },
+    },
+    new_session: {
+      kind: 'new_session', title: '新建会话并切过去', risk: 'normal', internal: false,
+      args: '无',
+      async run() { await startNewSession(); },
+    },
+    open_session: {
+      kind: 'open_session', title: '切换到某条会话', risk: 'normal', internal: false,
+      args: 'id: 会话 id（侧栏没有这条时会没反应）',
+      async run(m) {
+        const s = flatSessions.find((x) => x.id === m.id);
+        if (s) await loadSession(m.id);
+      },
+    },
+    rename_session: {
+      kind: 'rename_session', title: '改会话标题', risk: 'normal', internal: false,
+      args: 'id: 会话 id；title: 新标题（空串不理会）',
+      async run(m) {
+        const v = String(m.title || '').trim();
+        if (v) {
+          await fetch('/api/sessions/meta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: m.id, title: v }),
+          });
+          // 改的是当前会话时同步顶栏（与 submitRename 同规）
+          if (m.id === currentSessionId) currentTitle = v.slice(0, 60);
+          loadSessions();
+        }
+      },
+    },
+    fork_session: {
+      kind: 'fork_session', title: '分叉会话', risk: 'normal', internal: false,
+      args: 'id: 要分叉的会话 id',
+      async run(m) { await forkSession(m.id); },
+    },
+    pin_session: {
+      kind: 'pin_session', title: '置顶/取消置顶会话', risk: 'normal', internal: false,
+      args: 'id: 会话 id；on: true=执行 false=取消（默认 true）',
+      async run(m) {
+        await fetch('/api/sessions/meta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: m.id, pinned: m.on !== false }),
+        });
+        loadSessions();
+      },
+    },
+    archive_session: {
+      kind: 'archive_session', title: '归档/取消归档会话', risk: 'normal', internal: false,
+      args: 'id: 会话 id；on: true=执行 false=取消（默认 true）',
+      async run(m) {
+        await fetch('/api/sessions/meta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: m.id, archived: m.on !== false }),
+        });
+        loadSessions();
+      },
+    },
+    delete_session: {
+      kind: 'delete_session', title: '删除会话（不可逆）', risk: 'destructive', internal: false,
+      args: 'id: 会话 id',
+      async run(m) {
+        // 确认已在工具层审批卡完成（Dangerous 必问），这里不再弹二次确认
+        await fetch(`/api/session?id=${encodeURIComponent(m.id)}`, { method: 'DELETE' });
+        if (m.id === currentSessionId) await startNewSession();
+        else loadSessions();
+      },
+    },
+    undo_checkpoint: {
+      kind: 'undo_checkpoint', title: '撤销检查点（回滚工作区文件，不可逆）', risk: 'destructive', internal: false,
+      args: 'id: 检查点 id',
+      async run(m) {
+        // 与改动条「撤销」按钮同一条路（自带二次确认）
+        const cp = dockCp && dockCp.id === m.id ? dockCp : null;
+        if (!cp) {
+          const r = await fetch('/api/checkpoints').then((r2) => r2.json()).catch(() => null);
+          const found = (r && r.checkpoints || []).find((c) => c.id === m.id);
+          if (found) await undoCheckpoint(found);
+        } else {
+          await undoCheckpoint(cp);
+        }
+      },
+    },
+    // 后端改完设置推来的同步动作：插件清单/侧栏可见性要刷，settings 派生的界面状态
+    // （模型卡片/思考档/配置名）也要刷——不然「实际改了、界面还显示旧的」
+    settings_changed: {
+      kind: 'settings_changed', title: '（内部）设置变更同步', risk: 'safe', internal: true,
+      args: 'keys: 变更键清单（仅通知用）',
+      run() { loadExt(); loadSettings(); },
+    },
+  };
+
+  // 可序列化的 ops 清单（剥掉 run 函数）——随 /api/ui/state 上报给后端读。
+  // 这就是「界面自报家门」：模型问「你能干什么」有清单可查，不用开发者替界面写死。
+  function uiOpsManifest() {
+    return Object.values(UI_OPS)
+      .filter((o) => !o.internal)
+      .map((o) => ({ kind: o.kind, title: o.title, risk: o.risk, args: o.args }));
+  }
+
   // 界面状态上报（agent 的 ui state 读它；open/close 识别 no-op）：边栏/终端/主题/设置弹窗
   // 一变就报——reactive 覆盖所有变更源（顶栏手点、恢复钮、agent 事件），多窗口后上报者覆盖前上报者
   let uiStateSeq = 0;
@@ -3694,6 +3904,8 @@
           active_tab: rpTab || '',
           // 用户手写 CSS（agent inject_css 前先读，才能做保留式追加）
           custom_css: customCss,
+          // 自描述动作清单：后端据此喂给模型「界面能干什么」+ 通用通道准入参考
+          ops: uiOpsManifest(),
           seq,
         }),
       });
@@ -3706,108 +3918,10 @@
     uiEventsSrc.onmessage = async (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
-      if (m.kind === 'open_panel') rpOpenExtByName(m.name);
-      else if (m.kind === 'close_panel') closeRpTab('ext:' + m.name);
-
-      // —— agent 的 session/ui 工具推来的界面动作（与用户手点同一条路）——
-      else if (m.kind === 'new_session') await startNewSession();
-      else if (m.kind === 'open_session') {
-        const s = flatSessions.find((x) => x.id === m.id);
-        if (s) await loadSession(m.id);
-      } else if (m.kind === 'rename_session') {
-        const v = String(m.title || '').trim();
-        if (v) {
-          await fetch('/api/sessions/meta', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: m.id, title: v }),
-          });
-          // 改的是当前会话时同步顶栏（与 submitRename 同规）
-          if (m.id === currentSessionId) currentTitle = v.slice(0, 60);
-          loadSessions();
-        }
-      } else if (m.kind === 'fork_session') {
-        await forkSession(m.id);
-      } else if (m.kind === 'delete_session') {
-        // 确认已在工具层审批卡完成（Dangerous 必问），这里不再弹二次确认
-        await fetch(`/api/session?id=${encodeURIComponent(m.id)}`, { method: 'DELETE' });
-        if (m.id === currentSessionId) await startNewSession();
-        else loadSessions();
-      } else if (m.kind === 'pin_session' || m.kind === 'archive_session') {
-        const field = m.kind === 'pin_session' ? 'pinned' : 'archived';
-        await fetch('/api/sessions/meta', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: m.id, [field]: m.on !== false }),
-        });
-        loadSessions();
-      } else if (m.kind === 'open_file') {
-        if (m.path) openPreviewTab(String(m.path));
-      } else if (m.kind === 'open_memory') {
-        if (features.galaxy) galaxyOpen = true;
-      } else if (m.kind === 'sidebar') {
-        // agent 的 ui 工具 open_sidebar/close_sidebar：与顶栏按钮同状态同行为
-        if (m.side === 'right') {
-          if (m.open) {
-            terminalOpen = false;
-            rightPanelOpen = true;
-            openRightPanel();
-          } else {
-            rightPanelOpen = false;
-          }
-        } else if (m.side === 'left') {
-          sidebarCollapsed = !m.open;
-        }
-      } else if (m.kind === 'terminal') {
-        // 终端与右侧面板互斥（与顶栏按钮同语义）
-        if (m.open) {
-          terminalOpen = true;
-          rightPanelOpen = false;
-        } else {
-          terminalOpen = false;
-        }
-      } else if (m.kind === 'settings') {
-        if (m.open) {
-          settingsOpen = true;
-          if (m.tab) settingsTab = m.tab;
-        } else {
-          settingsOpen = false;
-        }
-      } else if (m.kind === 'theme') {
-        if (['dark', 'light', 'system'].includes(m.mode)) applyThemeMode(m.mode);
-      } else if (m.kind === 'open_tab') {
-        // 内置标签（产物/审查/网页）——白名单在 RP_BUILTIN，别让事件开乱七八糟的标签
-        const b = RP_BUILTIN.find((x) => x.key === m.key);
-        if (b) {
-          addRpTab(b);
-          rightPanelOpen = true;
-          if (terminalOpen) terminalOpen = false;
-        }
-      } else if (m.kind === 'close_tab') {
-        if (m.key) closeRpTab(m.key);
-      } else if (m.kind === 'css_inject') {
-        // agent 的 ui inject_css：与用户粘进 CSS 注入框同一条路（applyCustomCss 里
-        // 有 escalate/转义与 localStorage 落盘；css-ui 插件只是编辑器，应用端在宿主）
-        if (typeof m.css === 'string') {
-          customCss = m.append ? `${customCss}\n${m.css}` : m.css;
-          applyCustomCss();
-        }
-      } else if (m.kind === 'undo_checkpoint') {
-        // agent 的 ui undo_checkpoint：与改动条「撤销」按钮同一条路（自带二次确认）
-        const cp = dockCp && dockCp.id === m.id ? dockCp : null;
-        if (!cp) {
-          const r = await fetch('/api/checkpoints').then((r2) => r2.json()).catch(() => null);
-          const found = (r && r.checkpoints || []).find((c) => c.id === m.id);
-          if (found) await undoCheckpoint(found);
-        } else {
-          await undoCheckpoint(cp);
-        }
-      } else if (m.kind === 'settings_changed') {
-        // agent 改完设置：插件清单要刷（侧栏/插件页可见性），settings 派生的界面状态
-        // （模型卡片/思考档/配置名）也要刷——不然「实际改了、界面还显示旧的」
-        loadExt();
-        loadSettings();
-      }
+      // 查表执行（UI_OPS 通用入口）：新界面事件只在前端注册表加一行，后端 fire_event
+      // 白名单/本处都不再为它写分支。未登记的 kind 静默忽略（老服务推的/别的来源）。
+      const op = UI_OPS[m.kind];
+      if (op) await op.run(m);
     };
   } catch {}
 
