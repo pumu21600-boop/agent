@@ -30,7 +30,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             })
             .to_string())
         }
-        // 界面状态（侧栏开合等）：读前端最近一次上报；没有页面报过 = 没人开着界面
+        // 界面状态（侧栏/终端/主题/设置弹窗）：读前端最近一次上报；没有页面报过 = 没人开着界面
         "state" => match crate::server::ui_events::last_state() {
             Some(s) => Ok(s.to_string()),
             None => Err("界面状态未知：没有活跃页面在报（页面关着/壳没开时没法看界面）；界面动作对无人看的界面照样会播，但你看不到结果。".into()),
@@ -88,6 +88,77 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             }
             Ok(out)
         }
+        // 终端面板（与右侧面板互斥）：open=弹终端并收起右侧面板，close=收起终端
+        "open_terminal" | "close_terminal" => {
+            super::selfmod_gate()?;
+            let open = method == "open_terminal";
+            let already = ui_state_bool("terminal_open")
+                .map(|cur| cur == open)
+                .unwrap_or(false);
+            crate::server::ui_events::emit(json!({ "kind": "terminal", "open": open }));
+            let mut out = if open { "已打开终端面板".to_string() } else { "已收起终端面板".to_string() };
+            if already {
+                out.push_str("（界面本来就是目标态，这次没有实际变化——如实告知用户）");
+            }
+            Ok(out)
+        }
+        // 设置弹窗：open 可带 tab 直接跳到某页签（appearance/model/roles/memory/skills/mcp/ext/schedule）
+        "open_settings" => {
+            super::selfmod_gate()?;
+            let tab = v.get("tab").and_then(|x| x.as_str()).unwrap_or("");
+            let tabs = [
+                "appearance", "model", "roles", "memory", "skills", "mcp", "ext", "schedule",
+            ];
+            let tab = match tab {
+                "" => "",
+                t if tabs.contains(&t) => t,
+                other => return Err(format!("未知设置页签: {other:?}（可选：{}）", tabs.join(" / "))),
+            };
+            crate::server::ui_events::emit(json!({ "kind": "settings", "open": true, "tab": tab }));
+            if tab.is_empty() {
+                Ok("已打开设置弹窗".into())
+            } else {
+                Ok(format!("已打开设置弹窗并跳到「{tab}」页签"))
+            }
+        }
+        "close_settings" => {
+            super::selfmod_gate()?;
+            crate::server::ui_events::emit(json!({ "kind": "settings", "open": false }));
+            Ok("已关闭设置弹窗".into())
+        }
+        // 主题：dark/light/system（跟随系统）
+        "set_theme" => {
+            super::selfmod_gate()?;
+            let mode = match v.get("mode").and_then(|x| x.as_str()).unwrap_or("") {
+                "dark" | "light" | "system" => v.get("mode").and_then(|x| x.as_str()).unwrap_or(""),
+                other => return Err(format!("未知主题: {other:?}（dark / light / system）")),
+            };
+            crate::server::ui_events::emit(json!({ "kind": "theme", "mode": mode }));
+            Ok(format!("已切换主题：{mode}"))
+        }
+        // 内置标签页（产物/审查/网页）开在右侧边栏
+        "open_tab" => {
+            super::selfmod_gate()?;
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
+            let (title, key) = match name {
+                "artifacts" => ("产物", "artifacts"),
+                "review" => ("审查", "review"),
+                "web" => ("网页", "web"),
+                other => return Err(format!("未知标签: {other:?}（artifacts / review / web）")),
+            };
+            crate::server::ui_events::emit(json!({ "kind": "open_tab", "key": key }));
+            Ok(format!("已在右侧边栏打开「{title}」标签"))
+        }
+        // 关标签：key 形如 artifacts/review/web、ext:usage、file:<路径>（先 state 看 tabs_open/active_tab）
+        "close_tab" => {
+            super::selfmod_gate()?;
+            let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if key.is_empty() {
+                return Err("缺少 key（artifacts / review / web / ext:usage / file:<路径>）".into());
+            }
+            crate::server::ui_events::emit(json!({ "kind": "close_tab", "key": key }));
+            Ok(format!("已请求关闭标签 {key}（本来就没开会没反应，如实告知用户）"))
+        }
         "open_memory" => {
             super::selfmod_gate()?;
             let galaxy_on = crate::config::settings::shared_settings()
@@ -100,7 +171,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             Ok("已打开记忆库（星云视图）".into())
         }
         other => Err(format!(
-            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar；会话管理用 session 工具）"
+            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar / open_terminal / close_terminal / open_settings / close_settings / set_theme / open_tab / close_tab / state；会话管理用 session 工具）"
         )),
     }
 }
@@ -118,4 +189,10 @@ fn ui_state_side(side: &str) -> Option<bool> {
     st.get("sidebars")
         .and_then(|s| s.get(side))
         .and_then(|b| b.as_bool())
+}
+
+/// 从界面最近一次上报里读一个布尔字段（terminal_open / settings_open 等）。
+fn ui_state_bool(field: &str) -> Option<bool> {
+    let st = crate::server::ui_events::last_state()?;
+    st.get(field).and_then(|b| b.as_bool())
 }

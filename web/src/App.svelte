@@ -3677,8 +3677,8 @@
     rightPanelOpen = true;
     if (terminalOpen) terminalOpen = false;
   }
-  // 界面状态上报（agent 的 ui state 读它；open/close 识别 no-op）：边栏开合一变就报——
-  // reactive 覆盖所有变更源（顶栏手点、恢复钮、agent 事件），多窗口后上报者覆盖前上报者
+  // 界面状态上报（agent 的 ui state 读它；open/close 识别 no-op）：边栏/终端/主题/设置弹窗
+  // 一变就报——reactive 覆盖所有变更源（顶栏手点、恢复钮、agent 事件），多窗口后上报者覆盖前上报者
   let uiStateSeq = 0;
   async function reportUiState() {
     const seq = ++uiStateSeq;
@@ -3688,6 +3688,9 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sidebars: { left: !sidebarCollapsed, right: rightPanelOpen },
+          terminal_open: terminalOpen,
+          settings_open: settingsOpen,
+          theme: themeMode,
           tabs_open: rpTabs.length,
           active_tab: rpTab || '',
           seq,
@@ -3695,7 +3698,7 @@
       });
     } catch {}
   }
-  $: reportUiState(sidebarCollapsed, rightPanelOpen, rpTabs);
+  $: reportUiState(sidebarCollapsed, rightPanelOpen, rpTabs, terminalOpen, settingsOpen, themeMode);
 
   try {
     const uiEventsSrc = new EventSource('/api/ui/events');
@@ -3754,6 +3757,33 @@
         } else if (m.side === 'left') {
           sidebarCollapsed = !m.open;
         }
+      } else if (m.kind === 'terminal') {
+        // 终端与右侧面板互斥（与顶栏按钮同语义）
+        if (m.open) {
+          terminalOpen = true;
+          rightPanelOpen = false;
+        } else {
+          terminalOpen = false;
+        }
+      } else if (m.kind === 'settings') {
+        if (m.open) {
+          settingsOpen = true;
+          if (m.tab) settingsTab = m.tab;
+        } else {
+          settingsOpen = false;
+        }
+      } else if (m.kind === 'theme') {
+        if (['dark', 'light', 'system'].includes(m.mode)) applyThemeMode(m.mode);
+      } else if (m.kind === 'open_tab') {
+        // 内置标签（产物/审查/网页）——白名单在 RP_BUILTIN，别让事件开乱七八糟的标签
+        const b = RP_BUILTIN.find((x) => x.key === m.key);
+        if (b) {
+          addRpTab(b);
+          rightPanelOpen = true;
+          if (terminalOpen) terminalOpen = false;
+        }
+      } else if (m.kind === 'close_tab') {
+        if (m.key) closeRpTab(m.key);
       }
     };
   } catch {}
