@@ -902,6 +902,9 @@
     { key: 'review', kind: 'review', title: '审查' },
     { key: 'web', kind: 'web', title: '网页' },
   ];
+  // 侧栏只收编这三个宿主面板插件（时间线/项目文件/用量）——其余插件哪怕 manifest 声明
+  // dock 也不进侧栏，+ 菜单与选择页都不出（用户 2026-10-03：装的插件别全列出来，六个够了）
+  const RP_EXT_PANELS = new Set(['trace', 'board', 'usage']);
   function rpDefaultTabs() {
     return [
       { key: 'ext:trace', kind: 'ext', name: 'trace', title: '时间线' },
@@ -914,7 +917,7 @@
   let rpTabs = (() => {
     try {
       const raw = JSON.parse(localStorage.getItem('rpTabs') || 'null');
-      if (Array.isArray(raw) && raw.length) return raw.filter((t) => t && t.key && t.kind);
+      if (Array.isArray(raw) && raw.length) return raw.filter((t) => t && t.key && t.kind && (t.kind !== 'ext' || RP_EXT_PANELS.has(t.name)));
     } catch {}
     return rpDefaultTabs();
   })();
@@ -923,7 +926,7 @@
   let rpTab = (() => {
     const want = localStorage.getItem('rpTab') || '';
     if (rpTabs.some((t) => t.key === want)) return want;
-    if (want.startsWith('ext:')) {
+    if (want.startsWith('ext:') && RP_EXT_PANELS.has(want.slice(4))) {
       const name = want.slice(4);
       rpTabs.push({ key: want, kind: 'ext', name, title: name });
       return want;
@@ -3664,18 +3667,20 @@
   $: builtInExts = extList.filter((e) => e.source !== 'workspace' && e.origin !== 'user' && !e.draft);
   $: thirdPartyExts = extList.filter((e) => !builtInExts.includes(e));
   // —— 右侧边栏标签：可见（开着的）+ 可添加（+ 号菜单 / 空态选择页）——
-  // 插件面板 = manifest 声明 dock（时间线/项目速览/用量）或旧 toolbar（视同面板并入这里，
-  // 顶栏不再放插件按钮——用户 2026-10-01 拍板）。停用插件的标签渲染时隐藏。
-  // 插件清单没到手（extList 空）时不判 ext 标签失效——那只是「还没加载」，不是「被停用」；
-  // 否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实锤）。
-  $: rpVisibleTabs = rpTabs.filter((t) => t.kind !== 'ext' || !extList.length || enabledExts.some((e) => e.name === t.name));
+  // 插件面板只收 RP_EXT_PANELS 三件套（时间线/项目文件/用量，旧 toolbar 视同面板并入），
+  // 其余插件不再进侧栏——+ 菜单与选择页都不出（用户 2026-10-03 拍板：六个够了）。
+  // 停用插件的标签渲染时隐藏；插件清单没到手（extList 空）时不判 ext 标签失效——
+  // 那只是「还没加载」，不是「被停用」；否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实锤）。
+  $: rpVisibleTabs = rpTabs.filter((t) => t.kind !== 'ext' || (RP_EXT_PANELS.has(t.name) && (!extList.length || enabledExts.some((e) => e.name === t.name))));
   $: rpAddable = [
     ...RP_BUILTIN,
-    ...enabledExts.flatMap((e) =>
-      (e.ui || [])
-        .filter((u) => u.slot === 'dock' || u.slot === 'toolbar')
-        .map((u) => ({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: u.title || e.title || e.name }))
-    ),
+    ...enabledExts
+      .filter((e) => RP_EXT_PANELS.has(e.name))
+      .flatMap((e) =>
+        (e.ui || [])
+          .filter((u) => u.slot === 'dock' || u.slot === 'toolbar')
+          .map((u) => ({ key: 'ext:' + e.name, kind: 'ext', name: e.name, title: u.title || e.title || e.name }))
+      ),
   ].filter((p) => !rpTabs.some((t) => t.key === p.key));
   // 激活标签掉出可见集合（插件被停用/标签被关）→ 退回第一个可见标签
   $: if (rpVisibleTabs.length && !rpVisibleTabs.some((t) => t.key === rpTab)) rpTab = rpVisibleTabs[0].key;
