@@ -3664,6 +3664,30 @@
   }
   let extLoadRetry = 0;
 
+  // —— 服务端 → 前端 UI 事件流（2026-10-03：agent 的 ui 工具 / settings 工具推送）——
+  // open_panel/close_panel：开/关侧栏面板标签（侧栏状态在前端，后端只能靠事件驱动）；
+  // settings_changed：agent 改了设置，插件页/侧栏即时重拉清单——不然 agent 改完用户
+  // 看到的还是旧状态（真机实锤：agent 停用用量插件落盘成功，插件页还显示开着）。
+  function rpOpenExtByName(name) {
+    if (!RP_EXT_PANELS.has(name)) return;
+    const e = enabledExts.find((x) => x.name === name);
+    if (!e) return; // 未启用或清单没到手：不硬开（渲染层本来也不显示）
+    const u = (e.ui || []).find((x) => x.slot === 'dock' || x.slot === 'toolbar');
+    addRpTab({ key: 'ext:' + name, kind: 'ext', name, title: (u && u.title) || e.title || name });
+    rightPanelOpen = true;
+    if (terminalOpen) terminalOpen = false;
+  }
+  try {
+    const uiEventsSrc = new EventSource('/api/ui/events');
+    uiEventsSrc.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.kind === 'open_panel') rpOpenExtByName(m.name);
+      else if (m.kind === 'close_panel') closeRpTab('ext:' + m.name);
+      else if (m.kind === 'settings_changed') loadExt();
+    };
+  } catch {}
+
   // 已启用的扩展（停用的不加载、不给按钮）
   $: enabledExts = extList.filter((e) => e.enabled !== false && e.ok);
   // 分组（用户 2026-09-30：Git/沙箱/内置面板插件统一归「内置」一组，别分两层）；

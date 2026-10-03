@@ -58,6 +58,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "subagent_spawn",
     // 2026-10-03 agent 自改设置（get/set；分级与红线见 risk_settings / red_line_hold）
     "settings",
+    // 2026-10-03 操作本应用界面（开/关侧栏面板标签；无持久副作用）
+    "ui",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -192,6 +194,9 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
 
         // 2026-10-03 agent 自改设置：get 只读；set 按补丁键分级（红线键见 SETTINGS_REDLINE_KEYS）
         "settings" => risk_settings(args),
+
+        // 2026-10-03 操作本应用界面：开/关侧栏面板标签，无持久副作用，恒定 Safe
+        "ui" => (RiskLevel::Safe, "应用界面面板开关（开/关侧栏标签）".into()),
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
         "write_file" | "edit_file" => risk_write_file(args, workspace_root),

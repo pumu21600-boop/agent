@@ -55,6 +55,7 @@ mod sessions;
 pub(crate) mod settings; // settings 工具（tools/settings.rs）复用 apply_settings_update / sync_runtime
 mod subagent;
 mod system;
+pub(crate) mod ui_events; // 2026-10-03：服务端→前端 UI 事件流（ui 工具开面板 / settings 变更刷新）
 mod usage;
 mod webpanel;
 mod workspace;
@@ -167,6 +168,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/version", get(get_version))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/toggle", post(toggle_plugin))
+        // 2026-10-03：服务端→前端 UI 事件流（ui 工具开/关侧栏面板、settings 变更即时刷新）
+        .route("/api/ui/events", get(crate::server::ui_events::ui_events_stream))
         // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
         .route("/api/plugins/draft", post(submit_draft).delete(discard_draft))
         .route("/api/plugins/promote", post(promote_draft))

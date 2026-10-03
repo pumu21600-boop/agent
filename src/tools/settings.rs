@@ -162,13 +162,14 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         changed.push("mcp_servers".into());
     }
 
-    // 4) 插件 / 技能停用名单（整表替换）
+    // 4) 插件 / 技能停用名单（整表替换；校验与联动见下方各函数——真机实锤过模型
+    //    写中文标题「用量」导致停了个寂寞，这里 id 为准、标题自动映射、垃圾名字报错）
     if let Some(list) = &p.disabled_plugins {
-        s.disabled_plugins = list.iter().map(|x| x.trim().to_string()).collect();
+        apply_disabled_plugins(s, list)?;
         changed.push("disabled_plugins".into());
     }
     if let Some(list) = &p.disabled_skills {
-        s.disabled_skills = list.iter().map(|x| x.trim().to_string()).collect();
+        s.disabled_skills = apply_disabled_skills(list)?;
         changed.push("disabled_skills".into());
     }
 
@@ -226,6 +227,9 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             s.save().map_err(|e| format!("保存 settings.json 失败: {e}"))?;
             *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
             crate::server::settings::sync_runtime(&s);
+            // 让打开中的界面即时跟上：插件页/侧栏重拉清单（不然 agent 改完，用户看到的
+            // 还是旧状态——真机实锤的坑）
+            crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": changed }));
             crate::observability::event(
                 crate::observability::EventType::State,
                 json!({ "kind": "settings.agent_updated", "keys": changed }),
@@ -244,6 +248,89 @@ fn key_hint_of(key: Option<String>) -> String {
             if n > 4 { k.chars().skip(n - 4).collect::<String>() } else { k.clone() }
         })
         .unwrap_or_default()
+}
+
+/// 插件停用名单（整表替换）的校验与联动：
+/// - 名字以插件 id（目录名）为准；模型常拿中文标题来（实锤：「用量」），能对上标题的
+///   自动映射成 id；对不上的直接报错并列出全部可用 id——宁可报错不静默落个废名单；
+/// - 启用状态发生翻转的插件若 manifest 声明了 feature（插件开关 = 功能总开关，
+///   2026-10-02 权限放开轮的联动语义），同步写 settings.features——与 UI 的
+///   toggle_plugin 同一套，否则「插件停了功能还在跑」。
+fn apply_disabled_plugins(s: &mut Settings, list: &[String]) -> Result<(), String> {
+    let known = crate::plugin::ui::scan_all(&[]);
+    let mut known = known;
+    known.extend(crate::plugin::wasm::scan_plugins(&[]));
+
+    let mut want: Vec<String> = Vec::new();
+    for n in list {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
+        // id 直认；标题映射；扫描不到任何插件（裸环境/测试）时放弃校验照收
+        let id = if known.iter().any(|e| e.name == n) {
+            n.to_string()
+        } else {
+            match known.iter().find(|e| e.title == n) {
+                Some(e) => e.name.clone(),
+                None if known.is_empty() => n.to_string(),
+                None => {
+                    let all = known.iter().map(|e| format!("{}({})", e.name, e.title)).collect::<Vec<_>>();
+                    return Err(format!(
+                        "未知插件: {n}（要用插件 id 不用中文标题。可用：{}）",
+                        all.join("、")
+                    ));
+                }
+            }
+        };
+        if !want.contains(&id) {
+            want.push(id);
+        }
+    }
+
+    // feature 联动：只对「这次发生翻转」的插件动 features（差集先拷自有，避免与
+    // set_feature 的可变借用打架）
+    let old_disabled = s.disabled_plugins.clone();
+    let newly_off: Vec<String> =
+        want.iter().filter(|n| !old_disabled.contains(n)).cloned().collect();
+    let newly_on: Vec<String> =
+        old_disabled.iter().filter(|n| !want.contains(n)).cloned().collect();
+    for n in &newly_off {
+        if let Some(e) = known.iter().find(|e| &e.name == n)
+            && !e.feature.is_empty()
+        {
+            s.set_feature(&e.feature, false)?;
+        }
+    }
+    for n in &newly_on {
+        if let Some(e) = known.iter().find(|e| &e.name == n)
+            && !e.feature.is_empty()
+        {
+            s.set_feature(&e.feature, true)?;
+        }
+    }
+
+    s.disabled_plugins = want;
+    Ok(())
+}
+
+/// 技能停用名单（整表替换）：技能名对不上就报错列可选（扫描不到技能的裸环境放弃校验）。
+fn apply_disabled_skills(list: &[String]) -> Result<Vec<String>, String> {
+    let known: Vec<String> = crate::skills::list().iter().map(|k| k.name.clone()).collect();
+    let mut want: Vec<String> = Vec::new();
+    for n in list {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
+        if !known.is_empty() && !known.iter().any(|k| k == n) {
+            return Err(format!("未知技能: {n}（可用：{}）", known.join("、")));
+        }
+        if !want.contains(&n.to_string()) {
+            want.push(n.to_string());
+        }
+    }
+    Ok(want)
 }
 
 /// 当前设置快照（脱敏）：key 只给 has_key/尾号；MCP 的 env/headers/oauth 细节不吐
@@ -286,6 +373,13 @@ fn snapshot_json(s: &settings::Settings) -> String {
         })).collect::<Vec<Value>>(),
         "disabled_plugins": s.disabled_plugins,
         "disabled_skills": s.disabled_skills,
+        // 可选名单：停用名单是整表替换，模型得知道有哪些合法 id（id + 中文标题）
+        "available_plugins": crate::plugin::ui::scan_all(&[])
+            .iter()
+            .chain(crate::plugin::wasm::scan_plugins(&[]).iter())
+            .map(|e| json!({ "id": e.name, "title": e.title, "feature": e.feature }))
+            .collect::<Vec<Value>>(),
+        "available_skills": crate::skills::list().iter().map(|k| k.name.clone()).collect::<Vec<String>>(),
         "schedules": s.schedules,
         "red_line_keys": ["base_url", "model", "provider_id", "active_config_id"],
         "out_of_scope": "api_key/工作区/价格表/信任插件不可经本工具修改；config.toml（花费上限/审批默认档/钩子）改文件且需重启，写前必经用户确认",
@@ -462,9 +556,19 @@ mod tests {
     fn disabled_lists_replace() {
         let mut s = test_settings();
         s.disabled_skills = vec!["旧技能".into()];
-        let p = patch(json!({"disabled_skills": ["git-helper"], "disabled_plugins": [" css-ui "]}));
+        // 技能名用环境里真实存在的（测试环境 app_root=仓库，skills/ 非空；校验对不上会报错）
+        let skill = crate::skills::list()
+            .first()
+            .map(|k| k.name.clone())
+            .unwrap_or_else(|| "any".into());
+        let p = patch(json!({"disabled_skills": [skill], "disabled_plugins": [" css-ui "]}));
         apply_patch(&mut s, &p).unwrap();
-        assert_eq!(s.disabled_skills, vec!["git-helper".to_string()]);
+        assert_eq!(s.disabled_skills, vec![skill]);
         assert_eq!(s.disabled_plugins, vec!["css-ui".to_string()], "名单条目去首尾空白");
+        // 未知技能名直接报错（宁可报错不静默落废名单）
+        if !crate::skills::list().is_empty() {
+            let p = patch(json!({"disabled_skills": ["不存在的技能xyz"]}));
+            assert!(apply_patch(&mut s, &p).is_err());
+        }
     }
 }

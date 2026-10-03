@@ -19,6 +19,7 @@ mod git;
 mod search;
 mod settings;
 mod shell;
+mod ui;
 mod web;
 
 pub(crate) use fs::*;
@@ -269,7 +270,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）。action=get 返回全部可改设置快照（API key 只给尾号提示）；action=set 携带 patch 只列要改的键，改完保存并即时生效，无需重启。普通键：thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles（角色路由）、features（功能开关）、sandbox_cpu_percent、mcp_servers（整表替换，先 get 再改；新 server 或改配置会回到「未确认」等用户确认）、disabled_plugins/disabled_skills（整表替换）、schedules（整表替换，新增 id 留空）。红线键：base_url/model/provider_id/active_config_id（渠道指向 = 换自己的大脑）——每次都会弹卡等用户确认，任何审批档位都不静默，改 base_url 会清空模型与模型列表。范围外：api_key/工作区/价格表/信任插件（本工具不收）；config.toml 里的花费上限/审批默认档/钩子等要改文件且需重启（同样属红线必问）。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）。action=get 返回全部可改设置快照（API key 只给尾号提示；available_plugins/available_skills 列出合法 id）。action=set 携带 patch 只列要改的键，改完保存并即时生效、打开中的界面自动刷新，无需重启。普通键：thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles（角色路由）、features（功能开关）、sandbox_cpu_percent、mcp_servers（整表替换，先 get 再改；新 server 或改配置会回到「未确认」等用户确认）、disabled_plugins/disabled_skills（整表替换，必须用 get 里 available_* 给出的插件 id / 技能名，写中文标题会自动映射但对不上的直接报错）、schedules（整表替换，新增 id 留空）。红线键：base_url/model/provider_id/active_config_id（渠道指向 = 换自己的大脑）——每次都会弹卡等用户确认，任何审批档位都不静默，改 base_url 会清空模型与模型列表。范围外：api_key/工作区/价格表/信任插件（本工具不收）；config.toml 里的花费上限/审批默认档/钩子等要改文件且需重启（同样属红线必问）。要开关侧栏面板用 ui 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -277,6 +278,19 @@ fn builtin_tools() -> Vec<ToolSpec> {
                     "patch": { "type": "object", "description": "set 时必填：要改的键与新值（只列要改的键；未知键会报错；mcp_servers/schedules/disabled_* 为整表替换，务必先 get 拿现状再改）" }
                 },
                 "required": ["action"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
+            name: "ui",
+            description: "操作本应用自己的界面：在右侧边栏打开/关闭面板标签。method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态。用户看着的界面即时生效（右侧边栏会自动亮起并切到该面板）；面板插件被停用时 open_panel 会拒绝——先用 settings 工具把它从 disabled_plugins 移除（用 id，别写中文标题）再打开。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels"], "description": "open_panel/close_panel 需配 name；list_panels 不需要" },
+                    "name": { "type": "string", "enum": ["trace", "board", "usage"], "description": "面板插件 id：trace=时间线、board=项目文件、usage=用量" }
+                },
+                "required": ["method"]
             }),
             danger_level: 0,
         },
@@ -351,6 +365,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "browser" => crate::browser::command(args, cfg.max_chars).await,
         // 2026-10-03 agent 自改设置：读/改 settings.json（分级与红线见 core/rules.rs）
         "settings" => settings::run(args).await,
+        // 2026-10-03：操作本应用界面（开/关侧栏面板标签，走 /api/ui/events 事件流）
+        "ui" => ui::run(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }
