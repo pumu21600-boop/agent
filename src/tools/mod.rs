@@ -21,7 +21,8 @@ mod session;
 mod settings;
 mod shell;
 mod skill;
-mod ui;
+// ui 工具与 rules.rs「同一批常量不各抄一份」：event kind 白名单/破坏 denlist 跨模块可见
+pub(crate) mod ui;
 mod web;
 
 pub(crate) use fs::*;
@@ -289,7 +290,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS）。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——白名单只收非破坏 kind（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session），新界面能力会逐步收进来，能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
+            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS，以及 ops 界面动作自报清单：每项 kind/title/risk/args）——投 fire_event 前先读它看界面认哪些 kind。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——准入 = 白名单 ∪ 当前界面自报的 ops 清单：先 method=state 读上报里的 ops（每项 kind/title/risk/args 参数说明）就知道此刻界面认哪些 kind；白名单（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）之外的新界面能力，只要登记在清单里且 risk 标 safe/normal 就能直接投递，不用等后端逐个收；破坏类（delete_session/undo_checkpoint）永远不收——必须走具名方法（删会话走 session 工具、撤销检查点走 undo_checkpoint），审批分级不为它从通用通道开口子；清单没登记这个 kind、或没有页面在报清单时按未登记拒绝并回带当前可用清单。能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -300,7 +301,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
                     "mode": { "type": "string", "enum": ["dark", "light", "system"], "description": "set_theme：dark=深色、light=浅色、system=跟随系统" },
                     "key": { "type": "string", "description": "close_tab：标签 key（artifacts/review/web/ext:usage/file:<路径>）" },
                     "path": { "type": "string", "description": "open_file：要预览的文件路径（工作区相对或绝对）" },
-                    "event": { "type": "object", "description": "fire_event：整条事件对象（kind 必填，其余字段按事件类型带，如 {\"kind\":\"theme\",\"mode\":\"light\"}）；只收白名单非破坏 kind" },
+                    "event": { "type": "object", "description": "fire_event：整条事件对象（kind 必填，其余字段按事件类型带，如 {\"kind\":\"theme\",\"mode\":\"light\"}）；kind 准入 = 白名单 ∪ 界面 ops 清单（非破坏类），fire_event 之前先 method=state 读 ops 清单" },
                     "id": { "type": "string", "description": "undo_checkpoint：检查点 id（/api/checkpoints 可列）" }
                 },
                 "required": ["method"]
@@ -974,5 +975,27 @@ mod tests {
         let again = ensure_bundled_git_at(&rt, &[]).expect("第二次应复用已解压目录");
         assert!(again.is_file(), "{again:?}");
         let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    // —— 2026-10-03 自改插件闸（Phase 0 口径补测试）：关着全拒+人话指路，开着放行 ——
+    #[test]
+    fn selfmod_gate_blocks_when_plugin_off_and_passes_when_on() {
+        use crate::config::settings::{install_shared_settings, shared_settings};
+        use std::sync::{Arc, RwLock};
+        // shared_settings 是进程级 OnceLock：已被别的测试装过就不抢（未来并行装载时静默跳过）
+        if shared_settings().is_some() {
+            return;
+        }
+        let h = Arc::new(RwLock::new(crate::config::settings::Settings::default()));
+        install_shared_settings(h.clone());
+        // 关：拒，且指路「设置→插件」开自改（Q4=A 口头引导，不许 agent 自开闸）
+        h.write().unwrap().features.self_mod = false;
+        let e = selfmod_gate().unwrap_err();
+        assert!(e.contains("自改") && e.contains("设置→插件"), "{e}");
+        // 开：放行（放行后的审批仍走档位规则，这里只验闸本身）
+        h.write().unwrap().features.self_mod = true;
+        assert!(selfmod_gate().is_ok());
+        // 收尾留回与 prod 默认一致（self_mod 默认 true），别给并行读者留非默认态
+        h.write().unwrap().features.self_mod = true;
     }
 }

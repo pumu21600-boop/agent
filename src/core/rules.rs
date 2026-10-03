@@ -206,7 +206,10 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             if method == "undo_checkpoint" {
                 (RiskLevel::Dangerous, "撤销检查点：回滚工作区文件（不可逆）".into())
             } else if method == "fire_event" {
-                // 白名单后端还要按 kind 复核一次（与工具内 SAFE_EVENT_KINDS 同源）
+                // 准入与工具层 event_kind_allowed 同源复核（同一批常量，不各抄一份）：
+                // 破坏 denylist → Dangerous；静态白名单 → Safe；前端 UI_OPS 清单登记的
+                // → 按清单 risk 映射；查无此 kind → Dangerous（未登记默认高危；清单是
+                // 广告不是闸——/api/ui/state 无鉴权可投毒，规则不因它放松）。
                 let kind = args
                     .get("event")
                     .and_then(|e| e.get("kind"))
@@ -214,8 +217,29 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
                     .unwrap_or("");
                 if kind.is_empty() {
                     (RiskLevel::Dangerous, "fire_event 缺少 event.kind".into())
-                } else {
+                } else if crate::tools::ui::DESTRUCTIVE_EVENT_KINDS.contains(&kind) {
+                    (
+                        RiskLevel::Dangerous,
+                        format!("界面事件 {kind}：破坏类只走具名方法，不进通用通道"),
+                    )
+                } else if crate::tools::ui::SAFE_EVENT_KINDS.contains(&kind) {
                     (RiskLevel::Safe, format!("界面事件投递: {kind}"))
+                } else {
+                    match crate::server::ui_events::ops_risk(kind).as_deref() {
+                        Some("safe") => {
+                            (RiskLevel::Safe, format!("界面事件投递（界面清单登记）: {kind}"))
+                        }
+                        Some("normal") => (
+                            RiskLevel::Normal,
+                            format!("界面事件投递（界面清单登记，有持久副作用）: {kind}"),
+                        ),
+                        _ => (
+                            RiskLevel::Dangerous,
+                            format!(
+                                "界面事件 {kind} 未在当前界面清单登记（无页面在报或前端没有）——按未登记高危兜底"
+                            ),
+                        ),
+                    }
                 }
             } else {
                 (RiskLevel::Safe, "应用界面操作（面板/边栏/主题/标签页/CSS 等无持久破坏面）".into())
@@ -1193,5 +1217,26 @@ mod tests {
             approval_scope("git", &json!({"args": "commit -m a"}), n),
             approval_scope("git", &json!({"args": "push"}), d)
         );
+    }
+
+    // —— 2026-10-03 重构轮 Phase 2：ui 工具按 method/kind 判级（清单无关分支，进程有无页面在报都不影响）——
+    #[test]
+    fn test_ui_tool_risk_by_method_and_kind() {
+        // 缺 event.kind：宁可多问不静默
+        assert_eq!(evaluate_risk("ui", &json!({"method": "fire_event", "event": {}}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("ui", &json!({"method": "fire_event"}), &ws()).0, RiskLevel::Dangerous);
+        // 破坏 denlist：任何页面自报清单都改不了判级（清单是广告不是闸——判级先于清单查询）
+        for k in crate::tools::ui::DESTRUCTIVE_EVENT_KINDS {
+            let (r, why) = evaluate_risk("ui", &json!({"method": "fire_event", "event": {"kind": k}}), &ws());
+            assert_eq!(r, RiskLevel::Dangerous, "{k} 须高危: {why}");
+        }
+        // 静态白名单：Safe（分支先于清单查询）
+        assert_eq!(evaluate_risk("ui", &json!({"method": "fire_event", "event": {"kind": "sidebar"}}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("ui", &json!({"method": "fire_event", "event": {"kind": "pin_session"}}), &ws()).0, RiskLevel::Safe);
+        // 撤销检查点：恒定高危（任何审批档位必问）
+        assert_eq!(evaluate_risk("ui", &json!({"method": "undo_checkpoint", "id": "cp-1"}), &ws()).0, RiskLevel::Dangerous);
+        // 其余具名界面动作照旧 Safe
+        assert_eq!(evaluate_risk("ui", &json!({"method": "open_panel", "name": "usage"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("ui", &json!({"method": "list_panels"}), &ws()).0, RiskLevel::Safe);
     }
 }

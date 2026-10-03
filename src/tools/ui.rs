@@ -5,6 +5,12 @@
 //! 与用户手点完全相同的函数（用户看着的界面即时变化）。
 //! 面板白名单与前端 RP_EXT_PANELS 对齐（trace 时间线 / board 项目文件 / usage 用量）。
 //! 除 list_panels（只读）外全部受「自改」插件闸；会话动作在 session 工具里。
+//!
+//! 2026-10-03 重构轮：前端把 UI_OPS 注册表序列化成 ops 清单随 /api/ui/state 上报，
+//! fire_event 通用通道的准入改为「SAFE_EVENT_KINDS 白名单 ∪ 前端清单里登记且非破坏类」——
+//! 新增界面能力后前端注册表加一行即可投递，不必再改这里。但清单是广告不是闸：
+//! DESTRUCTIVE_EVENT_KINDS 硬编码 denlist 永远把守（投毒伪造也不行），破坏类必须走具名
+//! 方法（rules 才能按参数分级、工具层才能完成确认）。
 
 use serde_json::{Value, json};
 
@@ -16,7 +22,11 @@ const PANELS: &[(&str, &str)] = &[("trace", "时间线"), ("board", "项目文�
 /// 只收「非破坏」类的 kind（SAFE_EVENT_KINDS 白名单）：破坏类（delete_session 等）
 /// 刻意不在表内——那些必须走具名方法，rules 才能按参数判 Dangerous 弹卡，从 fire_event
 /// 混过去就绕过了审批分级。
-const SAFE_EVENT_KINDS: &[&str] = &[
+///
+/// 2026-10-03 重构轮：准入扩为「白名单 ∪ 前端清单」。前端 UI_OPS 注册表序列化成 ops
+/// 清单随 /api/ui/state 上报，新 kind 只要前端登记且标 safe/normal 即放行，不再需要
+/// 一个个改本文件。破坏类仍由 DESTRUCTIVE_EVENT_KINDS 把守。
+pub(crate) const SAFE_EVENT_KINDS: &[&str] = &[
     "sidebar",
     "terminal",
     "settings",
@@ -35,6 +45,57 @@ const SAFE_EVENT_KINDS: &[&str] = &[
     "pin_session",
     "archive_session",
 ];
+
+/// 服务端硬编码的破坏类事件 denylist（2026-10-03 重构轮新增）：这些 kind **永远不收**
+/// 进通用 fire_event，哪怕前端清单把它们标成 safe（清单是广告不是闸——/api/ui/state
+/// 无鉴权，本地任何进程可投毒；真前端也犯不着为破坏类开口子）。走具名方法保分级。
+pub(crate) const DESTRUCTIVE_EVENT_KINDS: &[&str] = &["delete_session", "undo_checkpoint"];
+
+/// fire_event 的 kind 准入：白名单 ∪ 前端清单（非破坏类）。
+/// - denylist（DESTRUCTIVE_EVENT_KINDS）一律拒，哪怕清单把 kind 标成 safe；
+/// - 在 SAFE_EVENT_KINDS 里 → 放行（无页面报清单的无头环境也认这层）；
+/// - 页面报过 ops 清单且该 kind 登记其中、risk 标 safe/normal → 放行（新界面能力
+///   只加前端注册表一行就可用，不再逐 kind 改这里）；
+/// - 清单没报/没这条/标 destructive → 拒，报错里带当前可用 kind 与指路。
+fn event_kind_allowed(kind: &str) -> Result<(), String> {
+    if DESTRUCTIVE_EVENT_KINDS.contains(&kind) {
+        return Err(format!(
+            "kind「{kind}」是破坏类操作，只能走具名方法（删会话用 session 工具、撤销检查点用 undo_checkpoint）——审批分级不为它从通用通道开口子"
+        ));
+    }
+    if SAFE_EVENT_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    match crate::server::ui_events::ops_risk(kind).as_deref() {
+        Some("safe") | Some("normal") => Ok(()),
+        Some("destructive") => Err(format!(
+            "kind「{kind}」在界面清单里标的是破坏类（risk=destructive）——必须走具名方法，不进通用通道"
+        )),
+        _ => Err(format!(
+            "kind「{kind}」当前界面没登记（没有页面在报清单，或前端还没有这个 kind）；当前可用：{}",
+            list_reported_or_static_kinds()
+        )),
+    }
+}
+
+/// 报错用：清单里登记的非内部 kind + 静态白名单补集（没人报时指路白名单）。
+fn list_reported_or_static_kinds() -> String {
+    let mut ks: Vec<String> = crate::server::ui_events::ops_manifest()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|o| o.get("kind").and_then(Value::as_str).map(str::to_string))
+        .filter(|k| !DESTRUCTIVE_EVENT_KINDS.contains(&k.as_str()))
+        .collect();
+    for k in SAFE_EVENT_KINDS.iter() {
+        if !ks.contains(&k.to_string()) {
+            ks.push((*k).to_string());
+        }
+    }
+    if ks.is_empty() {
+        ks.push("（无）".into());
+    }
+    ks.join(" / ")
+}
 
 pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
@@ -221,9 +282,9 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
                 Ok("已按注入框同款路径写入这段 CSS 并即时生效（覆盖原有手写规则；重开也在）".into())
             }
         }
-        // 通用事件通道：event 传整条事件 JSON（kind 必填，其余字段任意）。白名单挡破坏类
-        // kind（delete_session 等必须走具名方法保审批分级）。前端新增界面事件后，这里加
-        // 一行 SAFE_EVENT_KINDS 就能用，不用再改工具签名——「别一个一个加」就指这个。
+        // 通用事件通道：event 传整条事件 JSON（kind 必填，其余字段任意）。准入 =
+        // SAFE_EVENT_KINDS 白名单 ∪ 前端 UI_OPS 清单（非破坏类），见 event_kind_allowed——
+        // 前端新增界面事件并登记进注册表即可投递，不用再逐 kind 改这里。
         "fire_event" => {
             super::selfmod_gate()?;
             // event 收对象，也容错收 stringify 过的 JSON（模型常见手滑，别让它被自己的
@@ -239,12 +300,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
                 .and_then(|x| x.as_str())
                 .ok_or("event.kind 必填（如 sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）")?
                 .to_string();
-            if !SAFE_EVENT_KINDS.contains(&kind.as_str()) {
-                return Err(format!(
-                    "kind「{kind}」不在安全事件白名单里（可用：{}）；破坏类操作（删会话等）走具名方法，审批分级不为它开口子",
-                    SAFE_EVENT_KINDS.join(" / ")
-                ));
-            }
+            event_kind_allowed(&kind)?;
             crate::server::ui_events::emit(ev);
             Ok(format!("已向界面投递事件 {kind}"))
         }
@@ -284,4 +340,75 @@ fn ui_state_side(side: &str) -> Option<bool> {
 fn ui_state_bool(field: &str) -> Option<bool> {
     let st = crate::server::ui_events::last_state()?;
     st.get(field).and_then(|b| b.as_bool())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // fire_event 的 kind 准入五分支。**单一写者**：本函数是整个 cargo test 进程里唯一
+    // 往 ui_events 全局态注入假 ops 清单的地方（进程启动时没人报过 state = None），
+    // 因此函数内必须顺序执行——先断言「无清单」分支，再注入清单断言登记分支；
+    // rules 侧的分级映射与清单解析断言也折叠在这里，不另起写者把前提冲掉。
+    // （cargo test 默认多线程并行：任何第二个写者都会让「无清单」断言随机翻车。）
+    #[test]
+    fn fire_event_kind_admission_five_branches() {
+        // ① 无页面在报（进程态 = None）：破坏 denlist 一律拒，且指明具名方法在哪
+        for k in DESTRUCTIVE_EVENT_KINDS {
+            let e = event_kind_allowed(k).unwrap_err();
+            assert!(e.contains("具名方法"), "{k} 拒因须指路具名方法: {e}");
+        }
+        // ② 无清单时静态白名单照样放行（无头环境行为不变）
+        assert!(event_kind_allowed("theme").is_ok());
+        assert!(event_kind_allowed("pin_session").is_ok());
+        // ③ 白名单外又没人登记：拒，报错回带当前可用 kind（此处回落静态白名单）
+        let e = event_kind_allowed("galaxy_toggle").unwrap_err();
+        assert!(e.contains("没登记"), "拒因要说清: {e}");
+        assert!(e.contains("theme"), "无清单时报错须回落白名单指路: {e}");
+
+        // —— 注入假清单：模拟前端 UI_OPS 注册表自报（含把破坏类标 safe 的恶意条目，
+        //    自证「清单是广告不是闸」——投毒伪造也绕不过 denlist）——
+        crate::server::ui_events::report_state(json!({
+            "ops": [
+                { "kind": "galaxy_toggle",  "title": "星云入口",  "risk": "safe",   "args": [] },
+                { "kind": "roles_sheet",    "title": "功能桥接",  "risk": "normal", "args": [] },
+                { "kind": "delete_session", "title": "删会话",    "risk": "safe",   "args": [] },
+                { "kind": "undo_checkpoint","title": "撤销",      "risk": "normal", "args": [] },
+                "garbage_string_entry_not_an_object", // 非对象条目：应被 ops_manifest 的 is_object 滤掉
+            ]
+        }));
+        // 清单解析：只收对象条目；能按 kind 取到 risk 档，未登记返回 None
+        let man = crate::server::ui_events::ops_manifest().expect("注入后应读到清单");
+        assert_eq!(man.len(), 4, "非对象条目应被滤掉: {man:?}");
+        assert_eq!(crate::server::ui_events::ops_risk("galaxy_toggle").as_deref(), Some("safe"));
+        assert_eq!(crate::server::ui_events::ops_risk("roles_sheet").as_deref(), Some("normal"));
+        assert_eq!(crate::server::ui_events::ops_risk("no_such_kind"), None);
+
+        // ④ 清单登记 safe/normal：放行（新界面能力 = 前端注册表加一行即用，不改后端）
+        assert!(event_kind_allowed("galaxy_toggle").is_ok());
+        assert!(event_kind_allowed("roles_sheet").is_ok());
+        // ⑤ 清单把破坏类标 safe/normal 也拒——denlist 是闸，清单只是广告
+        assert!(event_kind_allowed("delete_session").unwrap_err().contains("具名方法"));
+        assert!(event_kind_allowed("undo_checkpoint").unwrap_err().contains("具名方法"));
+        // 清单里没有、白名单也没有：拒，且报错列出清单登记的可投 kind
+        let e = event_kind_allowed("no_such_kind").unwrap_err();
+        assert!(e.contains("没登记"), "{e}");
+        assert!(e.contains("galaxy_toggle") && e.contains("roles_sheet"), "报错应列出清单登记的可用 kind: {e}");
+
+        // rules 侧同源映射（事实源在 rules.rs::evaluate_risk，与准入同一批常量/同一份清单）：
+        let ws = std::path::Path::new("C:/test/ws");
+        let risk = |kind: &str| {
+            crate::core::rules::evaluate_risk("ui", &json!({"method": "fire_event", "event": {"kind": kind}}), ws).0
+        };
+        use crate::core::rules::RiskLevel::*;
+        assert_eq!(risk("galaxy_toggle"), Safe,   "清单 safe → Safe");
+        assert_eq!(risk("roles_sheet"),   Normal, "清单 normal → Normal");
+        assert_eq!(risk("delete_session"), Dangerous, "清单标 safe 也改不了 denlist 判级");
+        assert_eq!(risk("undo_checkpoint"), Dangerous);
+        assert_eq!(risk("no_such_kind"), Dangerous, "未登记 → 高危兜底");
+        // 白名单 kind 判 Safe 不受清单注入影响（分支先于清单查询）
+        assert_eq!(risk("theme"), Safe);
+    }
 }

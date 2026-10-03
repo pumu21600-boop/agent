@@ -12,6 +12,13 @@
 //! 看不见也猜不准（「打开」=展开还是按一下开关，中文本就两义，模型按切换语义猜错过
 //! ——真机实锤）。页面把自己的边栏/面板状态报上来（内存态，仅最近一次页面有效），
 //! ui 工具的 state 方法读它，open/close 也靠它识别 no-op，不再凭空报「已完成」。
+//!
+//! 2026-10-03 重构轮：上报体新增 `ops` 字段——前端 UI_OPS 注册表序列化出的
+//! 「界面能干什么」自描述清单（kind/title/risk/args 数组）。用途二：① ui 工具的
+//! fire_event 通用通道准入参考（白名单之外、清单里登记且非破坏类的 kind 放行）；
+//! ② rules 按清单 risk 分级。**清单是广告不是闸**——/api/ui/state 是无鉴权本地端点，
+//! 任何本地进程可投毒，所以破坏类（见 core::rules 的破坏 denylist）由后端硬编码
+//! 永远把守，未登记 kind 默认高危。
 
 use super::*;
 use futures_util::stream::Stream;
@@ -44,6 +51,24 @@ pub(crate) fn report_state(v: Value) {
 /// agent 读最近一次界面状态上报；没有页面报过返回 None。
 pub(crate) fn last_state() -> Option<Value> {
     state_slot().read().ok().and_then(|s| s.clone())
+}
+
+/// 前端自报的 ops 动作清单（kind/title/risk/args 数组）；没有页面报过返回 None。
+/// **不可信**：本地无鉴权端点可投毒——只作广告与准入参考，破坏类另由 denylist 把守。
+pub(crate) fn ops_manifest() -> Option<Vec<Value>> {
+    last_state()?
+        .get("ops")?
+        .as_array()
+        .map(|a| a.iter().filter(|x| x.is_object()).cloned().collect())
+}
+
+/// 某 kind 在清单里的 risk 档（safe/normal/destructive）；未登记或没清单返回 None。
+pub(crate) fn ops_risk(kind: &str) -> Option<String> {
+    let ops = ops_manifest()?;
+    ops.iter()
+        .find(|o| o.get("kind").and_then(Value::as_str) == Some(kind))
+        .and_then(|o| o.get("risk").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 /// GET /api/ui/events —— SSE 事件流（本机来源校验由全局中间件兜着）。
