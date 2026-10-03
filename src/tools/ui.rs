@@ -61,6 +61,19 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             crate::server::ui_events::emit(json!({ "kind": "open_file", "path": path }));
             Ok(format!("已在侧边栏打开文件预览标签：{path}"))
         }
+        // 左右两侧边栏：side=left 会话列表侧栏，right 产物/页面/面板侧栏（含终端互斥切换）
+        "open_sidebar" | "close_sidebar" => {
+            super::selfmod_gate()?;
+            let side = match v.get("side").and_then(|x| x.as_str()).unwrap_or("") {
+                "left" => "left",
+                "right" => "right",
+                other => return Err(format!("未知 side: {other:?}（left / right）")),
+            };
+            let open = method == "open_sidebar";
+            crate::server::ui_events::emit(json!({ "kind": "sidebar", "side": side, "open": open }));
+            let which = if side == "left" { "左侧边栏" } else { "右侧边栏" };
+            Ok(if open { format!("已打开{which}") } else { format!("已收起{which}") })
+        }
         "open_memory" => {
             super::selfmod_gate()?;
             let galaxy_on = crate::config::settings::shared_settings()
@@ -73,7 +86,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             Ok("已打开记忆库（星云视图）".into())
         }
         other => Err(format!(
-            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory；会话管理用 session 工具）"
+            "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar；会话管理用 session 工具）"
         )),
     }
 }

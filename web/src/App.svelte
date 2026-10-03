@@ -3721,6 +3721,19 @@
         if (m.path) openPreviewTab(String(m.path));
       } else if (m.kind === 'open_memory') {
         if (features.galaxy) galaxyOpen = true;
+      } else if (m.kind === 'sidebar') {
+        // agent 的 ui 工具 open_sidebar/close_sidebar：与顶栏按钮同状态同行为
+        if (m.side === 'right') {
+          if (m.open) {
+            terminalOpen = false;
+            rightPanelOpen = true;
+            openRightPanel();
+          } else {
+            rightPanelOpen = false;
+          }
+        } else if (m.side === 'left') {
+          sidebarCollapsed = !m.open;
+        }
       }
     };
   } catch {}
