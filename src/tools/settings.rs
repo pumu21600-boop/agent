@@ -208,20 +208,32 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
     Ok(changed)
 }
 
-/// 工具执行入口：action=get 返回脱敏快照；action=set 应用补丁并落盘+同步。
+/// 工具执行入口。
+/// - action=get：脱敏快照（不受自改闸，只读）
+/// - action=set：补丁合并（受闸）
+/// - action=config：渠道配置新建/删除（受闸；删除高危必问）
+/// - action=mcp：MCP server 重连（受闸）
+/// - action=workspace：切换工作区（受闸 + 红线必问——改自己的文件边界）
+/// - action=schedule_run：立即触发一条定时任务（受闸；真花钱，高危必问）
+/// - action=memory：记忆库重建索引（受闸）
 pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
-    let handle =
-        settings::shared_settings().ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
-    match v.get("action").and_then(|x| x.as_str()) {
-        Some("get") => {
+    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    match action.as_str() {
+        "get" => {
+            let handle = settings::shared_settings()
+                .ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
             let s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(crate::context::compress(&snapshot_json(&s), 8000))
         }
-        Some("set") => {
+        // —— 以下全部受「自改」插件闸（闸在分发层；助手函数保持纯净供测试直达） ——
+        "set" => {
+            super::selfmod_gate()?;
             let patch: SettingsPatch =
                 serde_json::from_value(v.get("patch").cloned().unwrap_or(Value::Null))
                     .map_err(|e| format!("patch 不合法（未知键或值类型不对）: {e}；可改键见本工具说明"))?;
+            let handle =
+                settings::shared_settings().ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
             let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
             let changed = apply_patch(&mut s, &patch)?;
             s.save().map_err(|e| format!("保存 settings.json 失败: {e}"))?;
@@ -236,7 +248,133 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             );
             Ok(format!("已保存并即时生效（{}）", changed.join("、")))
         }
-        other => Err(format!("未知 action: {other:?}（只支持 get / set）")),
+        "config" => {
+            super::selfmod_gate()?;
+            config_op(&v).await
+        }
+        "mcp" => {
+            super::selfmod_gate()?;
+            mcp_refresh(&v).await
+        }
+        "workspace" => {
+            super::selfmod_gate()?;
+            switch_workspace(&v).await
+        }
+        "schedule_run" => {
+            super::selfmod_gate()?;
+            schedule_run_now(&v).await
+        }
+        "memory" => {
+            super::selfmod_gate()?;
+            memory_op(&v).await
+        }
+        other => Err(format!(
+            "未知 action: {other:?}（get / set / config / mcp / workspace / schedule_run / memory）"
+        )),
+    }
+}
+
+/// action=config：渠道配置新建（op=new，复制当前并激活）与删除（op=delete+id）。
+async fn config_op(v: &Value) -> Result<String, String> {
+    let handle =
+        settings::shared_settings().ok_or_else(|| "设置子系统尚未初始化".to_string())?;
+    let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
+    match v.get("op").and_then(|x| x.as_str()).unwrap_or("") {
+        "new" => {
+            // 不抢激活位：新配置不带 key（本工具拒绝碰 key），激活了等于把全服务
+            // 打进「API key 未设置」——真机 E2E 实锤。建好放在旁边，key 请用户到设置页
+            // 补，补完再 active_config_id 切换（切换是红线键，会弹卡）。
+            let prev_active = s.active_config_id.clone();
+            let id = s.new_config();
+            if let Some(prev) = prev_active
+                && !s.activate(&prev) {
+                    s.ensure_active_config();
+                }
+            s.save().map_err(|e| format!("保存失败: {e}"))?;
+            *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+            crate::server::settings::sync_runtime(&s);
+            crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["configs"] }));
+            Ok(format!("已新建渠道配置 id={id}（起点复制自原激活配置，当前激活没动——新配置没有密钥，要补 key 或改它的 base_url 请到设置页操作，或用 action=set 的 name/base_url 键）"))
+        }
+        "delete" => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if id.is_empty() {
+                return Err("缺少 id（action=get 看 configs 清单）".into());
+            }
+            if !s.delete_config(id) {
+                return Err(format!("配置不存在: {id}"));
+            }
+            s.save().map_err(|e| format!("保存失败: {e}"))?;
+            *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+            crate::server::settings::sync_runtime(&s);
+            crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["configs"] }));
+            Ok(format!("已删除渠道配置 {id}（它带的密钥一并清除）"))
+        }
+        other => Err(format!("未知 op: {other:?}（new / delete）")),
+    }
+}
+
+/// action=mcp：MCP server 重连（只重连+重新发现工具，不改配置）。
+async fn mcp_refresh(v: &Value) -> Result<String, String> {
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return Err("缺少 name（action=get 看 mcp_servers 清单）".into());
+    }
+    let known = settings::shared_settings()
+        .map(|h| h.read().map(|s| s.mcp_servers.iter().any(|c| c.name == name)).unwrap_or(false))
+        .unwrap_or(false);
+    if !known {
+        return Err(format!("未知 MCP server: {name}"));
+    }
+    let n = tokio::task::spawn_blocking(move || crate::mcp::ensure_online_by_name(&name))
+        .await
+        .map_err(|e| format!("重连任务失败: {e}"))?;
+    match n {
+        Ok(count) => Ok(format!("已重连并重新发现，找到 {count} 个工具")),
+        Err(e) => Err(format!("重连失败: {e}")),
+    }
+}
+
+/// action=workspace：切换工作区（红线：改自己的文件边界 + 记忆层重开，任何档位必问）。
+async fn switch_workspace(v: &Value) -> Result<String, String> {
+    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if path.is_empty() {
+        return Err("缺少 path（目录绝对路径）".into());
+    }
+    let p = std::path::PathBuf::from(&path);
+    if !p.is_dir() {
+        return Err(format!("目录不存在: {path}"));
+    }
+    let state = crate::server::shared_state().ok_or("工作区子系统尚未初始化")?;
+    let canon = crate::server::workspace::canon_workspace(p);
+    crate::server::workspace::apply_workspace(&state, &canon)
+        .map_err(|e| format!("切换失败: {e}"))?;
+    Ok(format!(
+        "已切换工作区到 {}（文件边界与记忆层已跟着切；旧工作区会话都还在侧栏原项目下）",
+        canon.display()
+    ))
+}
+
+/// action=schedule_run：立即触发一条定时任务（无头会话真跑，花真钱 → 高危必问）。
+async fn schedule_run_now(v: &Value) -> Result<String, String> {
+    let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return Err("缺少 id（action=get 看 schedules 清单）".into());
+    }
+    let state = crate::server::shared_state().ok_or("定时任务子系统尚未初始化")?;
+    crate::schedule::run_now(&state, &id).map(|_| format!("定时任务 {id} 已触发（无头会话在后台跑，结果进侧栏会话与通知）"))
+}
+
+/// action=memory：记忆库重建索引（强制忽略指纹，重新向量检索库）。
+async fn memory_op(v: &Value) -> Result<String, String> {
+    match v.get("op").and_then(|x| x.as_str()).unwrap_or("reindex") {
+        "reindex" => {
+            let state = crate::server::shared_state().ok_or("记忆库子系统尚未初始化")?;
+            let lib = crate::server::memory::build_library(&state, true).await;
+            let count = lib.get("points").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
+            Ok(format!("记忆库索引已强制重建（{count} 个会话光点）"))
+        }
+        other => Err(format!("未知 op: {other:?}（reindex）")),
     }
 }
 

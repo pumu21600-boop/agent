@@ -119,11 +119,17 @@ pub struct FeatureSettings {
     /// 开 = 检测到连接断开就取消本轮，不再继续烧 token
     #[serde(default)]
     pub cancel_on_disconnect: bool,
+    /// 自改总闸（2026-10-03 用户拍板 B）：关 = agent 所有「改自身」动作（设置/渠道/
+    /// 插件技能启停/定时任务/会话管理/面板）一律拒绝并引导用户到插件页打开；
+    /// 开 = 按当前审批档位放行（红线仍必问）。只读不闸。
+    /// 默认开——与插件行「装着即启用」一致（行开关是唯一真相，toggle 会同步写这里）。
+    #[serde(default = "default_true")]
+    pub self_mod: bool,
 }
 
 impl Default for FeatureSettings {
     fn default() -> Self {
-        Self { roles: true, css_tool: true, galaxy: true, cancel_on_disconnect: false }
+        Self { roles: true, css_tool: true, galaxy: true, cancel_on_disconnect: false, self_mod: true }
     }
 }
 
@@ -136,6 +142,7 @@ impl FeatureSettings {
             "css_tool" => self.css_tool = value,
             "galaxy" => self.galaxy = value,
             "cancel_on_disconnect" => self.cancel_on_disconnect = value,
+            "self_mod" => self.self_mod = value,
             other => {
                 return Err(format!(
                     "未知功能键 {other}（可选：{}）",

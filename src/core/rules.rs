@@ -62,6 +62,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "ui",
     // 2026-10-03 技能建/改/删正门（复用 skills::save/delete；分级见 evaluate_risk 的 skill 臂）
     "skill",
+    // 2026-10-03 会话管理（new/open/rename/fork/delete/pin/archive；分级见 session 臂）
+    "session",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -139,6 +141,9 @@ const APP_CONFIG_FILES: &[&str] = &[
     "prompts/system.md",
 ];
 
+/// settings 工具里「动作即红线」的 action（切换工作区 = 改自己的文件边界，任何档位必问）。
+const SETTINGS_REDLINE_ACTIONS: &[&str] = &["workspace"];
+
 /// write_file 敏感后缀（密钥/证书类）。
 const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".ppk"];
 
@@ -207,6 +212,16 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             "save" => (RiskLevel::Normal, "保存技能（写全局技能根）".into()),
             "delete" => (RiskLevel::Dangerous, "删除技能（不可逆）".into()),
             _ => (RiskLevel::Dangerous, "skill 工具缺少合法 action（list/save/delete）".into()),
+        },
+
+        // 2026-10-03 会话管理：list 只读；删除不可逆 → 高危；其余界面级动作常规
+        "session" => match args.get("method").and_then(|v| v.as_str()).unwrap_or("") {
+            "list" => (RiskLevel::Safe, "列出会话（只读）".into()),
+            "delete" => (RiskLevel::Dangerous, "删除会话（不可逆）".into()),
+            "new" | "open" | "rename" | "fork" | "pin" | "archive" => {
+                (RiskLevel::Normal, "会话管理（界面动作）".into())
+            }
+            _ => (RiskLevel::Dangerous, "session 工具缺少合法 method".into()),
         },
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
@@ -296,7 +311,21 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
                 (RiskLevel::Normal, format!("修改应用常规设置: {}", keys.join("/")))
             }
         }
-        _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action（get/set）".into()),
+        // 渠道配置增删：新建=常规（起点复制当前，行为不变）；删除=高危（可能带 key）
+        "config" => match args.get("op").and_then(|v| v.as_str()).unwrap_or("") {
+            "delete" => (RiskLevel::Dangerous, "删除渠道配置（含密钥，不可逆）".into()),
+            "new" => (RiskLevel::Normal, "新建渠道配置（复制当前并激活）".into()),
+            _ => (RiskLevel::Dangerous, "config 缺少合法 op（new/delete）".into()),
+        },
+        // MCP 重连：只重连+重新发现工具，不动配置
+        "mcp" => (RiskLevel::Normal, "重连 MCP server（重新发现工具）".into()),
+        // 立即跑定时任务：无头会话真跑真花钱
+        "schedule_run" => (RiskLevel::Dangerous, "立即执行定时任务（无头会话真实运行）".into()),
+        // 重建记忆索引：本地重建+向量计算，常规运维
+        "memory" => (RiskLevel::Normal, "重建记忆库索引".into()),
+        // 切换工作区：Dangerous 之外还进 red_line_hold（任何档位必问）
+        "workspace" => (RiskLevel::Dangerous, "切换工作区（改自己的文件边界）".into()),
+        _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action".into()),
     }
 }
 
@@ -313,7 +342,12 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
 pub fn red_line_hold(tool_name: &str, args: &Value, workspace_root: &Path) -> bool {
     match tool_name {
         "settings" => {
-            matches!(args.get("action").and_then(|v| v.as_str()), Some("set"))
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+            // 动作即红线的（切工作区）不看参数直接拦
+            if SETTINGS_REDLINE_ACTIONS.contains(&action) {
+                return true;
+            }
+            action == "set"
                 && args
                     .get("patch")
                     .and_then(|p| p.as_object())
@@ -1063,6 +1097,25 @@ mod tests {
         // 工作区内的绝对路径（哪怕文件还没建）不判越界
         let r = evaluate_risk("write_file", &json!({"path": "C:/test/ws/src/new.rs", "content": "x"}), &ws());
         assert_eq!(r.0, RiskLevel::Normal, "{}", r.1);
+    }
+
+    // —— 2026-10-03 自改大轮：session/settings 新动作分级 + workspace 红线 ——
+    #[test]
+    fn test_session_and_settings_new_actions() {
+        assert_eq!(evaluate_risk("session", &json!({"method": "list"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("session", &json!({"method": "open", "id": "x"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("session", &json!({"method": "fork", "id": "x"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("session", &json!({"method": "delete", "id": "x"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "config", "op": "new"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "config", "op": "delete", "id": "x"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "mcp", "op": "refresh", "name": "fs"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "schedule_run", "id": "t"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "memory", "op": "reindex"}), &ws()).0, RiskLevel::Normal);
+        // workspace：Dangerous 且进红线（完全访问也必问）
+        let (r, why) = evaluate_risk("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws());
+        assert_eq!(r, RiskLevel::Dangerous, "{why}");
+        assert!(red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()));
+        assert!(!red_line_hold("settings", &json!({"action": "config", "op": "new"}), &ws()));
     }
 
     #[test]

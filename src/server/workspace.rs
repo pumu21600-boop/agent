@@ -309,7 +309,7 @@ pub(super) async fn get_workspace(State(state): State<AppState>) -> Json<Value> 
 }
 
 /// 规范化工作区路径：Windows canonicalize 会加 `\\?\` 扩展前缀，显示与持久化都难看，剥掉。
-pub(super) fn canon_workspace(p: std::path::PathBuf) -> std::path::PathBuf {
+pub(crate) fn canon_workspace(p: std::path::PathBuf) -> std::path::PathBuf {
     match p.canonicalize() {
         Ok(c) => {
             let s = c.display().to_string();
@@ -334,7 +334,7 @@ pub(super) fn same_workspace(a: &str, b: &str) -> bool {
 
 /// 切换工作区（/api/workspace 与「打开会话」共用）：改全局根 → 记忆层热重开
 /// → settings 持久化 + 最近列表 → MCP 同步 → 事件。调用方负责校验目录存在。
-pub(super) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Result<(), String> {
+pub(crate) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Result<(), String> {
     let old = crate::tools::set_workspace_root(canon);
     // 记忆层重开：新项目的双层存储/index 登记/AGENTS.md 模板
     let new_mem = Arc::new(crate::memory::Memory::open(canon, &state.mem_cfg));

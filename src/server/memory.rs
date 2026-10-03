@@ -99,7 +99,7 @@ fn resolve_embedder<'a>(state: &'a AppState, s: &Settings) -> Option<crate::memo
 }
 
 /// 增量同步索引 → 记忆库 JSON（光点列表 + 项目聚合 + 索引状态）。
-pub(super) async fn build_library(state: &AppState, force: bool) -> Value {
+pub(crate) async fn build_library(state: &AppState, force: bool) -> Value {
     use crate::memory::library as lb;
     let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let embedder = resolve_embedder(state, &settings);

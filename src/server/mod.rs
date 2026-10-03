@@ -57,8 +57,8 @@ mod subagent;
 mod system;
 pub(crate) mod ui_events; // 2026-10-03：服务端→前端 UI 事件流（ui 工具开面板 / settings 变更刷新）
 mod usage;
+pub(crate) mod workspace; // settings 工具的 workspace 动作复用 canon_workspace/apply_workspace
 mod webpanel;
-mod workspace;
 
 use chat::*;
 use plugins::*;
@@ -121,6 +121,21 @@ pub struct AppState {
     pub gateway_cfg: Arc<crate::config::GatewayConfig>,
     /// P22-C 子代理并行度（config.toml [subagent]：max_concurrent / per_parent）
     pub subagent_cfg: Arc<crate::config::SubagentConfig>,
+}
+
+/// 进程级共享 AppState（2026-10-03 agent 自改设置轮）：settings/schedule 等工具要触达
+/// 定时任务、记忆库、工作区切换这类持有 AppState 的运维动作，经此取同一份克隆（全是
+/// Arc 字段，克隆共享底层状态）；main 启动时装一次。
+static SHARED_STATE: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
+
+/// main 启动时安装共享句柄。
+pub(crate) fn install_shared_state(state: AppState) {
+    let _ = SHARED_STATE.set(state);
+}
+
+/// 工具层取共享句柄；未安装（测试/极早调用）返回 None。
+pub(crate) fn shared_state() -> Option<AppState> {
+    SHARED_STATE.get().cloned()
 }
 
 pub fn router(state: AppState, dist_dir: PathBuf) -> Router {

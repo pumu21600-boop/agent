@@ -182,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
         // P22-C 子代理并行度（并发上限/单父任务上限）
         subagent_cfg: Arc::new(config.subagent.clone()),
     };
+    // 2026-10-03 agent 自改设置轮：工具层（settings/schedule 等运维动作）经共享句柄触达 AppState
+    server::install_shared_state(state.clone());
     let app = server::router(state.clone(), manifest.join("web").join("dist"));
     // P22-B 定时任务：2s 心跳到点唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
     schedule::start(state);

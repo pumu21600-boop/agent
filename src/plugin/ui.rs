@@ -40,7 +40,7 @@ pub const DIR: &str = "plugins";
 
 /// settings.features 的功能键全集（manifest `feature` 与 toggle_plugin 的联动只认这些）。
 /// 加减键时同步改 config/settings.rs 的 Features 结构体——两边不一致时以这边为准报错。
-pub const FEATURE_KEYS: &[&str] = &["roles", "css_tool", "galaxy", "cancel_on_disconnect"];
+pub const FEATURE_KEYS: &[&str] = &["roles", "css_tool", "galaxy", "cancel_on_disconnect", "self_mod"];
 
 /// 生态轮：停用名单的进程内副本。技能根扫描（skills::list → index_prompt）每轮对话都跑，
 /// 摸不到服务层的 settings 锁——与 wasm::set_disabled 同模式：启动（main）与启停端点两处灌入。

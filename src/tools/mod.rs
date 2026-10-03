@@ -17,6 +17,7 @@ use crate::config::SandboxConfig;
 mod fs;
 mod git;
 mod search;
+mod session;
 mod settings;
 mod shell;
 mod skill;
@@ -271,12 +272,16 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）。action=get 返回全部可改设置快照（API key 只给尾号提示；available_plugins/available_skills 列出合法 id）。action=set 携带 patch 只列要改的键，改完保存并即时生效、打开中的界面自动刷新，无需重启。普通键：thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles（角色路由）、features（功能开关）、sandbox_cpu_percent、mcp_servers（整表替换，先 get 再改；新 server 或改配置会回到「未确认」等用户确认）、disabled_plugins/disabled_skills（整表替换，必须用 get 里 available_* 给出的插件 id / 技能名，写中文标题会自动映射但对不上的直接报错）、schedules（整表替换，新增 id 留空）。红线键：base_url/model/provider_id/active_config_id（渠道指向 = 换自己的大脑）——每次都会弹卡等用户确认，任何审批档位都不静默，改 base_url 会清空模型与模型列表。范围外：api_key/工作区/价格表/信任插件（本工具不收）；config.toml 里的花费上限/审批默认档/钩子等要改文件且需重启（同样属红线必问）。要开关侧栏面板用 ui 工具。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）。自改纪律：除 action=get（只读）外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=set 配 patch：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；红线键（base_url/model/provider_id/active_config_id）任何档位都弹卡必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（必问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（红线必问）。action=schedule_run 配 id：立即跑一条定时任务（真花钱，必问）。action=memory 配 op=reindex：重建记忆库索引。范围外：api_key/价格表/信任插件；config.toml 改文件需重启（同样必问）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["get", "set"], "description": "get=读当前设置快照；set=按 patch 合并写入" },
-                    "patch": { "type": "object", "description": "set 时必填：要改的键与新值（只列要改的键；未知键会报错；mcp_servers/schedules/disabled_* 为整表替换，务必先 get 拿现状再改）" }
+                    "action": { "type": "string", "enum": ["get", "set", "config", "mcp", "workspace", "schedule_run", "memory"], "description": "get/set/config/mcp/workspace/schedule_run/memory；除 get 外都要「自改」插件开着" },
+                    "patch": { "type": "object", "description": "set 时必填：要改的键与新值（整表替换的键先 get 拿现状）" },
+                    "op": { "type": "string", "enum": ["new", "delete", "refresh", "reindex"], "description": "config：new/delete；mcp：refresh；memory：reindex" },
+                    "id": { "type": "string", "description": "config=配置 id；schedule_run=任务 id；mcp=server 名" },
+                    "name": { "type": "string", "description": "mcp refresh：server 名" },
+                    "path": { "type": "string", "description": "workspace：目标目录绝对路径" }
                 },
                 "required": ["action"]
             }),
@@ -284,12 +289,28 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。面板：method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态；面板插件被停用时 open_panel 会拒绝——先用 settings 工具把它从 disabled_plugins 移除（用 id，别写中文标题）再打开。会话：method=new_session 在当前工作区新建一条会话，界面会立刻切过去（等同用户点「新会话」按钮；你自己的回复仍落在原会话里，用户看的是新会话）。用户要「新建会话/开个新对话」就用 new_session，不要去翻文件系统。",
+            description: "操作本应用自己的界面。自改纪律：除 list_panels（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。面板：method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态；面板插件被停用时 open_panel 拒绝并指路 settings 工具。文件：method=open_file 配 path（工作区路径），在侧边栏打开预览标签。记忆库：method=open_memory 打开星云视图（星云入口关着会拒绝并指路 settings 开 features.galaxy）。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "new_session"], "description": "open_panel/close_panel 配 name；list_panels/new_session 不需要" },
-                    "name": { "type": "string", "enum": ["trace", "board", "usage"], "description": "面板插件 id：trace=时间线、board=项目文件、usage=用量" }
+                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "open_file", "open_memory"], "description": "open_panel/close_panel/open_file 配 name/path；list_panels/open_memory 不需要额外参数" },
+                    "name": { "type": "string", "enum": ["trace", "board", "usage"], "description": "面板插件 id：trace=时间线、board=项目文件、usage=用量" },
+                    "path": { "type": "string", "description": "open_file：要预览的文件路径（工作区相对或绝对）" }
+                },
+                "required": ["method"]
+            }),
+            danger_level: 0,
+        },
+        ToolSpec {
+            name: "session",
+            description: "会话管理：method=list 列出全部会话（id/标题/工作区/置顶归档态，只读不受闸）；new=新建会话并切过去；open+id=切换到某条会话；rename+id+title=改标题；fork+id=分叉；delete+id=删除（不可逆，必问）；pin/archive+id(+on)=置顶/归档。自改纪律：除 list 外全部动作要求插件页「自改」开关开着——没开就引导用户去 设置→插件 打开「自改」，别硬试。注意：切换/新建后 agent 自己的回复仍落在原会话，结果里要向用户交代这一点。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "method": { "type": "string", "enum": ["list", "new", "open", "rename", "fork", "delete", "pin", "archive"], "description": "list/new 不需要 id；open/rename/fork/delete/pin/archive 配 id；rename 再配 title；pin/archive 可配 on（默认 true）" },
+                    "id": { "type": "string", "description": "会话 id（method=list 查）" },
+                    "title": { "type": "string", "description": "rename：新标题" },
+                    "on": { "type": "boolean", "description": "pin/archive：true=执行，false=取消（默认 true）" }
                 },
                 "required": ["method"]
             }),
@@ -385,6 +406,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "ui" => ui::run(args).await,
         // 2026-10-03：技能建/改/删正门（复用 skills::save/delete，模型不用找文件）
         "skill" => skill::run(args).await,
+        // 2026-10-03：会话管理（new/open/rename/fork/delete/pin/archive，事件驱动前端）
+        "session" => session::run(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }
@@ -412,6 +435,23 @@ pub fn resolve_workspace_path(rel: &str) -> Result<PathBuf, String> {
 fn cap(s: &str, max: usize) -> String {
     // P5 起工具结果统一走头尾压缩（替代旧的单向硬截断）
     crate::context::compress(s, max)
+}
+
+/// 自改插件闸（2026-10-03 用户拍板 B/A/A/A）：所有「改自身」动作要求插件页「自改」
+/// 开关打开；读（settings get / skill list / ui list_panels / session list）不闸。
+/// 插件关着时给人话指路（Q4=A 口头引导，agent 不能自己开自己的闸）。
+/// 放行后的审批仍走原档位规则（Q2=A 跟随档位），红线照旧必问（Q3=A）。
+pub(crate) fn selfmod_gate() -> Result<(), String> {
+    let on = crate::config::settings::shared_settings()
+        .map(|h| h.read().map(|s| s.features.self_mod).unwrap_or(false))
+        .unwrap_or(false);
+    if on {
+        return Ok(());
+    }
+    Err(
+        "「自改」插件没开，我做不了这件事。请到 设置→插件 找到「自改」一行把开关打开，然后再叫我重做即可。"
+            .to_string(),
+    )
 }
 
 /// 解析路径并做工作目录穿越校验，返回 canonicalize 后的绝对路径。

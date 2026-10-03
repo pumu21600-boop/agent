@@ -3679,14 +3679,49 @@
   }
   try {
     const uiEventsSrc = new EventSource('/api/ui/events');
-    uiEventsSrc.onmessage = (ev) => {
+    uiEventsSrc.onmessage = async (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.kind === 'open_panel') rpOpenExtByName(m.name);
       else if (m.kind === 'close_panel') closeRpTab('ext:' + m.name);
       else if (m.kind === 'settings_changed') loadExt();
-      // agent 的 ui 工具 new_session：与「新会话」按钮同一条路（建会话+侧栏刷新+切过去）
-      else if (m.kind === 'new_session') startNewSession();
+      // —— agent 的 session/ui 工具推来的界面动作（与用户手点同一条路）——
+      else if (m.kind === 'new_session') await startNewSession();
+      else if (m.kind === 'open_session') {
+        const s = flatSessions.find((x) => x.id === m.id);
+        if (s) await loadSession(m.id);
+      } else if (m.kind === 'rename_session') {
+        const v = String(m.title || '').trim();
+        if (v) {
+          await fetch('/api/sessions/meta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: m.id, title: v }),
+          });
+          // 改的是当前会话时同步顶栏（与 submitRename 同规）
+          if (m.id === currentSessionId) currentTitle = v.slice(0, 60);
+          loadSessions();
+        }
+      } else if (m.kind === 'fork_session') {
+        await forkSession(m.id);
+      } else if (m.kind === 'delete_session') {
+        // 确认已在工具层审批卡完成（Dangerous 必问），这里不再弹二次确认
+        await fetch(`/api/session?id=${encodeURIComponent(m.id)}`, { method: 'DELETE' });
+        if (m.id === currentSessionId) await startNewSession();
+        else loadSessions();
+      } else if (m.kind === 'pin_session' || m.kind === 'archive_session') {
+        const field = m.kind === 'pin_session' ? 'pinned' : 'archived';
+        await fetch('/api/sessions/meta', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: m.id, [field]: m.on !== false }),
+        });
+        loadSessions();
+      } else if (m.kind === 'open_file') {
+        if (m.path) openPreviewTab(String(m.path));
+      } else if (m.kind === 'open_memory') {
+        if (features.galaxy) galaxyOpen = true;
+      }
     };
   } catch {}
 
@@ -4247,7 +4282,7 @@
         case 'features.set': {
           if (!perms.includes('settings.feature')) return reply(false, '未声明权限 settings.feature');
           const k = String(params.feature || '');
-          if (!['roles', 'css_tool', 'galaxy', 'cancel_on_disconnect'].includes(k)) return reply(false, `未知功能键 ${k}`);
+          if (!['roles', 'css_tool', 'galaxy', 'cancel_on_disconnect', 'self_mod'].includes(k)) return reply(false, `未知功能键 ${k}`);
           const v = params.value !== false;
           // toggleFeature 是「取反」语义：先比再翻，别翻两次
           if ((features[k] || false) !== v) toggleFeature(k);
