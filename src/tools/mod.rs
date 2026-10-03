@@ -284,11 +284,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面：在右侧边栏打开/关闭面板标签。method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态。用户看着的界面即时生效（右侧边栏会自动亮起并切到该面板）；面板插件被停用时 open_panel 会拒绝——先用 settings 工具把它从 disabled_plugins 移除（用 id，别写中文标题）再打开。",
+            description: "操作本应用自己的界面。面板：method=open_panel/close_panel 配 name（面板插件 id：trace=时间线、board=项目文件、usage=用量），method=list_panels 列出三个面板与启用状态；面板插件被停用时 open_panel 会拒绝——先用 settings 工具把它从 disabled_plugins 移除（用 id，别写中文标题）再打开。会话：method=new_session 在当前工作区新建一条会话，界面会立刻切过去（等同用户点「新会话」按钮；你自己的回复仍落在原会话里，用户看的是新会话）。用户要「新建会话/开个新对话」就用 new_session，不要去翻文件系统。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels"], "description": "open_panel/close_panel 需配 name；list_panels 不需要" },
+                    "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "new_session"], "description": "open_panel/close_panel 配 name；list_panels/new_session 不需要" },
                     "name": { "type": "string", "enum": ["trace", "board", "usage"], "description": "面板插件 id：trace=时间线、board=项目文件、usage=用量" }
                 },
                 "required": ["method"]

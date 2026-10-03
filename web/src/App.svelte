@@ -3685,6 +3685,8 @@
       if (m.kind === 'open_panel') rpOpenExtByName(m.name);
       else if (m.kind === 'close_panel') closeRpTab('ext:' + m.name);
       else if (m.kind === 'settings_changed') loadExt();
+      // agent 的 ui 工具 new_session：与「新会话」按钮同一条路（建会话+侧栏刷新+切过去）
+      else if (m.kind === 'new_session') startNewSession();
     };
   } catch {}
 
