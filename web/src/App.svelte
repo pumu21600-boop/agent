@@ -3709,7 +3709,7 @@
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.kind === 'open_panel') rpOpenExtByName(m.name);
       else if (m.kind === 'close_panel') closeRpTab('ext:' + m.name);
-      else if (m.kind === 'settings_changed') loadExt();
+
       // —— agent 的 session/ui 工具推来的界面动作（与用户手点同一条路）——
       else if (m.kind === 'new_session') await startNewSession();
       else if (m.kind === 'open_session') {
@@ -3793,6 +3793,21 @@
           customCss = m.append ? `${customCss}\n${m.css}` : m.css;
           applyCustomCss();
         }
+      } else if (m.kind === 'undo_checkpoint') {
+        // agent 的 ui undo_checkpoint：与改动条「撤销」按钮同一条路（自带二次确认）
+        const cp = dockCp && dockCp.id === m.id ? dockCp : null;
+        if (!cp) {
+          const r = await fetch('/api/checkpoints').then((r2) => r2.json()).catch(() => null);
+          const found = (r && r.checkpoints || []).find((c) => c.id === m.id);
+          if (found) await undoCheckpoint(found);
+        } else {
+          await undoCheckpoint(cp);
+        }
+      } else if (m.kind === 'settings_changed') {
+        // agent 改完设置：插件清单要刷（侧栏/插件页可见性），settings 派生的界面状态
+        // （模型卡片/思考档/配置名）也要刷——不然「实际改了、界面还显示旧的」
+        loadExt();
+        loadSettings();
       }
     };
   } catch {}

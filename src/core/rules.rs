@@ -203,7 +203,29 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         "settings" => risk_settings(args),
 
         // 2026-10-03 操作本应用界面：开/关侧栏面板标签，无持久副作用，恒定 Safe
-        "ui" => (RiskLevel::Safe, "应用界面面板开关（开/关侧栏标签）".into()),
+        // 2026-10-03 操作本应用界面：panel/sidebar/terminal/settings/theme/tab/css/
+        // fire_event（白名单只收非破坏 kind）都无持久破坏面；undo_checkpoint 回滚工作区
+        // 文件不可逆 → 高危必问（fire_event 白名单刻意不收它，防绕过分级）
+        "ui" => {
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if method == "undo_checkpoint" {
+                (RiskLevel::Dangerous, "撤销检查点：回滚工作区文件（不可逆）".into())
+            } else if method == "fire_event" {
+                // 白名单后端还要按 kind 复核一次（与工具内 SAFE_EVENT_KINDS 同源）
+                let kind = args
+                    .get("event")
+                    .and_then(|e| e.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind.is_empty() {
+                    (RiskLevel::Dangerous, "fire_event 缺少 event.kind".into())
+                } else {
+                    (RiskLevel::Safe, format!("界面事件投递: {kind}"))
+                }
+            } else {
+                (RiskLevel::Safe, "应用界面操作（面板/边栏/主题/标签页/CSS 等无持久破坏面）".into())
+            }
+        }
 
         // 2026-10-03 技能管理：list 只读；save 常规（校验统一在 skills::save，落全局技能根）；
         // delete 不可逆 → 高危（插件自带技能工具层本就拒删）

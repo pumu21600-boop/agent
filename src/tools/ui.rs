@@ -11,6 +11,31 @@ use serde_json::{Value, json};
 /// 侧栏面板白名单（与前端 RP_EXT_PANELS 同源；两边改动要同步）。
 const PANELS: &[(&str, &str)] = &[("trace", "时间线"), ("board", "项目文件"), ("usage", "用量")];
 
+/// 通用事件通道（2026-10-03 用户拍板「别一个一个加」）：新界面能力以后只加前端一条
+/// 分支 + 这里一行 kind，模型即可触达，不再为每个动作改 Rust 工具签名。
+/// 只收「非破坏」类的 kind（SAFE_EVENT_KINDS 白名单）：破坏类（delete_session 等）
+/// 刻意不在表内——那些必须走具名方法，rules 才能按参数判 Dangerous 弹卡，从 fire_event
+/// 混过去就绕过了审批分级。
+const SAFE_EVENT_KINDS: &[&str] = &[
+    "sidebar",
+    "terminal",
+    "settings",
+    "theme",
+    "open_tab",
+    "close_tab",
+    "css_inject",
+    "open_file",
+    "open_memory",
+    "open_panel",
+    "close_panel",
+    "new_session",
+    "open_session",
+    "rename_session",
+    "fork_session",
+    "pin_session",
+    "archive_session",
+];
+
 pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("");
@@ -195,6 +220,44 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             } else {
                 Ok("已按注入框同款路径写入这段 CSS 并即时生效（覆盖原有手写规则；重开也在）".into())
             }
+        }
+        // 通用事件通道：event 传整条事件 JSON（kind 必填，其余字段任意）。白名单挡破坏类
+        // kind（delete_session 等必须走具名方法保审批分级）。前端新增界面事件后，这里加
+        // 一行 SAFE_EVENT_KINDS 就能用，不用再改工具签名——「别一个一个加」就指这个。
+        "fire_event" => {
+            super::selfmod_gate()?;
+            // event 收对象，也容错收 stringify 过的 JSON（模型常见手滑，别让它被自己的
+            // 错误参数打得判 Dangerous 再被无头拒掉——那等于把路堵死还给人错信号）
+            let ev = match v.get("event") {
+                Some(Value::Object(_)) => v.get("event").cloned().unwrap_or(Value::Null),
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                    .map_err(|e| format!("event 是字符串但不是合法 JSON: {e}"))?,
+                _ => return Err("缺少 event（整条事件 JSON，如 {\"kind\":\"theme\",\"mode\":\"dark\"}）".into()),
+            };
+            let kind = ev
+                .get("kind")
+                .and_then(|x| x.as_str())
+                .ok_or("event.kind 必填（如 sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）")?
+                .to_string();
+            if !SAFE_EVENT_KINDS.contains(&kind.as_str()) {
+                return Err(format!(
+                    "kind「{kind}」不在安全事件白名单里（可用：{}）；破坏类操作（删会话等）走具名方法，审批分级不为它开口子",
+                    SAFE_EVENT_KINDS.join(" / ")
+                ));
+            }
+            crate::server::ui_events::emit(ev);
+            Ok(format!("已向界面投递事件 {kind}"))
+        }
+        // 撤销某次任务的改动：前端走与改动条「撤销」按钮同一条路（自带二次确认），
+        // 高风险 → rules 判 Dangerous 必问（不被 fire_event 白名单收）。
+        "undo_checkpoint" => {
+            super::selfmod_gate()?;
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if id.is_empty() {
+                return Err("缺少 id（检查点 id；/api/checkpoints 可列）".into());
+            }
+            crate::server::ui_events::emit(json!({ "kind": "undo_checkpoint", "id": id }));
+            Ok(format!("已请求撤销检查点 {id} 的改动（界面会弹确认，用户点了才真做）"))
         }
         other => Err(format!(
             "未知 method: {other:?}（open_panel / close_panel / list_panels / open_file / open_memory / open_sidebar / close_sidebar / open_terminal / close_terminal / open_settings / close_settings / set_theme / open_tab / close_tab / state / inject_css；会话管理用 session 工具）"
