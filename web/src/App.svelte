@@ -36,11 +36,11 @@
   let autoSaveTimer = null;
   let pendingSave = null; // autoSave 挂起的字段（切换配置前 flush 用）
   let approvalMode = (() => {
-    // 四档（P19）；旧档名自动迁移
-    const map = { suggest: 'read-only', 'auto-edit': 'auto', 'full-auto': 'auto', local: 'full-access' };
+    // 三档（2026-10-03 并三档：sandbox 档取消，旧值迁移 read-only）；旧档名自动迁移
+    const map = { suggest: 'read-only', sandbox: 'read-only', 'auto-edit': 'auto', 'full-auto': 'auto', local: 'full-access' };
     const saved = localStorage.getItem('approvalMode');
     return map[saved] || saved || 'auto';
-  })(); // 审批四档：read-only / sandbox / auto / full-access
+  })(); // 审批三档：read-only / auto / full-access
   // M1：每会话各自的档位（切会话时圆点显示该会话真实在跑的档，而不是全局最后一次选的）
   let approvalBySession = {};
   $: approvalEffective = approvalBySession[currentSessionId || '@new'] || approvalMode;
@@ -486,10 +486,9 @@
   let approvalMenuOpen = false;
   // 四档语义（P19）：
   // 只读 = 只读操作自动放行，写/执行逐次询问（shell 恒沙箱）
-  // 沙箱 = 只读 + 沙箱内执行；工作区和电脑都不改（写文件直接驳回）
   // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
   // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
-  const APPROVAL_LABELS = { 'read-only': '只读', sandbox: '沙箱', auto: '自动', 'full-access': '完全访问' };
+  const APPROVAL_LABELS = { 'read-only': '只读', auto: '自动', 'full-access': '完全访问' };
   // 审批档切换的请求序号：并发乱序时以「最后一次点击」为准，过期响应丢弃（F14）
   let approvalPickSeq = 0;
   function pickApproval(m) {
@@ -5158,7 +5157,7 @@
                 class="pill"
                 class:danger={approvalEffective === 'full-access'}
                 on:click={() => (approvalMenuOpen = !approvalMenuOpen)}
-                title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 沙箱=只在沙箱执行不动工作区和电脑 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
+                title="审批档位（按会话记忆，运行中切换下一步即生效）：只读=写/执行逐次问 · 自动=可动工作区与电脑高危先问 · 完全访问=全免审本机直跑"
               >
                 <span class="pill-label">审批:</span> {APPROVAL_LABELS[approvalEffective] || approvalEffective}
                 <svg class="caret-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>

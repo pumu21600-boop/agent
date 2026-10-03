@@ -70,9 +70,8 @@ impl agent::ApprovalGate for ChatGate {
         let mode = self.effective_mode();
         let ws = crate::tools::workspace_root();
         let val: Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
-        // 红线（2026-10-03 agent 自改设置轮）：任何档位（含完全访问全免审）必问——
-        // 换渠道指向 = 换大脑；直写 settings.json/config.toml 等应用自身配置 =
-        // 动 key、动花费上限、动审批默认档。红线凌驾于档位之上。
+        // 红线（2026-10-03 并三档轮改版）：只「撤销检查点」一项任何档位必问（回滚
+        // 工作区文件不可逆）。其余破坏操作按档位走——档位即用户意愿（用户拍板）。
         if crate::core::rules::red_line_hold(tool, &val, &ws) {
             return true;
         }
@@ -105,38 +104,13 @@ impl agent::ApprovalGate for ChatGate {
     }
 
     /// P19：文件工具是否允许越出工作区——auto / full-access 档=true（auto 档越界写会按
-    /// Dangerous 先弹审批；full-access 全免审），read-only / sandbox 档锁死工作区。
+    /// Dangerous 先弹审批；full-access 全免审），read-only 档锁死工作区。
     /// 每步现读：运行中切档，下一个决策步即按新档位执行。
     fn file_tools_unconfined(&self) -> bool {
         matches!(
             self.effective_mode().as_str(),
             "auto" | "full-auto" | "auto-edit" | "full-access" | "local"
         )
-    }
-
-    /// P19 sandbox 档：工作区文件写入直接驳回（不进审批弹窗）——「只能在沙箱执行，
-    /// 工作区和电脑都动不了」。shell/git 照常走审批流（执行恒在沙箱内）。
-    fn tier_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {
-        if self.effective_mode() != "sandbox" {
-            return None;
-        }
-        if matches!(tool, "write_file" | "edit_file") {
-            let _ = args_json;
-            Some(
-                "沙箱档只允许在沙箱内执行，不修改工作区和电脑上的任何文件（要写文件请切「自动」或「完全访问」档）"
-                    .into(),
-            )
-        } else if tool == "settings"
-            && serde_json::from_str::<Value>(args_json)
-                .ok()
-                .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(|s| s.to_string()))
-                .as_deref()
-                == Some("set")
-        {
-            Some("沙箱档不修改应用设置（只可读取；要改设置请切「自动」或「完全访问」档）".into())
-        } else {
-            None
-        }
     }
 
     fn session_id(&self) -> &str {
@@ -220,8 +194,10 @@ pub(super) async fn set_approval_mode(
     ) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "未知档位" })));
     }
+    // 旧档名迁移（2026-10-03 并三档：sandbox 档取消——审批矩阵与 read-only 相同，
+    // 旧值（localStorage/会话记忆里的）一律迁移 read-only，写文件从直接驳回变弹卡问）
     let mut mode = match mode {
-        "suggest" => "read-only",
+        "suggest" | "sandbox" => "read-only",
         "auto-edit" | "full-auto" => "auto",
         "local" => "full-access",
         other => other,
@@ -322,9 +298,9 @@ mod tests {
         assert_eq!(b.effective_mode(), "read-only");
     }
 
-    /// P19 四档：sandbox 档硬拦写文件工具；文件放行面与沙箱开关按档位区分。
+    /// 2026-10-03 并三档：sandbox 档取消（旧值迁移 read-only），文件放行面按三档区分。
     #[test]
-    fn tier_semantics_sandbox_and_fs_scope() {
+    fn tier_semantics_three_tiers_and_fs_scope() {
         let def = Arc::new(std::sync::RwLock::new("auto".to_string()));
         let modes = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -348,33 +324,34 @@ mod tests {
                 steer: Arc::new(crate::core::steer::SteerQueue::new()),
             }
         };
-        // sandbox 档：写文件直接驳回（不进审批），读与执行不拦；文件工具锁工作区，执行恒沙箱
+        // 旧 sandbox 档位值仍在会话记忆里时：行为归 read-only（文件锁工作区、执行恒沙箱、
+        // 写文件从「直接驳回」变「弹卡问」——并入 read-only 的询问语义）
         let s = gate("sess-s", "sandbox");
-        assert!(s.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_some());
-        assert!(s.tier_block_reason("edit_file", r#"{"path":"a.txt"}"#).is_some());
-        assert!(s.tier_block_reason("read_file", r#"{"path":"a.txt"}"#).is_none());
-        assert!(s.tier_block_reason("shell", r#"{"command":"cargo build"}"#).is_none());
-        assert!(!s.file_tools_unconfined(), "sandbox 档文件工具锁死工作区");
-        assert!(s.sandbox_enabled(), "sandbox 档执行恒在沙箱内");
-        // auto 档：不硬拦（越界写走 Dangerous 审批），文件工具放行出工作区，shell 仍沙箱
+        assert!(!s.file_tools_unconfined(), "旧 sandbox 值文件工具锁死工作区");
+        assert!(s.sandbox_enabled(), "旧 sandbox 值执行恒在沙箱内");
+        assert!(
+            s.needs_approval_for("write_file", r#"{"path":"a.txt","content":"x"}"#),
+            "旧 sandbox 档位：写文件改走弹卡问（不再硬拦）"
+        );
+        // auto 档：文件工具放行出工作区，shell 仍沙箱
         let a = gate("sess-a", "auto");
-        assert!(a.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_none());
         assert!(a.file_tools_unconfined(), "auto 档文件工具可越出工作区");
         assert!(a.sandbox_enabled(), "auto 档 shell 仍在沙箱内");
         // full-access 档：文件全放行 + 本机直跑
         let f = gate("sess-f", "full-access");
         assert!(f.file_tools_unconfined());
         assert!(!f.sandbox_enabled());
-        // read-only 档：写文件走审批（不硬拦），文件工具锁工作区
+        // read-only 档：文件工具锁工作区，写/执行逐次问
         let r = gate("sess-r", "read-only");
-        assert!(r.tier_block_reason("write_file", r#"{"path":"a.txt"}"#).is_none());
         assert!(!r.file_tools_unconfined());
+        assert!(r.needs_approval_for("shell", r#"{"command":"cargo build"}"#));
+        assert!(!r.needs_approval_for("read_file", r#"{"path":"a.txt"}"#));
     }
 
-    /// 2026-10-03 agent 自改设置轮：红线凌驾于档位——完全访问档下 settings 红线键
-    /// 与应用配置文件直写仍必问；普通键照旧免审；sandbox 档 settings set 硬拦。
+    /// 2026-10-03 并三档轮拍板口径：只有「撤销检查点」任何档位必问；其余破坏操作按档位
+    /// 走（full-access 放行、auto 问）；普通键与只读不受影响。
     #[test]
-    fn red_line_asks_even_in_full_access() {
+    fn red_line_hold_scoped_to_undo_checkpoint() {
         let def = Arc::new(std::sync::RwLock::new("auto".to_string()));
         let modes = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -398,27 +375,28 @@ mod tests {
                 steer: Arc::new(crate::core::steer::SteerQueue::new()),
             }
         };
-        // 完全访问档：红线键与应用配置文件直写仍必问；普通键免审
+        // 完全访问档：撤销检查点仍必问（不可逆）；换渠道指向/直写自身配置改按档位放行
         let f = gate("sess-f", "full-access");
         assert!(
-            f.needs_approval_for("settings", r#"{"action":"set","patch":{"base_url":"https://x/v1"}}"#),
-            "完全访问档下渠道指向仍属红线必问"
+            f.needs_approval_for("ui", r#"{"method":"undo_checkpoint","id":"cp-1"}"#),
+            "撤销检查点 = 回滚工作区文件不可逆，任何档位必问"
         );
-        assert!(
-            f.needs_approval_for("write_file", r#"{"path":"config.toml","content":"x"}"#),
-            "完全访问档下直写 config.toml 仍必问（花费上限/审批默认档在里面）"
-        );
+        assert!(!f.needs_approval_for("settings", r#"{"action":"set","patch":{"base_url":"https://x/v1"}}"#));
+        assert!(!f.needs_approval_for("write_file", r#"{"path":"config.toml","content":"x"}"#));
+        assert!(!f.needs_approval_for("session", r#"{"method":"delete","id":"s1"}"#));
         assert!(!f.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
         assert!(!f.needs_approval_for("settings", r#"{"action":"get"}"#));
         assert!(!f.needs_approval_for("write_file", r#"{"path":"src/main.rs","content":"x"}"#));
-        // auto 档：红线走 Dangerous 必问
+        // auto 档：破坏操作照旧问（Dangerous 档位映射），撤销检查点进红线分支也问
         let a = gate("sess-a", "auto");
         assert!(a.needs_approval_for("settings", r#"{"action":"set","patch":{"model":"glm-5.3-flash"}}"#));
+        assert!(a.needs_approval_for("session", r#"{"method":"delete","id":"s1"}"#));
+        assert!(a.needs_approval_for("ui", r#"{"method":"undo_checkpoint","id":"cp-1"}"#));
         assert!(!a.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
-        // sandbox 档：set 档位硬拦（不进审批弹窗），get 放行
-        let s = gate("sess-s", "sandbox");
-        assert!(s.tier_block_reason("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#).is_some());
-        assert!(s.tier_block_reason("settings", r#"{"action":"get"}"#).is_none());
+        // read-only 档：只读静默，其余逐次问
+        let r = gate("sess-r", "read-only");
+        assert!(r.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
+        assert!(r.needs_approval_for("ui", r#"{"method":"undo_checkpoint","id":"cp-1"}"#));
     }
 
 }

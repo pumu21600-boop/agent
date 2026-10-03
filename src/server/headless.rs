@@ -133,9 +133,6 @@ impl agent::ApprovalGate for HeadlessGate {
     fn file_tools_unconfined(&self) -> bool {
         self.inner.file_tools_unconfined()
     }
-    fn tier_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {
-        self.inner.tier_block_reason(tool, args_json)
-    }
     fn session_id(&self) -> &str {
         &self.session_id
     }

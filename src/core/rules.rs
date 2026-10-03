@@ -128,21 +128,16 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "prompts/system.md",
 ];
 
-/// settings 工具 set 动作的红线键（改渠道指向 = 换自己的大脑）：命中即 Dangerous，
-/// 且经 `red_line_hold` 在任何审批档位强制弹卡。与 tools/settings.rs 的补丁字段对应。
+/// settings 工具 set 动作的红线键（改渠道指向 = 换自己的大脑）：命中判 Dangerous，
+/// 是否弹卡由审批档位决定（2026-10-03 并三档轮起不再「任何档位强制弹卡」——
+/// 用户拍板：除撤销检查点外，破坏操作一律按档位走，档位本身就是用户的决定）。
+/// 与 tools/settings.rs 的补丁字段对应。
 pub const SETTINGS_REDLINE_KEYS: &[&str] = &["base_url", "model", "provider_id", "active_config_id"];
 
-/// 应用自身配置文件（红线面：key、花费上限、审批默认档、脱沙箱总开关、系统提示词
-/// 的藏身处）——文件工具或 shell 直写它们都算红线，任何档位必问。
-const APP_CONFIG_FILES: &[&str] = &[
-    "settings.json",
-    "config.toml",
-    "providers.json",
-    "prompts/system.md",
-];
-
-/// settings 工具里「动作即红线」的 action（切换工作区 = 改自己的文件边界，任何档位必问）。
-const SETTINGS_REDLINE_ACTIONS: &[&str] = &["workspace"];
+/// 唯一「任何档位必问」的操作（2026-10-03 用户拍板）：撤销检查点——回滚工作区文件
+/// 不可逆，且界面还会弹二次确认。其余破坏操作（删会话/删配置/切工作区/跑定时任务/
+/// 删技能/换渠道指向/直写自身配置文件）都按审批档位判，档位即用户意愿。
+const ALWAYS_ASK_OPS: &[(&str, &str)] = &[("ui", "undo_checkpoint")];
 
 /// write_file 敏感后缀（密钥/证书类）。
 const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".ppk"];
@@ -310,7 +305,7 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
 
 /// settings 工具风险分级（2026-10-03 agent 自改设置轮）：
 /// get 只读 Safe；set 普通键常规改动（auto 档静默），红线键（渠道指向） Dangerous；
-/// 「任何档位都必问」的兜底在 `red_line_hold`（needs_approval_for 开头调用）。
+/// 是否弹卡由审批档位决定（2026-10-03 并三档轮起 red_line_hold 不再强制任何档位）。
 fn risk_settings(args: &Value) -> (RiskLevel, String) {
     match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
         "get" => (RiskLevel::Safe, "读取应用设置（只读快照，key 只给尾号）".into()),
@@ -345,60 +340,25 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
         "schedule_run" => (RiskLevel::Dangerous, "立即执行定时任务（无头会话真实运行）".into()),
         // 重建记忆索引：本地重建+向量计算，常规运维
         "memory" => (RiskLevel::Normal, "重建记忆库索引".into()),
-        // 切换工作区：Dangerous 之外还进 red_line_hold（任何档位必问）
+        // 切换工作区：Dangerous，按档位弹卡（full-access 放行——档位即用户意愿）
         "workspace" => (RiskLevel::Dangerous, "切换工作区（改自己的文件边界）".into()),
         _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action".into()),
     }
 }
 
-/// 红线判定（2026-10-03 agent 自改设置轮）：命中即**无论审批档位**（含完全访问/全免审）
+/// 红线判定（2026-10-03 并三档轮改版）：命中即**无论审批档位**（含完全访问/全免审）
 /// 都必须弹卡由用户确认。审批判定单点 `ApprovalGate::needs_approval_for` 在最开头调用
-/// 本函数——红线凌驾于档位之上，是「agent 自我提权/换大脑/动钱袋」的最后一道闸。
+/// 本函数——红线凌驾于档位之上。
 ///
-/// 覆盖三条路：
-/// 1. settings 工具 set 带红线键（base_url/model/provider_id/active_config_id）；
-/// 2. 文件工具直写应用自身配置（settings.json / config.toml / providers.json /
-///    prompts/system.md——key、花费上限、审批默认档、allow_unsandboxed、系统提示词）；
-/// 3. shell 命令写到这些文件（命令点到文件名且整体不是纯只读形态；`type config.toml`
-///    这类纯读不拦）。注意沙箱并不按路径拦工作区外写入，这里补的就是那条缝。
-pub fn red_line_hold(tool_name: &str, args: &Value, workspace_root: &Path) -> bool {
-    match tool_name {
-        "settings" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
-            // 动作即红线的（切工作区）不看参数直接拦
-            if SETTINGS_REDLINE_ACTIONS.contains(&action) {
-                return true;
-            }
-            action == "set"
-                && args
-                    .get("patch")
-                    .and_then(|p| p.as_object())
-                    .map(|o| o.keys().any(|k| SETTINGS_REDLINE_KEYS.contains(&k.as_str())))
-                    .unwrap_or(false)
-        }
-        "write_file" | "edit_file" => {
-            let p = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_lowercase()
-                .replace('\\', "/");
-            APP_CONFIG_FILES.iter().any(|f| p.contains(f))
-        }
-        "shell" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let lower = cmd.to_lowercase();
-            if !APP_CONFIG_FILES.iter().any(|f| lower.contains(f)) {
-                return false;
-            }
-            // 纯只读形态（dir/type/echo 等安全程序且无写重定向）不拦；其余只要点到
-            // 配置文件名就必问——`copy x settings.json`、`echo ... > config.toml`
-            // 这类写法没有统一形状，宁可多问一次
-            let (risk, _) = risk_shell(cmd, workspace_root);
-            risk != RiskLevel::Safe
-        }
-        _ => false,
-    }
+/// 用户拍板（2026-10-03）：红线只保留「撤销检查点」一项——回滚工作区文件不可逆、界面
+/// 还会弹二次确认。其余破坏操作（换渠道指向、删会话/删配置/删技能、切工作区、跑定时
+/// 任务、shell 直写自身配置文件）全部按审批档位判：read-only/auto 问、full-access
+/// 放行。档位本身就是用户的决定，「任何档位强制弹卡」的面就此收窄到一项。
+/// （shell 写敏感文件的判级从本函数搬进了 `risk_shell`——档位矩阵照样管得住。）
+pub fn red_line_hold(tool_name: &str, args: &Value, _workspace_root: &Path) -> bool {
+    ALWAYS_ASK_OPS.iter().any(|(t, method)| {
+        *t == tool_name && args.get("method").and_then(|v| v.as_str()).unwrap_or("") == *method
+    })
 }
 
 /// 剥掉 git 全局参数，取出真正的子命令与其后的参数。
@@ -624,6 +584,19 @@ fn risk_shell(command: &str, ws: &Path) -> (RiskLevel, String) {
         }
     }
 
+    // 敏感文件升级（2026-10-03 并三档轮从 red_line_hold 搬来）：命令点到应用自身
+    // 配置/密钥类文件名且不是纯只读形态（`type config.toml` 照旧 Safe 不拦； echo 带
+    // 重定向写它们本就是 Normal）——写它们 = 动 key/花费上限/审批默认档，判 Dangerous
+    // 按档位弹卡（read-only/auto 问、full-access 放行）
+    if worst != RiskLevel::Safe {
+        let lower_all = command.to_lowercase();
+        if let Some(f) = SENSITIVE_PATTERNS.iter().find(|p| lower_all.contains(**p)) {
+            return (
+                RiskLevel::Dangerous,
+                format!("命令涉及敏感文件 {f}（应用自身配置/密钥类，写入即高危）: {command}"),
+            );
+        }
+    }
     (worst, format!("{worst_reason}: {command}"))
 }
 
@@ -813,19 +786,19 @@ pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String 
 
 /// 判定当前审批模式下该风险等级是否需要向用户请求审批。
 ///
-/// 四档映射（P19，Codex 式三档扩为四档）：
-/// - "read-only" (原 suggest)：Safe(0) 放行，Normal(1) 及以上需审批；
-/// - "sandbox"：执行仅限沙箱内（shell/git 恒沙箱），工作区文件写入在进审批前已被
-///   `ApprovalGate::tier_block_reason` 直接驳回——能走到这里的 Normal/Dangerous
-///   只有沙箱内执行类（git 提交、重定向写等），照 read-only 语义逐次询问；
+/// 三档映射（2026-10-03 并三档轮：原 read-only/sandbox/auto/full-access 四档合并为
+/// 三档——sandbox 档的审批矩阵与 read-only 相同，取消后旧值迁移为 read-only）：
+/// - "read-only" (原 suggest / sandbox)：Safe(0) 放行，Normal(1) 及以上需审批；
+///   shell/git 执行恒在沙箱内，文件工具锁死工作区；
 /// - "auto" (原 auto-edit / full-auto)：Safe(0) 与 Normal(1) 静默放行，仅 Dangerous(2) 需审批；
 ///   工作区外写入判 Dangerous（见 `risk_write_file`），因此在 auto 档「能动电脑但高危先问」；
 /// - "full-access" (原 local)：全免审（除非配置显式强制了 unsandboxed_approval）。
+/// 唯一「任何档位必问」是撤销检查点（见 `red_line_hold`）——档位即用户意愿，其余不强制。
 pub fn should_ask_approval(mode: &str, risk: RiskLevel) -> bool {
     match mode {
         "full-access" | "local" => false,
         "auto" | "full-auto" | "auto-edit" => risk >= RiskLevel::Dangerous,
-        // read-only / sandbox / suggest / 未知：Normal 及以上逐次询问
+        // read-only / sandbox(旧值) / suggest / 未知：Normal 及以上逐次询问
         _ => risk >= RiskLevel::Normal,
     }
 }
@@ -1032,26 +1005,48 @@ mod tests {
     // —— 2026-10-03：红线判定（任何档位必问，含完全访问）——
     #[test]
     fn test_red_line_hold() {
-        // settings 红线键必问；普通键不拦（交给档位判定）
-        assert!(red_line_hold("settings", &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}), &ws()));
-        assert!(red_line_hold("settings", &json!({"action": "set", "patch": {"thinking": "on", "active_config_id": "cfg-b"}}), &ws()));
-        assert!(!red_line_hold("settings", &json!({"action": "set", "patch": {"thinking": "high"}}), &ws()));
-        assert!(!red_line_hold("settings", &json!({"action": "get"}), &ws()));
-        // 文件工具直写应用自身配置
+        // 2026-10-03 并三档轮：红线收缩为「撤销检查点」一项（任何档位必问）
+        assert!(red_line_hold("ui", &json!({"method": "undo_checkpoint", "id": "cp-1"}), &ws()));
+        // 其余破坏操作不再任何档位强制弹卡——按档位判（档位即用户意愿）
+        assert!(!red_line_hold("settings", &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}), &ws()));
+        assert!(!red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()));
+        // 文件工具直写应用自身配置：不再强制，但按档位判 Dangerous（见 risk_write_file）
         for p in ["config.toml", "settings.json", "providers.json", "prompts/system.md", ".cargo/config.toml"] {
             assert!(
-                red_line_hold("write_file", &json!({"path": p, "content": "x"}), &ws()),
-                "{p} 直写必须红线必问"
+                !red_line_hold("write_file", &json!({"path": p, "content": "x"}), &ws()),
+                "{p} 直写改按档位判（Dangerous），不再任何档位强制"
+            );
+            assert_eq!(
+                evaluate_risk("write_file", &json!({"path": p, "content": "x"}), &ws()).0,
+                RiskLevel::Dangerous,
+                "{p} 直写仍须判高危（auto 档问、full-access 放行）"
             );
         }
-        assert!(!red_line_hold("write_file", &json!({"path": "src/main.rs", "content": "x"}), &ws()));
-        // Windows 反斜杠路径同样命中
-        assert!(red_line_hold("edit_file", &json!({"path": "prompts\\system.md", "old_string": "a", "new_string": "b"}), &ws()));
-        // shell：写语义且点到配置文件名 = 必问；纯读与不相干命令不拦
-        assert!(red_line_hold("shell", &json!({"command": "echo key=xxx > config.toml"}), &ws()));
-        assert!(red_line_hold("shell", &json!({"command": "copy evil.json settings.json"}), &ws()));
-        assert!(!red_line_hold("shell", &json!({"command": "type config.toml"}), &ws()));
-        assert!(!red_line_hold("shell", &json!({"command": "cargo build"}), &ws()));
+        assert_eq!(
+            evaluate_risk("write_file", &json!({"path": "src/main.rs", "content": "x"}), &ws()).0,
+            RiskLevel::Normal
+        );
+        // Windows 反斜杠路径同样命中敏感面
+        assert_eq!(
+            evaluate_risk("edit_file", &json!({"path": "prompts\\system.md", "old_string": "a", "new_string": "b"}), &ws()).0,
+            RiskLevel::Dangerous
+        );
+        // shell：写敏感文件从 red_line_hold 搬进 risk_shell——非纯读即 Dangerous
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "echo key=xxx > config.toml"}), &ws()).0,
+            RiskLevel::Dangerous,
+            "echo 重定向写自身配置 = 高危（此前靠 red_line_hold 兜，现在判级自带）"
+        );
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "copy evil.json settings.json"}), &ws()).0,
+            RiskLevel::Dangerous
+        );
+        // 纯读与不相干命令不受影响（type 只读不拦；敏感面不误伤普通命令）
+        assert_eq!(evaluate_risk("shell", &json!({"command": "type config.toml"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "cargo build"}), &ws()).0, RiskLevel::Normal);
+        // 其余工具一律不碰红线
+        assert!(!red_line_hold("session", &json!({"method": "delete", "id": "x"}), &ws()));
+        assert!(!red_line_hold("shell", &json!({"command": "del x.txt"}), &ws()));
     }
 
     // —— 2026-10-03：settings 的同类允许粒度按键区分 ——
@@ -1133,10 +1128,13 @@ mod tests {
         assert_eq!(evaluate_risk("settings", &json!({"action": "mcp", "op": "refresh", "name": "fs"}), &ws()).0, RiskLevel::Normal);
         assert_eq!(evaluate_risk("settings", &json!({"action": "schedule_run", "id": "t"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("settings", &json!({"action": "memory", "op": "reindex"}), &ws()).0, RiskLevel::Normal);
-        // workspace：Dangerous 且进红线（完全访问也必问）
+        // workspace：Dangerous 按档位问（2026-10-03 并三档轮起不再任何档位强制红线）
         let (r, why) = evaluate_risk("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws());
         assert_eq!(r, RiskLevel::Dangerous, "{why}");
-        assert!(red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()));
+        assert!(
+            !red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()),
+            "切工作区改按档位判定（full-access 放行），不再任何档位强制弹卡"
+        );
         assert!(!red_line_hold("settings", &json!({"action": "config", "op": "new"}), &ws()));
     }
 

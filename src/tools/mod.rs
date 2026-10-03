@@ -155,7 +155,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。自动/完全访问档下也接受绝对路径写工作区外（完全访问静默，自动档按高危先询问）；只读/沙箱档拒绝。",
+            description: "在工作目录内创建/覆盖一个 UTF-8 文本文件（自动创建父目录）。写入前无需确认与否决，按当前审批档位执行。自动/完全访问档下也接受绝对路径写工作区外（完全访问静默，自动档按高危先询问）；只读档对写操作逐次询问。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -214,7 +214,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
                 "properties": {
                     "task": { "type": "string", "description": "子任务描述：要它做什么、产出什么（说清楚边界，它看不到你的对话历史）" },
                     "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 功能桥接里的子代理席位，未配则跟主渠道）" },
-                    "approval_mode": { "type": "string", "enum": ["read-only", "sandbox", "auto", "full-access"], "description": "可选：子代理的审批档（缺省 auto）" },
+                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "可选：子代理的审批档（缺省 auto）" },
                     "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（缺省 deny 拒绝并回喂；approve 才放行高危）" },
                     "timeout_secs": { "type": "integer", "description": "可选：整轮超时秒数（0 = 默认 1800）" },
                     "label": { "type": "string", "description": "可选：一句话标签，方便你在结果里识别是哪个子代理" }
@@ -272,7 +272,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）。自改纪律：除 action=get（只读）外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=set 配 patch：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；红线键（base_url/model/provider_id/active_config_id）任何档位都弹卡必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（必问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（红线必问）。action=schedule_run 配 id：立即跑一条定时任务（真花钱，必问）。action=memory 配 op=reindex：重建记忆库索引。范围外：api_key/价格表/信任插件；config.toml 改文件需重启（同样必问）。审批档位（read-only/sandbox/auto/full-access）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切，别翻 config.toml、别用 shell 试。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）。自改纪律：除 action=get（只读）外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快apshot（key 只给尾号；available_plugins/available_skills 列合法 id）。action=set 配 patch：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）判高危，按审批档位决定是否弹卡（read-only/auto 档问、full-access 档放行）。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，高危按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（高危按档位问）。action=schedule_run 配 id：立即跑一条定时任务（真花钱，高危按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外：api_key/价格表/信任插件；config.toml 改文件需重启（同样按档位问）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切，别翻 config.toml、别用 shell 试。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -289,7 +289,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS）。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——白名单只收非破坏 kind（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session），新界面能力会逐步收进来，能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，必问；界面会弹二次确认）。会话管理用 session 工具。",
+            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS）。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——白名单只收非破坏 kind（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session），新界面能力会逐步收进来，能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
