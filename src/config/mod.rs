@@ -9,6 +9,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub mod settings;
+pub mod settings_schema;
 
 /// 应用根目录：**打包分发的唯一形态是「exe 同级目录」**，开发形态回退编译期源码目录。
 ///

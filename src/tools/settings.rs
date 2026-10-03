@@ -56,12 +56,55 @@ pub(crate) struct SettingsPatch {
     /// 整表替换（先 get 拿现状再改）。新增任务 id 留空自动生成；带 id 改已有任务时
     /// 创建时间与运行态（上次运行/状态/错误）以旧值为准。
     pub schedules: Option<Vec<ScheduleTask>>,
+    /// 2026-10-03 schema round: dot sub-paths (features.<key>/roles.<field>) collected apart.
+    #[serde(skip)]
+    pub dot_paths: Vec<(String, Value)>,
 }
 
-/// 把补丁合并进 Settings（不落盘、不同步——纯函数便于单测）。
+/// 解析 patch：顶层键走结构化 SettingsPatch（deny_unknown_fields 原样保留），
+/// 点号路径（features.<键> / roles.<字段>）单收进 dot_paths——白名单即
+/// config::settings_schema 全表。表外路径报错并列合法路径（宁可拒不静默）。
+fn parse_patch(raw: &Value) -> Result<SettingsPatch, String> {
+    let mut obj = match raw {
+        Value::Object(o) => o.clone(),
+        Value::Null => return Ok(SettingsPatch::default()),
+        _ => return Err("patch 需要 JSON object".into()),
+    };
+    let mut dot: Vec<(String, Value)> = Vec::new();
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    for k in keys {
+        if k.contains('.') {
+            if !crate::config::settings_schema::is_known_path(&k) {
+                return Err(format!(
+                    "未知设置路径 {k}（合法路径：{}）",
+                    crate::config::settings_schema::legal_paths_hint()
+                ));
+            }
+            dot.push((k.clone(), obj.remove(&k).unwrap_or(Value::Null)));
+        }
+    }
+    let mut p: SettingsPatch = serde_json::from_value(Value::Object(obj))
+        .map_err(|e| format!("patch 不合法（未知键或值类型不对）: {e}；可改键见本工具说明"))?;
+    p.dot_paths = dot;
+    Ok(p)
+}
+
+
 /// 返回人话变更清单（逐键一行）。渠道字段语义与 HTTP 端点完全同源。
 pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<String>, String> {
     let mut changed: Vec<String> = Vec::new();
+
+    // 2026-10-03 schema round: dot sub-paths (features.<key> / roles.<field>) apply first,
+    // in SCHEMA order (table order authoritative; active_config_id still precedes channel
+    // fields). Whole-table keys keep original branches below.
+    if !p.dot_paths.is_empty() {
+        for e in crate::config::settings_schema::application_order() {
+            if let Some((_, v)) = p.dot_paths.iter().find(|(k, _)| k == e.path) {
+                let line = crate::config::settings_schema::apply_entry_value(s, e.path, v)?;
+                changed.push(line);
+            }
+        }
+    }
 
     // 0) 切激活配置要放在所有渠道字段之前——后面改的是「切换后」的激活配置
     if let Some(id) = p.active_config_id.as_deref() {
@@ -220,6 +263,8 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string();
     match action.as_str() {
+        // schema: settable-path manifest (read-only, no selfmod gate; 2026-10-03 schema round)
+        "schema" => Ok(crate::config::settings_schema::manifest_json().to_string()),
         "get" => {
             let handle = settings::shared_settings()
                 .ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
@@ -229,9 +274,8 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
         // —— 以下全部受「自改」插件闸（闸在分发层；助手函数保持纯净供测试直达） ——
         "set" => {
             super::selfmod_gate()?;
-            let patch: SettingsPatch =
-                serde_json::from_value(v.get("patch").cloned().unwrap_or(Value::Null))
-                    .map_err(|e| format!("patch 不合法（未知键或值类型不对）: {e}；可改键见本工具说明"))?;
+            let raw = v.get("patch").cloned().unwrap_or(Value::Null);
+            let patch: SettingsPatch = parse_patch(&raw)?;
             let handle =
                 settings::shared_settings().ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
             let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -519,7 +563,7 @@ fn snapshot_json(s: &settings::Settings) -> String {
             .collect::<Vec<Value>>(),
         "available_skills": crate::skills::list().iter().map(|k| k.name.clone()).collect::<Vec<String>>(),
         "schedules": s.schedules,
-        "red_line_keys": ["base_url", "model", "provider_id", "active_config_id"],
+        "red_line_keys": crate::config::settings_schema::red_line_paths(),
         "out_of_scope": "api_key/工作区/价格表/信任插件不可经本工具修改；config.toml（花费上限/审批默认档/钩子）改文件且需重启，写前必经用户确认",
     })
     .to_string()
@@ -708,5 +752,59 @@ mod tests {
             let p = patch(json!({"disabled_skills": ["不存在的技能xyz"]}));
             assert!(apply_patch(&mut s, &p).is_err());
         }
+    }
+
+    #[test]
+    fn schema_dot_paths_apply_and_unknown_rejected() {
+        // 合法点号 + 顶层键混合：点号走 SCHEMA 表序，顶层键走原分支，各按各自语义落地
+        let mut s = test_settings();
+        let p = parse_patch(&json!({"features.galaxy": false, "roles.summary": "cfg-b", "thinking": "low"}))
+            .expect("合法点号/顶层混合 patch 应解析通过");
+        let changed = apply_patch(&mut s, &p).expect("合法混合 patch 应可应用");
+        assert!(
+            changed.iter().any(|x| x.as_str() == "features.galaxy"),
+            "changed 应含点号路径行 features.galaxy: {changed:?}"
+        );
+        assert!(
+            changed.iter().any(|x| x.as_str() == "roles.summary"),
+            "changed 应含点号路径行 roles.summary: {changed:?}"
+        );
+        assert!(
+            changed.iter().any(|x| x.as_str() == "thinking"),
+            "changed 应含顶层键行 thinking: {changed:?}"
+        );
+        assert!(!s.features.galaxy, "features.galaxy 点号直写应生效");
+        assert_eq!(
+            s.roles.as_ref().unwrap().summary.as_deref(),
+            Some("cfg-b"),
+            "roles.summary 点号直写只改指定字段"
+        );
+        assert_eq!(
+            s.active().unwrap().thinking.as_deref(),
+            Some("low"),
+            "同补丁的顶层 thinking 应照旧落到激活配置"
+        );
+
+        // 表外点号路径：解析层就拒，错误串点名路径并列合法路径
+        let err = parse_patch(&json!({"nope.key": 1})).expect_err("表外点号路径必须报错");
+        assert!(err.contains("nope.key"), "错误串要点名路径: {err}");
+        assert!(err.contains("合法路径"), "错误串要列合法路径: {err}");
+
+        // 表外顶层键：结构化 deny_unknown_fields 老路径不受影响（解析层即拒）
+        assert!(
+            parse_patch(&json!({"cost": {}})).is_err(),
+            "范围外顶层键 cost 仍在解析层被拒（deny_unknown_fields 原样保留）"
+        );
+
+        // 空 patch：解析 Ok（default），apply 报「没有任何要改的键」
+        let p = parse_patch(&Value::Null).expect("null patch 解析应 Ok");
+        let err = apply_patch(&mut test_settings(), &p).expect_err("空 patch 应用应报错");
+        assert!(err.contains("patch 里没有任何要改的键"), "错误串: {err}");
+
+        // 自改总闸可用点路径关（语义=自改动作全拒，不是红线，无弹卡）
+        let mut s = test_settings();
+        let p = parse_patch(&json!({"features.self_mod": false})).expect("自改总闸点号路径应合法");
+        apply_patch(&mut s, &p).expect("features.self_mod=false 应可应用");
+        assert!(!s.features.self_mod, "自改总闸可经点号路径 features.self_mod 关闭");
     }
 }

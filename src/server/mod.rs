@@ -142,6 +142,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     let mut app = Router::new()
         .route("/api/providers", get(list_providers))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/settings/schema", get(crate::server::settings::get_settings_schema))
         .route("/api/models", post(list_models))
         .route("/api/configs", post(manage_configs))
         .route("/api/workspace", get(get_workspace).post(set_workspace))

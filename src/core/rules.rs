@@ -132,7 +132,10 @@ const SENSITIVE_PATTERNS: &[&str] = &[
 /// 是否弹卡由审批档位决定（2026-10-03 并三档轮起不再「任何档位强制弹卡」——
 /// 用户拍板：除撤销检查点外，破坏操作一律按档位走，档位本身就是用户的决定）。
 /// 与 tools/settings.rs 的补丁字段对应。
-pub const SETTINGS_REDLINE_KEYS: &[&str] = &["base_url", "model", "provider_id", "active_config_id"];
+/// 设置红线路径集合（2026-10-03 schema round：改由 config::settings_schema 表派生——
+/// 表里 risk="red_line" 的行。新增红线键只改表一处，不再维护第二份名单）。
+pub static SETTINGS_REDLINE_KEYS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(crate::config::settings_schema::red_line_paths);
 
 /// 唯一「任何档位必问」的操作（2026-10-03 用户拍板）：撤销检查点——回滚工作区文件
 /// 不可逆，且界面还会弹二次确认。其余破坏操作（删会话/删配置/切工作区/跑定时任务/
@@ -339,12 +342,37 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
                 .and_then(|p| p.as_object())
                 .map(|o| o.keys().map(|s| s.as_str()).collect())
                 .unwrap_or_default();
-            let hit: Vec<&str> =
-                keys.iter().copied().filter(|k| SETTINGS_REDLINE_KEYS.contains(k)).collect();
+            // 2026-10-03 schema round：分级查表——顶层键与点号子路径同一套口径。
+            // 红线键（渠道指向）/ 表外路径（宁可多问不静默）判 Dangerous；表内普通键 Normal。
+            // 纵深：工具解析层会先拒表外路径，这里仍自洽兜底。
+            let hit: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|k| {
+                    crate::config::settings_schema::risk_of(k) == Some("red_line")
+                        || SETTINGS_REDLINE_KEYS.contains(k)
+                })
+                .collect();
+            let off_table: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|k| {
+                    crate::config::settings_schema::risk_of(k).is_none()
+                        && !SETTINGS_REDLINE_KEYS.contains(k)
+                })
+                .collect();
             if !hit.is_empty() {
                 (
                     RiskLevel::Dangerous,
                     format!("试图修改红线配置（渠道指向: {}，等于给 agent 换大脑）", hit.join("/")),
+                )
+            } else if !off_table.is_empty() {
+                (
+                    RiskLevel::Dangerous,
+                    format!(
+                        "设置路径不在可改清单里（{}）——合法路径先 action=schema 看",
+                        off_table.join("/")
+                    ),
                 )
             } else if keys.is_empty() {
                 (RiskLevel::Dangerous, "settings set 缺少 patch".into())
@@ -1024,6 +1052,49 @@ mod tests {
         // 非法 action / 缺 patch：宁可多问不静默
         assert_eq!(evaluate_risk("settings", &json!({"action": "delete"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("settings", &json!({"action": "set"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— 2026-10-03 schema round：settings 分级查表，点号子路径同吃一套 ——
+    #[test]
+    fn test_settings_dot_path_grading() {
+        // 测试模块已有 ws() helper：假工作区根（分级逻辑不碰真实文件系统，只为统一签名）
+        let ws = ws();
+        // 点号子路径全部 normal（含自改总闸——它不是红线，关它只是让自改动作全拒）
+        for (k, v) in [
+            ("features.self_mod", json!(false)),
+            ("features.galaxy", json!(false)),
+            ("roles.summary", json!("cfg-a")),
+            ("roles.fallbacks", json!(["cfg-a"])),
+        ] {
+            let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {k: v}}), &ws);
+            assert_eq!(r, RiskLevel::Normal, "{k} 表内 normal 点号路径应判常规: {why}");
+        }
+        // 表外路径兜底高危：未知点号前缀/未知角色字段一律 Dangerous（宁可多问不静默）。
+        // 注意 roles.cancel_on_disconnect_x_invalid 这个键不在表里——同样断言为 Dangerous（未知路径兜底）。
+        for k in [
+            "features.nope_key",
+            "roles.nope",
+            "roles.cancel_on_disconnect_x_invalid",
+        ] {
+            let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {k: "x"}}), &ws);
+            assert_eq!(r, RiskLevel::Dangerous, "{k} 表外路径应兜底高危: {why}");
+        }
+        // 顶层红线键仍 Dangerous（与 test_settings_tool_risk 断言一致，防回归）
+        let (r, why) = evaluate_risk(
+            "settings",
+            &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}),
+            &ws,
+        );
+        assert_eq!(r, RiskLevel::Dangerous, "base_url 红线键应判高危: {why}");
+        // 顶层普通键仍 Normal
+        let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "low"}}), &ws);
+        assert_eq!(r, RiskLevel::Normal, "thinking 普通键应判常规: {why}");
+        // 表内顶层键的枚举：SCHEMA 里 risk=="normal" 的项逐个用 {"<path>": null} 断言 Normal。
+        // null 是合法 JSON，分级只看键名；roles/features 两个 object 型给 null 也照样 Normal。
+        for e in crate::config::settings_schema::SCHEMA.iter().filter(|e| e.risk == "normal") {
+            let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {e.path: null}}), &ws);
+            assert_eq!(r, RiskLevel::Normal, "{} 表内 normal 路径应判常规: {why}", e.path);
+        }
     }
 
     // —— 2026-10-03：红线判定（任何档位必问，含完全访问）——

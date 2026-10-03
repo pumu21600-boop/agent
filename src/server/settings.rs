@@ -97,6 +97,13 @@ fn key_hint_of(key: Option<String>) -> String {
         .unwrap_or_default()
 }
 
+/// GET /api/settings/schema — settable-path manifest (paths/types/enums/defaults/risks/descs).
+/// Read-only local endpoint; the settings UI and the agent share this one table.
+pub(super) async fn get_settings_schema() -> Json<Value> {
+    Json(crate::config::settings_schema::manifest_json())
+}
+
+
 pub(super) async fn get_settings(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let mut v = config_state_json(&s);
@@ -666,5 +673,48 @@ mod tests {
         // 对照：默认（不勾掉）→ tools_enabled=true，agent 循环携带 tools
         let p = build_chat_params(&test_config(), gateway::providers::find("custom"));
         assert!(p.tools_enabled);
+    }
+
+    /// GET /api/settings/schema：全表 manifest 原样返回（条数/字段/红线/表外提示）。
+    #[tokio::test]
+    async fn settings_schema_endpoint_returns_full_manifest() {
+        let Json(v) = get_settings_schema().await;
+        // paths 数组长度与 schema 表一致
+        assert_eq!(
+            v["paths"].as_array().unwrap().len(),
+            crate::config::settings_schema::SCHEMA.len(),
+            "paths 条数应等于 SCHEMA.len()"
+        );
+        // 表外路径提示含 api_key（key 永不外泄）
+        assert!(
+            v["out_of_scope"].as_str().unwrap().contains("api_key"),
+            "out_of_scope 应声明 api_key 不在表内"
+        );
+        // 每条路径五个必备字段（Rust 侧 SchemaEntry.ty 在 JSON 里键名为 type）
+        assert!(
+            v["paths"].as_array().unwrap().iter().all(|p| {
+                p.get("path").is_some()
+                    && p.get("label").is_some()
+                    && p.get("type").is_some()
+                    && p.get("risk").is_some()
+                    && p.get("desc").is_some()
+            }),
+            "paths 每条都要有 path/label/type/risk/desc"
+        );
+        // 红线恰好 4 个：base_url/model/provider_id/active_config_id
+        let mut red: Vec<String> = v["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["risk"] == "red_line")
+            .map(|p| p["path"].as_str().unwrap().to_string())
+            .collect();
+        red.sort();
+        let mut expect = vec!["active_config_id", "base_url", "model", "provider_id"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<String>>();
+        expect.sort();
+        assert_eq!(red, expect, "红线路径集合应恰好是渠道指向四件套");
     }
 }
