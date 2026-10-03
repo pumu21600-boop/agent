@@ -423,12 +423,19 @@ pub fn delete(name: &str) -> Result<(), String> {
 /// system 提示注入的技能索引；无技能时返回空串（不占上下文）。
 pub fn index_prompt() -> String {
     let dis = disabled();
-    let skills = list().into_iter().filter(|s| !dis.contains(&s.name)).collect::<Vec<_>>();
+    // 2026-10-03（用户拍板「这些不是技能，是插件」）：技能索引只列自建技能（项目/全局）。
+    // 插件自带的技能不是磁盘上的技能目录，混在这里会诱导模型去文件系统找它们的
+    // SKILL.md（真机实锤：模型 dir 翻遍用户目录直到重复调用保护击杀）。它们已在
+    // 「可用插件」一节按插件标注（自带技能：…），read_skill 照样按名读得到。
+    let skills = list()
+        .into_iter()
+        .filter(|s| s.source != "plugin" && !dis.contains(&s.name))
+        .collect::<Vec<_>>();
     if skills.is_empty() {
         return String::new();
     }
     let mut s = String::from("\n\n## 可用技能（Skills）\n");
-    s.push_str("以下是本环境可用的技能清单。当用户消息中出现 `/技能名`、或任务与某技能的描述明显相关时，先调用 read_skill 工具读取该技能全文，再严格按其步骤执行：\n");
+    s.push_str("以下是本环境的自建技能清单。当用户消息中出现 `/技能名`、或任务与某技能的描述明显相关时，先调用 read_skill 工具读取该技能全文，再严格按其步骤执行。\n新建/修改/删除技能一律用 skill 工具（不用去找 SKILL.md 文件在哪）；「可用插件」一节里标了「自带技能」的是插件包内的说明书，read_skill 按名可读，但它们不属于本清单、也改不得：\n");
     for sk in &skills {
         let desc = if sk.description.is_empty() {
             "（无描述）"
@@ -573,6 +580,24 @@ mod tests {
         let idx = index_prompt();
         if !idx.is_empty() {
             assert!(idx.starts_with("\n\n## 可用技能"));
+        }
+    }
+
+    /// 2026-10-03（用户拍板「这些不是技能，是插件」）：技能索引只列自建技能。
+    /// 插件自带技能混进索引会诱导模型去文件系统找它们的 SKILL.md（真机实锤）。
+    #[test]
+    fn index_prompt_excludes_plugin_skills() {
+        let all: Vec<Skill> = list().into_iter().filter(|s| s.enabled).collect();
+        let idx = index_prompt();
+        if let Some(plug) = all.iter().find(|s| s.source == "plugin") {
+            assert!(
+                !idx.contains(&format!("- /{}", plug.name)),
+                "插件技能 {} 不得进技能索引: {idx}",
+                plug.name
+            );
+        }
+        if let Some(own) = all.iter().find(|s| s.source != "plugin") {
+            assert!(idx.contains(&format!("- /{}", own.name)), "自建技能 {} 应在索引: {idx}", own.name);
         }
     }
 

@@ -488,7 +488,9 @@ fn index_prompt_of(exts: &[UiExt]) -> String {
     let mut s = String::from("\n\n## 可用插件（Extensions）\n");
     s.push_str(
         "用户消息里形如 `/插件名` 的前缀，表示他要动用下面某个已启用插件的能力：\
-         按描述理解他的意图，不要把它当作工具名去调用。\n",
+         按描述理解他的意图，不要把它当作工具名去调用。\
+         标了「自带技能」的，全文用 read_skill 按名读取（如 read_skill(\"pptx\")）后照做；\
+         这些是插件包内的文档，不是磁盘上的技能目录，也别用 skill 工具去改。\n",
     );
     for e in listed {
         let desc = match e.description.is_empty() {

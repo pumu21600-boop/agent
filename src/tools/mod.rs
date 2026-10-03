@@ -19,6 +19,7 @@ mod git;
 mod search;
 mod settings;
 mod shell;
+mod skill;
 mod ui;
 mod web;
 
@@ -140,7 +141,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_skill",
-            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部技能；用户消息中出现 /技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
+            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部自建技能（「可用插件」节标「自带技能」的插件包文档同样按名读取）；用户消息中出现 /技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -294,6 +295,21 @@ fn builtin_tools() -> Vec<ToolSpec> {
             }),
             danger_level: 0,
         },
+        ToolSpec {
+            name: "skill",
+            description: "技能管理正门：action=list 列出全部技能（含插件自带的，标注 source/plugin）；action=save 新建或覆盖一个技能（name + description 一句话 + content 正文：触发时机与步骤，markdown；落全局技能根，下一轮对话进系统提示索引）；action=delete 删除自建技能（插件自带技能拒删，想覆盖用 save 写同名自建版）。要创建技能就用本工具——不用也不要去文件系统找 SKILL.md 的位置。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "save", "delete"], "description": "list 不需要其他参数；save/delete 配 name，save 再配 description/content" },
+                    "name": { "type": "string", "description": "技能名（save 用它做目录名与 frontmatter name；中文可用）" },
+                    "description": { "type": "string", "description": "save：一句话描述（索引里给模型看的触发依据）" },
+                    "content": { "type": "string", "description": "save：技能正文（markdown 步骤；已有 frontmatter 的话会被保留，description 行自动同步）" }
+                },
+                "required": ["action"]
+            }),
+            danger_level: 0,
+        },
     ]
 }
 
@@ -367,6 +383,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "settings" => settings::run(args).await,
         // 2026-10-03：操作本应用界面（开/关侧栏面板标签，走 /api/ui/events 事件流）
         "ui" => ui::run(args).await,
+        // 2026-10-03：技能建/改/删正门（复用 skills::save/delete，模型不用找文件）
+        "skill" => skill::run(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }

@@ -60,6 +60,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "settings",
     // 2026-10-03 操作本应用界面（开/关侧栏面板标签；无持久副作用）
     "ui",
+    // 2026-10-03 技能建/改/删正门（复用 skills::save/delete；分级见 evaluate_risk 的 skill 臂）
+    "skill",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -197,6 +199,15 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
 
         // 2026-10-03 操作本应用界面：开/关侧栏面板标签，无持久副作用，恒定 Safe
         "ui" => (RiskLevel::Safe, "应用界面面板开关（开/关侧栏标签）".into()),
+
+        // 2026-10-03 技能管理：list 只读；save 常规（校验统一在 skills::save，落全局技能根）；
+        // delete 不可逆 → 高危（插件自带技能工具层本就拒删）
+        "skill" => match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
+            "list" => (RiskLevel::Safe, "列出技能（只读）".into()),
+            "save" => (RiskLevel::Normal, "保存技能（写全局技能根）".into()),
+            "delete" => (RiskLevel::Dangerous, "删除技能（不可逆）".into()),
+            _ => (RiskLevel::Dangerous, "skill 工具缺少合法 action（list/save/delete）".into()),
+        },
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
         "write_file" | "edit_file" => risk_write_file(args, workspace_root),
