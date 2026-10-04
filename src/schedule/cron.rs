@@ -167,11 +167,16 @@ impl CronSpec {
                 self.dow.iter().map(|d| WEEK_CN[*d as usize]).collect::<Vec<_>>().join("")
             ));
         }
-        if !is_full(&self.dom, 1, 31) {
-            parts.push(format!("每月 {} 日", list(&self.dom)));
-        }
         if !is_full(&self.months, 1, 12) {
-            parts.push(format!("{} 月", list(&self.months)));
+            // 月份受限 = 一年只在那几个月跑，说「每月」是错的（如 `25 20 4 10 *`
+            // 实际每年 10 月 4 日一次），日也受限时并进去说「每年 X 月 Y 日」
+            if !is_full(&self.dom, 1, 31) {
+                parts.push(format!("每年 {} 月 {} 日", list(&self.months), list(&self.dom)));
+            } else {
+                parts.push(format!("每年 {} 月", list(&self.months)));
+            }
+        } else if !is_full(&self.dom, 1, 31) {
+            parts.push(format!("每月 {} 日", list(&self.dom)));
         }
         if parts.is_empty() {
             // 无日期限制：「每 N 分钟」这类间隔说法自带每天义，只有具体钟点要补「每天」
@@ -287,7 +292,9 @@ mod tests {
         assert_eq!(parse("0 9 * * 1-5").unwrap().describe(), "工作日 09:00");
         assert_eq!(parse("30 8,20 * * *").unwrap().describe(), "每天 8,20 时 30 分");
         assert_eq!(parse("0 9 1 * *").unwrap().describe(), "每月 1 日 09:00");
-        assert_eq!(parse("0 0 1 1,7 *").unwrap().describe(), "每月 1 日 1,7 月 00:00");
+        assert_eq!(parse("0 0 1 1,7 *").unwrap().describe(), "每年 1,7 月 1 日 00:00");
+        // 月份受限+日不限：纯按月份（用户实锤 `25 20 4 10 *` 曾被说成「每月」，实际每年一次）
+        assert_eq!(parse("0 9 * 3 *").unwrap().describe(), "每年 3 月 09:00");
         assert_eq!(parse("0 9 * * 1,3").unwrap().describe(), "每周一三 09:00");
         // 每小时整点（分钟只有 0）
         assert_eq!(parse("0 * * * *").unwrap().describe(), "每小时 0 分");

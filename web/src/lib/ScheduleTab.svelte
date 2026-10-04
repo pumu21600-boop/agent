@@ -381,8 +381,9 @@
               <button class="btn" on:click={() => (schedEditor = null)}>取消</button>
             </div>
           </div>
-        {/if}
-        {#if schedLoading && !schedulesData.length}
+        <!-- 与技能页同款：编辑器开着只留编辑器，列表让位（用户 2026-10-05 实锤回归：
+             编辑时该任务还挂在下面） -->
+        {:else if schedLoading && !schedulesData.length}
           <div class="trace-empty">加载中…</div>
         {:else}
           {#each schedulesData as t (t.id)}

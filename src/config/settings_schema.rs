@@ -245,7 +245,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         enum_values: &[],
         default: None,
         risk: "normal",
-        desc: "整表替换（先 get 拿现状）。新增任务 id 留空自动生成；带 id 改已有任务时创建时间与运行态以旧值为准",
+        desc: "整表替换（先 get 拿现状）。新增任务 id 留空自动生成；带 id 改已有任务时创建时间与运行态以旧值为准。每条任务字段：name=名称；message=到点发送的内容；kind=message（固定消息，缺省）|memory（先回顾 memory_days 天对话再唤醒）；enabled=开关。时间二选一：cron=5 段「分 时 日 月 周」本地时区周期表达式（如 25 20 4 10 * = 每年 10 月 4 日 20:25）；once_ts=unix 秒时间戳的单次任务（到点跑一次自动停用，此时 cron 留空）。可选：workspace=绝对路径限定工作区；config_id+model=用哪套渠道跑；timeout_secs=整轮超时秒；memory_days=回顾天数 1-90；budget_tokens=上下文上限",
     },
     // —— features.* 点号子路径（单开关；整表替换请用顶层 features）——
     SchemaEntry {
