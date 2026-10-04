@@ -1,6 +1,10 @@
 <script>
   import Select from '../Select.svelte';
   import ScheduleCronPicker from '../ScheduleCronPicker.svelte';
+  import { createEventDispatcher } from 'svelte';
+
+  // 「去查看」：交给宿主 App 打开对应会话（组件内拿不到会话切换逻辑）
+  const dispatch = createEventDispatcher();
 
   export let tab = '';
   export let workspace = '';
@@ -400,6 +404,7 @@
                 <span class="flex-sp"></span>
                 <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>
+                {#if t.last_session_id}<button class="btn ghost" on:click={() => dispatch('open-session', { id: t.last_session_id })}>去查看</button>{/if}
                 <button class="btn ghost danger" on:click={() => deleteSchedule(t.id)}>删除</button>
               </div>
               {#if t.kind === 'memory'}
@@ -423,7 +428,11 @@
         {#if scheduleNotices.length}
           <div class="field"><label>完成记录</label></div>
           {#each scheduleNotices as n (n.ts + n.task_id)}
-            <div class="mcp-cmd">{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</div>
+            <div class="sub-row">
+              <span>{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</span>
+              <span class="flex-sp"></span>
+              {#if n.session_id}<button class="btn ghost" on:click={() => dispatch('open-session', { id: n.session_id })}>去查看</button>{/if}
+            </div>
           {/each}
         {/if}
       {/if}

@@ -574,6 +574,12 @@ pub(crate) async fn run_headless_inner(
             "prompt_tokens": prompt_tokens,
         }),
     );
+    // 顶层无头轮（定时任务/CLI/脚本唤醒，非子代理）跑完 → 通知打开中的页面刷新会话列表：
+    // 新建的会话即时进侧栏，不用重启/手动刷新（2026-10-05 用户实锤「重启软件才能看到」）。
+    // 子代理轮（parent_session 非空）不推，免得刷屏。界面刷新类事件，无人订阅即丢弃。
+    if req.parent_session.trim().is_empty() {
+        crate::server::ui_events::emit(json!({ "kind": "sessions_changed" }));
+    }
     Ok(HeadlessResult {
         session_id,
         status,

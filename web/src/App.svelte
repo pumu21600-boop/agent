@@ -2882,6 +2882,14 @@
     }
   }
 
+  // 定时任务「完成记录 / 上次完成」里的「去查看」：先关掉设置弹窗，再打开对应会话
+  // （/api/sessions/open 会在会话属于别的项目时先切过去）。id 空则不动。
+  async function openScheduleSession(id) {
+    if (!id) return;
+    settingsOpen = false;
+    await loadSession(id);
+  }
+
   // 服务端用量快照（/api/sessions/open 的 r.usage）→ 圆环/缓存行同形。
   // 旧会话文件里是 tokens/budget（改造前口径）——后端已用 serde alias 收下并改写成
   // projected/window，这里对老服务端载荷也做一次兜底，免得切回旧会话圆环空掉
@@ -3907,6 +3915,13 @@
       kind: 'settings_changed', title: '（内部）设置变更同步', risk: 'safe', internal: true,
       args: 'keys: 变更键清单（仅通知用）',
       run() { loadExt(); loadSettings(); },
+    },
+    // 顶层无头轮（定时任务/CLI 唤醒）跑完推来的同步动作：刷新侧栏会话列表，新建的会话
+    // 即时出现，不必重启软件（2026-10-05 用户实锤「重启才看得到」）。autoPick 传 false
+    // ——后台刷新不许抢夺当前打开的会话。
+    sessions_changed: {
+      kind: 'sessions_changed', title: '（内部）会话清单刷新', risk: 'safe', internal: true,
+      run() { loadSessions(); },
     },
 
     // —— 插件桥方法（扩展 iframe postMessage；阶段4 并表）——
@@ -6579,7 +6594,7 @@
         <div class="param-hint">目录：内置 {extInfo.app_dir || '（读取中）'} ｜ 工作区 {extInfo.workspace_dir || '（读取中）'}</div>
       {/if}
 
-      <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} />
+      <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} on:open-session={(e) => openScheduleSession(e.detail.id)} />
 
         </div>
       </div>
