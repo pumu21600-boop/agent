@@ -13,6 +13,13 @@
   // —— P22-B 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
   let schedulesData = [];
   let scheduleNotices = [];
+  // 用户 2026-10-05 实锤：完成记录改成小字一行，右边给个 × 关掉——原来整行按钮太占地方，
+  // 「去查看」任务卡片上已有。只用 × 关当前页显示（后端缓冲重启即失，不跟着落盘持久化）。
+  let dismissedNotices = {};
+  $: visibleNotices = scheduleNotices.filter((n) => !dismissedNotices[n.ts + n.task_id]);
+  function dismissNotice(key) {
+    dismissedNotices = { ...dismissedNotices, [key]: true };
+  }
   let schedMsg = '';
   // P27 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）
   let confirmModal = null;
@@ -425,13 +432,12 @@
             <div class="menu-empty">还没有定时任务。</div>
           {/each}
         {/if}
-        {#if scheduleNotices.length}
+        {#if visibleNotices.length}
           <div class="field"><label>完成记录</label></div>
-          {#each scheduleNotices as n (n.ts + n.task_id)}
-            <div class="sub-row">
-              <span>{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</span>
-              <span class="flex-sp"></span>
-              {#if n.session_id}<button class="btn ghost" on:click={() => dispatch('open-session', { id: n.session_id })}>去查看</button>{/if}
+          {#each visibleNotices as n (n.ts + n.task_id)}
+            <div class="mcp-cmd sched-notice">
+              <span class="sched-notice-text">{n.ts} · {n.title}{n.detail ? `：${n.detail}` : ''}</span>
+              <button class="notice-x" title="关掉这条记录" on:click={() => dismissNotice(n.ts + n.task_id)}>×</button>
             </div>
           {/each}
         {/if}
@@ -522,6 +528,33 @@
   .mcp-risk-label {
     font-size: 12px;
     color: var(--g6);
+  }
+  /* 完成记录：小字一行 + 行尾 ×（关掉这条）。不放大字号、不加按钮——
+     「去查看」任务卡片上已有，这里只做记录本体 */
+  .sched-notice {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 2px 0;
+  }
+  .sched-notice-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .notice-x {
+    flex: none;
+    border: none;
+    background: none;
+    color: var(--g5);
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 5px;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .notice-x:hover {
+    color: var(--g7);
+    background: var(--g2);
   }
   .dot {
     display: inline-block;
