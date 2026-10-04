@@ -76,11 +76,19 @@ const DANGEROUS_PROGRAMS: &[&str] = &[
 
 /// 只读/诊断类程序（无论参数如何都判 Safe）。
 /// 注意是精确匹配：`dirname` 不会因 `dir` 而被误判安全。
+/// 刻意不含解释器（python/pytest/npx 等）：`python -c "任删全盘"` 首 token 也是
+/// python——解释器见 INTERPRETER_PROGRAMS 单独判，不进这张表（2026-10-04 审计）。
 const SAFE_PROGRAMS: &[&str] = &[
     "dir", "ls", "type", "cat", "echo", "pwd", "where", "which", "head", "tail",
     "findstr", "grep", "wc", "sort", "tree", "hostname", "whoami", "date", "time",
-    "ver", "python", "python3", "pytest", "npx",
+    "ver",
 ];
+
+/// 解释器类程序：能执行任意代码（`-c`/脚本参数/自动发现 conftest/拉包执行），
+/// 除版本/帮助查询外一律 Dangerous——宁可 auto 档多问，不静默跑任意代码。
+/// （2026-10-04 审计：原 SAFE_PROGRAMS 无条件收 python/pytest/npx，`python -c
+/// "shutil.rmtree(...)"` 三档全静默。本机没装 python 时零摩擦，装了才开始弹卡。）
+const INTERPRETER_PROGRAMS: &[&str] = &["python", "python3", "pytest", "npx"];
 
 /// 需要看子命令才能判安全的程序（程序 + 第二个 token 精确匹配）。
 /// 不在表内的同程序命令（如 `cargo build`、`npm run build`）保持 Normal。
@@ -99,8 +107,6 @@ const SAFE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("rustc", "--version"),
     ("rustc", "-v"),
     ("rustup", "--version"),
-    ("python", "-v"),
-    ("python", "--version"),
 ];
 
 /// 三段式安全组合（程序 + 子命令 + 参数），用于 `npm run test` 这类。
@@ -336,6 +342,9 @@ fn risk_write_file(args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
 fn risk_settings(args: &Value) -> (RiskLevel, String) {
     match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
         "get" => (RiskLevel::Safe, "读取应用设置（只读快照，key 只给尾号）".into()),
+        // 2026-10-04 真机补：阶段3 给 settings 加了 action=schema（只读合法路径清单），
+        // 工具层放行但判级器漏了同名分支——纯只读查询掉进兜底判 Dangerous 弹卡。
+        "schema" => (RiskLevel::Safe, "读取可改设置路径清单（只读 manifest）".into()),
         "set" => {
             let keys: Vec<&str> = args
                 .get("patch")
@@ -680,6 +689,25 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
         return (RiskLevel::Dangerous, "检测到高危数据库删除语句".to_string());
     }
 
+    // 3.5) powershell -EncodedCommand：base64 载荷判级完全不可见，盲判高危
+    if lower.contains("-encodedcommand") || lower.contains(" -enc ") {
+        return (
+            RiskLevel::Dangerous,
+            "powershell -EncodedCommand 内容无法判级（base64），一律按高危弹卡".into(),
+        );
+    }
+
+    // 3.6) 解释器（python/pytest/npx）：可执行任意代码，除版本/帮助查询外一律高危
+    if INTERPRETER_PROGRAMS.contains(&prog.as_str()) {
+        if matches!(second.as_str(), "-v" | "--version" | "-h" | "--help" | "-vv") {
+            return (RiskLevel::Safe, "解释器版本/帮助查询".into());
+        }
+        return (
+            RiskLevel::Dangerous,
+            format!("解释器 {prog} 可执行任意代码（脚本/-c/拉包都算），按档位弹卡"),
+        );
+    }
+
     // 4) 重定向/管道写文件：即便程序只读也算常规改动（可能覆盖文件）
     let writes = lower.contains('>') || lower.contains("| out-file") || lower.contains("tee ");
 
@@ -694,7 +722,28 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
         return (RiskLevel::Safe, "安全只读或自动化测试命令".to_string());
     }
 
-    // 6) 其余命令（含安全程序带重定向、cargo build 等）
+    // 6) 包装/复合形态兜底（2026-10-04 审计）：首 token 判级对 cmd 语法不设防——
+    // `if exist x (del x)`、`cmd /c del x`、`for ... do del %i`、`powershell "Remove-Item"`
+    // 的程序名都不是 del，DANGEROUS_PROGRAMS 全部失效后落 Normal（auto 档静默）。
+    // 这里对非安全程序的命令串做高危名 token 扫描（词级、剥括号引号），
+    // 任何位置出现高危程序即 Dangerous；安全程序（echo/findstr 等打印/搜索
+    // "del" 字样）跳过避免误伤。残余盲区：`%var%` 间接展开、`d^el` 转义——
+    // cmd 语义无法完全模拟，宁可后续再收。
+    if !SAFE_PROGRAMS.contains(&prog.as_str()) {
+        for tok in trimmed.split(['(', ')', '"', '\'', ' ', '\t', ',', '=']) {
+            let t = tok
+                .trim_matches(['&', '|', ';', '^'])
+                .to_lowercase();
+            if DANGEROUS_PROGRAMS.contains(&t.as_str()) {
+                return (
+                    RiskLevel::Dangerous,
+                    format!("复合命令中出现高危程序 {t}（包装/嵌套形态也拦）"),
+                );
+            }
+        }
+    }
+
+    // 7) 其余命令（含安全程序带重定向、cargo build 等）
     (RiskLevel::Normal, "沙箱命令执行".to_string())
 }
 
@@ -721,23 +770,23 @@ fn program_name(cmd: &str) -> String {
     lower
 }
 
-/// 按命令分隔符拆分（`&&` `||` `;` `|` 换行），引号内的分隔符不拆。
+/// 按命令分隔符拆分（`&&` `||` `&` `;` `|` 换行），双引号内的分隔符不拆。
+/// 2026-10-04 审计两处修正：① 单 `&` 也是 cmd 合法分隔符（`dir & del x`），
+/// 原先只认 `&&` 导致整条按首个程序判级；② cmd 不认单引号（只有 `"` 是引号），
+/// 原先把 `'` 当引号反而保护了 `' & del x & '` 里的分隔符不被拆——拆开才算得对。
 fn split_commands(cmd: &str) -> Vec<String> {
     let chars: Vec<char> = cmd.chars().collect();
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut in_single = false;
     let mut in_double = false;
     let mut i = 0usize;
 
     while i < chars.len() {
         let c = chars[i];
-        match c {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            _ => {}
+        if c == '"' {
+            in_double = !in_double;
         }
-        if !in_single && !in_double {
+        if !in_double {
             let two = if i + 1 < chars.len() {
                 format!("{c}{}", chars[i + 1])
             } else {
@@ -751,7 +800,7 @@ fn split_commands(cmd: &str) -> Vec<String> {
                 i += 2;
                 continue;
             }
-            if c == ';' || c == '|' || c == '\n' {
+            if c == ';' || c == '|' || c == '&' || c == '\n' {
                 if !cur.trim().is_empty() {
                     out.push(cur.clone());
                 }
@@ -1002,6 +1051,58 @@ mod tests {
         assert_eq!(evaluate_risk("shell", &json!({"command": "dir > list.txt"}), &ws()).0, RiskLevel::Normal);
     }
 
+    // —— 2026-10-04 审计修复：cmd 语法对首 token 判级的成片绕过 ——
+    #[test]
+    fn test_shell_cmd_syntax_hardening() {
+        // 单 `&` 是 cmd 合法分隔符：dir 判 Safe 但后面的 del 必须被看到
+        let r = evaluate_risk("shell", &json!({"command": "dir & del /f main.rs"}), &ws());
+        assert_eq!(r.0, RiskLevel::Dangerous, "单 & 串联的删除不得按首程序判 Safe: {}", r.1);
+        // cmd 不认单引号：原先 `'` 被当引号保护了 `& del &` 不拆分，整条判 echo Safe
+        let r = evaluate_risk("shell", &json!({"command": "echo ' & del /f main.rs & echo '"}), &ws());
+        assert_eq!(r.0, RiskLevel::Dangerous, "单引号内的 & 分隔符必须拆开判: {}", r.1);
+        // 包装/嵌套形态：程序名不是 del 但命令串里出现高危程序 token
+        for cmd in [
+            "if exist x (del x)",
+            "cmd /c del x",
+            "C:\\Windows\\System32\\cmd.exe /c del x",
+            "for %i in (*) do del %i",
+            "call del x",
+            "start \"\" cmd /c del x",
+            "powershell -Command \"Remove-Item x\"",
+            "set d=del && %d% /f x",
+        ] {
+            let r = evaluate_risk("shell", &json!({ "command": cmd }), &ws());
+            assert_eq!(r.0, RiskLevel::Dangerous, "包装/嵌套删除应判高危: {cmd}: {}", r.1);
+        }
+        // base64 载荷判级不可见，盲判高危
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "powershell -EncodedCommand ZGVsIHg="}), &ws()).0,
+            RiskLevel::Dangerous
+        );
+        // 误伤护栏：安全程序（echo/findstr/dir）打印、搜索、列举"del"字样不拦
+        assert_eq!(evaluate_risk("shell", &json!({"command": "findstr del notes.txt"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "dir del*"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo it's ok"}), &ws()).0, RiskLevel::Safe);
+    }
+
+    // —— 2026-10-04 审计修复：解释器不再无条件 Safe ——
+    #[test]
+    fn test_shell_interpreters_not_blanket_safe() {
+        // `python -c "<任意代码>"` 原先三档全静默，现按高危弹卡
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "python -c \"import shutil; shutil.rmtree(r'C:\\Users\\me')\""}), &ws()).0,
+            RiskLevel::Dangerous
+        );
+        assert_eq!(evaluate_risk("shell", &json!({"command": "pytest"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "npx some-pkg"}), &ws()).0, RiskLevel::Dangerous);
+        // 版本/帮助查询仍然 Safe
+        assert_eq!(evaluate_risk("shell", &json!({"command": "python -V"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "npx --version"}), &ws()).0, RiskLevel::Safe);
+        // node 不在解释器名单（本机日常工具链），除版本 Safe 外维持 Normal 原口径
+        assert_eq!(evaluate_risk("shell", &json!({"command": "node -v"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "node script.js"}), &ws()).0, RiskLevel::Normal);
+    }
+
     #[test]
     fn test_write_file_path_traversal() {
         assert_eq!(evaluate_risk("write_file", &json!({"path": "src/lib.rs", "content": "..."}), &ws()).0, RiskLevel::Normal);
@@ -1038,6 +1139,8 @@ mod tests {
     fn test_settings_tool_risk() {
         // get 只读
         assert_eq!(evaluate_risk("settings", &json!({"action": "get"}), &ws()).0, RiskLevel::Safe);
+        // schema 只读清单（2026-10-04 补：阶段3 工具层加了 action，判级器漏分支掉兜底弹卡）
+        assert_eq!(evaluate_risk("settings", &json!({"action": "schema"}), &ws()).0, RiskLevel::Safe);
         // 普通键常规改动（auto 档静默放行）
         let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "high"}}), &ws());
         assert_eq!(r, RiskLevel::Normal, "{why}");

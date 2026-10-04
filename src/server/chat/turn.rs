@@ -154,7 +154,7 @@ fn selfop_policy(state: &AppState) -> String {
     let self_on = state.settings.read().map(|s| s.features.self_mod).unwrap_or(false);
     format!(
         "\n\n## 自我管理与探索纪律\n\
-        - 改自身（设置/渠道/插件技能启停/定时任务/会话/侧栏面板/边栏/主题/终端/设置弹窗）\
+        - 改自身（设置/渠道/插件技能启停/定时任务/会话/侧栏面板/边栏/主题/壁纸/终端/设置弹窗）\
          由「自改」插件管着：它现在{state}。没开时只回一句引导（去 设置→插件 打开「自改」），\
          不要翻文件系统找替代路径、不要试绕；开了才动手，红线照旧先问。\n\
         - 红线（agent 没有任何通道可改，说了也做不到）：审批档位（read-only只读/auto自动/\

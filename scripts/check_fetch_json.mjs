@@ -30,6 +30,8 @@ const ALLOW = [
   [/fetch\('\/cancel'/, '会话级停止：发了就忘，效果由本地 controller.abort() 立即体现'],
   [/fetch\('\/api\/sessions\/meta'/, '发了就忘，.then 里跟着 loadSessions 刷新'],
   [/fetch\('\/api\/workspace\/alias'/, '发了就忘，.then 里跟着 loadSettings 刷新'],
+  [/\.then\(\(r\) => \{$/, 'workspace/raw 二进制取回（图片/pdf/xlsx 预览）：then 体内读 arrayBuffer()/blob()，16 行扫描窗看不见'],
+  [/await fetch\('\/api\/ui\/state'/, 'state 上报：发了就忘，故意不读响应体（多窗口后报者覆盖前报者）'],
 ];
 
 function walk(dir, out = []) {

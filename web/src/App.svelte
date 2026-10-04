@@ -1774,7 +1774,10 @@
       rpSet(path, { loading: false, content: '', error: `docx 渲染失败: ${e.message || e}` });
     }
   }
-  // xlsx → HTML 表格（SheetJS；每 sheet 一张表，纯预览无标注）
+  // xlsx → 二维文本网格（SheetJS；每 sheet 一个 { name, rows[][] }，渲染侧全走文本插值）。
+  // 2026-10-04 审计：原先 sheet_to_html 直出 {@html}——SheetJS 的 cell.h 存在时绕过
+  // 转义、超链接 Target 原样拼进 href，模型往工作区写一个恶意 xlsx，打开预览就在
+  // 宿主 origin 执行任意脚本（连 P0）。现在只取显示文本（raw:false），不含任何标签。
   async function loadXlsxHtml(path) {
     rpSet(path, { loading: true, error: '' });
     try {
@@ -1783,7 +1786,10 @@
         return r.arrayBuffer();
       });
       const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
-      const sheets = wb.SheetNames.map((name) => XLSX.utils.sheet_to_html(wb.Sheets[name], { editable: false }));
+      const sheets = wb.SheetNames.map((name) => {
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: false, blankrows: true, defval: '' });
+        return { name, rows: rows.map((row) => (Array.isArray(row) ? row : []).map((c) => String(c ?? ''))) };
+      });
       rpSet(path, { loading: false, content: JSON.stringify(sheets), error: '' });
     } catch (e) {
       rpSet(path, { loading: false, content: '', error: `xlsx 渲染失败: ${e.message || e}` });
@@ -3749,6 +3755,18 @@
       args: 'mode: dark（深色）/light（浅色）/system（跟随系统）',
       run(m) {
         if (['dark', 'light', 'system'].includes(m.mode)) applyThemeMode(m.mode);
+      },
+    },
+    // 壁纸（2026-10-04 用户真机反馈「帮我改壁纸」agent 说没通道——能力审计漏项，
+    // 与主题同族补上；持久但可逆所以 normal 档，read-only/auto 会问、完全访问直放）
+    wallpaper: {
+      kind: 'wallpaper', title: '设置/清除应用壁纸', risk: 'normal', internal: false,
+      args: 'value: 工作区内图片相对路径（自动走 /api/workspace/raw 载入）或 data: 开头的图片 dataURL；空串=清除壁纸',
+      run(m) {
+        const v = String(m.value ?? '');
+        wallpaper = v === '' || v.startsWith('data:') ? v : `/api/workspace/raw?path=${encodeURIComponent(v)}`;
+        if (v === '') localStorage.removeItem('wallpaper');
+        else localStorage.setItem('wallpaper', wallpaper);
       },
     },
     open_tab: {
@@ -5720,7 +5738,14 @@
                   {:else}
                     <div class="rp-xlsx">
                       {#each (() => { try { return JSON.parse((rpPreviewCache[t.path] || {}).content || '[]'); } catch { return []; } })() as sh}
-                        <div class="rp-xlsx-sheet"><div class="rp-xlsx-body">{@html sh}</div></div>
+                        <div class="rp-xlsx-sheet">
+                          {#if sh.name}<div class="rp-xlsx-name">{sh.name}</div>{/if}
+                          <div class="rp-xlsx-body">
+                            <table>
+                              {#each sh.rows as row}<tr>{#each row as cell}<td>{cell}</td>{/each}</tr>{/each}
+                            </table>
+                          </div>
+                        </div>
                       {/each}
                     </div>
                   {/if}
