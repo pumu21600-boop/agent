@@ -1,13 +1,5 @@
 use super::*;
 
-/// 是否构成「重复调用死循环」（纯函数）：两步工具调用签名完全相同，且上一轮**不是**
-/// 全部失败。失败后重试是正当行为——超时/后端重置后状态可能已变，模型重试一次
-/// 理应放行（用户反馈：navigate 超时被当场判死循环，用户只看到天书横幅）；
-/// 真正要防的是对成功调用的重复请求，那种由步数上限兜底。
-pub(crate) fn is_repeat_loop(prev: &[String], cur: &[String], prev_all_failed: bool) -> bool {
-    !prev.is_empty() && prev == cur && !prev_all_failed
-}
-
 /// P22-C：执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
 /// （子代理跑在独立会话，实现见 server/subagent.rs）；其余走工具注册表。
 pub(crate) async fn exec_tool_call(

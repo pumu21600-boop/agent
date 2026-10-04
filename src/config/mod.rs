@@ -322,7 +322,7 @@ fn default_log_max_mb() -> u64 {
 }
 fn default_max_steps() -> u32 {
     // 0 = 不限（2026-10-03 用户拍板：大项目 100+ 次工具调用是常态；失控由取消标志/
-    // 相同调用护栏/花费硬闸三道缰绳管，不由步数把长任务拦腰砍断）
+    // 花费硬闸两道缰绳管，不由步数把长任务拦腰砍断）
     0
 }
 fn default_tool_result_max_chars() -> usize {

@@ -1,8 +1,8 @@
 //! 核心循环 v1（施工单 003）
 //!
 //! 任务消息 → 模型（带 tools）→ 若返回 tool_calls 则执行回填继续；纯文本则终止。
-//! 步数上限 cfg.max_steps：0 = 不限（2026-10-03 用户拍板）；失控由取消标志/相同调用
-//! 护栏/花费硬闸三道缰绳管。每步开始与每个流式分片前查取消标志。
+//! 步数上限 cfg.max_steps：0 = 不限（2026-10-03 用户拍板）；失控由取消标志/花费硬闸
+//! 两道缰绳管。每步开始与每个流式分片前查取消标志。
 //! thought / tool_call / tool_result 全量落 JSONL；on_event 把结构化事件转给前端。
 
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -407,13 +407,9 @@ pub async fn run_task(
     // 「裁剪后回落」全都是自动的，不再需要手工维护 last_real/last_added 两个数。
     // 起点可由 server 从上一轮的用量快照带入（跨轮沿用样本，见 LoopChannels::prior_anchor）。
     let mut anchor: Option<(u64, u64)> = channels.prior_anchor.filter(|(p, e)| *p > 0 && *e > 0);
-    let mut prev_tool_sigs: Vec<String> = Vec::new();
-    // 上一轮工具调用是否**全部失败**（超时/后端重置/审批拒绝…）。连续两步相同调用
-    // 通常是死循环，但「失败后重试」是正当行为——失败本身就是状态可能已变的信号。
-    let mut prev_all_failed = false;
 
     // 步数上限：0 = 不限（2026-10-03 用户拍板——大项目 100+ 次工具调用是常态，步数
-    // 上限本只该防死循环，而防死循环有取消标志/相同调用护栏/花费硬闸三道缰绳，不该由它
+    // 上限本只该防死循环，而防死循环有取消标志/花费硬闸两道缰绳，不该由它
     // 把长任务拦腰砍断）。非 0 时是硬上限：撞顶即止并抛 StepLimit（前端提示可回「继续」）。
     for step in 0usize.. {
         if cfg.max_steps > 0 && step >= cfg.max_steps as usize {
@@ -693,21 +689,6 @@ pub async fn run_task(
                 }
             return Ok(LoopOutcome::Done);
         }
-
-        // 护栏：模型连续两步请求完全相同的工具调用 → 死循环，立即终止。
-        // 例外：上一轮相同调用**全部失败**时重试是正当行为（用户反馈：navigate 超时被
-        // 当成死循环终止，用户看到的是天书错误横幅，而不是 AI 说「访问超时」）。
-        // 真正要防的是对成功调用的重复请求；失败重试由步数上限兜底。
-        let sigs: Vec<String> =
-            turn.tool_calls.iter().map(|c| format!("{}|{}", c.name, c.arguments)).collect();
-        if is_repeat_loop(&prev_tool_sigs, &sigs, prev_all_failed) {
-            observability::event(
-                EventType::Error,
-                json!({ "message": "模型重复请求相同工具调用，已终止循环" }),
-            );
-            return Err(anyhow::anyhow!("模型重复请求相同工具调用，已终止"));
-        }
-        prev_tool_sigs = sigs;
 
         // 回填 assistant 消息（含 tool_calls）；思考内容随消息落盘（前端切回会话可恢复）
         let calls_json: Vec<Value> = turn
@@ -1016,8 +997,6 @@ pub async fn run_task(
         }
         // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
         on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-        // 记录本轮成败：下一步的「相同调用」护栏要靠它区分死循环与失败重试
-        prev_all_failed = !results.is_empty() && results.iter().all(|(_, ok)| !ok);
     }
 
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
@@ -1039,20 +1018,6 @@ mod tests {
     }
 
     // —— P9 B3：plan 块解析 ——
-    /// 重复调用护栏：成功后的重复 = 死循环；失败后的重试 = 放行（步数上限兜底）。
-    #[test]
-    fn repeat_loop_allows_retry_after_failure() {
-        let a = vec!["browser|{\"method\":\"navigate\"}".to_string()];
-        // 上一轮相同调用成功了 → 重复即死循环
-        assert!(is_repeat_loop(&a, &a, false));
-        // 上一轮相同调用失败了（超时/后端重置）→ 重试放行
-        assert!(!is_repeat_loop(&a, &a, true));
-        // 不同调用 / 首轮（prev 空）→ 都不是循环
-        let b = vec!["browser|{\"method\":\"snapshot\"}".to_string()];
-        assert!(!is_repeat_loop(&a, &b, false));
-        assert!(!is_repeat_loop(&[], &a, false));
-    }
-
     // —— P12 018：写冲突检测 ——
     #[test]
     fn write_conflict_detection() {        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
@@ -1402,6 +1367,134 @@ mod tests {
         assert!(
             last.iter().any(|m| m.get("display_only").and_then(Value::as_bool) == Some(true)),
             "截断提示应以 display_only 消息落盘（重启后气泡还在）"
+        );
+    }
+
+    // —— 2026-10-05 用户拍板：删掉「连续两步相同工具调用 → 终止」护栏（与步数上限一样
+    // 属变相限制，一律不要）。用户实锤：建个定时任务翻几步配置就被判「模型重复请求相同
+    // 工具调用」当场击杀。mock SSE：第 1、2 轮返回**完全相同**的 tool_calls，第 3 轮才收尾；
+    // 旧护栏会在第 2 轮抛错终止，现在必须放行到自然收尾（三轮都发出去）。——
+    #[tokio::test]
+    async fn repeated_identical_tool_call_is_not_terminated() {
+        fn init_logger() {
+            static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            ONCE.get_or_init(|| {
+                let dir = std::env::temp_dir().join("agent-test-logs");
+                let _ = crate::observability::init(&dir, "agent.jsonl", format!("ag-{}", uuid::Uuid::new_v4()));
+            });
+        }
+        init_logger();
+        use crate::config::MemoryConfig;
+        use crate::memory::Memory;
+        use std::sync::atomic::AtomicUsize;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = hits.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_c = stop.clone();
+        let mock = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let _ = s.set_nonblocking(false);
+                        let mut buf = [0u8; 65536];
+                        let _ = Read::read(&mut s, &mut buf);
+                        let n = hits_c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = if n < 2 {
+                            // 两步 name+arguments 完全一致——旧护栏的击杀条件
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"config.toml\\\"}\"}}]}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":800,\"completion_tokens\":10}}\n\n\
+                             data: [DONE]\n\n"
+                        } else {
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"好了\"}}]}\n\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                             data: [DONE]\n\n"
+                        };
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = s.write_all(r.as_bytes());
+                        let _ = s.flush();
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+                }
+            }
+        });
+
+        let gateway = Arc::new(Gateway::new());
+        let ch = Channel::new(
+            &format!("http://127.0.0.1:{port}/v1"),
+            "mock-model",
+            "sk-dummy",
+            ChatParams::default(),
+        );
+        let channels = LoopChannels {
+            primary: ch,
+            summary: None,
+            title: None,
+            fallbacks: Vec::new(),
+            downgrade: None,
+            budget_hit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subagents: None,
+            prior_anchor: None,
+        };
+        let ws = std::env::temp_dir().join(format!("agent-repeat-{}-{}", std::process::id(), port));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mem = Memory::open_at(
+            &ws,
+            &MemoryConfig { enabled: false, persist_sensitive: false },
+            ws.join("global"),
+        );
+        struct G;
+        impl ApprovalGate for G {
+            fn needs_approval_for(&self, _tool: &str, _args_json: &str) -> bool {
+                false
+            }
+            fn sandbox_enabled(&self) -> bool {
+                true
+            }
+            fn ask(&self, _tool: &str, _args: &str) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                Box::pin(async { true })
+            }
+        }
+        let cancel = CancelFlag::new();
+        let outcome = run_task(
+            &gateway,
+            &channels,
+            "sys prompt",
+            &[json!({ "role": "user", "content": "读一下配置" })],
+            &cancel,
+            &AgentConfig::default(),
+            &SandboxConfig::default(),
+            0,
+            &ContextConfig::default(),
+            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &mem,
+            None,
+            false,
+            &G,
+            crate::tools::workspace_root(),
+            |_ev: AgentEvent| {},
+        )
+        .await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        mock.join().unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(
+            outcome.unwrap(),
+            LoopOutcome::Done,
+            "重复相同工具调用不再终止循环（护栏已删）"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "三轮都被请求到：重复步没有触发终止"
         );
     }
 }

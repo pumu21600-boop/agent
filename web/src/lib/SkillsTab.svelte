@@ -5,6 +5,9 @@
   export let tab = '';
   export let skills = [];
   export let loading = false;
+  // 删除确认弹窗：用宿主 App 的通用确认框（confirmAsk）——技能/MCP/定时任务等删除类
+  // 一律先弹确认（2026-10-05 用户拍板）。默认放行以兼容独立挂载（测试用）。
+  export let confirm = async () => true;
   // 列表数据(skills)与加载(loadSkills)在 App 侧:能力菜单共用;保存/删除/启停后回酒刷新
 
   let skillMsg = '';
@@ -53,6 +56,7 @@
     }
   }
   async function deleteSkill(name) {
+    if (!(await confirm(`删除技能「${name}」？不可恢复。`))) return;
     try {
       const r = await fetch('/api/skills', {
         method: 'POST',

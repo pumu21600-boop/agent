@@ -666,11 +666,14 @@
     manageConfig('new');
   }
 
-  function deleteConfig() {
+  async function deleteConfig() {
     if (configs.length <= 1) {
       settingsMsg = '至少保留一套配置';
       return;
     }
+    const cur = configs.find((c) => c.id === activeConfigId);
+    // 删除类先弹确认（2026-10-05 用户拍板）
+    if (!(await confirmAsk(`删除配置「${cur ? configLabel(cur) : activeConfigId}」？\n该配置的密钥会一并删除，不可恢复。`))) return;
     manageConfig('delete', activeConfigId);
   }
 
@@ -3582,6 +3585,8 @@
     }
   }
   async function mcpAction(action, name, server) {
+    // 删除类先弹确认（2026-10-05 用户拍板：技能/MCP/插件/定时任务等删除一律先确认）
+    if (action === 'remove' && !(await confirmAsk(`删除 MCP 服务「${name}」？\n配置与已授权状态会一并移除，不可恢复。`))) return;
     try {
       const r = await fetch('/api/mcp', {
         method: 'POST',
@@ -6453,7 +6458,7 @@
       </div>
       {/if}
       <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
-      <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} on:reload={loadSkills} />
+      <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} confirm={confirmAsk} on:reload={loadSkills} />
       <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.server)} on:reload={loadMcp} />
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
