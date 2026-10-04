@@ -59,8 +59,11 @@
     }
     return opts;
   }
-  function modelOptions() {
-    const cfg = schedConfigs.find((c) => c.id === (schedEditor?.config_id || ''));
+  // configId 由模板直接传参：Svelte4 只跟踪表达式里直接引用的变量，包进函数体
+  // 读 schedEditor.config_id 不建依赖（toolFold 同款坑，真机实锤过），选供应商时
+  // 模型下拉不会重算——2026-10-05 用户实锤「选了 bai 要出 bai 的三个模型」。
+  function modelOptions(configId) {
+    const cfg = schedConfigs.find((c) => c.id === (configId || ''));
     const opts = [{ value: '', label: '默认（该配置的模型）' }];
     for (const m of cfg?.models || []) opts.push({ value: m, label: m });
     // 配置当前模型不在清单里（手填的）也给一个可选项
@@ -324,20 +327,11 @@
                 <Select
                   value={schedEditor.model || ''}
                   title="模型（默认=该配置的模型）"
-                  options={modelOptions()}
+                  options={modelOptions(schedEditor.config_id || '')}
                   on:change={(e) => (schedEditor.model = e.detail)}
                 />
               </div>
             </div>
-            {#if schedEditor.config_id}
-              {@const picked = schedConfigs.find((c) => c.id === schedEditor.config_id)}
-              {#if picked}
-                <div class="field">
-                  <label>上下文（跟随所选模型配置）</label>
-                  <div class="mcp-cmd">{((picked.context_length || 0)).toLocaleString() || '跟随全局设置'} tokens{#if schedEditor.model} · 注意：换了非默认模型，上下文按该配置的 context_length 算{/if}</div>
-                </div>
-              {/if}
-            {/if}
             <div class="sub-row">
               <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
             </div>
@@ -422,7 +416,7 @@
               {/if}
             </div>
           {:else}
-            <div class="menu-empty">还没有定时任务。到点会唤醒 agent 跑一轮，结果出现在下面的完成记录里。</div>
+            <div class="menu-empty">还没有定时任务。</div>
           {/each}
         {/if}
         {#if scheduleNotices.length}
