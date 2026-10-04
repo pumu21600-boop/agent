@@ -4474,11 +4474,18 @@
       return;
     }
     try {
-      const r = await fetch('/api/plugins/create', {
+      const resp = await fetch('/api/plugins/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, description: extCreateForm.description.trim() }),
-      }).then((r) => r.json());
+      });
+      // 旧版本服务没有这个路由时返回的是非 JSON 空体——直接 .json() 会炸出一段
+      // 「Unexpected end of JSON input」洋文，这里兜住说人话（用户 2026-10-05 实锤）
+      const r = await resp.json().catch(() => null);
+      if (!r) {
+        extMsg = `新建插件失败: 服务没有返回数据（HTTP ${resp.status}）。如果刚更新过应用，重启后再试`;
+        return;
+      }
       if (r.error) {
         extMsg = `新建插件失败: ${r.error}`;
         return;
