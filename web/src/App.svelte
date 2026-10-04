@@ -4458,6 +4458,39 @@
     }
   }
 
+  // 用户 2026-10-05：插件页「新建插件」——和技能/MCP 同款，表单默认收起。创建只是在
+  // 工作区 plugins/ 下生成脚手架（manifest + index.html），不等于放行：新插件出现在
+  // 第三方分组，仍要走既有「审核/信任」链路才加载
+  let extCreateOpen = false;
+  let extCreateForm = { name: '', description: '' };
+  function cancelCreateExt() {
+    extCreateForm = { name: '', description: '' };
+    extCreateOpen = false;
+  }
+  async function createExt() {
+    const name = extCreateForm.name.trim();
+    if (!name) {
+      extMsg = '插件名不能为空';
+      return;
+    }
+    try {
+      const r = await fetch('/api/plugins/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description: extCreateForm.description.trim() }),
+      }).then((r) => r.json());
+      if (r.error) {
+        extMsg = `新建插件失败: ${r.error}`;
+        return;
+      }
+      extMsg = `已在工作区 plugins/ 下建好「${name}」，到第三方分组点「信任」后即可打开`;
+      if (r.plugins) extList = r.plugins;
+      cancelCreateExt();
+    } catch (err) {
+      extMsg = `新建插件失败: ${err.message || err}`;
+    }
+  }
+
   // P21 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
   // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查，blocker 后端直接拒；审核报告按插件名缓存
   let extReviews = {}; // name -> report（{verdict, findings, files_scanned, bytes_scanned}）
@@ -6421,6 +6454,23 @@
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
+        <!-- 用户 2026-10-05：「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
+        <div class="sub-row">
+          <button class="btn primary" on:click={() => (extCreateOpen = true)}>新建插件</button>
+          <button class="btn" on:click={() => loadExt()}>刷新</button>
+        </div>
+        {#if extCreateOpen}
+          <div class="field">
+            <label>新建插件（工作区）</label>
+            <div class="sub-row">
+              <input placeholder="名称（字母数字-_）" bind:value={extCreateForm.name} style="max-width:160px" />
+              <input placeholder="一句话描述" bind:value={extCreateForm.description} />
+              <button class="btn primary" on:click={createExt} disabled={!extCreateForm.name.trim()}>创建</button>
+              <button class="btn" on:click={cancelCreateExt}>取消</button>
+            </div>
+          </div>
+        {/if}
+
         <!-- 权限放开轮（用户 2026-10-02 拍板）：内置能力已全部插件化——Git/沙箱/功能桥接/
              css-ui注入/星云/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
              host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行 -->
@@ -6512,8 +6562,8 @@
           {/each}
         {:else if !extList.length}
           <div class="menu-empty">
-            还没有插件。在 <code>{extInfo.workspace_dir}</code> 下建一个目录（内含 manifest.json
-            与 index.html）即可。
+            还没有插件。点上方「新建插件」生成脚手架（再点「信任」即可打开），或自己在 <code>{extInfo.workspace_dir}</code>
+            下建目录（内含 manifest.json 与 index.html）。
           </div>
         {/if}
         <div class="param-hint">目录：内置 {extInfo.app_dir || '（读取中）'} ｜ 工作区 {extInfo.workspace_dir || '（读取中）'}</div>

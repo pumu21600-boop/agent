@@ -190,6 +190,112 @@ pub(super) async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// 新建插件的起始 index.html：自包含、无外联、无动态执行——静态审核（review）干净
+/// 通过；深浅色主题变量对齐其它内置面板。
+const STARTER_INDEX_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>新插件</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31;
+    margin: 0; padding: 16px 18px;
+    font: 13px/1.7 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  body.light {
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    color-scheme: light;
+  }
+  h3 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+  p { margin: 6px 0; }
+  .dim { color: var(--dim); font-size: 12px; }
+  code {
+    background: var(--line); border-radius: 4px; padding: 1px 5px;
+    font-family: Consolas, monospace; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+  <h3>新插件已就绪</h3>
+  <p>改插件目录下的 <code>index.html</code> 与 <code>manifest.json</code>，这个页面就是插件本体。</p>
+  <p class="dim">插件跑在沙箱 iframe 里，碰不到宿主页面；要数据走 postMessage 桥，写法参考内置面板。</p>
+</body>
+</html>
+"#;
+
+/// POST /api/plugins/create —— 用户 2026-10-05：插件页「新建插件」脚手架。在工作区
+/// plugins/<name>/ 下生成 manifest.json + 起始 index.html。**创建不等于放行**：新插件
+/// 与手工放置的插件走同一条信任/审核链路，仍要用户点「信任」才加载（模型自产的 draft
+/// 隔离区不适用于用户主动创建——来源是 user、权限该自己声明）。
+pub(super) async fn create_plugin(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let description = req
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
+    if !crate::plugin::draft::safe_name(&name) {
+        return err("插件名非法（仅字母数字与 - _ .，且不能是 . 或 ..）".into());
+    }
+    if description.len() > 200 {
+        return err("描述太长（200 字以内）".into());
+    }
+    // 重名即拒：内置 / 工作区 / 内存 draft / 工具注册表全查（避免「同名覆盖内置」的迷惑性）
+    if crate::plugin::ui::scan_all(&[]).iter().any(|e| e.name == name)
+        || crate::plugin::wasm::has_plugin(&name)
+    {
+        return err(format!("已存在同名插件（{name}），换一个名字"));
+    }
+    let dir = crate::tools::workspace_root().join(crate::plugin::ui::DIR).join(&name);
+    if dir.exists() && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(true) {
+        return err(format!("目录 {name} 已存在且非空：换一个名字或先手工清理"));
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(format!("建插件目录失败: {e}"));
+    }
+    let manifest = json!({
+        "apiVersion": 1,
+        "source": "user",
+        "title": name,
+        "description": description,
+        "version": "0.1.0",
+        "entry": "index.html",
+    });
+    if let Err(e) = crate::fsx::write_atomic_str(
+        &dir.join("manifest.json"),
+        &serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    ) {
+        return err(format!("写 manifest.json 失败: {e}"));
+    }
+    if let Err(e) = crate::fsx::write_atomic_str(&dir.join("index.html"), STARTER_INDEX_HTML) {
+        return err(format!("写 index.html 失败: {e}"));
+    }
+    let disabled = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .disabled_plugins
+        .clone();
+    let list = crate::plugin::ui::scan_all(&disabled);
+    observability::event(
+        EventType::State,
+        json!({ "kind": "plugin.create", "name": name, "dir": dir.display().to_string() }),
+    );
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "plugins": list, "dir": dir.display().to_string() })),
+    )
+}
+
 /// POST /api/plugins/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
 pub(super) async fn toggle_plugin(
     State(state): State<AppState>,
@@ -515,5 +621,38 @@ fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
             Err(e) => (StatusCode::NOT_FOUND, format!("读文件失败: {e}")).into_response(),
         },
         Err(e) => (StatusCode::NOT_FOUND, e).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 新建插件的脚手架必须干净过静态审核（review 判 Pass）——否则建出来的插件
+    /// 点「信任」会被后端拦下，「新建插件」入口就成了死路。改起始页模板先跑这个测试。
+    #[test]
+    fn scaffold_passes_static_review() {
+        let d = std::env::temp_dir().join(format!("agent-plugin-scaffold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // 与 create_plugin 落盘的 manifest 同字段（描述留空也走这条）
+        let manifest = json!({
+            "apiVersion": 1,
+            "source": "user",
+            "title": "demo",
+            "description": "",
+            "version": "0.1.0",
+            "entry": "index.html",
+        });
+        crate::fsx::write_atomic_str(
+            &d.join("manifest.json"),
+            &serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        crate::fsx::write_atomic_str(&d.join("index.html"), STARTER_INDEX_HTML).unwrap();
+        let report = crate::plugin::review::review_dir(&d);
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(report.verdict, crate::plugin::review::Verdict::Pass);
+        assert!(report.findings.is_empty(), "脚手架不该亮任何旗: {:?}", report.findings);
     }
 }

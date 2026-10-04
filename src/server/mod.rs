@@ -183,6 +183,7 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/mcp", get(get_mcp).post(post_mcp))
         .route("/api/version", get(get_version))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/create", post(create_plugin))
         .route("/api/plugins/toggle", post(toggle_plugin))
         // 2026-10-03：服务端→前端 UI 事件流（ui 工具开/关侧栏面板、settings 变更即时刷新）
         .route("/api/ui/events", get(crate::server::ui_events::ui_events_stream))

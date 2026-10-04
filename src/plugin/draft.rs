@@ -41,7 +41,8 @@ fn store() -> &'static RwLock<BTreeMap<String, Draft>> {
 const MAX_FILE_BYTES: usize = 64 * 1024;
 const MAX_FILES: usize = 32;
 
-fn safe_name(name: &str) -> bool {
+/// 插件目录名合法性（draft 提交与插件页「新建插件」共用同一把尺子）。
+pub(crate) fn safe_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name != "."
