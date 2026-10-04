@@ -61,6 +61,9 @@ pub(crate) struct HeadlessRequest {
     /// 整轮超时（秒）；0 = 不限。超时即取消本轮，已产出的部分回答照常返回
     #[serde(default)]
     pub timeout_secs: u64,
+    /// 本任务的上下文 token 预算覆盖（0 = 全局/模型口径；>0 = 本任务硬覆盖）
+    #[serde(default)]
+    pub budget_tokens: u64,
     /// 唤醒来源（cli / schedule / subagent / webhook…），只进审计与台账口径
     #[serde(default)]
     pub purpose: String,
@@ -220,6 +223,10 @@ pub(crate) async fn run_headless_inner(
         let mut c = (*state.context_cfg).clone();
         if let Some(cl) = active_cfg.context_length {
             c.budget_tokens = cl;
+        }
+        // 任务级显式覆盖最优先（定时任务高级选项填的）
+        if req.budget_tokens > 0 {
+            c.budget_tokens = req.budget_tokens;
         }
         c
     };

@@ -108,6 +108,7 @@
       on_approval: 'deny',
       enabled: true,
       timeout_secs: '',
+      budget_tokens: '',
       isNew: true,
     };
     previewCron();
@@ -116,7 +117,7 @@
     schedMsg = '';
     schedAdvOpen = schedAdvNonDefault(t);
     // 超时回显为空 + 占位符，不显示突兀的 0；保存时留空按 1800 发（见 saveSchedule）
-    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '' };
+    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '' };
     previewCron();
   }
   async function saveSchedule() {
@@ -139,6 +140,8 @@
       enabled: e.enabled !== false,
       // 留空 = 1800（与服务端 DEFAULT_TIMEOUT_SECS 对齐，显式发值不靠「0 走默认」隐式契约，F10）
       timeout_secs: Number(e.timeout_secs) || 1800,
+      // 上下文上限（tokens）：留空=0=跟全局/渠道口径，填了本任务硬覆盖
+      budget_tokens: Number(e.budget_tokens) || 0,
     };
     // 单次模式没选时间（或周期模式没产出 cron）：本地拦下，不发请求
     if (!String(body.cron || '').trim() && !body.once_ts) {
@@ -305,6 +308,13 @@
                   on:change={(e) => (schedEditor.on_approval = e.detail)}
                 />
                 <input placeholder="超时（秒）" type="number" bind:value={schedEditor.timeout_secs} style="max-width:110px" />
+                <input
+                  placeholder="上下文上限"
+                  type="number"
+                  bind:value={schedEditor.budget_tokens}
+                  style="max-width:150px"
+                  title="本任务的上下文 token 预算。留空=跟全局设置或渠道的 context_length；要读更多历史、不想被过早裁剪就填大值。超过模型真实窗口会报错，按你渠道的量力填。"
+                />
               </div>
             {/if}
             <div class="sub-row">
@@ -325,6 +335,7 @@
                 <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
                 {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
                 {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
+                {#if t.budget_tokens}<span class="mcp-risk" title={`本任务上下文上限 ${Number(t.budget_tokens).toLocaleString()} tokens`}>⛨ {Number(t.budget_tokens).toLocaleString()} tokens</span>{/if}
                 <span class="flex-sp"></span>
                 <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
                 <button class="btn ghost" on:click={() => editSchedule(t)}>编辑</button>

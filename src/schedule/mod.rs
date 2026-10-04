@@ -76,6 +76,10 @@ pub struct ScheduleTask {
     /// 整轮超时（秒）；0 = 用默认 1800
     #[serde(default)]
     pub timeout_secs: u64,
+    /// 本任务的上下文 token 上限（0 = 跟全局 [context].budget_tokens / 渠道
+    /// context_length；>0 = 本任务硬覆盖，长任务不被过早裁剪）
+    #[serde(default)]
+    pub budget_tokens: u64,
     #[serde(default)]
     pub created_ts: i64,
     /// 上次**自动**触发时间（排期基准；手动运行不动它）
@@ -334,6 +338,7 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             approval_mode: task.approval_mode.clone(),
             plan_mode: false,
             on_approval: task.on_approval.clone(),
+                budget_tokens: task.budget_tokens,
                 timeout_secs: if task.timeout_secs == 0 {
                     DEFAULT_TIMEOUT_SECS
                 } else {
@@ -516,6 +521,7 @@ mod tests {
             on_approval: String::new(),
             enabled: true,
             timeout_secs: 0,
+            budget_tokens: 0,
             created_ts: 0,
             last_run_ts: None,
             last_manual_ts: None,

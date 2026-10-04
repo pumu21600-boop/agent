@@ -268,6 +268,7 @@ impl SubagentDispatcher {
                 plan_mode: false,
                 on_approval: args.on_approval.clone(),
                 timeout_secs: args.timeout_secs,
+                budget_tokens: 0,
                 purpose: "subagent".into(),
                 parent_session: parent.to_string(),
                 workspace: String::new(),
