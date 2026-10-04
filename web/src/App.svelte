@@ -861,10 +861,12 @@
     );
   }
 
-  function openAbilityMenu() {
+  // 2026-10-04 修：原来 loadMcp/loadSkills 不 await，菜单先于数据打开——第一次开
+  // 能力菜单 MCP/技能组永远空的（数据到了要开第二次才见）。改成等加载完再开。
+  async function openAbilityMenu() {
     plusMenuOpen = false;
-    if (!skillsData.length) loadSkills();
-    if (!mcpServers.length && !wasmPlugins.length) loadMcp();
+    if (!skillsData.length) await loadSkills();
+    if (!mcpServers.length && !wasmPlugins.length) await loadMcp();
     abilityMenuOpen = true;
   }
   // 「/」菜单分组（用户 2026-10-02 第三/四轮）：技能=自己建的非插件技能；
@@ -5260,13 +5262,13 @@
                   {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length) && !wasmPlugins.some((w) => (w.tools || []).length)}
                     <div class="menu-empty">暂无可用工具</div>
                   {/if}
+                  <!-- 2026-10-04 用户拍板：MCP 只列服务本体，工具不逐条刷屏——
+                       插服务级引用，模型按本体名找到并用它下面的工具 -->
                   {#each mcpServers as srv}
                     {#if srv.online !== false && srv.tools && srv.tools.length}
-                      {#each srv.tools as t}
-                        <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/mcp__${srv.name}__${t.name} `); }}>
-                          <span class="menu-sym">/</span> {t.name}
-                        </button>
-                      {/each}
+                      <button class="bar-item" on:click={() => { abilityMenuOpen = false; insertAtCursor(`/mcp__${srv.name} `); }} title={srv.transport + ` · ${srv.tools.length} 个工具`}>
+                        <span class="menu-sym">/</span> {srv.name}<span class="menu-sub">{srv.tools.length} 工具</span>
+                      </button>
                     {/if}
                   {/each}
                   {#each wasmPlugins as w}
@@ -9627,6 +9629,12 @@
   }
   .bar-item-sub {
     padding-left: 28px;
+  }
+  /* 菜单行右侧的弱化小字（MCP 行显示工具数） */
+  .menu-sub {
+    margin-left: 8px;
+    font-size: 11px;
+    color: var(--g4, #8a8f98);
   }
   .bar-dropdown.compact .bar-item {
     justify-content: center;

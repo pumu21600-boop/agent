@@ -70,6 +70,14 @@ async fn main() -> anyhow::Result<()> {
     // —— 设置：settings.json 持久化；首次用 config.toml 的 gateway 节作种子 ——
     let user_settings = config::settings::Settings::load(&config.gateway.base_url, &config.gateway.model);
     crate::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
+    // 预连启用中的 MCP server（2026-10-04 用户拍板「装了就装了」）：异步拉起不阻塞启动
+    // （npx 首发装包要几十秒），失败静默保持离线、工具调用路径会再试。
+    for c in user_settings.mcp_servers.iter().filter(|c| c.enabled) {
+        let name = c.name.clone();
+        std::thread::spawn(move || {
+            let _ = crate::mcp::ensure_online_by_name(&name);
+        });
+    }
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
     crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
     crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); // P18 027：停用名单贯通工具插件

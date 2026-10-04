@@ -593,24 +593,20 @@ mod tests {
     async fn tools_use_pinned_workspace_not_global() {
         init_logger();
         let pinned = std::env::temp_dir().join(format!("agent-ws-pinned-{}", std::process::id()));
-        let other = std::env::temp_dir().join(format!("agent-ws-other-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&pinned);
-        let _ = std::fs::remove_dir_all(&other);
         std::fs::create_dir_all(&pinned).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
-        let old = workspace_root();
-        set_workspace_root(&other); // 全局切到别处（模拟用户切换）
+        // 2026-10-04：原实现会 set_workspace_root 切全局再还原——并发跑时把别的测试
+        // 的工作区根拽走/提前还原，是全量偶发 FAILED 的源头。钉住语义本身只依赖
+        // ExecConfig.workspace，不碰全局同样能证：写读全落 pinned、与全局根无关。
         let mut c = cfg();
         c.workspace = pinned.clone();
         let r = execute(&c, "write_file", r#"{"path":"pinned.txt","content":"钉住"}"#).await;
         assert!(r.is_ok(), "{r:?}");
         assert!(pinned.join("pinned.txt").is_file(), "文件必须落在钉住的工作区");
-        assert!(!other.join("pinned.txt").exists(), "不许被全局新值拽走");
+        assert!(!workspace_root().join("pinned.txt").exists(), "不许落到全局工作区");
         let r = execute(&c, "read_file", r#"{"path":"pinned.txt"}"#).await;
         assert_eq!(r.unwrap(), "钉住");
-        set_workspace_root(&old);
         let _ = std::fs::remove_dir_all(&pinned);
-        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[tokio::test]

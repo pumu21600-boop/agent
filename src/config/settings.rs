@@ -523,11 +523,13 @@ impl Settings {
     /// 逐级迁移：旧版单 key / keys 映射 -> configs 专属 key。
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {
         let path = Self::path();
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(mut s) = parse_settings(&text) {
-                // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
-                if s.configs.is_empty()
-                    && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse_settings(&text) {
+                Ok(mut s) => {
+                    // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
+                    if s.configs.is_empty()
+                        && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text)
+                    {
                         let provider_id = legacy.provider_id.unwrap_or_else(|| "deepseek".to_string());
                         let base_url = legacy.base_url.unwrap_or_default();
                         let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
@@ -565,11 +567,27 @@ impl Settings {
                 // P28 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
                 migrate_legacy_trust_keys(&mut s.trusted_plugins);
                 // 确保存在有效激活配置
-                s.ensure_active_config();
-                let _ = s.save();
-                return s;
+                    s.ensure_active_config();
+                    // 落盘前留一份 .bak（2026-10-04 真机教训：settings.json 丢过一次
+                    // 整个 mcp_servers，触发原因没定位到，先保证任何丢失可回退一份）
+                    let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+                    let _ = s.save();
+                    return s;
+                }
+                Err(e) => {
+                    // 解析失败：坏文件先改名备份，绝不静默用种子覆盖用户配置
+                    eprintln!("[settings] 解析失败（{e}），坏文件备份后重建默认设置");
+                    let bak = path.with_extension(format!(
+                        "json.corrupt-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    ));
+                    let _ = std::fs::rename(&path, &bak);
+                }
             }
-            eprintln!("[settings] 解析失败，重建默认设置");
+            Err(_) => {} // 文件不存在：首次启动走下方种子
         }
 
         let mut s = Self::default();
