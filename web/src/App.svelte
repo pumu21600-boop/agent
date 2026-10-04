@@ -5011,14 +5011,12 @@
         {:else if m.role === 'assistant'}
           <div class="msg assistant">
             <div class="bubble asst-bubble">
-              {#if m.workStartedAt || m.workMs || m.stepMs}
+              {#if m.workStartedAt || m.workMs}
                 <div class="work-line">
                   {#if m.streaming && m.workStartedAt}
                     工作中 {fmtDurCn(nowTick - m.workStartedAt)}
                   {:else if m.workMs}
                     工作用时 {fmtDurCn(m.workMs)}
-                  {:else if m.stepMs}
-                    用时 {fmtDurCn(m.stepMs)}
                   {/if}
                 </div>
               {/if}
