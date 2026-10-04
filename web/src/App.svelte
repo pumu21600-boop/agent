@@ -3677,12 +3677,17 @@
     if (terminalOpen) terminalOpen = false;
   }
 
-  // —— UI_OPS 注册表（2026-10-03 重构轮）：界面动作的自描述清单 ——
-  // 原先是 SSE 里逐 kind 的 if/else 长链 + 插件桥逐 method 的 switch，两套手写分支。
-  // 现在收成一张表：每项 { kind, title, risk, args: 参数说明, run(m) }。
-  // ① 新增界面能力 = 本表加一行（run 闭包里调既有函数），不再改后端白名单/长分支；
-  // ② 表可序列化（剥掉 run）成 ops 清单随 /api/ui/state 上报给后端，模型可读「界面
-  //    能干什么、参数什么形状」——用应用自报家门代替枚举硬编码；
+  // —— UI_OPS 注册表（2026-10-03 重构轮）：界面动作的自描述清单，服务两条入口 ——
+  // 原先是 SSE 里逐 kind 的 if/else 长链 + 插件桥逐 method 的 switch，两套手写分支，
+  // 各自独立长（阶段1 收了 SSE 侧，阶段4 把桥侧也并进来）。现在一张表按通道取形：
+  // · SSE 事件（后端 fire_event 推来）：{ kind, title, risk, internal?, args, run(m) }
+  //   —— m 是整条事件对象；
+  // · 插件桥（扩展 iframe postMessage 调用）：{ bridge: true, perm?, title, run(ctx) }
+  //   —— ctx = { params, from, ext, perms, reply, get }，run 负责恰好 reply 一次；
+  //   perm = manifest 权限名，省略 = 只读信息类不占权限白名单（与旧 switch 口径一致）。
+  // ① 新增界面/桥能力 = 本表加一行（run 闭包里调既有函数），不再改后端白名单/长分支；
+  // ② 表可序列化（剥掉 run、滤掉 internal 与 bridge）成 ops 清单随 /api/ui/state 上报给
+  //    后端，模型可读「界面能干什么、参数什么形状」——桥方法是插件私货，不上报；
   // ③ 破坏类（delete_session/undo_checkpoint）risk 标 destructive：后端 denylist 永不
   //    收进通用 fire_event，必须走具名方法保分级——前端清单说了不算（见 tools/ui.rs）。
   // risk 口径：safe=无持久破坏面（纯界面态）；normal=有持久副作用但可逆/常规；
@@ -3876,13 +3881,348 @@
       args: 'keys: 变更键清单（仅通知用）',
       run() { loadExt(); loadSettings(); },
     },
+
+    // —— 插件桥方法（扩展 iframe postMessage；阶段4 并表）——
+    // perm = manifest 声明的权限（省略 = 只读信息类，与 workspace.info 同级不占白名单）。
+    // run(ctx) 自己 reply 恰好一次；抛错由桥分发兜底翻成 reply(false, e.message)。
+    'app.info': {
+      bridge: true, title: '插件握手（拿初始载荷）',
+      run({ reply }) { reply(true, extInitPayload()); },
+    },
+    'workspace.info': {
+      bridge: true, title: '读工作区信息',
+      async run({ reply, get }) { reply(true, await get('/api/workspace')); },
+    },
+    'workspace.files': {
+      bridge: true, title: '列工作区文件',
+      async run({ reply, get }) { reply(true, await get('/api/workspace/files')); },
+    },
+    // 读工作区文本文件（「项目文件」文件预览用）：与 workspace.files 同为只读信息类，
+    // 不占权限白名单；读不到的（二进制/越界）由 apiJson 以 reject 带回人话
+    'workspace.file': {
+      bridge: true, title: '读工作区文本文件',
+      async run({ reply, get, params }) {
+        const path = String(params.path || '').trim();
+        if (!path) return reply(false, '缺少 path');
+        reply(true, await get(`/api/workspace/file?path=${encodeURIComponent(path)}`));
+      },
+    },
+    // 列工作区某目录的直接子项（「项目文件」树面板折叠/展开按需拉一层）
+    'workspace.dir': {
+      bridge: true, title: '列工作区目录子项',
+      async run({ reply, get, params }) {
+        const path = String(params.path || '').trim();
+        reply(true, await get(`/api/workspace/dir?path=${encodeURIComponent(path)}`));
+      },
+    },
+    'git.status': {
+      bridge: true, title: '读 git 状态',
+      async run({ reply, get }) { reply(true, await get('/api/git/status')); },
+    },
+    // 记忆检索（星云插件用）：会话级口径，插件拿不到别的会话的也不该看；不透明源本来
+    // 也够不着 /api/memory/*。兼容扩展作者两种写法：top_k（后端字段）或 limit。
+    // （旧 switch 里曾有两个同 method 的 case——后者带校验但是死代码且把后端字段 top_k
+    // 错发成 limit，并表时按「活的那个」收编，死分支就地清除）
+    'memory.search': {
+      bridge: true, title: '记忆向量检索',
+      async run({ reply, params }) {
+        reply(
+          true,
+          await fetch('/api/memory/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: params.query || '', top_k: params.top_k || params.limit || 10 }),
+          }).then((r) => r.json()),
+        );
+      },
+    },
+    'memory.library': {
+      bridge: true, title: '读记忆库清单',
+      async run({ reply, get }) { reply(true, await get('/api/memory/library')); },
+    },
+    'session.info': {
+      bridge: true, title: '读当前会话信息',
+      run({ reply }) { reply(true, { id: currentSessionId, title: displayTitle }); },
+    },
+    // —— P17 写操作（都要 manifest 里先声明权限）——
+    'composer.insert': {
+      bridge: true, perm: 'composer.insert', title: '往输入框插入文本',
+      run({ reply, params }) {
+        const text = String(params.text || '');
+        input = input ? `${input}\n${text}` : text;
+        reply(true, { ok: true });
+      },
+    },
+    'notify': {
+      bridge: true, perm: 'notify', title: '发系统消息',
+      run({ reply, params, ext, from }) {
+        pushMsg(curKey(), {
+          id: nextId(),
+          role: 'system',
+          content: `[${ext.title || from}] ${String(params.text || '')}`,
+        });
+        reply(true, { ok: true });
+      },
+    },
+    'bus.publish': {
+      bridge: true, perm: 'bus.publish', title: '扩展间广播（宿主转发）',
+      run({ reply, params, from }) {
+        // 扩展间通信：宿主转发给其它**已启用**扩展（发布者自己不发回）
+        const topic = String(params.topic || '').trim();
+        if (!topic) return reply(false, '缺少 topic');
+        let delivered = 0;
+        for (const e of enabledExts) {
+          if (e.name === from) continue;
+          const el = extFrameEls[e.name];
+          if (el && el.contentWindow) {
+            el.contentWindow.postMessage(
+              { type: 'bus.message', from, topic, payload: params.payload ?? null },
+              '*'
+            );
+            delivered += 1;
+          }
+        }
+        reply(true, { delivered });
+      },
+    },
+    'workspace.write': {
+      bridge: true, perm: 'workspace.write', title: '写工作区文件（宿主替扩展问用户）',
+      async run({ reply, params, ext, from }) {
+        const path = String(params.path || '').trim();
+        const content = String(params.content ?? '');
+        if (!path) return reply(false, '缺少 path');
+        // 写工作区是敏感动作：宿主替扩展问一次用户
+        if (!(await confirmAsk(`插件「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`))) {
+          return reply(false, '用户拒绝');
+        }
+        const r = await fetch('/api/workspace/file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path, content }),
+        });
+        const j = await r.json().catch(() => ({}));
+        reply(!!r.ok, r.ok ? { ok: true, path: j.path, bytes: j.bytes } : j.error || '写入失败');
+      },
+    },
+    // 写剪贴板（插件右键「复制路径」用）：iframe 是不透明源，剪贴板 API 不归它使，
+    // 由宿主页代写；用户右键触发 + manifest 声明 clipboard 权限才放行
+    'clipboard.write': {
+      bridge: true, perm: 'clipboard', title: '写剪贴板（宿主页代写）',
+      async run({ reply, params }) {
+        const text = String(params.text ?? '');
+        if (!text) return reply(false, '缺少 text');
+        await putClipboard(text);
+        reply(true, { ok: true });
+      },
+    },
+    // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
+    // 后端按插件名隔离目录（plugin_data/<name>/），内核保留区（会话/设置/记忆）不在任何
+    // 插件写路径上；键名白名单在前后端双重校验。
+    'storage.read': {
+      bridge: true, perm: 'storage', title: '读插件命名空间数据',
+      async run({ reply, params, from }) {
+        const key = String(params.key || '');
+        const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { cache: 'no-store' });
+        if (r.status === 404) return reply(true, null); // 键不存在 = 空值，不算错
+        const j = await r.json();
+        reply(r.ok && j.ok, j.ok ? j.value : j.error || '读取失败');
+      },
+    },
+    'storage.write': {
+      bridge: true, perm: 'storage', title: '写插件命名空间数据',
+      async run({ reply, params, from }) {
+        const key = String(params.key || '');
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
+        const r = await fetch('/api/plugin/data', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: from, key, value: params.value ?? null }),
+        });
+        const j = await r.json().catch(() => ({}));
+        reply(!!r.ok, r.ok ? { ok: true, bytes: j.bytes } : j.error || '写入失败');
+      },
+    },
+    'storage.delete': {
+      bridge: true, perm: 'storage', title: '删插件命名空间数据',
+      async run({ reply, params, from }) {
+        const key = String(params.key || '');
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
+        const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+        const j = await r.json().catch(() => ({}));
+        reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
+      },
+    },
+    // —— P21 只读桥：「用量」插件（plugins/usage 试点）拉当前会话的用量统计 ——
+    'usage.session': {
+      bridge: true, title: '读当前会话用量',
+      async run({ reply, get, params }) {
+        const group = params.group === 'model' ? 'model' : 'provider';
+        const range = ['today', '7d', '30d', 'all'].includes(params.range) ? params.range : 'all';
+        // 面板口径 = 当前对话：session 由宿主注入（插件拿不到别的会话的也不该看）
+        const sid = encodeURIComponent(currentSessionId || '');
+        reply(true, await get(`/api/usage?group=${group}&range=${range}&session=${sid}`));
+      },
+    },
+    // 圆环同源的当前上下文占用（活数据）：面板的「输入 token」是各次请求累计，
+    // 和圆环的窗口占用是两个口径——同一张卡里并排放，对照关系自明
+    'session.usage': {
+      bridge: true, title: '读上下文窗口占用（活数据）',
+      run({ reply }) {
+        reply(true, {
+          projected: ctxUsage.projected,
+          pressure: ctxUsage.pressure,
+          window: ctxUsage.window,
+          breakdown: ctxUsage.breakdown,
+          api: apiTotals,
+        });
+      },
+    },
+    // —— P21 价格设置（保存/重算是写操作，须声明 usage.prices 权限）——
+    'usage.prices': {
+      bridge: true, title: '读价格表',
+      async run({ reply, get }) { reply(true, await get('/api/usage/prices')); },
+    },
+    'usage.prices.save': {
+      bridge: true, perm: 'usage.prices', title: '保存价格表',
+      async run({ reply, params }) {
+        const body = {
+          prices: Array.isArray(params.prices) ? params.prices : [],
+          currency: params.currency === 'CNY' ? 'CNY' : 'USD',
+          usd_cny_rate: Number(params.usd_cny_rate) || 7.2,
+        };
+        const r = await fetch('/api/usage/prices', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const j = await r.json().catch(() => ({}));
+        reply(r.ok && j.ok !== false, r.ok ? j : j.error || '保存失败');
+      },
+    },
+    'usage.recompute': {
+      bridge: true, perm: 'usage.prices', title: '按当前价格重算历史费用（宿主替扩展问用户）',
+      async run({ reply }) {
+        if (!(await confirmAsk(`用当前价格表重算全部历史记录的费用？
+
+之前已记的账会按新价改写（累计花费同步刷新）。`))) {
+          return reply(false, '用户取消');
+        }
+        const r = await fetch('/api/usage/recompute', { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        reply(r.ok && j.ok !== false, r.ok ? j : j.error || '重算失败');
+      },
+    },
+    // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
+    // 服务端只返回**当前工作区**的任务（session_id → 会话文件的 workspace 映射）；
+    // 当前会话可能还没落盘，把 id 带上兜底。
+    'trace.recent': {
+      bridge: true, title: '读最近任务事件流',
+      async run({ reply, get, params }) {
+        const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
+        const sid = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
+        reply(true, await get(`/api/trace?limit=${limit}${sid}`));
+      },
+    },
+    // —— 权限放开轮（用户 2026-10-02 拍板）：功能类插件读自己的功能状态、改自己的
+    //    功能设置、触发宿主动作。三道口子都白名单化：能读的只有脱敏快照，能改的只有
+    //    settings.features / roles / 沙箱 CPU（密钥/渠道/审批档/对外发送永不开放），
+    //    能触发的只有 action.run 里枚举的那几个动作 ——
+    'features.get': {
+      bridge: true, title: '读功能脱敏快照',
+      run({ reply }) {
+        reply(true, {
+          features,
+          roles: roles || {},
+          sandbox_cpu_percent: sandboxCpu,
+          // 只给渠道的 id/名字/模型——密钥、base_url 一个字节都不出这道门
+          configs: configs.map((c) => ({ id: c.id, label: configLabel(c), model: c.model || '' })),
+          git: gitRuntime,
+          sandbox: sandboxInfo,
+        });
+      },
+    },
+    'features.set': {
+      bridge: true, perm: 'settings.feature', title: '开关功能',
+      run({ reply, params }) {
+        const k = String(params.feature || '');
+        if (!['roles', 'css_tool', 'galaxy', 'cancel_on_disconnect', 'self_mod'].includes(k)) return reply(false, `未知功能键 ${k}`);
+        const v = params.value !== false;
+        // toggleFeature 是「取反」语义：先比再翻，别翻两次
+        if ((features[k] || false) !== v) toggleFeature(k);
+        reply(true, { features });
+      },
+    },
+    'settings.feature.save': {
+      bridge: true, perm: 'settings.feature', title: '存功能设置（roles 全量替换语义）',
+      run({ reply, params }) {
+        const patch = {};
+        if (params.roles && typeof params.roles === 'object') {
+          // 白名单必须与 RolesSettings 的字段一一对应（summary/title/vision/video/audio/
+          // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
+          // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实锤）。
+          // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
+          const allow = ['summary', 'title', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
+          const next = { ...roles };
+          for (const k of allow) {
+            if (params.roles[k] === null) delete next[k];
+            else if (typeof params.roles[k] === 'string') next[k] = params.roles[k];
+          }
+          patch.roles = next;
+        }
+        if (params.sandbox_cpu_percent !== undefined) {
+          patch.sandbox_cpu_percent = Math.max(0, Math.min(100, Math.round(Number(params.sandbox_cpu_percent) || 80)));
+          sandboxCpu = patch.sandbox_cpu_percent;
+        }
+        if (!Object.keys(patch).length) return reply(false, '没有可写的字段');
+        autoSave(patch, 0);
+        reply(true, { roles: patch.roles ?? roles, sandbox_cpu_percent: patch.sandbox_cpu_percent ?? sandboxCpu });
+      },
+    },
+    'action.run': {
+      bridge: true, perm: 'action.run', title: '触发宿主动作（白名单枚举）',
+      async run({ reply, params }) {
+        const act = String(params.action || '');
+        // 白名单逐个放行：都是设置页上用户本人也能点的同款动作（探测/检测/刷新），
+        // 不新增任何宿主能力；沙箱探测会真拉受限进程，与点「检测」按钮等价
+        if (act === 'git.detect') {
+          await loadGitRuntime(true);
+          reply(true, { git: gitRuntime });
+        } else if (act === 'sandbox.detect') {
+          await loadSandboxInfo(true);
+          reply(true, { sandbox: sandboxInfo });
+        } else if (act === 'sandbox.probe') {
+          await runSandboxProbe();
+          reply(true, { probe: sandboxProbe });
+        } else if (act === 'skills.reload') {
+          await loadSkills();
+          reply(true, { ok: true });
+        } else if (act === 'ext.reload') {
+          await loadExt();
+          reply(true, { ok: true });
+        } else {
+          reply(false, `未知动作 ${act}（git.detect / sandbox.detect / sandbox.probe / skills.reload / ext.reload）`);
+        }
+      },
+    },
+    // 在右侧边栏新开文件预览标签（「项目速览」点文件用）：纯界面动作，不占权限；
+    // 只读来源是 workspace.file，内容安全由它兜
+    'preview.open': {
+      bridge: true, title: '右侧栏开文件预览标签',
+      run({ reply, params }) {
+        const path = String(params.path || '').trim();
+        if (!path) return reply(false, '缺少 path');
+        openPreviewTab(path);
+        reply(true, { ok: true });
+      },
+    },
   };
 
   // 可序列化的 ops 清单（剥掉 run 函数）——随 /api/ui/state 上报给后端读。
   // 这就是「界面自报家门」：模型问「你能干什么」有清单可查，不用开发者替界面写死。
+  // 桥条目（bridge: true）是插件私货不在此列——agent 的 ui 通道与插件通道各走各的。
   function uiOpsManifest() {
     return Object.values(UI_OPS)
-      .filter((o) => !o.internal)
+      .filter((o) => !o.internal && !o.bridge)
       .map((o) => ({ kind: o.kind, title: o.title, risk: o.risk, args: o.args }));
   }
 
@@ -3919,9 +4259,10 @@
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       // 查表执行（UI_OPS 通用入口）：新界面事件只在前端注册表加一行，后端 fire_event
-      // 白名单/本处都不再为它写分支。未登记的 kind 静默忽略（老服务推的/别的来源）。
+      // 白名单/本处都不再为它写分支。未登记的 kind 静默忽略（老服务推的/别的来源）；
+      // 桥条目（bridge: true）只归 postMessage 分发，SSE 侧够不着。
       const op = UI_OPS[m.kind];
-      if (op) await op.run(m);
+      if (op && !op.bridge) await op.run(m);
     };
   } catch {}
 
@@ -4234,8 +4575,9 @@
     if (!ok) throw new Error('浏览器拒绝了剪贴板写入');
   }
 
-  /// 扩展 → 宿主：只读白名单 + P17 写操作。写操作按 manifest 声明的 permissions 放行，
-  /// 没声明一律拒；写工作区文件额外弹一次确认（宿主替扩展问）。
+  /// 扩展 → 宿主：查 UI_OPS 桥条目（bridge: true）分发。只读信息类不占权限白名单，
+  /// 写操作按条目 perm 声明的 manifest 权限放行，没声明一律拒；写工作区文件等敏感动作
+  /// 在条目里额外弹确认（宿主替扩展问）。新桥方法 = 表加一行，这里不再写分支。
   async function onExtMessage(ev) {
     const from = extWindowName(ev.source);
     if (!from) return; // 只认我们挂出去的扩展 iframe
@@ -4249,7 +4591,6 @@
     }
     if (d.type !== 'agent:request') return;
     const id = d.id;
-    const params = d.params || {};
     const reply = (ok, result) => postToName(from, { type: 'agent:response', id, ok, result });
     // 桥上的 GET 回传的必须是**解析后的 JSON**：fetch 的 Response 过不了 postMessage 的
     // 结构化克隆——真机原话 "Response object could not be cloned"，插件侧只看到这句天书，
@@ -4258,317 +4599,10 @@
     const get = (url) =>
       apiJson(url, { cache: 'no-store' }, '服务端没有这个接口，跑的还是旧版程序——请重启服务（先 cargo build --release 再 start.bat）');
     try {
-      switch (d.method) {
-        case 'app.info':
-          reply(true, extInitPayload());
-          break;
-        case 'workspace.info':
-          reply(true, await get('/api/workspace'));
-          break;
-        case 'workspace.files':
-          reply(true, await get('/api/workspace/files'));
-          break;
-        // 读工作区文本文件（「项目文件」文件预览用）：与 workspace.files 同为只读信息类，
-        // 不占权限白名单；读不到的（二进制/越界）以 reject 带回人话
-        case 'workspace.file': {
-          const path = String(params.path || '').trim();
-          if (!path) return reply(false, '缺少 path');
-          reply(true, await get(`/api/workspace/file?path=${encodeURIComponent(path)}`));
-          break;
-        }
-        // 列工作区某目录的直接子项（「项目文件」树面板折叠/展开按需拉一层）
-        case 'workspace.dir': {
-          const path = String(params.path || '').trim();
-          reply(true, await get(`/api/workspace/dir?path=${encodeURIComponent(path)}`));
-          break;
-        }
-        case 'git.status':
-          reply(true, await get('/api/git/status'));
-          break;
-        case 'memory.search':
-          reply(
-            true,
-            await fetch('/api/memory/search', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              // 兼容扩展作者两种写法：top_k（后端字段）或 limit
-              body: JSON.stringify({ query: params.query || '', top_k: params.top_k || params.limit || 10 }),
-            }).then((r) => r.json()),
-          );
-          break;
-        case 'session.info':
-          reply(true, { id: currentSessionId, title: displayTitle });
-          break;
-        // —— P17 写操作（都要 manifest 里先声明权限）——
-        case 'composer.insert': {
-          if (!perms.includes('composer.insert')) return reply(false, '未声明权限 composer.insert');
-          const text = String(params.text || '');
-          input = input ? `${input}\n${text}` : text;
-          reply(true, { ok: true });
-          break;
-        }
-        case 'notify': {
-          if (!perms.includes('notify')) return reply(false, '未声明权限 notify');
-          pushMsg(curKey(), {
-            id: nextId(),
-            role: 'system',
-            content: `[${ext.title || from}] ${String(params.text || '')}`,
-          });
-          reply(true, { ok: true });
-          break;
-        }
-        case 'bus.publish': {
-          // 扩展间通信：宿主转发给其它**已启用**扩展（发布者自己不发回）
-          if (!perms.includes('bus.publish')) return reply(false, '未声明权限 bus.publish');
-          const topic = String(params.topic || '').trim();
-          if (!topic) return reply(false, '缺少 topic');
-          let delivered = 0;
-          for (const e of enabledExts) {
-            if (e.name === from) continue;
-            const el = extFrameEls[e.name];
-            if (el && el.contentWindow) {
-              el.contentWindow.postMessage(
-                { type: 'bus.message', from, topic, payload: params.payload ?? null },
-                '*'
-              );
-              delivered += 1;
-            }
-          }
-          reply(true, { delivered });
-          break;
-        }
-        case 'workspace.write': {
-          if (!perms.includes('workspace.write')) return reply(false, '未声明权限 workspace.write');
-          const path = String(params.path || '').trim();
-          const content = String(params.content ?? '');
-          if (!path) return reply(false, '缺少 path');
-          // 写工作区是敏感动作：宿主替扩展问一次用户
-          if (!(await confirmAsk(`插件「${ext.title || from}」要写工作区文件：\n\n${path}（${content.length} 字节）\n\n允许吗？`))) {
-            return reply(false, '用户拒绝');
-          }
-          const r = await fetch('/api/workspace/file', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path, content }),
-          });
-          const j = await r.json().catch(() => ({}));
-          reply(!!r.ok, r.ok ? { ok: true, path: j.path, bytes: j.bytes } : j.error || '写入失败');
-          break;
-        }
-        // 写剪贴板（插件右键「复制路径」用）：iframe 是不透明源，剪贴板 API 不归它使，
-        // 由宿主页代写；用户右键触发 + manifest 声明 clipboard 权限才放行
-        case 'clipboard.write': {
-          if (!perms.includes('clipboard')) return reply(false, '未声明权限 clipboard');
-          const text = String(params.text ?? '');
-          if (!text) return reply(false, '缺少 text');
-          await putClipboard(text);
-          reply(true, { ok: true });
-          break;
-        }
-        // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
-        // 后端按插件名隔离目录（plugin_data/<name>/），内核保留区（会话/设置/记忆）不在任何
-        // 插件写路径上；键名白名单在前后端双重校验。
-        case 'storage.read': {
-          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
-          const key = String(params.key || '');
-          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { cache: 'no-store' });
-          if (r.status === 404) return reply(true, null); // 键不存在 = 空值，不算错
-          const j = await r.json();
-          reply(r.ok && j.ok, j.ok ? j.value : j.error || '读取失败');
-          break;
-        }
-        case 'storage.write': {
-          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
-          const key = String(params.key || '');
-          if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
-          const r = await fetch('/api/plugin/data', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: from, key, value: params.value ?? null }),
-          });
-          const j = await r.json().catch(() => ({}));
-          reply(!!r.ok, r.ok ? { ok: true, bytes: j.bytes } : j.error || '写入失败');
-          break;
-        }
-        case 'storage.delete': {
-          if (!perms.includes('storage')) return reply(false, '未声明权限 storage');
-          const key = String(params.key || '');
-          if (!/^[A-Za-z0-9_-]{1,64}$/.test(key)) return reply(false, '键名只能用字母数字与 - _（≤64 字符）');
-          const r = await fetch(`/api/plugin/data?name=${encodeURIComponent(from)}&key=${encodeURIComponent(key)}`, { method: 'DELETE' });
-          const j = await r.json().catch(() => ({}));
-          reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
-          break;
-        }
-        // —— P21 只读桥：「用量」插件（plugins/usage 试点）拉当前会话的用量统计 ——
-        case 'usage.session': {
-          const group = params.group === 'model' ? 'model' : 'provider';
-          const range = ['today', '7d', '30d', 'all'].includes(params.range) ? params.range : 'all';
-          // 面板口径 = 当前对话：session 由宿主注入（插件拿不到别的会话的也不该看）
-          const sid = encodeURIComponent(currentSessionId || '');
-          reply(true, await get(`/api/usage?group=${group}&range=${range}&session=${sid}`));
-          break;
-        }
-        // 圆环同源的当前上下文占用（活数据）：面板的「输入 token」是各次请求累计，
-        // 和圆环的窗口占用是两个口径——同一张卡里并排放，对照关系自明
-        case 'session.usage': {
-          reply(true, {
-            projected: ctxUsage.projected,
-            pressure: ctxUsage.pressure,
-            window: ctxUsage.window,
-            breakdown: ctxUsage.breakdown,
-            api: apiTotals,
-          });
-          break;
-        }
-        // —— P21 价格设置（写操作，须声明 usage.prices 权限）——
-        case 'usage.prices': {
-          reply(true, await get('/api/usage/prices'));
-          break;
-        }
-        case 'usage.prices.save': {
-          if (!perms.includes('usage.prices')) return reply(false, '未声明权限 usage.prices');
-          const body = {
-            prices: Array.isArray(params.prices) ? params.prices : [],
-            currency: params.currency === 'CNY' ? 'CNY' : 'USD',
-            usd_cny_rate: Number(params.usd_cny_rate) || 7.2,
-          };
-          const r = await fetch('/api/usage/prices', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          const j = await r.json().catch(() => ({}));
-          reply(r.ok && j.ok !== false, r.ok ? j : j.error || '保存失败');
-          break;
-        }
-        case 'usage.recompute': {
-          if (!perms.includes('usage.prices')) return reply(false, '未声明权限 usage.prices');
-          if (!(await confirmAsk(`用当前价格表重算全部历史记录的费用？
-
-之前已记的账会按新价改写（累计花费同步刷新）。`))) {
-            return reply(false, '用户取消');
-          }
-          const r = await fetch('/api/usage/recompute', { method: 'POST' });
-          const j = await r.json().catch(() => ({}));
-          reply(r.ok && j.ok !== false, r.ok ? j : j.error || '重算失败');
-          break;
-        }
-        // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
-        // 只读信息类方法与 workspace.info 同级，不占权限白名单。
-        // 服务端只返回**当前工作区**的任务（session_id → 会话文件的 workspace 映射）；
-        // 当前会话可能还没落盘，把 id 带上兜底。
-        case 'trace.recent': {
-          const limit = Math.min(Math.max(Number(params.limit) || 10, 1), 50);
-          const sid = currentSessionId ? `&session=${encodeURIComponent(currentSessionId)}` : '';
-          reply(true, await get(`/api/trace?limit=${limit}${sid}`));
-          break;
-        }
-        // —— 权限放开轮（用户 2026-10-02 拍板）：功能类插件读自己的功能状态、改自己的
-        //    功能设置、触发宿主动作。三道口子都白名单化：能读的只有脱敏快照，能改的只有
-        //    settings.features / roles / 沙箱 CPU（密钥/渠道/审批档/对外发送永不开放），
-        //    能触发的只有下面 action.run 那几个枚举动作 ——
-        case 'features.get': {
-          reply(true, {
-            features,
-            roles: roles || {},
-            sandbox_cpu_percent: sandboxCpu,
-            // 只给渠道的 id/名字/模型——密钥、base_url 一个字节都不出这道门
-            configs: configs.map((c) => ({ id: c.id, label: configLabel(c), model: c.model || '' })),
-            git: gitRuntime,
-            sandbox: sandboxInfo,
-          });
-          break;
-        }
-        case 'features.set': {
-          if (!perms.includes('settings.feature')) return reply(false, '未声明权限 settings.feature');
-          const k = String(params.feature || '');
-          if (!['roles', 'css_tool', 'galaxy', 'cancel_on_disconnect', 'self_mod'].includes(k)) return reply(false, `未知功能键 ${k}`);
-          const v = params.value !== false;
-          // toggleFeature 是「取反」语义：先比再翻，别翻两次
-          if ((features[k] || false) !== v) toggleFeature(k);
-          reply(true, { features });
-          break;
-        }
-        case 'settings.feature.save': {
-          if (!perms.includes('settings.feature')) return reply(false, '未声明权限 settings.feature');
-          const patch = {};
-          if (params.roles && typeof params.roles === 'object') {
-            // 白名单必须与 RolesSettings 的字段一一对应（summary/title/vision/video/audio/
-            // embedding/budget/subagent）——漏一个键，插件每存一次就静默抹掉那条路由
-            // （真机验收时漏了多模态三个，用户 settings.json 里的 vision 被冲掉，实锤）。
-            // PUT /api/settings 对 roles 是全量替换，所以这里先把现有 roles 合进来再发。
-            const allow = ['summary', 'title', 'vision', 'video', 'audio', 'embedding', 'budget', 'subagent'];
-            const next = { ...roles };
-            for (const k of allow) {
-              if (params.roles[k] === null) delete next[k];
-              else if (typeof params.roles[k] === 'string') next[k] = params.roles[k];
-            }
-            patch.roles = next;
-          }
-          if (params.sandbox_cpu_percent !== undefined) {
-            patch.sandbox_cpu_percent = Math.max(0, Math.min(100, Math.round(Number(params.sandbox_cpu_percent) || 80)));
-            sandboxCpu = patch.sandbox_cpu_percent;
-          }
-          if (!Object.keys(patch).length) return reply(false, '没有可写的字段');
-          autoSave(patch, 0);
-          reply(true, { roles: patch.roles ?? roles, sandbox_cpu_percent: patch.sandbox_cpu_percent ?? sandboxCpu });
-          break;
-        }
-        case 'action.run': {
-          if (!perms.includes('action.run')) return reply(false, '未声明权限 action.run');
-          const act = String(params.action || '');
-          // 白名单逐个放行：都是设置页上用户本人也能点的同款动作（探测/检测/刷新），
-          // 不新增任何宿主能力；沙箱探测会真拉受限进程，与点「检测」按钮等价
-          if (act === 'git.detect') {
-            await loadGitRuntime(true);
-            reply(true, { git: gitRuntime });
-          } else if (act === 'sandbox.detect') {
-            await loadSandboxInfo(true);
-            reply(true, { sandbox: sandboxInfo });
-          } else if (act === 'sandbox.probe') {
-            await runSandboxProbe();
-            reply(true, { probe: sandboxProbe });
-          } else if (act === 'skills.reload') {
-            await loadSkills();
-            reply(true, { ok: true });
-          } else if (act === 'ext.reload') {
-            await loadExt();
-            reply(true, { ok: true });
-          } else {
-            reply(false, `未知动作 ${act}（git.detect / sandbox.detect / sandbox.probe / skills.reload / ext.reload）`);
-          }
-          break;
-        }
-        // 记忆只读桥（星云插件用）：会话级口径，与用量面板同思路——插件拿不到别的会话
-        // 的也不该看。检索/清单位于 /api/memory/*，插件侧本来也够不着（不透明源）
-        case 'memory.search': {
-          const q = String(params.query || '').trim();
-          if (!q) return reply(false, '缺少 query');
-          const r = await fetch('/api/memory/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query: q, limit: Math.min(Math.max(Number(params.limit) || 10, 1), 50) }),
-          });
-          const j = await r.json().catch(() => ({}));
-          reply(r.ok, r.ok ? j : j.error || '检索失败');
-          break;
-        }
-        case 'memory.library': {
-          reply(true, await get('/api/memory/library'));
-          break;
-        }
-        // 在右侧边栏新开文件预览标签（「项目速览」点文件用）：纯界面动作，不占权限；
-        // 只读来源是 workspace.file，内容安全由它兜
-        case 'preview.open': {
-          const path = String(params.path || '').trim();
-          if (!path) return reply(false, '缺少 path');
-          openPreviewTab(path);
-          reply(true, { ok: true });
-          break;
-        }
-        default:
-          reply(false, `未知方法: ${d.method}`);
-      }
+      const op = UI_OPS[d.method];
+      if (!op || !op.bridge) return reply(false, `未知方法: ${d.method}`);
+      if (op.perm && !perms.includes(op.perm)) return reply(false, `未声明权限 ${op.perm}`);
+      await op.run({ params: d.params || {}, from, ext, perms, reply, get });
     } catch (e) {
       reply(false, String(e.message || e));
     }
