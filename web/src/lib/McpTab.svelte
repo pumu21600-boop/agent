@@ -87,7 +87,6 @@
               </div>
             </div>
             <span class="plug-chip" class:warn={!sv.online}>{sv.online ? '在线' : '离线'}</span>
-            {#if !sv.confirmed}<span class="plug-chip warn">待确认</span>{/if}
             <span class="flex-sp"></span>
             <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
             <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
@@ -113,46 +112,6 @@
               {/if}
               {#if sv.oauth_status?.status === 'error'}
                 <span class="mcp-status" style="color: var(--tint-red-fg, #e5484d)">{sv.oauth_status.message}</span>
-              {/if}
-            </div>
-          {/if}
-          {#if !sv.confirmed}
-            <!-- 首次接入确认：工具清单过目后启用（审批跟随全局档位，2026-10-04 去掉每服务档） -->
-            <div class="mcp-confirm">
-              {#if sv.tools.length}
-                <div class="mcp-tools-list">
-                  <b>发现 {sv.tools.length} 个工具，请确认后启用：</b>
-                  {#each sv.tools as t}
-                    <div class="mcp-tool-item"><code>{t.name}</code> {t.desc}</div>
-                  {/each}
-                </div>
-                <div class="sub-row">
-                  <button class="btn primary" on:click={() => mcpAction('confirm', sv.name)}>确认启用</button>
-                </div>
-              {:else}
-                <div class="sub-row mcp-oauth">
-                  <span class="mcp-status">未发现工具</span>
-                  <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>连接并获取工具清单</button>
-                </div>
-              {/if}
-            </div>
-          {:else}
-            <div class="mcp-tools-list">
-              {#each sv.tools as t}
-                <div class="mcp-tool-item"><code>mcp__{sv.name}__{t.name}</code> {t.desc}</div>
-              {/each}
-              {#if !sv.tools.length}<span class="mcp-status">未发现工具——点「重连」尝试</span>{/if}
-              {#if sv.resources && sv.resources.length}
-                <div class="mcp-tool-item"><b>资源 {sv.resources.length}</b>（模型可用 list_resources / read_resource 读取）</div>
-                {#each sv.resources.slice(0, 8) as r}
-                  <div class="mcp-tool-item"><code>{r}</code></div>
-                {/each}
-              {/if}
-              {#if sv.prompts && sv.prompts.length}
-                <div class="mcp-tool-item"><b>提示词模板 {sv.prompts.length}</b>（模型可用 list_prompts / get_prompt 取用）</div>
-                {#each sv.prompts.slice(0, 8) as p}
-                  <div class="mcp-tool-item"><code>{p}</code></div>
-                {/each}
               {/if}
             </div>
           {/if}

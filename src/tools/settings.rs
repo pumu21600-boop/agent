@@ -192,12 +192,6 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
                     && o.url == c.url
                     && o.headers == c.headers
                     && o.oauth == c.oauth);
-            match (&old, same_config) {
-                (Some(o), true) => {
-                    c.confirmed = o.confirmed;
-                }
-                _ => c.confirmed = false,
-            }
             next.push(c);
         }
         s.mcp_servers = next;
@@ -559,7 +553,6 @@ fn snapshot_json(s: &settings::Settings) -> String {
             "args": c.args,
             "url": c.url,
             "enabled": c.enabled,
-            "confirmed": c.confirmed,
             "has_oauth": c.oauth.is_some(),
         })).collect::<Vec<Value>>(),
         "disabled_plugins": s.disabled_plugins,
@@ -681,31 +674,16 @@ mod tests {
             headers: Default::default(),
             oauth: None,
             enabled: true,
-            confirmed: true, // 模型传 true 也要被守卫改写
         };
 
-        // 原样带回（比如只是想改 enabled）→ 保留已确认
+        // 原样带回（比如只是想改 enabled）→ enabled 按整表语义保留
         let mut s = test_settings();
         s.mcp_servers.push(mk("node old.js"));
         let mut keep = mk("node old.js");
         keep.enabled = false;
         let p = SettingsPatch { mcp_servers: Some(vec![keep]), ..Default::default() };
         apply_patch(&mut s, &p).unwrap();
-        assert!(s.mcp_servers[0].confirmed, "配置未变的 server 保留确认态");
         assert!(!s.mcp_servers[0].enabled);
-
-        // 命令变了 → 强制回未确认（哪怕模型传 confirmed=true）
-        let mut s2 = test_settings();
-        s2.mcp_servers.push(mk("node old.js"));
-        let p = SettingsPatch { mcp_servers: Some(vec![mk("node NEW.js")]), ..Default::default() };
-        apply_patch(&mut s2, &p).unwrap();
-        assert!(!s2.mcp_servers[0].confirmed, "配置有改动的 server 必须重新确认");
-
-        // 全新 server → 未确认
-        let mut s3 = test_settings();
-        let p = SettingsPatch { mcp_servers: Some(vec![mk("node new.js")]), ..Default::default() };
-        apply_patch(&mut s3, &p).unwrap();
-        assert!(!s3.mcp_servers[0].confirmed, "新 server 不得由模型自确认");
     }
 
     #[test]

@@ -724,10 +724,10 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
     let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
     let st = m.get(&srv)?;
     let cfg = st.cfg.as_ref()?;
-    if !cfg.enabled || !cfg.confirmed {
-        return Some(2); // Dangerous：未确认/禁用的 MCP 工具不可静默执行
+    if !cfg.enabled {
+        return Some(2); // Dangerous：停用的 MCP 工具不可调用
     }
-    Some(1) // Normal：按全局审批档位走
+    Some(1) // Normal：按全局审批档位走（2026-10-04 用户拍板：装了就能用，无首装确认）
 }
 
 /// 资源/提示词相关的合成工具名（server 自己若已有同名工具，以它为准，不覆盖）。
@@ -777,7 +777,7 @@ pub fn tool_definitions() -> Vec<Value> {
             continue;
         }
         let Some(cfg) = st.cfg.as_ref() else { continue };
-        if !cfg.enabled || !cfg.confirmed {
+        if !cfg.enabled {
             continue;
         }
         for (name, desc, schema) in &st.tools {
@@ -1225,7 +1225,6 @@ data: \"result\":{\"n\":7}}";
             headers: BTreeMap::from([("X-Test".to_string(), "1".to_string())]),
             oauth: None,
             enabled: true,
-            confirmed: true,
         };
         sync_configs(std::slice::from_ref(&cfg));
 
@@ -1312,7 +1311,6 @@ data: \"result\":{\"n\":7}}";
             headers: BTreeMap::new(),
             oauth: None,
             enabled: true,
-            confirmed: true,
         };
         sync_configs(std::slice::from_ref(&cfg));
         ensure_online_by_name("mockres").expect("握手应成功");
@@ -1416,7 +1414,6 @@ data: \"result\":{\"n\":7}}";
             headers: BTreeMap::new(),
             oauth: None,
             enabled: true,
-            confirmed: true,
         };
         sync_configs(std::slice::from_ref(&cfg));
         let n = ensure_online_by_name("mocksse").expect("SSE 握手应成功");
@@ -1460,7 +1457,6 @@ data: \"result\":{\"n\":7}}";
             headers: BTreeMap::new(),
             oauth: None,
             enabled: true,
-            confirmed: true,
         };
         sync_configs(std::slice::from_ref(&cfg));
         ensure_online_by_name("mockbare").expect("握手应成功");
@@ -1489,7 +1485,6 @@ data: \"result\":{\"n\":7}}";
             headers: BTreeMap::new(),
             oauth: None,
             enabled: true,
-            confirmed: true,
         };
         sync_configs(std::slice::from_ref(&cfg));
         let e = ensure_online_by_name("deadhttp").expect_err("连不上必须报错");

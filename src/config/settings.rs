@@ -474,9 +474,6 @@ pub struct McpServerCfg {
     /// 启停（false 时工具不下发、不可调用）
     #[serde(default = "crate::config::settings::yes")]
     pub enabled: bool,
-    /// 首装确认（总架构 §7：接入时向用户展示完整工具清单后确认）
-    #[serde(default)]
-    pub confirmed: bool,
 }
 fn yes() -> bool {
     true
