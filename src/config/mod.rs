@@ -404,6 +404,125 @@ impl Default for ContextConfig {
     }
 }
 
+/// agent 经 settings 工具改 config.toml 的一个键（2026-10-04 放开权限轮，用户拍板
+/// 「除审批档位/API key 全部可改」）。key 形如 `agent.max_steps`（section.field，支持更深）。
+/// 用 toml_edit 保注释改写——config.toml 是用户精心维护的注释文件，toml::to_string
+/// 重排会把这些注释全冲掉。改完需重启服务才生效（config 不热加载），返回里带提示。
+pub fn set_config_key(key: &str, value: &serde_json::Value) -> Result<String, String> {
+    let path = app_root().join("config.toml");
+    set_config_key_at(&path, key, value)
+}
+
+/// 同上，路径可注入（单测用）。
+pub fn set_config_key_at(path: &std::path::Path, key: &str, value: &serde_json::Value) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("读 config.toml 失败: {e}"))?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("config.toml 不是合法 TOML: {e}"))?;
+    // 类型对齐（真机实锤：模型常把数字发成字符串，"0" 写进整数键会让重启时 TOML
+    // 反序列化失败、服务起不来）——键已存在时按既有值的 TOML 类型强制转换，
+    // 转不动（如把 "abc" 塞给整数键）直接报错拒绝写，不让坏类型落盘。
+    let value = coerce_to_existing(&doc, key, value)?;
+    // JSON 值 → TOML 值（字符串/布尔/整数/浮点/数组；null 视为删除该键）
+    let item = match &value {
+        serde_json::Value::Null => toml_edit::Item::None,
+        serde_json::Value::String(s) => toml_edit::value(s.clone()),
+        serde_json::Value::Bool(b) => toml_edit::value(b.clone()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml_edit::value(i)
+            } else {
+                toml_edit::value(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let mut a = toml_edit::Array::new();
+            for v in arr {
+                match v {
+                    serde_json::Value::String(s) => a.push(s.clone()),
+                    serde_json::Value::Number(n) if n.is_i64() => a.push(n.as_i64().unwrap_or(0)),
+                    serde_json::Value::Number(n) => a.push(n.as_f64().unwrap_or(0.0)),
+                    serde_json::Value::Bool(b) => a.push(*b),
+                    _ => return Err("数组里只支持字符串/数字/布尔".into()),
+                }
+            }
+            toml_edit::value(a)
+        }
+        serde_json::Value::Object(_) => {
+            return Err("set_config 只支持标量与一维数组值（结构体键请逐键改）".into());
+        }
+    };
+    let mut cur = doc.as_table_mut();
+    let segs: Vec<&str> = key.split('.').collect();
+    for (i, seg) in segs.iter().enumerate() {
+        let last = i + 1 == segs.len();
+        if last {
+            if matches!(value, serde_json::Value::Null) {
+                cur.remove(seg);
+            } else {
+                cur[seg] = item.clone();
+            }
+        } else {
+            if !cur.contains_key(seg) {
+                cur[seg] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+            cur = cur[seg]
+                .as_table_mut()
+                .ok_or_else(|| format!("config.toml 的 {seg} 不是小节，无法往下钻"))?;
+        }
+    }
+    crate::fsx::write_atomic_str(path, &doc.to_string())
+        .map_err(|e| format!("写 config.toml 失败: {e}"))?;
+    Ok(format!("{key} 已写入 config.toml（重启服务后生效）"))
+}
+
+/// 按 config.toml 里既有键的 TOML 类型把新值对齐（键不存在时原样返回）。
+/// 实锤动机：模型发 `"0"` 给整数键 max_steps，写出的 `max_steps = "0"` 会让重启时
+/// TOML 反序列化失败、服务起不来——字符串数字/布尔在写前翻回目标标量类型，
+/// 实在对不上就报错拒写。
+fn coerce_to_existing(
+    doc: &toml_edit::DocumentMut,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut cur: &toml_edit::Table = doc.as_table();
+    let segs: Vec<&str> = key.split('.').collect();
+    for (i, seg) in segs.iter().enumerate() {
+        let Some(item) = cur.get(*seg) else {
+            return Ok(value.clone());
+        };
+        if i + 1 == segs.len() {
+            let Some(v) = item.as_value() else { return Ok(value.clone()) };
+            let bad = || {
+                Err(format!(
+                    "config.toml 的 {key} 是 {}，不能写成 {}（类型对不上会让重启失败）",
+                    if v.is_integer() { "整数" } else if v.is_float() { "浮点数" } else if v.is_bool() { "布尔" } else { "字符串" },
+                    value
+                ))
+            };
+            return match (value, v.is_str(), v.is_integer(), v.is_float(), v.is_bool()) {
+                (serde_json::Value::String(s), false, true, _, _) => serde_json::from_str::<i64>(s)
+                    .map(serde_json::Value::from)
+                    .or_else(|_| bad()),
+                (serde_json::Value::String(s), false, _, true, _) => serde_json::from_str::<f64>(s)
+                    .map(serde_json::Value::from)
+                    .or_else(|_| bad()),
+                (serde_json::Value::String(s), false, _, _, true) => match s.trim() {
+                    "true" => Ok(serde_json::Value::Bool(true)),
+                    "false" => Ok(serde_json::Value::Bool(false)),
+                    _ => bad(),
+                },
+                (serde_json::Value::Number(n), true, _, _, _) => Ok(serde_json::json!(n.to_string())),
+                (serde_json::Value::Bool(b), true, _, _, _) => Ok(serde_json::json!(b.to_string())),
+                _ => Ok(value.clone()),
+            };
+        }
+        cur = item.as_table().ok_or_else(|| format!("config.toml 的 {} 不是小节", seg))?;
+    }
+    Ok(value.clone())
+}
+
 /// 读取 config.toml（不存在则落一份默认），再应用环境变量覆盖。
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     if !path.exists() {
@@ -421,4 +540,38 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
         config.gateway.base_url = override_url;
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod set_config_tests {
+    use super::*;
+
+    #[test]
+    fn set_config_coerces_to_existing_type_and_keeps_comments() {
+        let dir = std::env::temp_dir().join(format!("agent_cfg_coerce_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[agent]\n# 步数上限注释要保住\nmax_steps = 0\n").unwrap();
+        // 模型发字符串 "200" 给整数键 → 应对齐为整数落盘（真机实锤的坑）
+        set_config_key_at(&p, "agent.max_steps", &serde_json::json!("200")).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("max_steps = 200"), "应写为整数: {text}");
+        assert!(text.contains("# 步数上限注释要保住"), "注释应保留: {text}");
+        // 数字发给字符串键 → 翻成字符串
+        std::fs::write(&p, "[server]\nhost = \"127.0.0.1\"\n").unwrap();
+        set_config_key_at(&p, "server.host", &serde_json::json!(127999)).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("host = \"127999\""), "{text}");
+        // 类型实在对不上 → 拒写
+        std::fs::write(&p, "[agent]\nmax_steps = 0\n").unwrap();
+        let err = set_config_key_at(&p, "agent.max_steps", &serde_json::json!("abc")).unwrap_err();
+        assert!(err.contains("类型对不上"), "{err}");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("max_steps = 0"), "拒写后文件应保持原样: {text}");
+        // 键不存在 → 按 JSON 原类型新建
+        set_config_key_at(&p, "agent.brand_new", &serde_json::json!("text")).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("brand_new = \"text\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

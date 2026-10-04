@@ -265,6 +265,17 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
     match action.as_str() {
         // schema: settable-path manifest (read-only, no selfmod gate; 2026-10-03 schema round)
         "schema" => Ok(crate::config::settings_schema::manifest_json().to_string()),
+        // set_config: config.toml 键改写（2026-10-04 放开权限轮；toml_edit 保注释，
+        // 改完需重启生效）。default_approval（审批档位红线）判级层已拦，这里不再重复。
+        "set_config" => {
+            super::selfmod_gate()?;
+            let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
+            if key.is_empty() {
+                return Err("set_config 需要 key（形如 agent.max_steps / cost.spend_cap_usd）".into());
+            }
+            let value = v.get("value").cloned().unwrap_or(Value::Null);
+            crate::config::set_config_key(key, &value)
+        }
         "get" => {
             let handle = settings::shared_settings()
                 .ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;

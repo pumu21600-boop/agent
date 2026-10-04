@@ -64,6 +64,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "skill",
     // 2026-10-03 会话管理（new/open/rename/fork/delete/pin/archive；分级见 session 臂）
     "session",
+    // 2026-10-04 放开权限轮：第三方插件信任（先审后装；分级见 evaluate_risk 的 plugin 臂）
+    "plugin",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -113,6 +115,10 @@ const SAFE_SUBCOMMANDS: &[(&str, &str)] = &[
 const SAFE_TRIPLES: &[(&str, &str, &str)] = &[("npm", "run", "test"), ("npm", "run", "test:")];
 
 /// write_file 敏感路径特征（命中即 Dangerous，小写匹配）。
+/// 2026-10-04 放开权限轮（用户拍板「除审批档位/API key 全部可改」）摘出 config.toml
+/// 与 providers.json——前者走 set_config 通道（default_approval 特判弹卡），后者是
+/// 厂商预设清单无密钥。settings.json 保留：它是 api_key（DPAPI 密文）的载体；
+/// prompts/system.md 保留：行为契约，agent 改它必须过卡。
 const SENSITIVE_PATTERNS: &[&str] = &[
     ".git/",
     ".agent/",
@@ -127,10 +133,6 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "id_rsa",
     "id_ed25519",
     ".keystore",
-    // 2026-10-03 agent 自改设置轮：应用自身配置收进敏感面（此前 auto 档可静默改写
-    // config.toml / prompts/system.md，是绕开审批的后门）。settings.json 早已在列。
-    "config.toml",
-    "providers.json",
     "prompts/system.md",
 ];
 
@@ -274,6 +276,19 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             _ => (RiskLevel::Dangerous, "session 工具缺少合法 method".into()),
         },
 
+        // 2026-10-04 放开权限轮：第三方插件信任交给 agent——先审后装（blocker 自动
+        // 停下带回报告），审查没过要强装（force）必须用户亲自批准（弹卡=选择权）。
+        // 卸载可逆走 Normal；审查本身只读。
+        "plugin" => match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
+            "review" => (RiskLevel::Normal, "审查插件（只读，不改信任状态）".into()),
+            "install" if args.get("force").and_then(|v| v.as_bool()).unwrap_or(false) => {
+                (RiskLevel::Dangerous, "强制安装未通过审查的第三方插件（blocker 在身，等用户拍板）".into())
+            }
+            "install" => (RiskLevel::Normal, "安装插件（先审后装：blocker 会自动停下并带回报告）".into()),
+            "unpin" => (RiskLevel::Normal, "取消插件信任（可逆，停用即可恢复）".into()),
+            _ => (RiskLevel::Dangerous, "plugin 工具缺少合法 action（install/review/unpin）".into()),
+        },
+
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
         "write_file" | "edit_file" => risk_write_file(args, workspace_root),
 
@@ -345,6 +360,19 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
         // 2026-10-04 真机补：阶段3 给 settings 加了 action=schema（只读合法路径清单），
         // 工具层放行但判级器漏了同名分支——纯只读查询掉进兜底判 Dangerous 弹卡。
         "schema" => (RiskLevel::Safe, "读取可改设置路径清单（只读 manifest）".into()),
+        // 2026-10-04 放开权限轮：config.toml 键改写走 set_config（toml_edit 保注释）。
+        // 唯一红线是审批档位的持久形态 default_approval——其余键（花费上限/钩子/步数）
+        // 按用户拍板全部放开，Normal 按档位走。
+        "set_config" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            if key.is_empty() {
+                (RiskLevel::Dangerous, "set_config 缺少 key（形如 agent.max_steps）".into())
+            } else if key.contains("approval") {
+                (RiskLevel::Dangerous, format!("试图改 config.toml 的 {key}（审批档位相关，红线）"))
+            } else {
+                (RiskLevel::Normal, format!("改 config.toml 的 {key}（重启后生效）"))
+            }
+        }
         "set" => {
             let keys: Vec<&str> = args
                 .get("patch")
@@ -651,6 +679,14 @@ fn risk_shell(command: &str, ws: &Path) -> (RiskLevel, String) {
     // 按档位弹卡（read-only/auto 问、full-access 放行）
     if worst != RiskLevel::Safe {
         let lower_all = command.to_lowercase();
+        // 审批档位的持久形态：config.toml 的 default_approval（2026-10-04 放开轮保留的
+        // 红线之一）——shell 碰 config.toml 本身已放开，但带着 default_approval 写必问
+        if lower_all.contains("config.toml") && lower_all.contains("default_approval") {
+            return (
+                RiskLevel::Dangerous,
+                "命令要写 config.toml 的 default_approval（审批档位的持久形态，红线）".into(),
+            );
+        }
         if let Some(f) = SENSITIVE_PATTERNS.iter().find(|p| lower_all.contains(**p)) {
             return (
                 RiskLevel::Dangerous,
@@ -1144,17 +1180,36 @@ mod tests {
         // 普通键常规改动（auto 档静默放行）
         let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "high"}}), &ws());
         assert_eq!(r, RiskLevel::Normal, "{why}");
-        // 红线键（渠道指向）高危
+        // 渠道键（原红线四件套）2026-10-04 放开为 Normal——档位即用户意愿
         for k in ["base_url", "model", "provider_id", "active_config_id"] {
             let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {k: "x"}}), &ws());
-            assert_eq!(r, RiskLevel::Dangerous, "{k} 应判红线: {why}");
+            assert_eq!(r, RiskLevel::Normal, "{k} 应判常规: {why}");
         }
-        // 混合补丁沾红线即高危
-        let (r, _) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "high", "model": "x"}}), &ws());
-        assert_eq!(r, RiskLevel::Dangerous);
+        // set_config：普通键 Normal；审批档位的持久形态 default_approval 必问
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set_config", "key": "agent.max_steps", "value": 0}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set_config", "key": "cost.spend_cap_usd", "value": 5.0}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set_config", "key": "agent.default_approval", "value": "auto"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set_config"}), &ws()).0, RiskLevel::Dangerous);
+        // mcp_servers 入表（放开权限轮）：Normal
+        assert_eq!(evaluate_risk("settings", &json!({"action": "set", "patch": {"mcp_servers": []}}), &ws()).0, RiskLevel::Normal);
         // 非法 action / 缺 patch：宁可多问不静默
         assert_eq!(evaluate_risk("settings", &json!({"action": "delete"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("settings", &json!({"action": "set"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // —— 2026-10-04 放开权限轮：plugin 工具判级（先审后装，force 必问）——
+    #[test]
+    fn test_plugin_tool_grading() {
+        // 常规安装 Normal（blocker 由工具层自动停下带回报告）
+        let (r, why) = evaluate_risk("plugin", &json!({"action": "install", "name": "calc", "manifest": {}, "files": {"index.html": "<p>x</p>"}}), &ws());
+        assert_eq!(r, RiskLevel::Normal, "先审后装应判常规: {why}");
+        // 强装未过审插件 = 用户亲自拍板，任何档位必问
+        let (r, why) = evaluate_risk("plugin", &json!({"action": "install", "name": "calc", "manifest": {}, "files": {"index.html": "<p>x</p>"}, "force": true}), &ws());
+        assert_eq!(r, RiskLevel::Dangerous, "force 强装必问: {why}");
+        // review 只读、unpin 可逆
+        assert_eq!(evaluate_risk("plugin", &json!({"action": "review", "key": "plugins:calc"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("plugin", &json!({"action": "unpin", "key": "plugins:calc"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("plugin", &json!({"action": "nope"}), &ws()).0, RiskLevel::Dangerous);
     }
 
     // —— 2026-10-03 schema round：settings 分级查表，点号子路径同吃一套 ——
@@ -1182,13 +1237,13 @@ mod tests {
             let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {k: "x"}}), &ws);
             assert_eq!(r, RiskLevel::Dangerous, "{k} 表外路径应兜底高危: {why}");
         }
-        // 顶层红线键仍 Dangerous（与 test_settings_tool_risk 断言一致，防回归）
+        // 顶层渠道键 2026-10-04 放开为 Normal（与 test_settings_tool_risk 一致，防回归）
         let (r, why) = evaluate_risk(
             "settings",
             &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}),
             &ws,
         );
-        assert_eq!(r, RiskLevel::Dangerous, "base_url 红线键应判高危: {why}");
+        assert_eq!(r, RiskLevel::Normal, "base_url 放开后应判常规: {why}");
         // 顶层普通键仍 Normal
         let (r, why) = evaluate_risk("settings", &json!({"action": "set", "patch": {"thinking": "low"}}), &ws);
         assert_eq!(r, RiskLevel::Normal, "thinking 普通键应判常规: {why}");
@@ -1208,8 +1263,9 @@ mod tests {
         // 其余破坏操作不再任何档位强制弹卡——按档位判（档位即用户意愿）
         assert!(!red_line_hold("settings", &json!({"action": "set", "patch": {"base_url": "https://x/v1"}}), &ws()));
         assert!(!red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()));
-        // 文件工具直写应用自身配置：不再强制，但按档位判 Dangerous（见 risk_write_file）
-        for p in ["config.toml", "settings.json", "providers.json", "prompts/system.md", ".cargo/config.toml"] {
+        // 文件工具直写应用自身配置：不再强制，按档位判——2026-10-04 放开轮后
+        // config.toml/providers.json 降 Normal（走 set_config/表内键都行），其余仍 Dangerous
+        for p in ["settings.json", "prompts/system.md"] {
             assert!(
                 !red_line_hold("write_file", &json!({"path": p, "content": "x"}), &ws()),
                 "{p} 直写改按档位判（Dangerous），不再任何档位强制"
@@ -1218,6 +1274,13 @@ mod tests {
                 evaluate_risk("write_file", &json!({"path": p, "content": "x"}), &ws()).0,
                 RiskLevel::Dangerous,
                 "{p} 直写仍须判高危（auto 档问、full-access 放行）"
+            );
+        }
+        for p in ["config.toml", "providers.json"] {
+            assert_eq!(
+                evaluate_risk("write_file", &json!({"path": p, "content": "x"}), &ws()).0,
+                RiskLevel::Normal,
+                "{p} 放开权限轮后直写判 Normal"
             );
         }
         assert_eq!(
@@ -1229,15 +1292,25 @@ mod tests {
             evaluate_risk("edit_file", &json!({"path": "prompts\\system.md", "old_string": "a", "new_string": "b"}), &ws()).0,
             RiskLevel::Dangerous
         );
-        // shell：写敏感文件从 red_line_hold 搬进 risk_shell——非纯读即 Dangerous
+        // shell：settings.json 仍敏感；config.toml 放开（带 default_approval 例外=审批档位红线）
         assert_eq!(
-            evaluate_risk("shell", &json!({"command": "echo key=xxx > config.toml"}), &ws()).0,
+            evaluate_risk("shell", &json!({"command": "echo key=xxx > settings.json"}), &ws()).0,
             RiskLevel::Dangerous,
-            "echo 重定向写自身配置 = 高危（此前靠 red_line_hold 兜，现在判级自带）"
+            "echo 重定向写 settings.json（api_key 载体）= 高危"
         );
         assert_eq!(
             evaluate_risk("shell", &json!({"command": "copy evil.json settings.json"}), &ws()).0,
             RiskLevel::Dangerous
+        );
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "echo x > config.toml"}), &ws()).0,
+            RiskLevel::Normal,
+            "config.toml 放开权限轮后 shell 写判 Normal"
+        );
+        assert_eq!(
+            evaluate_risk("shell", &json!({"command": "echo default_approval = \"auto\" > config.toml"}), &ws()).0,
+            RiskLevel::Dangerous,
+            "写 config.toml 的 default_approval（审批档位持久形态）= 红线必问"
         );
         // 纯读与不相干命令不受影响（type 只读不拦；敏感面不误伤普通命令）
         assert_eq!(evaluate_risk("shell", &json!({"command": "type config.toml"}), &ws()).0, RiskLevel::Safe);

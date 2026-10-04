@@ -12,9 +12,12 @@
 //! - `setter`：把「值写进 Settings」的现有语义**原样搬进来**（不重造），patch 应用
 //!   顺序 = 表序（active_config_id 排最前，保证「切完后改参数」落到切换后的配置）。
 //!
-//! **安全边界不因 schema 化放松**：api_key/clear_key（key 永不经模型之手）、workspace
-//! （自己挪自己的笼子）、cost（价格表=钱）、trusted_plugins（准入审核归用户）刻意
-//! **不在表内**——表外路径一律报错并列合法路径，不存在「静默不生效」的灰区。
+//! **安全边界（2026-10-04 用户拍板收紧到两条）**：api_key/clear_key（key 永不经模型之手）、
+//! workspace（自己挪自己的笼子）刻意**不在表内**——表外路径一律报错并列合法路径，
+//! 不存在「静默不生效」的灰区。审批档位也不在本表（config.toml 的 default_approval
+//! 是它的持久形态，set_config 改它一律弹卡）。其余全部可改：渠道指向（原先的
+//! red_line 四件套）降为 normal，MCP 配置（mcp_servers）入表；config.toml 其余键走
+//! settings 工具 action=set_config；第三方插件信任走 plugin 工具（先审后装）。
 
 use serde_json::{Value, json};
 
@@ -42,14 +45,15 @@ pub struct SchemaEntry {
 /// 全表。顺序 = apply_patch 的应用序（与既有逐字段语义一致：
 /// 激活配置切换必须排在所有渠道字段之前）。
 pub const SCHEMA: &[SchemaEntry] = &[
-    // —— 红线：渠道指向（换 agent 自己的大脑；任何档位弹卡必问）——
+    // —— 渠道指向（2026-10-04 用户拍板放开：除审批档位/API key 外全部可改；
+    // 档位即用户意愿，改坏了可改回）——
     SchemaEntry {
         path: "active_config_id",
         label: "切换激活配置",
         ty: "config_name",
         enum_values: &[],
         default: None,
-        risk: "red_line",
+        risk: "normal",
         desc: "写 settings.json 里某套配置的 id（先 action=get 看 configs 清单）。后面的渠道字段改的是切换后的激活配置",
     },
     SchemaEntry {
@@ -58,7 +62,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         ty: "string",
         enum_values: &[],
         default: None,
-        risk: "red_line",
+        risk: "normal",
         desc: "渠道提供商标识（presets.json 里的 id）",
     },
     SchemaEntry {
@@ -67,7 +71,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         ty: "string",
         enum_values: &[],
         default: None,
-        risk: "red_line",
+        risk: "normal",
         desc: "API 端点 URL。变更会清空已存模型与模型列表（URL 变了旧的作废），需重新拉取",
     },
     SchemaEntry {
@@ -76,7 +80,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         ty: "string",
         enum_values: &[],
         default: None,
-        risk: "red_line",
+        risk: "normal",
         desc: "当前激活配置用的模型",
     },
     // —— 普通：渠道周边 ——
@@ -224,6 +228,15 @@ pub const SCHEMA: &[SchemaEntry] = &[
         default: None,
         risk: "normal",
         desc: "技能名整表替换（对不上报错并列可用名）",
+    },
+    SchemaEntry {
+        path: "mcp_servers",
+        label: "MCP 服务配置",
+        ty: "object",
+        enum_values: &[],
+        default: None,
+        risk: "normal",
+        desc: "MCP 服务整表（name/command/args/env/url 等，按 name 合并：已存在的服务不带的字段保留旧值）。第三方服务的密钥也在 env 里——2026-10-04 用户拍板放开，改动后用 action=mcp op=refresh 重连",
     },
     SchemaEntry {
         path: "schedules",
@@ -410,7 +423,7 @@ pub fn manifest_json() -> Value {
             "risk": e.risk,
             "desc": e.desc,
         })).collect::<Vec<Value>>(),
-        "out_of_scope": "api_key/clear_key（key 永不经模型之手，换 key 请到设置页）/workspace（自己挪自己的笼子）/cost（价格表=钱）/trusted_plugins（准入审核归用户）不可经本工具修改；config.toml（花费上限/审批默认档/钩子）改文件且需重启，写前必经用户确认",
+        "out_of_scope": "api_key/clear_key（key 永不经模型之手，换 key 请到设置页）/workspace（自己挪自己的笼子）不可经本工具修改。审批档位不在本表：config.toml 的 default_approval 是它的持久形态，set_config 改它一律弹卡。config.toml 其余键走 action=set_config（改完需重启生效）。第三方插件的信任走 plugin 工具（先审查后装，审查不过要强装需用户批准）",
     })
 }
 

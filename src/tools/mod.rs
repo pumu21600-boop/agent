@@ -16,6 +16,7 @@ use crate::config::SandboxConfig;
 
 mod fs;
 mod git;
+mod plugin;
 mod search;
 mod session;
 mod settings;
@@ -273,12 +274,14 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）。自改纪律：除 action=get（只读）外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快apshot（key 只给尾号；available_plugins/available_skills 列合法 id）。action=schema（只读，不受闸）：全部可改路径的自描述清单（每项路径/类型/可选值/默认/风险档/一句话说明）——set 之前先读它，别瞎猜键名。红线路径（风险档=red_line）任何审批档位都必问。action=set 配 patch（可给顶层键，也可给点号子路径 features.<键>/roles.<字段>，如 features.galaxy=false、roles.summary=主力配置名）：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）判高危，按审批档位决定是否弹卡（read-only/auto 档问、full-access 档放行）。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，高危按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（高危按档位问）。action=schedule_run 配 id：立即跑一条定时任务（真花钱，高危按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外：api_key/价格表/信任插件；config.toml 改文件需重启（同样按档位问）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切，别翻 config.toml、别用 shell 试。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。自改纪律：除 action=get（只读）与 schema/set_config 外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=schema（只读，不受闸）：全部可改路径的自描述清单（每项路径/类型/可选值/默认/风险档/一句话说明）——set 之前先读它，别瞎猜键名。action=set 配 patch（可给顶层键，也可给点号子路径 features.<键>/roles.<字段>，如 features.galaxy=false、roles.summary=主力配置名）：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）2026-10-04 起与普通键同档（Normal，按审批档位走）。action=set_config 配 key（形如 agent.max_steps/cost.spend_cap_usd）+value：改 config.toml（toml_edit 保注释，重启服务后生效）；default_approval（审批档位的持久形态）任何档位必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（按档位问）。action=schedule_run 配 id：立即跑一条定时任务（真花钱，按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外（表外路径直接报错）：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）与 workspace（工作区边界）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件的信任走 plugin 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["schema", "get", "set", "config", "mcp", "workspace", "schedule_run", "memory"], "description": "get/set/config/mcp/workspace/schedule_run/memory；除 get 外都要「自改」插件开着" },
+                    "action": { "type": "string", "enum": ["schema", "get", "set", "set_config", "config", "mcp", "workspace", "schedule_run", "memory"], "description": "get/set/set_config/config/mcp/workspace/schedule_run/memory；除 get/schema/set_config 外都要「自改」插件开着" },
                     "patch": { "type": "object", "description": "set 时必填：要改的键与新值。顶层键 + 点号子路径均可（点号如 features.galaxy / roles.summary；合法路径全集见 action=schema）；整表替换的键（mcp_servers/schedules/roles/features）先 get 拿现状" },
+                    "key": { "type": "string", "description": "set_config：config.toml 的键路径（形如 agent.max_steps，section.field）" },
+                    "value": { "description": "set_config：新值（字符串/数字/布尔/一维数组）" },
                     "op": { "type": "string", "enum": ["new", "delete", "refresh", "reindex"], "description": "config：new/delete；mcp：refresh；memory：reindex" },
                     "id": { "type": "string", "description": "config=配置 id；schedule_run=任务 id；mcp=server 名" },
                     "name": { "type": "string", "description": "mcp refresh：server 名" },
@@ -322,6 +325,23 @@ fn builtin_tools() -> Vec<ToolSpec> {
                 "required": ["method"]
             }),
             danger_level: 0,
+        },
+        ToolSpec {
+            name: "plugin",
+            description: "第三方插件安装与信任（2026-10-04 放开权限轮；自改纪律：install/unpin 要求「自改」插件开着，review 只读不受闸）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）装第三方插件：宿主先落位再跑静态审查（外联/密钥/动态执行等红线项为 blocker）——审查通过自动信任并即时生效，用户可在界面看到；有 blocker 会停下不信任（插件休眠不加载），返回完整报告：把 blocked 里的问题逐条讲给用户听，用户同意继续就带 force=true 重试（会弹审批卡让用户亲自拍板，别替用户做这个决定）。action=review 配 key（形如 plugins:名字）只审不信返回完整报告——装之前想先看审查结论就用它。action=unpin 配 key 撤回信任（插件停载、文件保留，可逆）。审查由宿主统一执行，不要用 shell 自己审也不要绕过这个工具。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["install", "review", "unpin"], "description": "install 配 name/manifest/files（force 可选）；review/unpin 配 key" },
+                    "name": { "type": "string", "description": "install：插件名（仅字母数字与 - _ .）" },
+                    "manifest": { "type": "object", "description": "install：manifest.json 内容（apiVersion=1 + title + ui/tools 声明）" },
+                    "files": { "type": "object", "description": "install：{相对路径: 文本内容}，如 {\"index.html\": \"<html>…\"}" },
+                    "force": { "type": "boolean", "description": "install：审查有 blocker 时经用户明确同意后强装（任何档位弹卡）" },
+                    "key": { "type": "string", "description": "review/unpin：插件键（形如 plugins:名字）" }
+                },
+                "required": ["action"]
+            }),
+            danger_level: 1,
         },
         ToolSpec {
             name: "skill",
@@ -409,6 +429,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "browser" => crate::browser::command(args, cfg.max_chars).await,
         // 2026-10-03 agent 自改设置：读/改 settings.json（分级与红线见 core/rules.rs）
         "settings" => settings::run(args).await,
+        // 2026-10-04 放开权限轮：第三方插件信任交给 agent（先审后装，force 必问）
+        "plugin" => plugin::run(args).await,
         // 2026-10-03：操作本应用界面（开/关侧栏面板标签，走 /api/ui/events 事件流）
         "ui" => ui::run(args).await,
         // 2026-10-03：技能建/改/删正门（复用 skills::save/delete，模型不用找文件）

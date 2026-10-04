@@ -387,9 +387,10 @@ mod tests {
         assert!(!f.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));
         assert!(!f.needs_approval_for("settings", r#"{"action":"get"}"#));
         assert!(!f.needs_approval_for("write_file", r#"{"path":"src/main.rs","content":"x"}"#));
-        // auto 档：破坏操作照旧问（Dangerous 档位映射），撤销检查点进红线分支也问
+        // auto 档：破坏操作照旧问（Dangerous 档位映射），撤销检查点进红线分支也问；
+        // 渠道键 2026-10-04 放开为 Normal → auto 静默（档位即用户意愿）
         let a = gate("sess-a", "auto");
-        assert!(a.needs_approval_for("settings", r#"{"action":"set","patch":{"model":"glm-5.3-flash"}}"#));
+        assert!(!a.needs_approval_for("settings", r#"{"action":"set","patch":{"model":"glm-5.3-flash"}}"#));
         assert!(a.needs_approval_for("session", r#"{"method":"delete","id":"s1"}"#));
         assert!(a.needs_approval_for("ui", r#"{"method":"undo_checkpoint","id":"cp-1"}"#));
         assert!(!a.needs_approval_for("settings", r#"{"action":"set","patch":{"thinking":"high"}}"#));

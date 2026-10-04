@@ -701,20 +701,18 @@ mod tests {
             }),
             "paths 每条都要有 path/label/type/risk/desc"
         );
-        // 红线恰好 4 个：base_url/model/provider_id/active_config_id
-        let mut red: Vec<String> = v["paths"]
+        // 红线集合 2026-10-04 放开权限轮后应为空（审批档位不在 settings.json 表内，
+        // api_key 本就表外）——settings.json 里不再有 red_line 行
+        let red: Vec<String> = v["paths"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|p| p["risk"] == "red_line")
             .map(|p| p["path"].as_str().unwrap().to_string())
             .collect();
-        red.sort();
-        let mut expect = vec!["active_config_id", "base_url", "model", "provider_id"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<String>>();
-        expect.sort();
-        assert_eq!(red, expect, "红线路径集合应恰好是渠道指向四件套");
+        assert!(red.is_empty(), "渠道键已放开，settings.json 表内不应再有 red_line: {red:?}");
+        // 放开轮新增的 mcp_servers 行在表内且为 normal
+        let mcp = v["paths"].as_array().unwrap().iter().find(|p| p["path"] == "mcp_servers").expect("mcp_servers 应入表");
+        assert_eq!(mcp["risk"], "normal", "mcp_servers 应为 normal");
     }
 }
