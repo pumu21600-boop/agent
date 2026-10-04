@@ -55,7 +55,7 @@
   function configOptions() {
     const opts = [{ value: '', label: '跟随当前激活配置' }];
     for (const c of schedConfigs) {
-      opts.push({ value: c.id, label: c.model ? `${c.name} · ${c.model}` : c.name });
+      opts.push({ value: c.id, label: c.name }); // 只显示供应商名；模型是下一个下拉的事（用户 2026-10-05 实锤）
     }
     return opts;
   }
