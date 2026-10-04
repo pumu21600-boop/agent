@@ -8,6 +8,8 @@
   // xlsx 表格渲染（SheetJS 前端库，走 raw 字节解析）
   import * as XLSX from 'xlsx/dist/xlsx.full.min.js';
   import ImagePreview from './lib/ImagePreview.svelte';
+  // 助手消息 markdown 渲染（2026-10-04 用户拍板「星号太多」：escape-first 安全渲染）
+  import { md } from './lib/md.js';
   import RenameModal from './lib/RenameModal.svelte';
   import ConfirmModal from './lib/ConfirmModal.svelte';
   import WorkspaceModal from './lib/WorkspaceModal.svelte';
@@ -4981,7 +4983,7 @@
                 </div>
               {/if}
               {#if m.thinking}
-                {@const thinkingOpen = thinkingOpenMap[m.id] ?? !!m.streaming}
+                {@const thinkingOpen = thinkingOpenMap[m.id] ?? false}
                 {@const liveThinkMs = m.thinkPhaseStart
                   ? (m.thinkMs || 0) + (nowTick - m.thinkPhaseStart)
                   : m.thinkMs || 0}
@@ -5048,7 +5050,7 @@
                   <!-- open 直接在模板里读 toolFold（Svelte 模板只对直接引用的变量做响应式，
                        包进函数就收不到 toolFold 的变更——真机实锤过） -->
                   {@const foldKey = `${m.id}:${ti}`}
-                  {@const open = toolFold[foldKey] !== undefined ? !toolFold[foldKey] : !!m.streaming}
+                  {@const open = toolFold[foldKey] !== undefined ? !toolFold[foldKey] : false}
                   <div class="tool-card">
                     <div
                       class="tool-head"
@@ -5069,7 +5071,7 @@
                 {/each}
               {/if}
               {#if m.content}
-                <div class="content">{m.content}</div>
+                <div class="content">{@html md(m.content)}</div>
               {:else if m.streaming}
                 <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
               {/if}
@@ -8672,7 +8674,61 @@
   }
   .user-text,
   .content {
-    white-space: pre-wrap;
+    /* markdown 渲染（2026-10-04）：结构标签自带节奏，不再 pre-wrap 平铺 */
+    word-break: break-word;
+  }
+  .content .md-p {
+    margin: 0 0 8px;
+  }
+  .content .md-p:last-child {
+    margin-bottom: 0;
+  }
+  .content .md-h {
+    margin: 12px 0 6px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .content .md-ul,
+  .content .md-ol {
+    margin: 4px 0 8px;
+    padding-left: 20px;
+  }
+  .content .md-li,
+  .content li {
+    margin: 2px 0;
+  }
+  .content .md-code {
+    background: var(--g2);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font: 12px/1.5 Consolas, 'Cascadia Code', monospace;
+  }
+  .content .md-pre {
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 6px 0 10px;
+    overflow-x: auto;
+  }
+  .content .md-pre code {
+    font: 12px/1.55 Consolas, 'Cascadia Code', monospace;
+    white-space: pre;
+  }
+  .content .md-quote {
+    margin: 6px 0;
+    padding: 2px 12px;
+    border-left: 3px solid var(--g3);
+    color: var(--g5);
+  }
+  .content .md-hr {
+    border: none;
+    border-top: 1px solid var(--g3);
+    margin: 10px 0;
+  }
+  .content .md-a {
+    color: var(--accent, #7c9ff5);
+    text-decoration: underline;
   }
   /* 用户消息不再画气泡（用户 2026-10-01：去掉气泡，ZCode 式纯文本）；
      模型回复也没有边框底色，工具/审批/思考块自己带边框即可 */
