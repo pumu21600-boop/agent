@@ -64,6 +64,10 @@ pub(crate) struct HeadlessRequest {
     /// 本任务的上下文 token 预算覆盖（0 = 全局/模型口径；>0 = 本任务硬覆盖）
     #[serde(default)]
     pub budget_tokens: u64,
+    /// 用哪套渠道配置跑（config id；空 = 当前激活配置）。定时任务高级选项选模型用——
+    /// 选中后模型/base_url/key/context_length 全跟随该配置
+    #[serde(default)]
+    pub config_id: String,
     /// 唤醒来源（cli / schedule / subagent / webhook…），只进审计与台账口径
     #[serde(default)]
     pub purpose: String,
@@ -215,7 +219,16 @@ pub(crate) async fn run_headless_inner(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let active_cfg = s.active_or_default().clone();
+    // 按 config_id 选配置跑（定时任务选模型）；找不到/没传 = 当前激活配置
+    let active_cfg = if req.config_id.trim().is_empty() {
+        s.active_or_default().clone()
+    } else {
+        s.configs
+            .iter()
+            .find(|c| c.id == req.config_id)
+            .cloned()
+            .unwrap_or_else(|| s.active_or_default().clone())
+    };
     let cfg = (*state.agent_cfg).clone();
     let sandbox_cfg = (*state.sandbox_cfg).clone();
     // 上下文预算：当前模型设了上下文长度就用它（覆盖全局 [context].budget_tokens）

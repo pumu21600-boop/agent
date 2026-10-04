@@ -76,6 +76,13 @@ pub struct ScheduleTask {
     /// 整轮超时（秒）；0 = 用默认 1800
     #[serde(default)]
     pub timeout_secs: u64,
+    /// 用哪套渠道配置跑本任务（config id；空 = 当前激活配置）。选了之后模型/
+    /// base_url/key/context_length 全跟随该配置（2026-10-05 用户拍板）
+    #[serde(default)]
+    pub config_id: String,
+    /// 覆盖该配置的默认模型（空 = 用配置自带 model；从配置的 models 清单里选）
+    #[serde(default)]
+    pub model: String,
     /// 本任务的上下文 token 上限（0 = 跟全局 [context].budget_tokens / 渠道
     /// context_length；>0 = 本任务硬覆盖，长任务不被过早裁剪）
     #[serde(default)]
@@ -332,13 +339,14 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
         let req = crate::server::HeadlessRequest {
             message,
             session_id: task.fixed_session().unwrap_or("").to_string(),
-            model: String::new(),
             base_url: String::new(),
             api_key: String::new(),
             approval_mode: task.approval_mode.clone(),
             plan_mode: false,
             on_approval: task.on_approval.clone(),
                 budget_tokens: task.budget_tokens,
+                config_id: task.config_id.clone(),
+                model: task.model.clone(),
                 timeout_secs: if task.timeout_secs == 0 {
                     DEFAULT_TIMEOUT_SECS
                 } else {
@@ -522,6 +530,8 @@ mod tests {
             enabled: true,
             timeout_secs: 0,
             budget_tokens: 0,
+            config_id: String::new(),
+            model: String::new(),
             created_ts: 0,
             last_run_ts: None,
             last_manual_ts: None,

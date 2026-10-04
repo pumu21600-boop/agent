@@ -18,6 +18,8 @@
     });
   }
   let schedLoading = false;
+  // 渠道配置候选（执行模型选择；GET /api/settings 的 configs，含 id/label/model/models）
+  let schedConfigs = [];
   // 编辑器：null = 关；isNew = 新建（id 空）。档位/高危策略语义同审批四档
   let schedEditor = null;
   // 高级选项（会话/审批/超时）默认折叠；编辑老任务时若与默认不同则自动展开，不藏已配置的东西
@@ -27,11 +29,12 @@
   let schedCronText = '';
   let schedCronTimer = null;
   let schedCronPending = false;
+  // 三档（2026-10-05 用户实锤纠正：sandbox 档 10-03 就取消了，这里一直挂着四档旧表；
+  // 与输入框上方的全局档位菜单同一套口径，跟随全局语义）
   const SCHED_MODES = [
     { value: 'read-only', label: '只读（写/执行逐次询问）' },
-    { value: 'sandbox', label: '沙箱（只在沙箱执行）' },
-    { value: 'auto', label: '自动（可动工作区）' },
-    { value: 'full-access', label: '完全访问（需总开关）' },
+    { value: 'auto', label: '自动（可动工作区，高危先问）' },
+    { value: 'full-access', label: '完全访问（全免审，本机直跑）' },
   ];
   function schedAdvNonDefault(t) {
     const n = (v, d) => (v == null || v === '' ? d : v);
@@ -40,12 +43,31 @@
       !!(t.session_id && t.session_id.trim()) ||
       n(t.approval_mode, 'auto') !== 'auto' ||
       n(t.on_approval, 'deny') !== 'deny' ||
+      !!(t.config_id && t.config_id.trim()) ||
+      !!(t.model && t.model.trim()) ||
       (Number(t.timeout_secs) || 1800) !== 1800
     );
   }
   // 工作区：默认跟随触发时的当前工作区；下拉里给最近项目（去重）
   function wsLabel(w) {
     return String(w).split(/[\\/]/).filter(Boolean).pop() || w;
+  }
+  function configOptions() {
+    const opts = [{ value: '', label: '跟随当前激活配置' }];
+    for (const c of schedConfigs) {
+      opts.push({ value: c.id, label: c.model ? `${c.label} · ${c.model}` : c.label });
+    }
+    return opts;
+  }
+  function modelOptions() {
+    const cfg = schedConfigs.find((c) => c.id === (schedEditor?.config_id || ''));
+    const opts = [{ value: '', label: '默认（该配置的模型）' }];
+    for (const m of cfg?.models || []) opts.push({ value: m, label: m });
+    // 配置当前模型不在清单里（手填的）也给一个可选项
+    if (cfg?.model && !(cfg.models || []).includes(cfg.model)) {
+      opts.push({ value: cfg.model, label: `${cfg.model}（当前）` });
+    }
+    return opts;
   }
   function wsOptions() {
     const seen = new Set();
@@ -78,7 +100,17 @@
   async function loadSchedules() {
     schedLoading = true;
     try {
-      const r = await fetch('/api/schedules').then((r) => r.json());
+      const [r, st] = await Promise.all([
+        fetch('/api/schedules').then((r) => r.json()),
+        fetch('/api/settings', { cache: 'no-store' }).then((r) => r.json()).catch(() => ({})),
+      ]);
+      schedConfigs = (st.configs || []).map((c) => ({
+        id: c.id,
+        label: c.label || c.id.slice(0, 8),
+        model: c.model || '',
+        models: c.models || [],
+        context_length: c.context_length || 0,
+      }));
       schedulesData = r.schedules || [];
       scheduleNotices = r.notices || [];
     } catch (e) {
@@ -109,6 +141,8 @@
       enabled: true,
       timeout_secs: '',
       budget_tokens: '',
+      config_id: '',
+      model: '',
       isNew: true,
     };
     previewCron();
@@ -117,7 +151,7 @@
     schedMsg = '';
     schedAdvOpen = schedAdvNonDefault(t);
     // 超时回显为空 + 占位符，不显示突兀的 0；保存时留空按 1800 发（见 saveSchedule）
-    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '' };
+    schedEditor = { ...t, isNew: false, timeout_secs: Number(t.timeout_secs) || '', memory_days: t.memory_days || '', budget_tokens: t.budget_tokens ? Number(t.budget_tokens) : '', config_id: t.config_id || '', model: t.model || '' };
     previewCron();
   }
   async function saveSchedule() {
@@ -142,6 +176,8 @@
       timeout_secs: Number(e.timeout_secs) || 1800,
       // 上下文上限（tokens）：留空=0=跟全局/渠道口径，填了本任务硬覆盖
       budget_tokens: Number(e.budget_tokens) || 0,
+      config_id: e.config_id || '',
+      model: e.model || '',
     };
     // 单次模式没选时间（或周期模式没产出 cron）：本地拦下，不发请求
     if (!String(body.cron || '').trim() && !body.once_ts) {
@@ -274,6 +310,33 @@
               />
             </div>
             <div class="sub-row">
+              <span class="hint">用哪套渠道跑</span>
+              <Select
+                value={schedEditor.config_id || ''}
+                title="执行配置"
+                options={configOptions()}
+                on:change={(e) => {
+                  schedEditor.config_id = e.detail;
+                  schedEditor.model = ''; // 换配置清掉模型覆盖，回落到该配置默认
+                }}
+              />
+              <Select
+                value={schedEditor.model || ''}
+                title="模型（默认=该配置的模型）"
+                options={modelOptions()}
+                on:change={(e) => (schedEditor.model = e.detail)}
+              />
+            </div>
+            {#if schedEditor.config_id}
+              {@const picked = schedConfigs.find((c) => c.id === schedEditor.config_id)}
+              {#if picked}
+                <div class="hint">
+                  上下文 {((schedEditor.model ? 0 : picked.context_length) || 0).toLocaleString() || '跟随全局'} tokens 跟随该配置
+                  {#if schedEditor.model}·注意：换了非默认模型，上下文仍按该配置填的 context_length 算{/if}
+                </div>
+              {/if}
+            {/if}
+            <div class="sub-row">
               <button class="btn ghost" on:click={() => (schedAdvOpen = !schedAdvOpen)}>{schedAdvOpen ? '收起高级选项' : '高级选项'}</button>
             </div>
             {#if schedAdvOpen}
@@ -335,6 +398,7 @@
                 <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
                 {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
                 {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
+                {#if t.config_id}<span class="mcp-risk" title={`用配置 ${schedConfigs.find((c) => c.id === t.config_id)?.label || t.config_id} 跑${t.model ? `（${t.model}）` : ''}`}>◆ {schedConfigs.find((c) => c.id === t.config_id)?.label || t.config_id.slice(0, 8)}{t.model ? ` · ${t.model}` : ''}</span>{/if}
                 {#if t.budget_tokens}<span class="mcp-risk" title={`本任务上下文上限 ${Number(t.budget_tokens).toLocaleString()} tokens`}>⛨ {Number(t.budget_tokens).toLocaleString()} tokens</span>{/if}
                 <span class="flex-sp"></span>
                 <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
