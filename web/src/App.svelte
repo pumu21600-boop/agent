@@ -3577,12 +3577,12 @@
       wasmPlugins = [];
     }
   }
-  async function mcpAction(action, name, risk, server) {
+  async function mcpAction(action, name, server) {
     try {
       const r = await fetch('/api/mcp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, name, risk, server }),
+        body: JSON.stringify({ action, name, server }),
       }).then((r) => r.json());
       if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
       if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
@@ -6412,7 +6412,7 @@
       {/if}
       <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} on:reload={loadSkills} />
-      <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.risk, e.detail.server)} />
+      <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.server)} />
       {#if settingsTab === 'ext'}
         <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}

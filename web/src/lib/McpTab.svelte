@@ -6,7 +6,7 @@
   export let tab = '';
   export let servers = [];
   // 动作统一回 App 执行(那边握着 loadMcp 与 settingsMsg);parseHeaders 是表单本地助手
-  function mcpAction(action, name, risk, server) { dispatch('action', { action, name, risk, server }); }
+  function mcpAction(action, name, server) { dispatch('action', { action, name, server }); }
 
   // 021：transport 二选一。stdio=本地子进程；http=远端 MCP（Streamable HTTP）
   // P24：http 再加认证方式（无/自定义头、OAuth 授权码、OAuth 客户端凭据）
@@ -22,7 +22,6 @@
     oauth_client_secret: '',
     oauth_scope: '',
   };
-  let mcpRiskChoice = 'normal';
   // 表单里的 headers 写法：每行 `Key: Value`（值里可以有冒号，按第一个冒号切）
   function parseHeaders(text) {
     const out = {};
@@ -88,7 +87,7 @@
               </div>
             </div>
             <span class="plug-chip" class:warn={!sv.online}>{sv.online ? '在线' : '离线'}</span>
-            <span class="plug-chip" class:warn={sv.risk === 'dangerous'}>{sv.risk === 'dangerous' ? '高危档' : '常规档'}{sv.confirmed ? '' : ' · 待确认'}</span>
+            {#if !sv.confirmed}<span class="plug-chip warn">待确认</span>{/if}
             <span class="flex-sp"></span>
             <button class="btn ghost" on:click={() => mcpAction('refresh', sv.name)}>重连</button>
             <button class="btn ghost danger" on:click={() => mcpAction('remove', sv.name)}>删除</button>
@@ -118,7 +117,7 @@
             </div>
           {/if}
           {#if !sv.confirmed}
-            <!-- 首次接入确认：工具清单 + 审批档（安全功能，不是说明小字） -->
+            <!-- 首次接入确认：工具清单过目后启用（审批跟随全局档位，2026-10-04 去掉每服务档） -->
             <div class="mcp-confirm">
               {#if sv.tools.length}
                 <div class="mcp-tools-list">
@@ -128,17 +127,7 @@
                   {/each}
                 </div>
                 <div class="sub-row">
-                  <label class="mcp-risk-label">审批档：</label>
-                  <Select
-                    value={mcpRiskChoice}
-                    title="MCP 调用审批档"
-                    options={[
-                      { value: 'normal', label: '常规（auto 档自动放行）' },
-                      { value: 'dangerous', label: '高危（每次调用都弹窗）' },
-                    ]}
-                    on:change={(e) => (mcpRiskChoice = e.detail)}
-                  />
-                  <button class="btn primary" on:click={() => mcpAction('confirm', sv.name, mcpRiskChoice)}>确认启用</button>
+                  <button class="btn primary" on:click={() => mcpAction('confirm', sv.name)}>确认启用</button>
                 </div>
               {:else}
                 <div class="sub-row mcp-oauth">
@@ -254,9 +243,5 @@
   }
   .mcp-confirm {
     margin-top: 6px;
-  }
-  .mcp-risk-label {
-    font-size: 12px;
-    color: var(--g6);
   }
 </style>

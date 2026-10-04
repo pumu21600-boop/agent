@@ -195,7 +195,6 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
             match (&old, same_config) {
                 (Some(o), true) => {
                     c.confirmed = o.confirmed;
-                    c.risk = o.risk.clone();
                 }
                 _ => c.confirmed = false,
             }
@@ -561,7 +560,6 @@ fn snapshot_json(s: &settings::Settings) -> String {
             "url": c.url,
             "enabled": c.enabled,
             "confirmed": c.confirmed,
-            "risk": c.risk,
             "has_oauth": c.oauth.is_some(),
         })).collect::<Vec<Value>>(),
         "disabled_plugins": s.disabled_plugins,
@@ -684,7 +682,6 @@ mod tests {
             oauth: None,
             enabled: true,
             confirmed: true, // 模型传 true 也要被守卫改写
-            risk: "normal".into(),
         };
 
         // 原样带回（比如只是想改 enabled）→ 保留已确认

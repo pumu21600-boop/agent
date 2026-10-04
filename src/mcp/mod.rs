@@ -717,7 +717,8 @@ pub fn status() -> Vec<(String, bool, Vec<ToolBrief>)> {
 }
 
 /// 审批档判定（rules.rs mcp__ 分支调用）。
-/// 未确认 → Dangerous；禁用 → Dangerous；确认后按 server 配置档。
+/// 未确认 → Dangerous；禁用 → Dangerous；确认过 → Normal（2026-10-04 用户拍板：
+/// 去掉每服务独立审批档，MCP 工具与内置工具一样跟随输入框的全局档位）。
 pub fn risk_for(full_name: &str) -> Option<u8> {
     let (srv, _tool) = split_full_name(full_name)?;
     let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
@@ -726,10 +727,7 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
     if !cfg.enabled || !cfg.confirmed {
         return Some(2); // Dangerous：未确认/禁用的 MCP 工具不可静默执行
     }
-    Some(match cfg.risk.as_str() {
-        "dangerous" => 2,
-        _ => 1, // normal
-    })
+    Some(1) // Normal：按全局审批档位走
 }
 
 /// 资源/提示词相关的合成工具名（server 自己若已有同名工具，以它为准，不覆盖）。
@@ -1228,7 +1226,6 @@ data: \"result\":{\"n\":7}}";
             oauth: None,
             enabled: true,
             confirmed: true,
-            risk: "normal".into(),
         };
         sync_configs(std::slice::from_ref(&cfg));
 
@@ -1316,7 +1313,6 @@ data: \"result\":{\"n\":7}}";
             oauth: None,
             enabled: true,
             confirmed: true,
-            risk: "normal".into(),
         };
         sync_configs(std::slice::from_ref(&cfg));
         ensure_online_by_name("mockres").expect("握手应成功");
@@ -1421,7 +1417,6 @@ data: \"result\":{\"n\":7}}";
             oauth: None,
             enabled: true,
             confirmed: true,
-            risk: "normal".into(),
         };
         sync_configs(std::slice::from_ref(&cfg));
         let n = ensure_online_by_name("mocksse").expect("SSE 握手应成功");
@@ -1466,7 +1461,6 @@ data: \"result\":{\"n\":7}}";
             oauth: None,
             enabled: true,
             confirmed: true,
-            risk: "normal".into(),
         };
         sync_configs(std::slice::from_ref(&cfg));
         ensure_online_by_name("mockbare").expect("握手应成功");
@@ -1496,7 +1490,6 @@ data: \"result\":{\"n\":7}}";
             oauth: None,
             enabled: true,
             confirmed: true,
-            risk: "normal".into(),
         };
         sync_configs(std::slice::from_ref(&cfg));
         let e = ensure_online_by_name("deadhttp").expect_err("连不上必须报错");

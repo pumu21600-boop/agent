@@ -15,8 +15,6 @@ pub struct McpActionRequest {
     pub server: Option<Value>,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub risk: Option<String>,
 }
 
 /// POST /api/mcp —— 配置管理与生命周期动作（全部落 settings.json 并同步管理器）。
@@ -64,11 +62,8 @@ pub(super) async fn post_mcp(
             let Some(c) = s.mcp_servers.iter_mut().find(|c| &c.name == name) else {
                 return err(format!("未知 server: {name}"));
             };
+            // 2026-10-04 用户拍板：去掉每服务审批档（risk 字段已删）——确认即跟随全局档位
             c.confirmed = true;
-            if let Some(r) = &req.risk
-                && (r == "dangerous" || r == "normal") {
-                    c.risk = r.clone();
-                }
         }
         "toggle" => {
             let Some(name) = &req.name else { return err("缺少 name".into()) };
@@ -171,7 +166,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             json!({
                 "name": c.name, "transport": c.transport, "command": c.command, "args": c.args,
                 "env": c.env, "url": c.url, "headers": c.headers,
-                "enabled": c.enabled, "confirmed": c.confirmed, "risk": c.risk,
+                "enabled": c.enabled, "confirmed": c.confirmed,
                 "online": online,
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
                 "resources": res,

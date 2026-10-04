@@ -477,15 +477,9 @@ pub struct McpServerCfg {
     /// 首装确认（总架构 §7：接入时向用户展示完整工具清单后确认）
     #[serde(default)]
     pub confirmed: bool,
-    /// 该 server 全部工具的审批档："normal"（auto 档放行）| "dangerous"（逐次弹窗）
-    #[serde(default = "default_risk")]
-    pub risk: String,
 }
 fn yes() -> bool {
     true
-}
-fn default_risk() -> String {
-    "normal".into()
 }
 fn default_transport() -> String {
     "stdio".into()
