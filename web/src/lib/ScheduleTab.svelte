@@ -55,7 +55,7 @@
   function configOptions() {
     const opts = [{ value: '', label: '跟随当前激活配置' }];
     for (const c of schedConfigs) {
-      opts.push({ value: c.id, label: c.model ? `${c.label} · ${c.model}` : c.label });
+      opts.push({ value: c.id, label: c.model ? `${c.name} · ${c.model}` : c.name });
     }
     return opts;
   }
@@ -106,7 +106,7 @@
       ]);
       schedConfigs = (st.configs || []).map((c) => ({
         id: c.id,
-        label: c.label || c.id.slice(0, 8),
+        name: c.name || c.provider_id || c.id.slice(0, 8),
         model: c.model || '',
         models: c.models || [],
         context_length: c.context_length || 0,
@@ -300,8 +300,8 @@
             {:else}
               <div class="mcp-cmd">到点先检索最近 {schedEditor.memory_days || 3} 天的对话，让 agent 找出要跟进的事项</div>
             {/if}
-            <div class="sub-row">
-              <span class="hint">在哪儿完成</span>
+            <div class="field">
+              <label>工作区选择</label>
               <Select
                 value={schedEditor.workspace || ''}
                 title="工作区"
@@ -309,30 +309,32 @@
                 on:change={(e) => (schedEditor.workspace = e.detail)}
               />
             </div>
-            <div class="sub-row">
-              <span class="hint">用哪套渠道跑</span>
-              <Select
-                value={schedEditor.config_id || ''}
-                title="执行配置"
-                options={configOptions()}
-                on:change={(e) => {
-                  schedEditor.config_id = e.detail;
-                  schedEditor.model = ''; // 换配置清掉模型覆盖，回落到该配置默认
-                }}
-              />
-              <Select
-                value={schedEditor.model || ''}
-                title="模型（默认=该配置的模型）"
-                options={modelOptions()}
-                on:change={(e) => (schedEditor.model = e.detail)}
-              />
+            <div class="field">
+              <label>模型</label>
+              <div class="sub-row">
+                <Select
+                  value={schedEditor.config_id || ''}
+                  title="供应商（执行配置）"
+                  options={configOptions()}
+                  on:change={(e) => {
+                    schedEditor.config_id = e.detail;
+                    schedEditor.model = ''; // 换配置清掉模型覆盖，回落到该配置默认
+                  }}
+                />
+                <Select
+                  value={schedEditor.model || ''}
+                  title="模型（默认=该配置的模型）"
+                  options={modelOptions()}
+                  on:change={(e) => (schedEditor.model = e.detail)}
+                />
+              </div>
             </div>
             {#if schedEditor.config_id}
               {@const picked = schedConfigs.find((c) => c.id === schedEditor.config_id)}
               {#if picked}
-                <div class="hint">
-                  上下文 {((schedEditor.model ? 0 : picked.context_length) || 0).toLocaleString() || '跟随全局'} tokens 跟随该配置
-                  {#if schedEditor.model}·注意：换了非默认模型，上下文仍按该配置填的 context_length 算{/if}
+                <div class="field">
+                  <label>上下文（跟随所选模型配置）</label>
+                  <div class="mcp-cmd">{((picked.context_length || 0)).toLocaleString() || '跟随全局设置'} tokens{#if schedEditor.model} · 注意：换了非默认模型，上下文按该配置的 context_length 算{/if}</div>
                 </div>
               {/if}
             {/if}
@@ -398,7 +400,7 @@
                 <span class="mcp-status" title={t.cron}>{t.cron_text}</span>
                 {#if t.workspace}<span class="mcp-risk" title={t.workspace}>@ {wsLabel(t.workspace)}</span>
                 {:else if workspace}<span class="mcp-risk" title={`${workspace}（跟随当前工作区）`}>@ {wsLabel(workspace)}</span>{/if}
-                {#if t.config_id}<span class="mcp-risk" title={`用配置 ${schedConfigs.find((c) => c.id === t.config_id)?.label || t.config_id} 跑${t.model ? `（${t.model}）` : ''}`}>◆ {schedConfigs.find((c) => c.id === t.config_id)?.label || t.config_id.slice(0, 8)}{t.model ? ` · ${t.model}` : ''}</span>{/if}
+                {#if t.config_id}<span class="mcp-risk" title={`用配置 ${schedConfigs.find((c) => c.id === t.config_id)?.name || t.config_id.slice(0, 8)} 跑${t.model ? `（${t.model}）` : ''}`}>◆ {schedConfigs.find((c) => c.id === t.config_id)?.name || t.config_id.slice(0, 8)}{t.model ? ` · ${t.model}` : ''}</span>{/if}
                 {#if t.budget_tokens}<span class="mcp-risk" title={`本任务上下文上限 ${Number(t.budget_tokens).toLocaleString()} tokens`}>⛨ {Number(t.budget_tokens).toLocaleString()} tokens</span>{/if}
                 <span class="flex-sp"></span>
                 <button class="btn ghost" disabled={runningIds[t.id]} on:click={() => runScheduleNow(t.id)}>{runningIds[t.id] ? '触发中…' : '立即运行'}</button>
