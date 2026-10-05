@@ -249,6 +249,61 @@ pub(crate) fn sync_runtime(s: &Settings) {
     crate::usage::install_prices(&s.cost.prices);
 }
 
+/// 磁盘 settings.json 的外部改动监听（2026-10-05 用户实锤「前端也没有立马看得到」）。
+///
+/// 场景：agent 拿文件工具（或用户在记事本里）**直接改 settings.json**，不走任何
+/// HTTP 端点/工具。此前这条路径改完：服务内存里那份不刷新、界面也不推事件——
+/// 用户看着还是旧值，重启才好。v0.32.18 只堵住了「走接口」这条路，漏了这条。
+///
+/// 做法：500ms 轮询 mtime+长度（便宜），变了就重新解析并与内存逐字节比对：
+/// - 内容真不同才接管：换内存、sync_runtime、推 settings_changed（界面即时跟上）；
+/// - 自家端点/工具写盘后内容一致 → 空转，不重复推事件；
+/// - 解析失败 / 文件正被写（空或截断）→ 保持现状等下一次轮询，绝不拿坏文件覆盖内存；
+/// - 用规范化序列化后再比：键序/缩进/尾随换行不构成变化，只有值真变了才触发。
+pub(crate) fn start_external_reload(state: &AppState) {
+    use std::time::{Duration, SystemTime};
+    let settings = state.settings.clone();
+    let path = Settings::path_pub();
+    std::thread::spawn(move || {
+        let mut last_sig: Option<(SystemTime, u64)> = None;
+        let mut last_text: Option<String> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let Ok(mtime) = meta.modified() else { continue };
+            let sig = (mtime, meta.len());
+            if Some(sig) == last_sig {
+                continue;
+            }
+            last_sig = Some(sig);
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            // 正被写盘（编辑器 truncate-then-write）：空文件一律不接
+            if text.trim().is_empty() {
+                continue;
+            }
+            // mtime 变了但内容没变（另存为同内容）
+            if last_text.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            let Ok(fresh) = crate::config::settings::settings_from_text(&text) else {
+                observability::debug("[settings] 外部改动解析失败，保持内存现状（等下一次轮询）");
+                continue;
+            };
+            let cur = settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+            let same = serde_json::to_string(&cur).ok().as_deref() == serde_json::to_string(&fresh).ok().as_deref();
+            if same {
+                last_text = Some(text);
+                continue; // 自家端点/工具刚写盘的，内容一致
+            }
+            *settings.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+            last_text = Some(text);
+            sync_runtime(&fresh);
+            crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["external"] }));
+            observability::event(EventType::State, json!({ "kind": "settings.external_reloaded" }));
+        }
+    });
+}
+
 /// 拉取渠道模型列表。请求里没给 base_url/key 就用已保存设置。
 pub(super) async fn list_models(
     State(state): State<AppState>,

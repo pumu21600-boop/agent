@@ -196,3 +196,43 @@
         let err = f.set("no_such_feature", true).unwrap_err();
         assert!(err.contains("no_such_feature") && err.contains("roles"), "{err}");
     }
+
+    /// 外部改动重载与启动 load 必须走**同一把尺子**：同一份 JSON，两边解析出的状态
+    /// 逐字节相同。否则「重启后是一种状态、热加载后是另一种」，比不热加载更难查
+    /// （2026-10-05 真机实锤：agent 直接改 settings.json，界面不刷新）。
+    #[test]
+    fn settings_from_text_matches_load_migration_semantics() {
+        // 老版形态：无 configs 数组，全靠顶层字段 + 旧字段名 + 旧信任键
+        let legacy = r#"{
+            "active_profile_id": "p1",
+            "profiles": [{"id":"p1","name":"老配置","provider_id":"deepseek","base_url":"https://api.deepseek.com","model":"deepseek-chat"}],
+            "disabled_extensions": ["usage"],
+            "trusted_plugins": {"ui-ext:demo":"abc123"}
+        }"#;
+        let s = settings_from_text(legacy).expect("老版文本应可解析");
+        assert_eq!(s.configs.len(), 1, "旧 profiles 应迁成 configs");
+        assert_eq!(s.configs[0].name, "老配置");
+        assert_eq!(s.active_config_id.as_deref(), Some("p1"), "旧 active_profile_id 应迁成激活项");
+        assert_eq!(s.disabled_plugins, vec!["usage".to_string()], "旧 disabled_extensions 应迁名");
+        assert!(
+            s.trusted_plugins.contains_key("plugins:demo"),
+            "旧 ui-ext: 信任键应迁成 plugins:，实际 {:?}",
+            s.trusted_plugins
+        );
+    }
+
+    /// 空/坏 JSON 一律解析失败——外部监听据此「保持内存现状」，绝不拿半截文件覆盖
+    #[test]
+    fn settings_from_text_rejects_broken_text() {
+        assert!(settings_from_text("").is_err());
+        assert!(settings_from_text("   ").is_err());
+        assert!(settings_from_text("{ \"configs\": [").is_err(), "截断的半截 JSON 必须拒");
+    }
+
+    /// 合法最小 JSON 也要能解析出「有激活配置」的可用状态（热加载后不能处于残废态）
+    #[test]
+    fn settings_from_text_minimal_text_is_usable() {
+        let s = settings_from_text("{}").expect("空对象应可用默认值解析");
+        assert!(!s.configs.is_empty(), "应自动补一套配置");
+        assert!(s.active_config_id.is_some(), "应有激活配置");
+    }

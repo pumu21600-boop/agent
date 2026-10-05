@@ -193,7 +193,9 @@ async fn main() -> anyhow::Result<()> {
     // 2026-10-03 agent 自改设置轮：工具层（settings/schedule 等运维动作）经共享句柄触达 AppState
     server::install_shared_state(state.clone());
     let app = server::router(state.clone(), manifest.join("web").join("dist"));
-    // P22-B 定时任务：2s 心跳到点唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
+    // 2026-10-05 外部改动监听：agent/用户直接改 settings.json（不走端点）也即时生效
+    server::settings::start_external_reload(&state);
+    // P22-B 定时任务：2s 心跳到到唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
     schedule::start(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

@@ -529,51 +529,9 @@ impl Settings {
     /// 逐级迁移：旧版单 key / keys 映射 -> configs 专属 key。
     pub fn load(seed_base_url: &str, seed_model: &str) -> Self {
         let path = Self::path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_settings(&text) {
-                Ok(mut s) => {
-                    // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
-                    if s.configs.is_empty()
-                        && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(&text)
-                    {
-                        let provider_id = legacy.provider_id.unwrap_or_else(|| "deepseek".to_string());
-                        let base_url = legacy.base_url.unwrap_or_default();
-                        let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
-                        let models = legacy.models.unwrap_or_default();
-                        let cap = ModelCapabilities::default();
-                        s.configs.push(Config {
-                            id: new_config_id(),
-                            name: "配置 1".to_string(),
-                            provider_id,
-                            base_url,
-                            model,
-                            models,
-                            key_cipher: None,
-                            context_length: legacy.context_length,
-                            max_output_tokens: legacy.max_output_tokens,
-                            temperature: legacy.temperature,
-                            top_p: legacy.top_p,
-                            thinking: legacy.thinking,
-                            thinking_style: legacy.thinking_style,
-                            capabilities: cap,
-                            capabilities_user_set: false,
-                        });
-                    }
-
-                // v1 -> v2：key_cipher 挂到当前 provider 作用域
-                if s.keys.is_empty()
-                    && let Some(cipher) = s.key_cipher.take() {
-                        let pid = s.configs.first().map(|c| c.provider_id.clone()).unwrap_or_else(|| "deepseek".to_string());
-                        s.keys.insert(pid, cipher);
-                    }
-                // v2 -> v2.2：provider 作用域 key 归位到 base_url 作用域
-                s.migrate_provider_keys_to_urls();
-                // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
-                s.migrate_url_keys_to_configs();
-                // P28 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
-                migrate_legacy_trust_keys(&mut s.trusted_plugins);
-                // 确保存在有效激活配置
-                    s.ensure_active_config();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            match settings_from_text(&text) {
+                Ok(s) => {
                     // 落盘前留一份 .bak（2026-10-04 真机教训：settings.json 丢过一次
                     // 整个 mcp_servers，触发原因没定位到，先保证任何丢失可回退一份）
                     let _ = std::fs::copy(&path, path.with_extension("json.bak"));
@@ -593,8 +551,8 @@ impl Settings {
                     let _ = std::fs::rename(&path, &bak);
                 }
             }
-            Err(_) => {} // 文件不存在：首次启动走下方种子
         }
+        // 文件不存在：首次启动走下方种子
 
         let mut s = Self::default();
         let model = if seed_model.is_empty() {
@@ -632,10 +590,15 @@ impl Settings {
         crate::storage::write_settings(&Self::path(), &json)
     }
 
-    fn path() -> std::path::PathBuf {
+    /// settings.json 路径（外部监听与 load 共用；暴露成 pub(crate) 供 server 的
+    /// 外部改动监听轮询同一个文件，别在两处各写一份路径拼装）。
+    pub(crate) fn path_pub() -> std::path::PathBuf {
         crate::config::app_root().join("settings.json")
     }
 
+    fn path() -> std::path::PathBuf {
+        crate::config::app_root().join("settings.json")
+    }
     /// 迁移历史按 provider 存储的 key 到 base_url
     fn migrate_provider_keys_to_urls(&mut self) {
         let mut moved = Vec::new();
@@ -913,6 +876,61 @@ impl Settings {
         unsafe { LocalFree(output.pbData as *mut _) };
         Ok(base64::engine::general_purpose::STANDARD.encode(cipher))
     }
+}
+
+/// settings.json 文本 → 规范化 Settings（纯函数，无 IO 无落盘）。
+///
+/// `load`（启动/首次读）与**外部改动重载**（agent 或用户拿文件工具直接改了
+/// settings.json）共用这一把尺子——两边迁移语义必须完全一致，否则「同一份文件，
+/// 重启后是一种状态、热加载后是另一种」比不热加载更难查。历史迁移链：
+/// 旧字段名 → 老版无 configs 挽救 → key 三级归位 → 信任键合并 → ensure_active_config。
+/// 解析失败返回 Err（调用方各自处理：load 备份坏文件，重载保持内存现状）。
+pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Error> {
+    let mut s = parse_settings(text)?;
+    // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
+    if s.configs.is_empty()
+        && let Ok(legacy) = serde_json::from_str::<LegacyTopLevelFields>(text)
+    {
+        let provider_id = legacy.provider_id.unwrap_or_else(|| "deepseek".to_string());
+        let base_url = legacy.base_url.unwrap_or_default();
+        let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
+        let models = legacy.models.unwrap_or_default();
+        let cap = ModelCapabilities::default();
+        s.configs.push(Config {
+            id: new_config_id(),
+            name: "配置 1".to_string(),
+            provider_id,
+            base_url,
+            model,
+            models,
+            key_cipher: None,
+            context_length: legacy.context_length,
+            max_output_tokens: legacy.max_output_tokens,
+            temperature: legacy.temperature,
+            top_p: legacy.top_p,
+            thinking: legacy.thinking,
+            thinking_style: legacy.thinking_style,
+            capabilities: cap,
+            capabilities_user_set: false,
+        });
+    }
+
+    // v1 -> v2：key_cipher 挂到当前 provider 作用域
+    if s.keys.is_empty()
+        && let Some(cipher) = s.key_cipher.take()
+    {
+        let pid = s.configs.first().map(|c| c.provider_id.clone()).unwrap_or_else(|| "deepseek".to_string());
+        s.keys.insert(pid, cipher);
+    }
+    // v2 -> v2.2：provider 作用域 key 归位到 base_url 作用域
+    s.migrate_provider_keys_to_urls();
+    // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
+    s.migrate_url_keys_to_configs();
+    // P28 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
+    migrate_legacy_trust_keys(&mut s.trusted_plugins);
+    // 确保存在有效激活配置
+    s.ensure_active_config();
+    Ok(s)
 }
 
 fn new_config_id() -> String {
