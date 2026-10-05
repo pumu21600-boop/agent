@@ -114,8 +114,15 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
     // 工作区目录常驻系统提示：用户说「工作区/项目」都指这里，模型据此拼绝对路径，
     // 不再满磁盘 dir 猜位置（真机踩过：shell 工具描述写「项目根」，模型把用户说的
     // 工作区理解成了应用仓库，白搜 6 轮目录才找对文件）
+    //
+    // 2026-10-05 再补一句「改名 = 改建显示名」：用户说「把工作区名改成 X」时，模型
+    // 因为没有现成入口，去 dir 桌面、翻 .agent、读应用源码找接口，白花十几步（真机
+    // 实锤）。入口本来就在 settings 工具里，这里点名，别让模型再当侦探。
     let workspace_hint = format!(
-        "\n\n【工作区】当前工作区目录：{}\nread_file/write_file/shell 的相对路径、用户提到的工作区文件，都以这个目录为根。\n",
+        "\n\n【工作区】当前工作区目录：{}\nread_file/write_file/shell 的相对路径、用户提到的工作区文件，都以这个目录为根。\n\
+         用户说「把工作区/项目的名字改成 X」= 改它的**显示名**（侧栏那一行字），不是改磁盘目录名：\
+         直接调 settings 工具 action=alias 配 name（path 省略=当前工作区；name 留空=恢复文件夹名）。\
+         别去动目录名，也别翻应用源码找接口。\n",
         crate::tools::workspace_root().display()
     );
     let project_brief = {
