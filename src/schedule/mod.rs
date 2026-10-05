@@ -179,6 +179,11 @@ pub struct ScheduleNotice {
     pub duration_ms: u128,
 }
 
+/// 完成记录的 dismiss 键（ts+task_id；前端 dismissedNotices 同款口径）。
+pub fn notice_key(n: &ScheduleNotice) -> String {
+    format!("{}{}", n.ts, n.task_id)
+}
+
 fn notices_slot() -> &'static Mutex<std::collections::VecDeque<ScheduleNotice>> {
     static NOTICES: OnceLock<Mutex<std::collections::VecDeque<ScheduleNotice>>> = OnceLock::new();
     NOTICES.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
@@ -192,6 +197,65 @@ pub fn notices() -> Vec<ScheduleNotice> {
         .iter()
         .cloned()
         .collect()
+}
+
+/// 给界面的完成记录：剔除被用户 × 掉的。
+/// 壳重启只重载 WebView、设置弹窗每次重开都重建组件——dismissed 不落盘的话
+/// × 掉的一刷新就回来（2026-10-05 用户实锤），故读 settings 的 dismissed 表。
+pub fn visible_notices(state: &AppState) -> Vec<ScheduleNotice> {
+    let dismissed = state
+        .settings
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .schedule_dismissed
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    filter_dismissed(notices(), &dismissed)
+}
+
+/// 纯过滤：剔除 key 命中 dismissed 表的通知。
+fn filter_dismissed(notices: Vec<ScheduleNotice>, dismissed: &HashSet<String>) -> Vec<ScheduleNotice> {
+    notices
+        .into_iter()
+        .filter(|n| !dismissed.contains(&notice_key(n)))
+        .collect()
+}
+
+/// × 掉一条完成记录（落盘；key 不在当前 notices 里就拒——缓冲只有 50 条，
+/// 被挤掉的旧记录界面上也没有，不落无主 key）。
+pub fn dismiss_notice(state: &AppState, key: &str) -> Result<(), String> {
+    let key = key.trim().to_string();
+    if key.is_empty() || key.len() > 128 {
+        return Err("记录 key 不合法".into());
+    }
+    let live: HashSet<String> = notices().iter().map(notice_key).collect();
+    if !live.contains(&key) {
+        return Err("这条记录已经不在列表里了（可能已过期）".into());
+    }
+    {
+        let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
+        s.schedule_dismissed.retain(|k| k != &key);
+        s.schedule_dismissed.push(key);
+        trim_dismissed(&mut s.schedule_dismissed, &live);
+        let snapshot = s.clone();
+        drop(s);
+        if let Err(e) = snapshot.save() {
+            return Err(format!("保存失败: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// dismissed 表维护：清掉缓冲里已没有的陈尸 key + 硬顶（notices 上限 50，
+/// 正常远涨不到；防异常攒 key 把 settings.json 撑大）。
+fn trim_dismissed(list: &mut Vec<String>, live: &HashSet<String>) {
+    const MAX_DISMISSED: usize = 200;
+    list.retain(|k| live.contains(k));
+    let extra = list.len().saturating_sub(MAX_DISMISSED);
+    if extra > 0 {
+        list.drain(0..extra);
+    }
 }
 
 fn push_notice(n: ScheduleNotice) {
@@ -624,6 +688,52 @@ mod tests {
         t.kind = "memory".into();
         t.memory_days = 999;
         assert_eq!(t.memory_days(), 3);
+    }
+
+    fn notice(ts: &str, task: &str) -> ScheduleNotice {
+        ScheduleNotice {
+            ts: ts.into(),
+            trigger: "auto".into(),
+            task_id: task.into(),
+            task_name: "巡检".into(),
+            status: "done".into(),
+            title: "定时任务「巡检」已完成".into(),
+            detail: String::new(),
+            session_id: String::new(),
+            duration_ms: 100,
+        }
+    }
+
+    /// 2026-10-05 用户实锤：× 关掉的完成记录不能刷新一下就回来（壳重启只重载
+    /// WebView、服务常驻；设置弹窗每次重开都重建组件，内存过滤不落盘必复活）。
+    /// 这里锁 key 口径（ts+task_id）与过滤行为。
+    #[test]
+    fn dismissed_key_and_filter() {
+        let n = notice("2026-10-05 04:04:41", "t1");
+        assert_eq!(notice_key(&n), "2026-10-05 04:04:41t1");
+        let dismissed: HashSet<String> = [notice_key(&n)].into_iter().collect();
+        let out = filter_dismissed(
+            vec![notice("2026-10-05 04:04:41", "t1"), notice("2026-10-05 03:59:48", "t2")],
+            &dismissed,
+        );
+        assert_eq!(out.len(), 1, "被 × 的滤掉");
+        assert_eq!(out[0].task_id, "t2", "只留没 × 的");
+    }
+
+    /// dismissed 表维护：缓冲里已没有的陈尸 key 清掉；硬顶 200 留新丢旧，
+    /// 防异常攒 key 把 settings.json 撑大。
+    #[test]
+    fn trim_dismissed_clears_stale_and_caps() {
+        let live: HashSet<String> = ["k-live".to_string()].into_iter().collect();
+        let mut list = vec!["k-stale".to_string(), "k-live".to_string()];
+        trim_dismissed(&mut list, &live);
+        assert_eq!(list, vec!["k-live".to_string()], "陈尸 key 清掉");
+        let live2: HashSet<String> = (0..250).map(|i| format!("k{i}")).collect();
+        // Vec 按 push 序（dismiss 调用序），直接编号序构造
+        let mut list2: Vec<String> = (0..250).map(|i| format!("k{i}")).collect();
+        trim_dismissed(&mut list2, &live2);
+        assert_eq!(list2.len(), 200, "硬顶 200");
+        assert!(list2.contains(&"k249".to_string()) && !list2.contains(&"k0".to_string()), "留新丢旧");
     }
 
     /// P22-D：回顾指令生成——窗口过滤 / 归档与空会话排除 / 倒序取 12 / 空窗 None。

@@ -14,11 +14,21 @@
   let schedulesData = [];
   let scheduleNotices = [];
   // 用户 2026-10-05 实锤：完成记录改成小字一行，右边给个 × 关掉——原来整行按钮太占地方，
-  // 「去查看」任务卡片上已有。只用 × 关当前页显示（后端缓冲重启即失，不跟着落盘持久化）。
+  // 「去查看」任务卡片上已有。× 关掉必须落盘：壳重启只重载 WebView（agent.exe 服务常驻），
+  // 设置弹窗每次重开也重建组件——只做内存过滤的话，叉掉的刷新一下就回来。
   let dismissedNotices = {};
   $: visibleNotices = scheduleNotices.filter((n) => !dismissedNotices[n.ts + n.task_id]);
   function dismissNotice(key) {
+    // 本地先滤掉（即时消失），再调后端落盘；失败不吞，给人话反馈
     dismissedNotices = { ...dismissedNotices, [key]: true };
+    fetch(`/api/schedules/notice?id=${encodeURIComponent(key)}`, { method: 'DELETE' })
+      .then((r) => r.json())
+      .then((r) => {
+        if (r.error) schedMsg = `关掉失败：${r.error}`;
+      })
+      .catch((e) => {
+        schedMsg = `关掉失败：${e.message || e}`;
+      });
   }
   let schedMsg = '';
   // P27 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）

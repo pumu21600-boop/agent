@@ -158,6 +158,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         )
         .route("/api/schedules/run", post(run_schedule_now))
         .route("/api/schedules/cron-text", get(cron_text))
+        // P22-B 完成记录 × 掉一条（落盘；壳重启/弹窗重开都不复活）
+        .route("/api/schedules/notice", delete(dismiss_schedule_notice))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/new", post(new_session))

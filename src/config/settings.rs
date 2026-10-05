@@ -399,6 +399,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<crate::schedule::ScheduleTask>,
 
+    /// P22-B 完成记录里被用户 × 掉的通知 key（notice_key = ts+task_id）。
+    /// notices 缓冲本身重启即失，但桌面壳重启不重建 agent.exe 服务、设置弹窗每次重开
+    /// 都重建组件，× 不落盘就会「明明叉掉了又回来」（2026-10-05 用户实锤）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule_dismissed: Vec<String>,
+
     // —— 历史迁移源（仅在反序列化旧版 settings.json 时读入，序列化时不写出） ——
     #[serde(default, skip_serializing)]
     pub keys: BTreeMap<String, String>,

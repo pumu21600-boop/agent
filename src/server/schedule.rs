@@ -63,8 +63,20 @@ pub(super) async fn list_schedules(State(state): State<AppState>) -> Json<Value>
         .collect();
     Json(json!({
         "schedules": schedules,
-        "notices": schedule::notices(),
+        "notices": schedule::visible_notices(&state),
     }))
+}
+
+/// DELETE /api/schedules/notice?id=<notice_key> —— × 掉一条完成记录（落盘，
+/// 壳重启/弹窗重开都不复活）。id 是 notice_key（ts+task_id，界面每行一个 ×）。
+pub(super) async fn dismiss_schedule_notice(
+    State(state): State<AppState>,
+    Query(q): Query<ScheduleIdQuery>,
+) -> (StatusCode, Json<Value>) {
+    match schedule::dismiss_notice(&state, q.id.trim()) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
+    }
 }
 
 /// POST /api/schedules —— 新建（id 空）或修改（带 id）。校验不过返回人话错误。
