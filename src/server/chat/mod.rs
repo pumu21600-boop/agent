@@ -346,7 +346,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 ensure_attachments_ignored(&ws);
                 for att in &doc_attachments {
                     match persist_attachment(att, &ws) {
-                        Some(rel) => projections.push(att.document_notice(&rel)),
+                        Some(rel) => projections.push(att.document_intake_notice(&ws, &rel).await),
                         None => projections.push(format!(
                             "[📄 文档附件「{}」保存失败：附件内容解码异常，请用户重新发送该文件]",
                             att.name
@@ -586,25 +586,28 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     };
                     projections.push(substituted_text);
                 }
-
-                // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型
-                if !projections.is_empty()
-                    && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
-                        let orig = match &last_msg["content"] {
-                            Value::String(s) => s.clone(),
-                            Value::Array(arr) => {
-                                arr.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
-                            }
-                            _ => "".to_string(),
-                        };
-                        let combined = if orig.trim().is_empty() {
-                            projections.join("\n\n")
-                        } else {
-                            format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
-                        };
-                        last_msg["content"] = json!(combined);
-                    }
             }
+
+            // 5) 历史投影（projectMessages）：直接替换用户消息内容，媒体字节不传给会话模型。
+            // 文档附件与媒体转接共用同一份投影；注意这段必须在 forward 分支**外**——
+            // 原来嵌在分支里，纯文档消息（无转接附件）的收件通知从来没进过模型上下文
+            // （2026-10-06 真机实锤：模型收不到附件路径，靠 dir 翻目录才找到文件）。
+            if !projections.is_empty()
+                && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
+                    let orig = match &last_msg["content"] {
+                        Value::String(s) => s.clone(),
+                        Value::Array(arr) => {
+                            arr.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
+                        }
+                        _ => "".to_string(),
+                    };
+                    let combined = if orig.trim().is_empty() {
+                        projections.join("\n\n")
+                    } else {
+                        format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
+                    };
+                    last_msg["content"] = json!(combined);
+                }
         }
         // 请求级覆盖 + 角色/降级渠道组装（与无头会话同一路径；提示见 notices）
         let ch = assemble_turn_channels(&state, &s, &active_cfg, &req_model, &req_base_url, &req_api_key);
