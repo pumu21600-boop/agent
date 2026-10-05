@@ -45,12 +45,13 @@ function colToNum(col) {
   return n;
 }
 
-// 值类型推断：数字字面量→number；"=" 开头→公式；其余→文本
+// 值类型推断：数字字面量→number；"=" 开头→公式；其余→文本。
+// 注意：ExcelJS 不认 "=..." 字符串（会被当文本写坏，2026-10-06 实测），必须给 { formula } 对象。
 function coerceValue(v) {
   if (typeof v === 'number' || typeof v === 'boolean') return v;
   if (typeof v !== 'string') return v;
   const t = v.trim();
-  if (t.startsWith('=')) return t; // ExcelJS 写公式
+  if (t.startsWith('=')) return { formula: t.slice(1) };
   if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
   return v;
 }
@@ -116,8 +117,9 @@ async function runPatch(opsPath, inFile, outFile) {
       case 'setText':
       case 'formula': {
         const c = ws.getCell(op.cell);
-        c.value =
-          op.op === 'setText' ? String(op.value) : op.op === 'formula' ? String(op.value) : coerceValue(op.value);
+        const v = op.op === 'setText' ? String(op.value) : coerceValue(op.value);
+        // formula op 强制公式：值可带可不带 "="（coerceValue 已把 "=..." 转成 { formula }）
+        c.value = op.op === 'formula' && typeof v === 'string' ? { formula: v.replace(/^=/, '') } : v;
         if (op.style) applyStyle(c, op.style);
         break;
       }
@@ -202,6 +204,54 @@ function loadWorkbook(file) {
   return { XLSX, wb };
 }
 
+// 找不到就返回 null（不退出）——给「补全」这类非硬依赖用
+function softNeed(name) {
+  const bases = [
+    path.join(os.homedir(), '.agent', 'skill-modules', 'node_modules'),
+    path.join(__dirname, 'node_modules'),
+    path.join(process.cwd(), 'node_modules'),
+  ];
+  for (const b of bases) {
+    if (fs.existsSync(path.join(b, name))) return require(path.join(b, name));
+  }
+  return null;
+}
+
+// SheetJS 0.18.5 会把「无缓存值的公式单元格」整个读丢（程序写出的新公式、Excel 尚未自算
+// 的文件都这样，试遍读选项无解）。用 ExcelJS 补一遍：把 { formula } 单元格灌回网格并显示成
+// "=FORMULA"，否则 read 里公式看着像丢了、验收会误判。有缓存值的公式不受影响（照旧显示值）。
+async function fillUncachedFormulas(XLSX, wb, file) {
+  if (!/\.xlsx$/i.test(file)) return; // .xls/.ods 老格式 ExcelJS 打不开，跳过
+  const ExcelJS = softNeed('exceljs');
+  if (!ExcelJS) return;
+  try {
+    const ewb = new ExcelJS.Workbook();
+    await ewb.xlsx.readFile(file);
+    for (const ews of ewb.worksheets) {
+      const ws = wb.Sheets[ews.name];
+      if (!ws) continue;
+      ews.eachRow((row, rn) => {
+        row.eachCell({ includeEmpty: false }, (cell, cn) => {
+          const v = cell.value;
+          if (v && typeof v === 'object' && typeof v.formula === 'string') {
+            const ref = XLSX.utils.encode_cell({ r: rn - 1, c: cn - 1 });
+            const cur = ws[ref];
+            if (!cur || cur.v === undefined || cur.v === null) {
+              ws[ref] = { t: 'n', f: v.formula, v: '=' + v.formula };
+              const rng = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+              rng.e.r = Math.max(rng.e.r, rn - 1);
+              rng.e.c = Math.max(rng.e.c, cn - 1);
+              ws['!ref'] = XLSX.utils.encode_range(rng);
+            }
+          }
+        });
+      });
+    }
+  } catch {
+    /* 补全失败不致命：read 主体照旧（错误在别处会正常抛出） */
+  }
+}
+
 // 日期单元格统一转成人类可读字符串（序列号只对 Excel 有意义，模型看不懂 46027）
 function normalize(rows) {
   const iso = (d) => {
@@ -213,30 +263,38 @@ function normalize(rows) {
   return rows.map((r) => r.map((c) => (c instanceof Date ? iso(c) : c)));
 }
 
+async function runRead(file, sheetName, limitArg) {
+  const { XLSX, wb } = loadWorkbook(file);
+  await fillUncachedFormulas(XLSX, wb, file);
+  const limit = Math.min(Math.max(parseInt(limitArg || '200', 10) || 200, 1), 100000);
+  const names = wb.SheetNames;
+  if (!sheetName) {
+    console.log(`sheets: ${names.join(', ')}`);
+    for (const n of names) {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, blankrows: false });
+      console.log(`- ${n}: ${rows.length} rows x ${rows.reduce((m, r) => Math.max(m, r.length), 0)} cols`);
+    }
+    console.log('(use: read <file> <sheet> [limit] to dump a sheet as JSON)');
+    return;
+  }
+  if (!names.includes(sheetName)) {
+    console.error(`no such sheet "${sheetName}"; available: ${names.join(', ')}`);
+    process.exit(1);
+  }
+  const rows = normalize(
+    XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, blankrows: false }).slice(0, limit)
+  );
+  console.log(JSON.stringify({ sheet: sheetName, total_rows_limited_to: limit, rows }));
+}
+
 function main() {
   const [cmd, a, b, c] = process.argv.slice(2);
   if (cmd === 'read') {
     if (!a) usage();
-    const { XLSX, wb } = loadWorkbook(a);
-    const limit = Math.min(Math.max(parseInt(c || '200', 10) || 200, 1), 100000);
-    const names = wb.SheetNames;
-    if (!b) {
-      console.log(`sheets: ${names.join(', ')}`);
-      for (const n of names) {
-        const rows = XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, blankrows: false });
-        console.log(`- ${n}: ${rows.length} rows x ${rows.reduce((m, r) => Math.max(m, r.length), 0)} cols`);
-      }
-      console.log('(use: read <file> <sheet> [limit] to dump a sheet as JSON)');
-      return;
-    }
-    if (!names.includes(b)) {
-      console.error(`no such sheet "${b}"; available: ${names.join(', ')}`);
+    runRead(a, b, c).catch((e) => {
+      console.error(`FAIL: ${e.message}`);
       process.exit(1);
-    }
-    const rows = normalize(
-      XLSX.utils.sheet_to_json(wb.Sheets[b], { header: 1, blankrows: false }).slice(0, limit)
-    );
-    console.log(JSON.stringify({ sheet: b, total_rows_limited_to: limit, rows }));
+    });
   } else if (cmd === 'make') {
     if (!a || !b) usage();
     const XLSX = need('xlsx');
@@ -245,7 +303,16 @@ function main() {
     const wb = XLSX.utils.book_new();
     (spec.sheets || []).forEach((s, i) => {
       if (!Array.isArray(s.rows)) throw new Error(`sheets[${i}].rows must be a 2D array`);
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(s.rows), s.name || `Sheet${i + 1}`);
+      const ws = XLSX.utils.aoa_to_sheet(s.rows);
+      // SheetJS 会把 "=..." 字符串当文本写——补成真公式（对齐 SKILL 的 make 规格）
+      for (const addr of Object.keys(ws)) {
+        if (addr.startsWith('!')) continue;
+        const cell = ws[addr];
+        if (cell && cell.t === 's' && typeof cell.v === 'string' && cell.v.trim().startsWith('=')) {
+          ws[addr] = { t: 'n', f: cell.v.trim().slice(1) };
+        }
+      }
+      XLSX.utils.book_append_sheet(wb, ws, s.name || `Sheet${i + 1}`);
     });
     if (!wb.SheetNames.length) throw new Error('spec.sheets is empty, nothing to write');
     XLSX.writeFile(wb, b);
