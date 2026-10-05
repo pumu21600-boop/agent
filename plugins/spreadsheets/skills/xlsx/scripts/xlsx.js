@@ -1,11 +1,14 @@
 'use strict';
 /*
- * xlsx 技能 CLI —— 表格读写（SheetJS）。
+ * xlsx 技能 CLI —— 表格读写（SheetJS）+ 保真增量修改（ExcelJS）。
  * 用法：
  *   node xlsx.js read <in.xlsx|in.csv> [sheet名] [行数上限]
  *   node xlsx.js make <spec.json|-> <out.xlsx>
+ *   node xlsx.js patch <ops.json|-> <in.xlsx> <out.xlsx>
  *   node xlsx.js csv <in.csv> <out.xlsx>
  *   node xlsx.js tocsv <in.xlsx> [sheet名] <out.csv>
+ * patch = 改「已有文件」的正门：ExcelJS 载入原工作簿，按 ops 增量改，其余
+ * 样式/公式/合并单元格/列宽原样保留。默认交付 _updated 副本（out 自定）。
  * 依赖解析顺序：~/.agent/skill-modules → 本脚本目录 → 当前目录。
  */
 const fs = require('fs');
@@ -30,8 +33,167 @@ function need(name) {
 }
 
 function usage() {
-  console.error('usage: node xlsx.js read <in> [sheet] [limit] | make <spec.json|-> <out.xlsx> | csv <in.csv> <out.xlsx> | tocsv <in.xlsx> [sheet] <out.csv>');
+  console.error('usage: node xlsx.js read <in> [sheet] [limit] | make <spec.json|-> <out.xlsx> | patch <ops.json|-> <in.xlsx> <out.xlsx> | csv <in.csv> <out.xlsx> | tocsv <in.xlsx> [sheet] <out.csv>');
   process.exit(1);
+}
+
+// ---------------- patch：ExcelJS 保真增量改 ----------------
+
+function colToNum(col) {
+  let n = 0;
+  for (const ch of col.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n;
+}
+
+// 值类型推断：数字字面量→number；"=" 开头→公式；其余→文本
+function coerceValue(v) {
+  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  if (typeof v !== 'string') return v;
+  const t = v.trim();
+  if (t.startsWith('=')) return t; // ExcelJS 写公式
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  return v;
+}
+
+// setStyle 增量合并：ExcelJS 赋 cell.font= 会整体替换，先读旧样式再逐键合
+function padArgb(c) {
+  const s = String(c).replace('#', '');
+  return s.length === 6 ? `FF${s}` : s; // Excel 惯例：8 位 AARRGGBB
+}
+
+function applyStyle(cell, st) {
+  if (!st || typeof st !== 'object') return;
+  const font = {};
+  if (st.bold !== undefined) font.bold = !!st.bold;
+  if (st.italic !== undefined) font.italic = !!st.italic;
+  if (st.underline !== undefined) font.underline = !!st.underline;
+  if (st.fontSize !== undefined) font.size = st.fontSize;
+  if (st.fontName !== undefined) font.name = st.fontName;
+  if (st.color !== undefined) font.color = { argb: padArgb(st.color) };
+  if (Object.keys(font).length) {
+    const old = cell.font || {};
+    cell.font = Object.assign({}, old, font, {
+      color: font.color || old.color,
+      size: font.size || old.size,
+      name: font.name || old.name,
+    });
+  }
+  if (st.bg !== undefined) {
+    const argb = padArgb(st.bg);
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+  }
+  const align = {};
+  if (st.align !== undefined) align.horizontal = st.align; // left|center|right
+  if (st.valign !== undefined) align.vertical = st.valign; // top|middle|bottom
+  if (st.wrap !== undefined) align.wrapText = !!st.wrap;
+  if (Object.keys(align).length) {
+    const old = cell.alignment || {};
+    cell.alignment = Object.assign({}, old, align);
+  }
+  if (st.numFmt !== undefined) cell.numFmt = st.numFmt; // 如 '0.00%' 'yyyy-mm-dd'
+  if (st.border !== undefined) cell.border = st.border; // 高级用法：直接传 ExcelJS border 对象
+}
+
+async function runPatch(opsPath, inFile, outFile) {
+  const ExcelJS = need('exceljs');
+  const specText = opsPath === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(opsPath, 'utf8');
+  const spec = JSON.parse(specText);
+  if (!Array.isArray(spec.ops) || !spec.ops.length) throw new Error('ops 为空：spec 须为 {"ops":[...]}');
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(inFile);
+
+  const wsOf = (name) => {
+    const ws = wb.getWorksheet(name);
+    if (!ws) throw new Error(`no such sheet "${name}"; available: ${wb.worksheets.map((w) => w.name).join(', ')}`);
+    return ws;
+  };
+
+  let n = 0;
+  for (const op of spec.ops) {
+    const ws = op.op === 'addSheet' || op.op === 'delSheet' ? null : wsOf(op.sheet);
+    switch (op.op) {
+      case 'set':
+      case 'setText':
+      case 'formula': {
+        const c = ws.getCell(op.cell);
+        c.value =
+          op.op === 'setText' ? String(op.value) : op.op === 'formula' ? String(op.value) : coerceValue(op.value);
+        if (op.style) applyStyle(c, op.style);
+        break;
+      }
+      case 'addRow':
+        ws.insertRow(Number(op.at), (op.values || []).map(coerceValue), 'i+');
+        break;
+      case 'delRow':
+        // ExcelJS splice 系列是 1-based（at=7 删第 7 行）
+        ws.spliceRows(Number(op.at), 1);
+        break;
+      case 'addCol': {
+        // col=「插在第 col 列之前」（1-based）；undefined 填充保列存在、原列连带右移
+        const col = Math.max(1, colToNum(op.col || ''));
+        const fill = Array.from({ length: ws.rowCount }, () => undefined);
+        ws.spliceColumns(col, 0, fill);
+        if (op.header !== undefined && op.header !== null) ws.getCell(1, col).value = op.header;
+        (op.values || []).forEach((v, i) => {
+          if (v !== null && v !== undefined) ws.getCell(2 + i, col).value = coerceValue(v);
+        });
+        break;
+      }
+      case 'delCol':
+        ws.spliceColumns(colToNum(op.col), 1);
+        break;
+      case 'setStyle':
+        if (op.range) {
+          const [from, to] = op.range.split(':');
+          const top = ws.getCell(from), bottom = ws.getCell(to);
+          for (let r = top.row; r <= bottom.row; r++) {
+            for (let c = top.col; c <= bottom.col; c++) applyStyle(ws.getCell(r, c), op.style);
+          }
+        } else {
+          applyStyle(ws.getCell(op.cell), op.style);
+        }
+        break;
+      case 'merge':
+        ws.mergeCells(op.range);
+        break;
+      case 'unmerge':
+        ws.unMergeCells(op.range);
+        break;
+      case 'colWidth':
+        ws.getColumn(colToNum(op.col)).width = Number(op.width);
+        break;
+      case 'addSheet': {
+        const name = op.sheet;
+        if (wb.getWorksheet(name)) throw new Error(`sheet "${name}" 已存在`);
+        const nws = wb.addWorksheet(name);
+        (op.rows || []).forEach((row) => {
+          const r = nws.addRow(row.map(coerceValue));
+          if (op.headerStyle) applyStyle(r.getCell(1), op.headerStyle);
+        });
+        break;
+      }
+      case 'delSheet': {
+        // removeWorksheet 只认 id/名字，传实例会静默不删（getWorksheet(实例) 查不到）
+        const target = wb.getWorksheet(op.sheet);
+        if (!target) throw new Error(`no such sheet "${op.sheet}"; available: ${wb.worksheets.map((w) => w.name).join(', ')}`);
+        wb.removeWorksheet(target.name);
+        break;
+      }
+      case 'renameSheet':
+        if (wb.getWorksheet(op.to)) throw new Error(`目标表名 "${op.to}" 已存在`);
+        wsOf(op.sheet).name = op.to;
+        break;
+      default:
+        throw new Error(`未知 op "${op.op}"（受支持：set/setText/formula/addRow/delRow/addCol/delCol/setStyle/merge/unmerge/colWidth/addSheet/delSheet/renameSheet）`);
+    }
+    n++;
+  }
+
+  await wb.xlsx.writeFile(outFile);
+  const summary = wb.worksheets
+    .map((w) => `${w.name}(${w.rowCount}x${w.columnCount})`)
+    .join(', ');
+  console.log(`OK patch ${outFile} (${n} ops; sheets: ${summary})`);
 }
 
 function loadWorkbook(file) {
@@ -88,6 +250,12 @@ function main() {
     if (!wb.SheetNames.length) throw new Error('spec.sheets is empty, nothing to write');
     XLSX.writeFile(wb, b);
     console.log(`OK make ${b} (sheets: ${wb.SheetNames.join(', ')})`);
+  } else if (cmd === 'patch') {
+    if (!a || !b || !c) usage();
+    runPatch(a, b, c).catch((e) => {
+      console.error(`FAIL: ${e.message}`);
+      process.exit(1);
+    });
   } else if (cmd === 'csv') {
     if (!a || !b) usage();
     const XLSX = need('xlsx');

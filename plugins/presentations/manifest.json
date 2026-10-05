@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "演示文稿",
-  "description": "演示文稿（pptx）生成与逐页读取",
+  "description": "演示文稿（pptx）生成、逐页读取与保真增量改（替换/删页/移页/复制页）",
   "version": "0.1.0",
   "skills": "skills"
 }

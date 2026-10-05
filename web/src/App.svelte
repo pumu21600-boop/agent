@@ -5129,7 +5129,14 @@
                 {/each}
               {/if}
               {#if m.content}
-                <div class="content">{@html md(m.content)}</div>
+                <!-- doc-cite：agent 回复里 /api/workspace/... 的文件引用，点击落到右侧预览标签 -->
+                <div class="content" on:click={(e) => {
+                  const a = e.target instanceof HTMLElement ? e.target.closest('a.doc-cite') : null;
+                  if (!a) return;
+                  e.preventDefault();
+                  const p = new URL(a.href, location.origin).searchParams.get('path');
+                  if (p) openPreviewTab(p);
+                }}>{@html md(m.content)}</div>
               {:else if m.streaming}
                 <div class="typing"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>
               {/if}
@@ -5369,13 +5376,13 @@
               type="file"
               bind:this={fileInput}
               multiple
-              accept="image/*,video/*,audio/*"
+              accept="image/*,video/*,audio/*,.docx,.xlsx,.pptx,.pdf,.doc,.xls,.ppt,.csv,.rtf,.odt,.ods,.odp"
               style="display:none"
               on:change={onFileSelect}
             />
             <button
               class="icon-btn"
-              title="添加多模态媒体附件（图片/视频/音频）"
+              title="添加附件（图片/视频/音频/Office 文档）"
               on:click={() => fileInput && fileInput.click()}
             >
               <svg class="att-ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 12.5 6.5-6.5a2.8 2.8 0 0 1 4 4L9 19.5a4.5 4.5 0 0 1-6.4-6.4l8.5-8.5"/></svg>

@@ -288,8 +288,16 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             let roles = if s.features.roles { s.roles.as_ref() } else { None };
             let mut native_attachments: Vec<&MediaAttachment> = Vec::new();
             let mut forward_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut doc_attachments: Vec<&MediaAttachment> = Vec::new();
+            let mut projections: Vec<String> = Vec::new();
 
             for att in &attachments {
+                // P27+ 文档流水线：Office/PDF 类附件不做多模态内联（视觉模型解析不了
+                // 二进制文档），一律落盘工作区 + 文本通知，交给文档处理技能
+                if att.is_document() {
+                    doc_attachments.push(att);
+                    continue;
+                }
                 let is_vid = att.is_video();
                 let is_aud = att.is_audio();
                 let is_img = att.is_image();
@@ -331,9 +339,24 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     last_msg["content"] = json!(parts);
                 }
 
+            // 0. 文档类附件：落盘工作区 .attachments/ + 注入文档清单通知（与多模态流水线完全隔离）
+            if !doc_attachments.is_empty() {
+                let ws = crate::tools::workspace_root();
+                let _ = std::fs::create_dir_all(ws.join(".attachments"));
+                ensure_attachments_ignored(&ws);
+                for att in &doc_attachments {
+                    match persist_attachment(att, &ws) {
+                        Some(rel) => projections.push(att.document_notice(&rel)),
+                        None => projections.push(format!(
+                            "[📄 文档附件「{}」保存失败：附件内容解码异常，请用户重新发送该文件]",
+                            att.name
+                        )),
+                    }
+                }
+            }
+
             // 2. 对于主模型不支持的媒体类型，走专职转接与确定性文本投影（对齐 DSH media-understanding 规范）
             if !forward_attachments.is_empty() {
-                let mut projections = Vec::new();
 
                 for att in forward_attachments {
                     let is_vid = att.is_video();
@@ -343,26 +366,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     let success_label = if is_vid { "Video understanding" } else if is_aud { "Audio understanding" } else { "Image understanding" };
 
                     // 持久化附件到工作区 .attachments/ 便于主模型与工具查阅
-                    let ws = crate::tools::workspace_root();
-                    let att_dir = ws.join(".attachments");
-                    let _ = std::fs::create_dir_all(&att_dir);
                     // A5：附件目录自动进工作区 git 排除（幂等，只追加）
-                    ensure_attachments_ignored(&ws);
-                    let safe_name = std::path::Path::new(&att.name)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("attachment");
-                    let target_file = att_dir.join(safe_name);
-                    use base64::Engine;
-                    let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
-                    let unpadded = clean.trim_end_matches('=');
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(&clean)
-                        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
-                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded));
-                    if let Ok(bytes) = decoded {
-                        let _ = std::fs::write(&target_file, bytes);
-                    }
+                    let safe_name = persist_attachment(att, &crate::tools::workspace_root())
+                        .unwrap_or_else(|| "attachment".to_string());
 
                     // 1) 专属路由解析（对齐 DSH）：严格隔离，仅使用用户在 roles 中针对该模态显式配置的渠道，严禁自动跨渠道降级
                     let role_target = if is_vid {
@@ -964,4 +970,51 @@ mod tests {
         assert_eq!(resolve_key(&s, &c), "sk-dpapi");
         unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     }
+}
+
+/// 落盘附件到工作区 `.attachments/`（目录自动进 git 排除），返回最终文件名。
+/// 同名附件不互相覆盖：追加 `_2`/`_3` 后缀（同轮发两份「报表.xlsx」是常见场景）。
+fn persist_attachment(att: &MediaAttachment, ws: &std::path::Path) -> Option<String> {
+    let att_dir = ws.join(".attachments");
+    std::fs::create_dir_all(&att_dir).ok()?;
+    ensure_attachments_ignored(ws);
+    let safe_name = std::path::Path::new(&att.name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("attachment")
+        .to_string();
+    let stem = std::path::Path::new(&safe_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let ext = std::path::Path::new(&safe_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_string());
+    let mut target = att_dir.join(&safe_name);
+    if target.exists() {
+        for i in 2..100 {
+            let cand = match &ext {
+                Some(e) => att_dir.join(format!("{stem}_{i}.{e}")),
+                None => att_dir.join(format!("{stem}_{i}")),
+            };
+            if !cand.exists() {
+                target = cand;
+                break;
+            }
+        }
+    }
+    let final_name = target.file_name().and_then(|n| n.to_str())?.to_string();
+    use base64::Engine;
+    let clean = att.raw_base64().trim().replace(['\r', '\n', ' '], "");
+    let unpadded = clean.trim_end_matches('=');
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&clean)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(unpadded))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
+        .ok()?;
+    std::fs::write(&target, decoded).ok()?;
+    Some(final_name)
 }

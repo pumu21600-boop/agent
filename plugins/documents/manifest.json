@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "Word 文档",
-  "description": "Word 文档（docx）生成与读取",
+  "description": "Word 文档（docx）生成、读取与保真增量改",
   "version": "0.1.0",
   "skills": "skills"
 }

@@ -874,6 +874,6 @@ mod tests {
         for t in ["Git", "星云", "沙箱", "断线取消", "功能桥接", "Word 文档", "表格", "时间线", "用量"] {
             assert!(idx.contains(&format!("- /{t}: ")), "内置插件 {t} 没进索引: {idx}");
         }
-        assert!(idx.contains("- /Word 文档: Word 文档（docx）生成与读取（自带技能：docx）"), "带技能的插件要注明技能名: {idx}");
+        assert!(idx.contains("- /Word 文档: Word 文档（docx）生成、读取与保真增量改（自带技能：docx）"), "带技能的插件要注明技能名: {idx}");
     }
 }

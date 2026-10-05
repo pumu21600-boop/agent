@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "表格",
-  "description": "表格（xlsx/csv）读写与互转",
+  "description": "表格（xlsx/csv）新建、保真增量改（patch）与互转",
   "version": "0.1.0",
   "skills": "skills"
 }

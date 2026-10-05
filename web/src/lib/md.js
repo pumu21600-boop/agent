@@ -37,10 +37,12 @@ export function md(src) {
   t = t
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?=[^*\w]|$)/g, '$1<em>$2</em>');
-  // 7) 链接：只放行 http/https；javascript: 等协议整串当纯文本
-  t = t.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) =>
-    /^https?:\/\//i.test(url) ? `<a class="md-a" href="${url}" target="_blank" rel="noreferrer">${text}</a>` : text
-  );
+  // 7) 链接：放行 http/https（外链）与 /api/workspace/（站内预览，宿主拦截跳预览标签）
+  t = t.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+    if (/^https?:\/\//i.test(url)) return `<a class="md-a" href="${url}" target="_blank" rel="noreferrer">${text}</a>`;
+    if (url.startsWith('/api/workspace/')) return `<a class="md-a doc-cite" href="${url}">${text}</a>`;
+    return text;
+  });
   // 8) 列表（- / * / + 与 1. 两种；连续行整组成 ul/ol）
   t = t.replace(/(?:^[ \t]*[-*+]\s+.+\n?)+/gm, (block) => {
     const items = block.trimEnd().split('\n').map((l) => `<li>${l.replace(/^[ \t]*[-*+]\s+/, '')}</li>`).join('');

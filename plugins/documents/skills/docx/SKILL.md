@@ -11,7 +11,7 @@ description: 创建与「原地」修改 .docx：nodes 读出为可编辑 spec�
 2. **只用本技能自带 `scripts/docx.js`，不许自己另写生成脚本、不许装其他 docx 库**。自造脚本会丢字体/结构语义，是「改完不对版」的头号原因。
 3. **「改」已有文档 = nodes 读出 → 改 spec → make 输出到原同一路径覆盖**。这就是用户视角的原地改：不新建 `xxx2.docx`、不留中间文件（除非用户明确要求保留）。
 4. **不许用 subagent_spawn 验证**——本技能的 `fonts`/`read` 就是验证工具。**本机没有 Python**，任何「用 python-pptx/Python 脚本处理」的想法都是错的，直接走本脚本。
-5. 改完必须回读验证：动了字体就跑 `fonts`，动了内容就跑 `read`，把验证结果报告给用户再收尾。
+5. 改完必须回读验证：动了字体就跑 `fonts`，动了内容就跑 `read`；**最稳妥是两条都跑再加 `check.js`**（下方 1.5 节），check 有 FAIL 就不许收尾。
 6. 依赖缺失时只允许跑页尾的安装命令装到 `~/.agent/skill-modules`；装不上就停下来如实报告，不要降级凑合。
 
 ## 0. 环境检测（任务第一步，不跳过）
@@ -32,15 +32,56 @@ node "<技能目录>\scripts\docx.js" fonts <文件.docx>     # 核验：全篇 
 ```
 
 - 只改字体槽位，版式/字号/加粗/表格**原样不动**；要标题另用一种字体：`setfont <文件> 正文体 标题体`。
-- 改内容/加章节才走下面的 nodes→make 流程。
+- 改内容/加章节才走下面的流程。
 
-## 1. 工作流（创建 或 原地改内容，都走这 5 步）
+## 0.6 微创 patch：只改目标文字/段落（改已有文档的正门）
+
+「把第三段加粗」「把某某改成某某」「删掉某段」「加一段」——**优先走 patch 微创**，别 text→spec→make 全篇重建（重建会丢原文档的部分语义）：
+
+```
+node "<技能目录>\scripts\docx.js" patch <ops.json|-> <in.docx> <out.docx>
+```
+
+ops 规格：
+
+```json
+{
+  "tracked": false,
+  "ops": [
+    { "op": "replaceText", "find": "2024 年 3 月", "replace": "2025 年 10 月" },
+    { "op": "styleRun", "find": "营收超额完成", "style": { "bold": true, "color": "#FF0000" } },
+    { "op": "insertAfter", "find": "历时", "text": "（新增：第二阶段同步启动。）" },
+    { "op": "deletePara", "find": "本段将被删除" },
+    { "op": "setParaAlign", "find": "项目总结", "align": "center" }
+  ]
+}
+```
+
+- `replaceText` 在段落内替换；文本被拆进多个 run 的整句替换会合并为首 run 承载（run 间样式差异统一为首 run 样式）。
+- `styleRun`：bold/italic/underline/color/highlight/size(pt) 只加不删，保留原 rPr 其他属性；可多次对不同文本用。
+- `insertAfter` 在含 find 的段落后插入新段（继承该段首个 run 的样式）；`deletePara` 删整个段落。
+- `setParaAlign`：center/right/left/justify。
+- **`"tracked": true` = 红修订模式**：旧文本包 `w:del`、新文本包 `w:ins`（author=agent），用户在 Word 里看到修订痕迹，可逐条接受/拒绝。客户文档、审阅场景默认用它。
+- 查找不到会打 WARN 或直接报错，按报错核对 find 串；**find 在页眉页脚/文本框里的文本 patch 不动**（只动 document.xml 正文）。
+- **默认交付 `<原名>_updated.docx` 副本**；用户明说「原地改/覆盖」才 out 写原路径。
+- 改完 `read <输出.docx>` 回读验证。
+
+### 1.5 收尾验收（改完必跑，不过不收尾）
+
+```
+node "<技能目录>\scripts\check.js" <输出.docx> --expect "新文本" --not "旧文本"
+```
+
+- `--expect`/`--not` 按 ops 改了什么传什么（可多次）；`--render` 可选——有 LibreOffice 时额外做 soffice→PDF 渲染冒烟，没有就自动跳过（输出会标 render(skip)）。
+- check 报 FAIL = 文件结构坏/该改的没改/不该动的动了：回滚输出、修 ops 重做，**不要向用户报告「已完成」**。
+
+## 1. 工作流（创建 或 改内容）
 
 1. `read_skill("docx")`（已做，注意返回头部的绝对技能目录与资产清单）
 2. **有原文件先 `nodes <原文件>`** 读成 spec JSON（含字体/层级/表格）；只想看内容用 `read`
-3. 写/改 spec 为工作区内一个 `.json`（临时文件改完即删）
-4. `node "<技能目录>\scripts\docx.js" make <spec.json> <输出.docx>`
-   ——原地改时输出路径就是原文件路径
+3. 按改动性质选路线：**换字体→setfont；只改文字/段落/样式→patch 微创；整篇重写/大改结构→改 spec → make**
+4. `node "<技能目录>\scripts\docx.js" make <spec.json> <输出.docx>` 或 patch 的输出路径
+   ——原地改时输出路径就是原文件路径（默认 _updated 副本，用户明说才覆盖）
 5. `node "<技能目录>\scripts\docx.js" fonts <输出.docx>` + `read <输出.docx>` 验证并汇报
 
 ## 2. spec 格式
@@ -70,6 +111,8 @@ node "<技能目录>\scripts\docx.js" fonts <文件.docx>     # 核验：全篇 
 | --- | --- |
 | `nodes <in.docx>` | 读出可编辑 spec（字体/结构/表格都在） |
 | `make <spec.json\|-> <out.docx>` | 生成/覆盖 docx |
+| `patch <ops.json\|-> <in.docx> <out.docx>` | 微创增量改（替换/样式/增删段/对齐，可红修订） |
+| `setfont <in.docx> <字体> [标题字体]` | 原位换字体（字槽手术） |
 | `read <in.docx>` | HTML 结构视图（结构/表格全景） |
 | `fonts <in.docx>` | 逐字体 run 计数核验（换字体后必跑） |
 

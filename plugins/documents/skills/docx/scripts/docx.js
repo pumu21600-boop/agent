@@ -31,7 +31,7 @@ function need(name) {
 }
 
 function usage() {
-  console.error('usage: node docx.js setfont <in.docx> <font> [headingFont] | nodes <in.docx> | read <in.docx> | fonts <in.docx> | make <spec.json|-> <out.docx>');
+  console.error('usage: node docx.js setfont <in.docx> <font> [headingFont] | nodes <in.docx> | read <in.docx> | fonts <in.docx> | make <spec.json|-> <out.docx> | patch <ops.json|-> <in.docx> <out.docx>');
   process.exit(1);
 }
 
@@ -304,6 +304,158 @@ async function setFont(file, font, headingFont) {
   console.log(`OK setfont ${file} (body=${font}${headingFont ? `, heading=${headingFont}` : ''}, eastAsia replaced: ${east})`);
 }
 
+// —— patch：OOXML 微创手术（只动目标 run/段落，版式/图片/表格结构不动） ——
+// 与「nodes→改 spec→make 全篇重建」互补：微创保真，重建改结构。
+function jcVal(a) {
+  return { center: 'center', right: 'right', both: 'both', justify: 'both', left: 'left' }[a] || 'left';
+}
+
+// 段落 XML 里按 find 替换文本：返回 {xml, count}。段内文本常被拆多个 run，
+// 合并替换后首 run 承载全段新文本、其余 run 的 w:t 清空（保 run 属性=首 run）。
+function replaceInParagraph(p, find, replace) {
+  let count = 0;
+  let p2 = p.replace(/<w:t(?:\s[^>]*)?>[\s\S]*?<\/w:t>/g, (m) => {
+    const inner = m.replace(/^<w:t(?:\s[^>]*)?>/, '').replace(/<\/w:t>$/, '');
+    const t = decode(inner);
+    if (!t.includes(find)) return m;
+    const next = t.split(find).join(replace);
+    count += t.split(find).length - 1;
+    return `<w:t xml:space="preserve">${escapeXml(next)}</w:t>`;
+  });
+  if (count > 0) return { xml: p2, count };
+  // 跨 run：拼接段内全部 w:t 做段级替换
+  const texts = [...p.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)];
+  if (!texts.length) return { xml: p, count: 0 };
+  const concat = texts.map((m) => decode(m[1])).join('');
+  if (!concat.includes(find)) return { xml: p, count: 0 };
+  const nextConcat = concat.split(find).join(replace);
+  count = concat.split(find).length - 1;
+  let first = true;
+  p2 = p.replace(/<w:t(?:\s[^>]*)?>[\s\S]*?<\/w:t>/g, () => {
+    if (first) {
+      first = false;
+      return `<w:t xml:space="preserve">${escapeXml(nextConcat)}</w:t>`;
+    }
+    return '<w:t xml:space="preserve"></w:t>';
+  });
+  return { xml: p2, count };
+}
+
+// 红修订包裹：旧段全部 w:t → w:delText 包进 w:del，新文本 w:ins 插段首
+function toTracked(p, find, replace, seq) {
+  const texts = [...p.matchAll(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g)];
+  if (!texts.length) return { xml: p, count: 0 };
+  const concat = texts.map((m) => decode(m[1])).join('');
+  if (!concat.includes(find)) return { xml: p, count: 0 };
+  const count = concat.split(find).length - 1;
+  const date = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+  const attrs = (p.match(/^<w:p(\b[^>]*)>/) || ['', ''])[1];
+  const body = p.replace(/^<w:p\b[^>]*>/, '').replace(/<\/w:p>$/, '');
+  const delBody = body.replace(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g, (_m, t) => `<w:delText xml:space="preserve">${t}</w:delText>`);
+  const nextText = concat.split(find).join(replace);
+  return {
+    xml: `<w:p${attrs}><w:ins w:id="${seq.i++}" w:author="agent" w:date="${date}"><w:r><w:t xml:space="preserve">${escapeXml(nextText)}</w:t></w:r></w:ins><w:del w:id="${seq.i++}" w:author="agent" w:date="${date}">${delBody}</w:del></w:p>`,
+    count,
+  };
+}
+
+function escapeXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// 给含 find 的 run 增强 rPr（保留原属性，只动指定槽位）
+function styleRunsInPara(p, find, st) {
+  const rPrAdd = [];
+  if (st.bold !== undefined) rPrAdd.push(st.bold ? '<w:b/>' : '<w:b w:val="0"/>');
+  if (st.italic !== undefined) rPrAdd.push(st.italic ? '<w:i/>' : '<w:i w:val="0"/>');
+  if (st.underline !== undefined) rPrAdd.push(st.underline ? '<w:u w:val="single"/>' : '<w:u w:val="none"/>');
+  if (st.color) rPrAdd.push(`<w:color w:val="${st.color.replace('#', '')}"/>`);
+  if (st.highlight) rPrAdd.push(`<w:highlight w:val="${st.highlight}"/>`);
+  if (st.size) rPrAdd.push(`<w:sz w:val="${Math.round(st.size * 2)}"/>`); // pt → half-point
+  if (!rPrAdd.length) return p;
+  return p.replace(/<w:r>([\s\S]*?)<\/w:r>/g, (run) => {
+    const t = (run.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/) || [null, ''])[1];
+    if (!decode(t).includes(find)) return run;
+    if (/<w:rPr>[\s\S]*?<\/w:rPr>/.test(run)) {
+      return run.replace(/<w:rPr>/, `<w:rPr>${rPrAdd.join('')}`);
+    }
+    return run.replace(/<w:r>/, `<w:r><w:rPr>${rPrAdd.join('')}</w:rPr>`);
+  });
+}
+
+async function runPatch(opsPath, inFile, outFile) {
+  const JSZip = need('jszip');
+  const specText = opsPath === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(opsPath, 'utf8');
+  const spec = JSON.parse(specText);
+  if (!Array.isArray(spec.ops) || !spec.ops.length) throw new Error('ops 为空：spec 须为 {"ops":[...]}');
+  const zip = await JSZip.loadAsync(fs.readFileSync(inFile));
+  if (!zip.file('word/document.xml')) throw new Error('word/document.xml 缺失：不是有效 docx');
+  let xml = await zip.file('word/document.xml').async('string');
+  const paraRe = /<w:p\b[^>]*>[\s\S]*?<\/w:p>/g;
+  const seq = { i: 1000 };
+  let stats = { replace: 0, delPara: 0, insert: 0, style: 0 };
+
+  for (const op of spec.ops) {
+    if (op.op === 'replaceText') {
+      if (!op.find || String(op.find) === '') throw new Error('replaceText 需要非空 find');
+      xml = xml.replace(paraRe, (p) => {
+        const r = spec.tracked ? toTracked(p, String(op.find), String(op.replace), seq) : replaceInParagraph(p, String(op.find), String(op.replace));
+        stats.replace += r.count;
+        return r.xml;
+      });
+    } else if (op.op === 'styleRun') {
+      if (!op.find) throw new Error('styleRun 需要 find');
+      xml = xml.replace(paraRe, (p) => {
+        const next = styleRunsInPara(p, String(op.find), op.style || {});
+        if (next !== p) stats.style++;
+        return next;
+      });
+    } else if (op.op === 'insertAfter') {
+      if (!op.find) throw new Error('insertAfter 需要 find（锚定段落）');
+      if (op.text === undefined) throw new Error('insertAfter 需要 text（新段落内容）');
+      let done = 0;
+      xml = xml.replace(paraRe, (p) => {
+        if (done || !decode((p.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/) || [null, ''])[1]).includes(String(op.find)))
+          return p;
+        done++;
+        const rPr = (p.match(/<w:rPr>[\s\S]*?<\/w:rPr>/) || [''])[0]; // 新段继承锚点段首个 run 的样式
+        const newP = `<w:p><w:r>${rPr}<w:t xml:space="preserve">${escapeXml(op.text)}</w:t></w:r></w:p>`;
+        return p + newP;
+      });
+      if (!done) throw new Error(`insertAfter 找不到锚点段落（find=${op.find}）`);
+      stats.insert += done;
+    } else if (op.op === 'deletePara') {
+      if (!op.find) throw new Error('deletePara 需要 find');
+      xml = xml.replace(paraRe, (p) => {
+        const t = decode((p.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/) || [null, ''])[1]);
+        if (!t.includes(String(op.find))) return p;
+        stats.delPara++;
+        return '';
+      });
+    } else if (op.op === 'setParaAlign') {
+      if (!op.find) throw new Error('setParaAlign 需要 find');
+      const jc = `<w:jc w:val="${jcVal(op.align)}"/>`;
+      xml = xml.replace(paraRe, (p) => {
+        if (!decode((p.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/) || [null, ''])[1]).includes(String(op.find))) return p;
+        const stripped = p.replace(/<w:jc w:val="[^"]*"\/>/, '');
+        if (/<w:pPr>/.test(stripped)) return stripped.replace(/<w:pPr>/, `<w:pPr>${jc}`);
+        // 无 pPr：pPr 必须是段的第一个子元素
+        return stripped.replace(/^(<w:p\b[^>]*>)/, `$1<w:pPr>${jc}</w:pPr>`);
+      });
+    } else {
+      throw new Error(`未知 op "${op.op}"（受支持：replaceText/styleRun/insertAfter/deletePara/setParaAlign）`);
+    }
+  }
+
+  if (stats.replace === 0 && spec.ops.some((o) => o.op === 'replaceText')) {
+    console.error('WARN: 没有任何段落命中 find——document.xml 里找不到该文本，检查 find 串');
+  }
+  zip.file('word/document.xml', xml);
+  const buf = await zip.generateAsync({ type: 'nodebuffer' });
+  fs.writeFileSync(outFile, buf);
+  console.log(`OK patch ${outFile} (replace x${stats.replace}, styleRuns x${stats.style}, insert x${stats.insert}, delPara x${stats.delPara}${spec.tracked ? ', TRACKED' : ''}; ${buf.length} bytes)`);
+}
+
 async function main() {
   const [cmd, a, b, c] = process.argv.slice(2);
   if (cmd === 'make') {
@@ -327,6 +479,12 @@ async function main() {
     if (r.messages && r.messages.length) {
       console.error(`note: ${r.messages.length} conversion warnings; first: ${r.messages[0].message}`);
     }
+  } else if (cmd === 'patch') {
+    if (!a || !b || !c) {
+      console.error('usage: node docx.js patch <ops.json|-> <in.docx> <out.docx>');
+      process.exit(1);
+    }
+    await runPatch(a, b, c);
   } else if (cmd === 'fonts') {
     if (!a) usage();
     await fontsOf(a);
