@@ -250,6 +250,7 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
 /// - action=config：渠道配置新建/删除（受闸；删除高危必问）
 /// - action=mcp：MCP server 重连（受闸）
 /// - action=workspace：切换工作区（受闸 + 红线必问——改自己的文件边界）
+/// - action=alias：设置/清除工作区别名（侧栏显示名；受闸，Normal）
 /// - action=schedule_run：立即触发一条定时任务（受闸；真花钱，高危必问）
 /// - action=memory：记忆库重建索引（受闸）
 pub(crate) async fn run(args: &str) -> Result<String, String> {
@@ -307,6 +308,11 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
         "workspace" => {
             super::selfmod_gate()?;
             switch_workspace(&v).await
+        }
+        // 工作区别名（侧栏「重命名项目」）：只改显示名，不动目录、不动文件边界
+        "alias" => {
+            super::selfmod_gate()?;
+            set_workspace_alias(&v)
         }
         "schedule_run" => {
             super::selfmod_gate()?;
@@ -380,6 +386,29 @@ async fn mcp_refresh(v: &Value) -> Result<String, String> {
     match n {
         Ok(count) => Ok(format!("已重连并重新发现，找到 {count} 个工具")),
         Err(e) => Err(format!("重连失败: {e}")),
+    }
+}
+
+/// action=alias：给工作区起侧栏显示名（不碰目录本身，所以与 action=workspace 的
+/// 「改自己的文件边界」分级不同——这是可逆的展示层改动，Normal 按审批档位走）。
+/// path 省略 = 当前工作区；name 留空 = 清除别名回落目录名。与侧栏「重命名项目」
+/// 同一条落盘路（server::workspace::set_workspace_alias），改完界面即时刷新。
+fn set_workspace_alias(v: &Value) -> Result<String, String> {
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::tools::workspace_root().display().to_string());
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let state = crate::server::shared_state().ok_or("工作区子系统尚未初始化")?;
+    crate::server::workspace::set_workspace_alias(&state, &path, &name)?;
+    if name.is_empty() {
+        Ok(format!("已清除 {path} 的别名（侧栏恢复显示文件夹名）"))
+    } else {
+        Ok(format!(
+            "已把 {path} 的侧栏显示名改成「{name}」（只改显示名，目录没动；开着的界面已即时刷新）"
+        ))
     }
 }
 
@@ -557,6 +586,10 @@ fn snapshot_json(s: &settings::Settings) -> String {
         })).collect::<Vec<Value>>(),
         "disabled_plugins": s.disabled_plugins,
         "disabled_skills": s.disabled_skills,
+        // 工作区别名现状（只读可见）：模型要「把项目名改成 X」时先看这里有没有旧别名、
+        // 键长什么样（规范化绝对路径），别凭猜写 path 落个对不上的空别名
+        "workspace": crate::tools::workspace_root().display().to_string(),
+        "workspace_aliases": s.workspace_aliases,
         // 可选名单：停用名单是整表替换，模型得知道有哪些合法 id（id + 中文标题）
         "available_plugins": crate::plugin::ui::scan_all(&[])
             .iter()
@@ -566,7 +599,7 @@ fn snapshot_json(s: &settings::Settings) -> String {
         "available_skills": crate::skills::list().iter().map(|k| k.name.clone()).collect::<Vec<String>>(),
         "schedules": s.schedules,
         "red_line_keys": crate::config::settings_schema::red_line_paths(),
-        "out_of_scope": "api_key/工作区/价格表/信任插件不可经本工具修改；config.toml（花费上限/审批默认档/钩子）改文件且需重启，写前必经用户确认",
+        "out_of_scope": "api_key/价格表/信任插件不可经本工具修改；工作区目录切换走 action=workspace、显示名走 action=alias；config.toml（花费上限/审批默认档/钩子）改文件且需重启，写前必经用户确认",
     })
     .to_string()
 }

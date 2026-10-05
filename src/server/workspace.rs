@@ -352,6 +352,9 @@ pub(crate) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Resu
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    // 开着的界面即时跟上：工作区/最近列表/项目名全来自 settings（前端 loadSettings 才有），
+    // agent 经 settings 工具 action=workspace 切时不推这条，界面要重启才认新工作区。
+    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["workspace"] }));
     observability::event(
         EventType::State,
         json!({ "kind": "workspace.switched", "from": old.display().to_string(), "to": cur }),
@@ -443,6 +446,41 @@ pub(super) async fn remove_workspace(
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
 }
 
+/// 别名写入的纯部分（测试直达，不碰 save/广播）：路径先规范化再进表——侧栏渲染用的键是
+/// settings 里规范化过的字符串（`workspaceAliases[path]` 精确匹配），模型随手写的正斜杠、
+/// 大小写、尾分隔符对不上就会「改了却不显示」。空名 = 清除别名（回落目录名）。
+/// 返回规范化后的键（调用方要拿去落日志/回报）。
+pub(crate) fn alias_into(s: &mut Settings, path: &str, name: &str) -> String {
+    let key = canon_workspace(std::path::PathBuf::from(path.trim())).display().to_string();
+    let name = name.trim();
+    if name.is_empty() {
+        s.workspace_aliases.remove(&key);
+    } else {
+        s.workspace_aliases.insert(key.clone(), name.to_string());
+    }
+    key
+}
+
+/// 设置/清除工作区别名（侧边栏「重命名项目」与 agent 的 settings 工具 action=alias 共用）。
+pub(crate) fn set_workspace_alias(state: &AppState, path: &str, name: &str) -> Result<(), String> {
+    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
+    let key = alias_into(&mut s, path, name);
+    let name = name.trim().to_string();
+    s.save().map_err(|e| e.to_string())?;
+    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    // 开着的界面即时跟上：侧栏项目名读 settings.workspace_aliases，不推这条事件，
+    // agent/命令行改完落盘成功、界面还叫旧名，用户只能重启才看见（2026-10-05 真机实锤）。
+    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["workspace_aliases"] }));
+    observability::event(
+        EventType::State,
+        json!({ "kind": "workspace.aliased", "path": key, "name": name }),
+    );
+    Ok(())
+}
+
 /// POST /api/workspace/alias —— 侧边栏「重命名项目」：工作区显示别名；空名=清除别名。
 pub(super) async fn alias_workspace(
     State(state): State<AppState>,
@@ -452,24 +490,9 @@ pub(super) async fn alias_workspace(
     if path.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
     }
-    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        s.workspace_aliases.remove(path);
-    } else {
-        s.workspace_aliases.insert(path.to_string(), name.clone());
+    if let Err(e) = set_workspace_alias(&state, path, &req.name) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })));
     }
-    if let Err(e) = s.save() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
-    }
-    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
-    observability::event(
-        EventType::State,
-        json!({ "kind": "workspace.aliased", "path": path, "name": name }),
-    );
     (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
@@ -477,4 +500,71 @@ pub(super) async fn alias_workspace(
 pub struct WorkspaceAliasRequest {
     pub path: String,
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TmpDir(std::path::PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> TmpDir {
+        let p = std::env::temp_dir().join(format!("agent_alias_test_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("建临时目录");
+        TmpDir(p)
+    }
+
+    /// 别名键必须规范化：模型/接口随手写的正斜杠、大小写、尾分隔符都得落到同一条键上，
+    /// 否则「改了却不显示」（侧栏按 settings 里的规范化字符串精确匹配）——真机实锤过。
+    #[test]
+    fn alias_path_variants_land_on_one_key() {
+        let d = tmp("variants");
+        let base = d.0.display().to_string();
+        let mut s = Settings::default();
+
+        let k1 = alias_into(&mut s, &base, "测试");
+        let k2 = alias_into(&mut s, &base.replace('\\', "/"), "测试");
+        let k3 = alias_into(&mut s, &format!("{base}\\"), "测试");
+        let k4 = alias_into(&mut s, &base.to_uppercase(), "测试");
+
+        assert_eq!(s.workspace_aliases.len(), 1, "四种写法只能落一条键: {:?}", s.workspace_aliases);
+        assert_eq!(k1, k2);
+        assert_eq!(k1, k3);
+        assert_eq!(k1, k4);
+        assert_eq!(s.workspace_aliases.get(&k1).map(String::as_str), Some("测试"));
+    }
+
+    /// 空名 = 清除别名（回落显示文件夹名）；别的项目的别名不许被顺手抹掉。
+    #[test]
+    fn empty_name_clears_only_that_alias() {
+        let a = tmp("a");
+        let b = tmp("b");
+        let mut s = Settings::default();
+        alias_into(&mut s, &a.0.display().to_string(), "甲");
+        alias_into(&mut s, &b.0.display().to_string(), "乙");
+
+        let key = alias_into(&mut s, &a.0.display().to_string(), "");
+
+        assert!(!s.workspace_aliases.contains_key(&key), "空名应清掉该项目的别名");
+        assert_eq!(s.workspace_aliases.len(), 1, "只清目标那一条");
+        let other = b.0.display().to_string();
+        assert_eq!(s.workspace_aliases.get(&other).map(String::as_str), Some("乙"));
+    }
+
+    /// 目录已不在（移走/删了）也能起别名：规范化失败时原样用输入的路径当键，
+    /// 侧栏最近列表里那条照样能改名（用户重命名时不会先校验目录存在）。
+    #[test]
+    fn missing_dir_still_gets_an_alias() {
+        let gone = std::env::temp_dir().join("agent_alias_test_does_not_exist_42").display().to_string();
+        let mut s = Settings::default();
+        let key = alias_into(&mut s, &gone, "搬走的项目");
+        assert_eq!(key, gone);
+        assert_eq!(s.workspace_aliases.get(&gone).map(String::as_str), Some("搬走的项目"));
+    }
 }

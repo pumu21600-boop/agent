@@ -431,6 +431,10 @@ fn risk_settings(args: &Value) -> (RiskLevel, String) {
         "memory" => (RiskLevel::Normal, "重建记忆库索引".into()),
         // 切换工作区：Dangerous，按档位弹卡（full-access 放行——档位即用户意愿）
         "workspace" => (RiskLevel::Dangerous, "切换工作区（改自己的文件边界）".into()),
+        // 工作区别名：只改侧栏显示名，不碰目录与文件边界，可逆 → Normal 按档位走。
+        // 与 action=workspace 分开判——「改名」在用户语义里就是显示层的事（真机实锤：
+        // 用户说「把工作区名改成测试」要的是侧栏那一行字，不是把目录挪走）。
+        "alias" => (RiskLevel::Normal, "设置工作区别名（侧栏显示名，不动目录）".into()),
         _ => (RiskLevel::Dangerous, "settings 工具缺少合法 action".into()),
     }
 }
@@ -1406,6 +1410,13 @@ mod tests {
             !red_line_hold("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws()),
             "切工作区改按档位判定（full-access 放行），不再任何档位强制弹卡"
         );
+        // 别名：只改侧栏显示名（不动目录/文件边界）→ Normal 按档位走，也不是红线
+        let (r, why) = evaluate_risk("settings", &json!({"action": "alias", "name": "测试"}), &ws());
+        assert_eq!(r, RiskLevel::Normal, "{why}");
+        assert!(!red_line_hold("settings", &json!({"action": "alias", "name": "测试"}), &ws()));
+        // 审批档位映射：auto 档静默放行、read-only 档要问（ Normal 的口径）
+        assert!(!should_ask_approval("auto", RiskLevel::Normal));
+        assert!(should_ask_approval("read-only", RiskLevel::Normal));
         assert!(!red_line_hold("settings", &json!({"action": "config", "op": "new"}), &ws()));
     }
 
