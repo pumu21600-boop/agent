@@ -1,6 +1,6 @@
 ---
 name: git-commit
-description: 生成符合约定的 git 提交信息与提交流程
+description: 生成符合约定 git 提交信息与提交流程
 ---
 
 # git-commit 技能
