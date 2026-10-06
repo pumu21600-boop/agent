@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: PDF 文本提取、合并/拆分/查页信息；有 Edge/Chrome/WebView2 时把 HTML 排版转成 PDF（中文出片的可靠路径）
+description: PDF 文本提取/合并/拆分；HTML 排版转 PDF
 ---
 
 # pdf 技能

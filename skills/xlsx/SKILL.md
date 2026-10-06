@@ -1,6 +1,6 @@
 ---
 name: xlsx
-description: 创建与「保真」改 .xlsx：patch 增量改已有文件（公式/样式/合并/列宽全保留）、make 新建、read/tocsv 读出、csv 互转；勿另造脚本勿用 Python
+description: 创建与保真修改 .xlsx：公式/样式/合并全保留
 ---
 
 # xlsx 技能（表格）

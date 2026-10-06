@@ -1,6 +1,6 @@
 ---
 name: docx
-description: 创建与「原地」修改 .docx：nodes 读出为可编辑 spec、改完 make 输出覆盖原路径、fonts 核验字体；勿另造脚本
+description: 创建与保真修改 .docx：改字不动版式，原地覆盖原文件
 ---
 
 # docx 技能（Word 文档）

@@ -1,6 +1,6 @@
 ---
 name: github
-description: 用 gh CLI 完成 GitHub 仓库/提交/PR/issue/release/Actions 的查询与操作；含认证检测、审批纪律与无 gh 时的兜底路径
+description: 用 gh CLI 操作 GitHub：PR/issue/release/CI
 ---
 
 # GitHub 技能（gh CLI）

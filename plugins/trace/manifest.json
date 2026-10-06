@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "时间线",
-  "description": "当前工作区最近任务的事件流时间线",
+  "description": "当前对话的任务事件流时间线",
   "version": "0.2.0",
   "entry": "index.html",
   "ui": [

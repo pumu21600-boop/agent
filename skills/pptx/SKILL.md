@@ -1,6 +1,6 @@
 ---
 name: pptx
-description: 创建与「保真」改 .pptx：replace 增量改（改字不动版式、删页/移页/复制页）、make 生成、text 逐页读出；勿另造脚本勿用 Python
+description: 创建与保真修改 .pptx：增量改字不动版式
 ---
 
 # pptx 技能（演示文稿）

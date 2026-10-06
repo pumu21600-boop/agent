@@ -1,6 +1,6 @@
 ---
 name: browser-use
-description: 用内置浏览器打开/导航/检查/点击/输入/测试/验证网页与本地页面（含 localhost）的工作流纪律
+description: 用内置浏览器打开/点击/输入/测试网页与本地页面
 ---
 
 # browser-use 技能（内置浏览器）

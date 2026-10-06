@@ -1,1 +1,1 @@
-{"apiVersion":1,"source":"built_in","title":"记忆库","description":"以星云看每一次会话：会话光点、项目分布、关键词/语义搜索；停用只收这个视图，记忆功能本体不受影响","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"nebula","title":"记忆库"}],"feature":"galaxy"}
+{"apiVersion":1,"source":"built_in","title":"记忆库","description":"星云视图：光点浏览与搜索全部会话","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"nebula","title":"记忆库"}],"feature":"galaxy"}

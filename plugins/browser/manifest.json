@@ -2,7 +2,7 @@
   "apiVersion": 1,
   "source": "built_in",
   "title": "浏览器",
-  "description": "内置浏览器的使用技能与纪律（能力由宿主原生提供）",
+  "description": "内置浏览器能力与使用纪律",
   "version": "0.1.0",
   "skills": "skills"
 }
