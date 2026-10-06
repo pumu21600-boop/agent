@@ -152,8 +152,6 @@
               {/if}
             {/if}
           </div>
-        {:else if servers.length === 0}
-          <div class="trace-empty">还没有 MCP server。</div>
         {:else}
           {#each servers as sv}
             <div class="plug-row">

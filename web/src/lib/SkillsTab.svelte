@@ -109,14 +109,15 @@
         {:else if loading}
           <div class="trace-empty">加载中…</div>
         {:else}
-          <!-- 用户拍板（2026-09-30）：插件自带的技能不在这里列出（引导住在插件里，去插件页看），
-               这页只管自己建的技能；数据不过滤——composer 的 $ 技能选择菜单仍含插件技能。
-               形式对齐插件页 plug-row（2026-10-02）：图标 + 名字 + 一句话描述 + 行内开关 -->
+          <!-- 形式对齐插件页 plug-row：图标 + 名字 + 一句话描述 + 行内开关。
+               2026-10-07：行标题去掉 $ 前缀（引用前缀早统一成 /，$ 是死记忆）；
+               插件自带的技能不在这页列出（s.source !== 'plugin'），2026-10-06 重整后
+               五个文档技能降级成全局技能，这页连它们一起管 -->
           {#each skills.filter((s) => s.source !== 'plugin') as s (s.name)}
             <div class="plug-row" class:off={s.enabled === false}>
               <div class="plug-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13.5H11L9.5 22 19 10h-6.5z"/></svg></div>
               <div class="plug-meta">
-                <div class="plug-title">${s.name}</div>
+                <div class="plug-title">{s.name}</div>
                 <div class="plug-desc">{s.description || '（无描述）'}</div>
               </div>
               <span class="plug-chip">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>

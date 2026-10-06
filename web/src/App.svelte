@@ -5499,13 +5499,8 @@
                         <span class="menu-sym">/</span> {sk.name}
                       </button>
                     {/each}
-                  {:else}
-                    <div class="menu-empty">暂无技能</div>
                   {/if}
                   <div class="bar-group">MCP</div>
-                  {#if !mcpServers.some((s) => s.online !== false && (s.tools || []).length) && !wasmPlugins.some((w) => (w.tools || []).length)}
-                    <div class="menu-empty">暂无可用工具</div>
-                  {/if}
                   <!-- 2026-10-04 用户拍板：MCP 只列服务本体，工具不逐条刷屏——
                        插服务级引用，模型按本体名找到并用它下面的工具 -->
                   {#each mcpServers as srv}
@@ -5523,9 +5518,6 @@
                     {/each}
                   {/each}
                   <div class="bar-group">插件</div>
-                  {#if !enabledExts.length}
-                    <div class="menu-empty">暂无可用插件</div>
-                  {/if}
                   <!-- 全部插件平铺（不展开）：点哪个都往输入框插一个 /引用——带技能的插件
                        插它第一个技能名（模型按技能索引认得），纯面板插件插插件标题（模型按
                        系统提示的「可用插件」索引认得）。面板不从这里开：右侧栏「+」菜单才是
@@ -6841,11 +6833,6 @@
             </div>
             {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
           {/each}
-        {:else if !extList.length}
-          <div class="menu-empty">
-            还没有插件。点上方「新建插件」生成脚手架（再点「信任」即可打开），或自己在 <code>{extInfo.workspace_dir}</code>
-            下建目录（内含 manifest.json 与 index.html）。
-          </div>
         {/if}
         <!-- 宿主能力（2026-10-06 重整后不再是插件，留在设置页）：Git 运行时状态卡片从
              git-panel 插件分区搬来（哪个 git 在生效 + 重新检测）；沙箱自检同理 -->

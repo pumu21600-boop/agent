@@ -438,8 +438,6 @@
                 <div class="mcp-cmd" style="color: var(--tint-orange-fg)">{t.last_error}</div>
               {/if}
             </div>
-          {:else}
-            <div class="menu-empty">还没有定时任务。</div>
           {/each}
         {/if}
         {#if visibleNotices.length}
