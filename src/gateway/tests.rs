@@ -320,3 +320,33 @@
         assert_eq!(take_line(&mut buf).as_deref(), Some("data: x"));
         assert_eq!(take_line(&mut buf).as_deref(), Some(""));
     }
+
+    /// 请求体摘要：必须丢掉 messages 正文（那是日志体积的真凶），但留住排查维度。
+    ///
+    /// 回归 2026-10-06 用户实锤「时间线刷不出来」：完整 body 单条 2MB+，每步一条
+    /// 就把 20MB 轮转上限撞穿，task.start 被归档删掉 → 时间线空白。摘要后单条
+    /// 应只有几百字节。
+    #[test]
+    fn request_summary_drops_message_text_keeps_shape() {
+        let body = json!({
+            "model": "step-5-preview",
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": "x".repeat(20000)},
+                {"role": "user", "content": "y".repeat(30000)},
+            ],
+            "tools": [{"type":"function"},{"type":"function"}],
+        });
+        let s = crate::gateway::request_summary(&body);
+        let text = s.to_string();
+        assert!(text.len() < 1000, "摘要必须远小于原体：{} 字节", text.len());
+        assert!(!text.contains('x') || !text.contains("xxxxxxxxxx"), "正文不得进摘要");
+        assert_eq!(s["model"], "step-5-preview");
+        assert_eq!(s["messages"], 2);
+        assert_eq!(s["message_chars"], 50000);
+        assert_eq!(s["tools"], 2);
+        // 每条消息的角色与字符数要留（定位「哪一轮把历史撑大了」靠它）
+        assert_eq!(s["per_message"][0]["role"], "system");
+        assert_eq!(s["per_message"][0]["chars"], 20000);
+        assert_eq!(s["per_message"][1]["role"], "user");
+    }

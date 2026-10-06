@@ -31,6 +31,9 @@ pub struct TaskTrace {
     /// 注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），与工作区无关——
     /// 归属必须走这里，别再拿顶层字段（真机实锤过：按顶层过滤 = 时间线全空）。
     pub session: String,
+    /// 起点事件缺失（task.start 被日志轮转吃掉），本任务的开头是**近似**的：
+    /// start_ts 是兜底边界那条事件的时刻，不是任务真正的开始。时间线据此提示用户。
+    pub lost_start: bool,
     pub events: Vec<TraceEvent>,
 }
 
@@ -109,6 +112,12 @@ where
             // 任务收尾（旧日志兜底用）：loop.finish / cancel 后关闭任务，
             // 让下一个 step0 tool_call 正确开新任务
             let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel");
+            // 降级任务的收尾：真机日志里 loop.finish 压根不存在（实测 0 条），只靠
+            // session.saved。它每轮至少两条（任务起点一次、回复落地一次），所以
+            // 「本任务已经干过活（有 tool_result）之后来的那条」才是这一轮的结束——
+            // 起点那条在 tool_call 之前，不会误闭合。
+            let is_partial_end = kind == "session.saved"
+                && cur.as_ref().is_some_and(|t| t.lost_start && t.events.iter().any(|e| e.etype == "tool_result"));
             // 任务归属（时间线按工作区过滤用）：task.start 新带的 session 优先，
             // 旧日志回落任务内第一条 session.saved 的 session（实测 46 个任务里 45 个可归属）
             let ev_session = payload
@@ -117,17 +126,33 @@ where
                 .filter(|_| is_task_start || kind == "session.saved")
                 .unwrap_or("")
                 .to_string();
+            // 边界 3（轮转兜底）：当前没有任务，却出现了**只有任务里才会有**的活动事件。
+            // task.start 被日志轮转吃掉（keep_archives=3、单归档 ~100MB）是真机常态：
+            // 长任务的起点落在更早的归档里被删，后续 tool_call 还留在仅存的几份中。
+            // 旧代码把这些事件当孤儿全丢 → 时间线整块空白。这里开一个「起点缺失」的
+            // 降级任务，至少让用户看见这个任务干过什么，而不是什么都没有。
+            let is_orphan_activity = cur.is_none()
+                && !is_task_start
+                && matches!(etype.as_str(), "tool_call" | "tool_result")
+                && (etype != "tool_call" || !is_step0_tool);
 
             if is_task_start {
                 if let Some(t) = cur.take() {
                     tasks.push(t);
                 }
                 if cur.is_none() {
-                    cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: ev_session.clone(), events: Vec::new() });
+                    cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: ev_session.clone(), events: Vec::new(), lost_start: false });
                 }
-            } else if is_step0_tool {
+            } else if is_step0_tool || is_orphan_activity {
                 // cur 此时必为 None（条件里已保证），直接开新任务
-                cur = Some(TaskTrace { start_ts: ts.clone(), end_ts: ts.clone(), session: String::new(), events: Vec::new() });
+                cur = Some(TaskTrace {
+                    start_ts: ts.clone(),
+                    end_ts: ts.clone(),
+                    session: String::new(),
+                    events: Vec::new(),
+                    // step0 是旧日志的近似切分，起点时间同样是近似值
+                    lost_start: is_orphan_activity,
+                });
             }
             if let Some(t) = cur.as_mut() {
                 t.end_ts = ts.clone();
@@ -136,7 +161,7 @@ where
                 }
                 t.events.push(TraceEvent { ts: ts.clone(), etype, payload });
             }
-            if is_task_end
+            if (is_task_end || is_partial_end)
                 && let Some(t) = cur.take() {
                     tasks.push(t);
                 }
@@ -339,5 +364,78 @@ mod tests {
         assert_eq!(tasks[0].session, "sa", "归属跟着 task.start 走");
         assert_eq!(tasks[0].events.len(), 3, "task.start + tool_call + loop.finish 拼全");
         assert!(tasks[0].duration_ms() >= 22_000, "时长跨文件累计：{}", tasks[0].duration_ms());
+    }
+
+    /// 轮转兜底：task.start 被归档吃掉后，剩下的工具事件不能当孤儿全丢。
+    ///
+    /// 回归 2026-10-06 用户实锤「时间线刷不出来」：真机上长任务的 task.start 落在
+    /// 更早的归档里被删（keep_archives=3），后续 tool_call 还留在仅存的几份中，
+    /// 旧代码把它们全丢 → 时间线整块空白。现在要开一个 lost_start 的降级任务。
+    #[test]
+    fn orphan_tool_events_after_rotation_become_a_partial_task() {
+        // 没有 task.start；step 也不是 0（真机 step 是进程级累加计数器，永远不回 0）
+        let lines = vec![
+            rec("2026-10-06T08:00:00Z", "state", serde_json::json!({"kind":"startup"})),
+            rec("2026-10-06T08:07:09Z", "tool_call", serde_json::json!({"step":7768,"name":"shell","arguments":"del x"})),
+            rec("2026-10-06T08:07:20Z", "tool_result", serde_json::json!({"step":7768,"ok":true})),
+            rec("2026-10-06T08:07:31Z", "tool_call", serde_json::json!({"step":7769,"name":"shell","arguments":"del y"})),
+        ];
+        let (_g, path) = write_tmp("orphan", &lines);
+        let tasks = read_tasks_scoped(&path, 10, None).unwrap();
+        assert_eq!(tasks.len(), 1, "孤儿活动要落成一个降级任务，不是被丢弃");
+        let t = &tasks[0];
+        assert!(t.lost_start, "缺 task.start 的任务要标记起点缺失");
+        assert_eq!(t.events.len(), 3, "三条工具事件都要在");
+        // start_ts 用兜底边界那条的时刻，且必须照实反映「这不是真起点」
+        assert_eq!(t.start_ts, "2026-10-06T08:07:09Z");
+        // 进程启动的 state 不该被算进任务
+        assert!(t.events.iter().all(|e| e.payload.get("kind").and_then(Value::as_str) != Some("startup")));
+    }
+
+    /// 正常任务（有 task.start）不能被误标成起点缺失。
+    #[test]
+    fn normal_task_is_not_marked_lost_start() {
+        let lines = vec![
+            rec("2026-10-06T08:00:00Z", "state", serde_json::json!({"kind":"task.start","session":"s1"})),
+            rec("2026-10-06T08:00:02Z", "tool_call", serde_json::json!({"step":5,"name":"shell"})),
+            rec("2026-10-06T08:00:03Z", "tool_result", serde_json::json!({"step":5,"ok":true})),
+        ];
+        let (_g, path) = write_tmp("normal", &lines);
+        let tasks = read_tasks_scoped(&path, 10, None).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].lost_start, "有 task.start 就不是缺失");
+        assert_eq!(tasks[0].events.len(), 3);
+    }
+
+    /// 降级任务要**按轮收尾**，不能把所有孤儿事件并成一个巨无霸。
+    ///
+    /// 真机日志里 `loop.finish` 实测 0 条，唯一可用的轮边界是 session.saved；它每轮
+    /// 至少两条（任务起点一次、回复落地一次），所以判据是「本任务已有 tool_result
+    /// 之后来的那条」——起点那条在 tool_call 之前，不会误闭合。
+    #[test]
+    fn partial_tasks_close_per_turn_via_session_saved() {
+        let lines = vec![
+            // 第一轮：起点快照 → 干活 → 回复落地
+            rec("2026-10-06T08:00:00Z", "state", serde_json::json!({"kind":"session.saved","session":"s1","messages":1})),
+            rec("2026-10-06T08:00:02Z", "tool_call", serde_json::json!({"step":7768,"name":"shell"})),
+            rec("2026-10-06T08:00:03Z", "tool_result", serde_json::json!({"step":7768,"ok":true})),
+            rec("2026-10-06T08:00:04Z", "state", serde_json::json!({"kind":"session.saved","session":"s1","messages":5})),
+            // 第二轮：新的孤儿活动，结尾再来一次落地
+            rec("2026-10-06T08:10:00Z", "state", serde_json::json!({"kind":"session.saved","session":"s1","messages":6})),
+            rec("2026-10-06T08:10:02Z", "tool_call", serde_json::json!({"step":7800,"name":"git"})),
+            rec("2026-10-06T08:10:03Z", "tool_result", serde_json::json!({"step":7800,"ok":true})),
+            rec("2026-10-06T08:10:04Z", "state", serde_json::json!({"kind":"session.saved","session":"s1","messages":9})),
+        ];
+        let (_g, path) = write_tmp("partial-turn", &lines);
+        let tasks = read_tasks_scoped(&path, 10, None).unwrap();
+        assert_eq!(tasks.len(), 2, "两轮要切成两个任务，不是并成一个: {}", tasks.len());
+        assert!(tasks.iter().all(|t| t.lost_start), "都没有 task.start，都该标起点缺失");
+        // 任务从第一条 tool_call 起算（在那之前的 session.saved 是孤儿，丢弃）；
+        // 每轮 = tool_call + tool_result + 闭合用的那条 session.saved（它就是本轮的
+        // 收尾事件，计入比丢掉更诚实）
+        assert_eq!(tasks[1].events.len(), 3, "第一轮：tool_call + tool_result + 收尾落盘");
+        assert_eq!(tasks[0].events.len(), 3, "第二轮：tool_call + tool_result + 收尾落盘");
+        // 归属照样能从闭合那条 session.saved 推出来
+        assert_eq!(tasks[0].session, "s1");
     }
 }

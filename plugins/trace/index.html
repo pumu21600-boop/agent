@@ -148,6 +148,16 @@
       .time {
         font-variant-numeric: tabular-nums;
       }
+      /* 起点缺失提示：小而不抢眼，但要能被看见（用户得知道这个时间不是真的） */
+      .time .stale {
+        margin-left: 6px;
+        padding: 1px 5px;
+        border-radius: 4px;
+        background: var(--warn-bg, rgba(250, 204, 21, 0.14));
+        color: var(--warn-fg, #facc15);
+        font-size: 10.5px;
+        font-weight: 600;
+      }
       .meta {
         color: var(--dim);
         font-size: 12px;
@@ -394,7 +404,7 @@
           const pairs = open ? pairDurations(task.events) : null;
           html += `<div class="task"><button class="task-head" data-ts="${esc(task.start_ts)}">
             <span class="idx">#${ti + 1}</span>
-            <span class="time">${esc(fmtClock(task.start_ts))}</span>
+            <span class="time">${esc(fmtClock(task.start_ts))}${task.lost_start ? '<span class="stale" title="任务起点事件被日志轮转冲掉了：这个时间是兜底边界的时刻，不是任务真正的开始">起点缺失</span>' : ''}</span>
             <span class="meta">${esc(fmtDur(task.duration_ms))} · ${vis.length} 事件${hidden ? ` · 折叠 ${hidden}` : ''}</span>
             <svg class="caret${open ? ' open' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="m9 6 6 6-6 6"/></svg>
           </button>`;

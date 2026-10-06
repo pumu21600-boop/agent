@@ -62,6 +62,41 @@ pub struct Gateway {
     thinking_degraded: RwLock<std::collections::HashSet<String>>,
 }
 
+/// 请求体的 JSONL 摘要（完整体走 `observability::debug` 控制台，见调用处注释）。
+///
+/// 为什么必须摘要：完整 body 含 messages 全历史 + tools，长任务单条 2MB+，每步一条
+/// 就把 20MB 轮转上限撞穿——归档只留 3 份，`task.start` 被删掉而后续工具事件还在，
+/// 时间线任务边界丢失（2026-10-06 用户实锤「刷不出来」根因）。
+///
+/// 摘要保留排查需要的全部维度：模型、条数、字符数、工具数、以及每条消息的角色与
+/// 字符数（定位「哪一轮把历史撑大了」看这个就够，不必翻完整体）。
+fn request_summary(body: &Value) -> Value {
+    let msgs = body.get("messages").and_then(Value::as_array);
+    let tools = body.get("tools").and_then(Value::as_array);
+    let per_msg: Vec<Value> = msgs
+        .map(|m| {
+            m.iter()
+                .map(|x| {
+                    json!({
+                        "role": x.get("role").and_then(Value::as_str).unwrap_or(""),
+                        "chars": x.get("content").and_then(Value::as_str).map(|s| s.chars().count())
+                            .or_else(|| x.get("content").map(|c| c.to_string().chars().count()))
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
+        "stream": body.get("stream"),
+        "messages": msgs.map(|m| m.len()).unwrap_or(0),
+        "message_chars": per_msg.iter().map(|m| m["chars"].as_u64().unwrap_or(0)).sum::<u64>(),
+        "per_message": per_msg,
+        "tools": tools.map(|t| t.len()).unwrap_or(0),
+    })
+}
+
 /// 请求参数（P9）：全部可选，None=不发字段走渠道默认。
 /// 思考接线不再自带厂商字段——由 compat 按端点探测；用户设置只有开/关 + 档位。
 #[derive(Debug, Clone)]
@@ -430,7 +465,12 @@ impl Gateway {
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
         let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat);
-        observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "body": body, "purpose": "aux" }));
+        // 同主渠道：JSONL 只留摘要。aux 体量本就小（摘要/标题），但滚雪球时（prior_summary
+        // 越带越大）一样能把日志顶爆，规则统一不搞双标
+        observability::event(
+            EventType::State,
+            json!({ "kind": "gateway.request", "url": url, "body": request_summary(&body), "purpose": "aux" }),
+        );
         // 红线1（P21）：花费上限硬闸——辅助调用与主流程同一道闸
         if let Some(msg) = crate::usage::cap_block() {
             observability::event(
@@ -667,9 +707,13 @@ impl Gateway {
         let body = build_body_with_compat(model, &outgoing, true, &send_params, tools, &compat);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
+        // JSONL 里只留摘要：完整请求体（messages 历史 + tools）单条就能到 2MB+，
+        // 长任务每步一条，20MB 的轮转上限几次就撞穿——task.start 被归档删掉而后续
+        // 事件还留在仅存的 3 份里，时间线的任务边界就没了（2026-10-06 用户实锤
+        // 「时间线刷不出来」的根因）。完整体照旧走 debug（控制台），排查不缺料。
         observability::event(
             EventType::State,
-            json!({ "kind": "gateway.request", "url": url, "body": body, "reasoning": {
+            json!({ "kind": "gateway.request", "url": url, "body": request_summary(&body), "reasoning": {
                 "protocol": compat.protocol.as_str(),
                 "thinking_format": compat.thinking_format.as_str(),
                 "thinking": channel.params.thinking,

@@ -153,6 +153,9 @@ pub(super) async fn get_trace(
                         "start_ts": t.start_ts,
                         "end_ts": t.end_ts,
                         "duration_ms": t.duration_ms(),
+                        // 起点被日志轮转吃掉时为 true：start_ts 是近似值（兜底边界那条
+                        // 事件的时刻），面板要照实说，别让用户以为那就是任务开始时间
+                        "lost_start": t.lost_start,
                         "events": observability::trace::render_events(t),
                     })
                 })
