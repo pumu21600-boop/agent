@@ -47,6 +47,27 @@ pub struct ChatRequest {
     pub plan_mode: bool,
 }
 
+/// 本轮上下文 = 会话文件里的历史 + 本条新用户消息（见 chat() 里「历史的事实源」那段）。
+/// 文件末尾已经是同一条用户消息（同一条重发）就不重复接，免得上下文里同一句话出现两遍。
+/// 接不上（请求尾不是用户消息且 message 为空）时按原样返回文件历史，宁可少接不乱接。
+fn merge_file_history(mut file_msgs: Vec<Value>, req_history: &[Value], message: &str) -> Vec<Value> {
+    let tail = req_history
+        .last()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .cloned()
+        .or_else(|| (!message.trim().is_empty()).then(|| json!({ "role": "user", "content": message })));
+    if let Some(last) = tail {
+        let already = file_msgs
+            .last()
+            .map(|p| p.get("role").and_then(Value::as_str) == Some("user") && p.get("content") == last.get("content"))
+            .unwrap_or(false);
+        if !already {
+            file_msgs.push(last);
+        }
+    }
+    file_msgs
+}
+
 /// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
 pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
     let message = req.message.trim().to_string();
@@ -100,6 +121,15 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     // 例外：带附件的追加暂不支持（媒体流水线在轮首一次性构建），明确拒绝而不是悄悄丢附件。
     // M2：这里的 history 在「接管」分支里会被换成会话快照 + 队列消息，故为可变绑定。
     let mut history = history;
+    // 历史的事实源是**会话文件**，不是请求里的 messages（2026-10-05 真机实锤）。
+    // 前端只带气泡正文（role+content）：工具调用/思考/用时是挂在气泡上的界面字段，
+    // 序列化时不进请求。若照单全收请求的 messages 当本轮上下文，之后每次 Snapshot
+    // 落盘都按它整卷重写会话文件——每起一轮就把上一轮的工具卡/思考/用时抹掉，
+    // 只剩正在跑的那一轮（重启后只有最后一条能展开，前面全是光秃秃的文字）。
+    // 所以：文件里有历史就用文件，只把本条新用户消息接上去；文件空/新会话再说。
+    if let Some(f) = session.get(&session_id) {
+        history = merge_file_history(f.messages, &history, &message);
+    }
     let mut run_flag = state.cancel.try_begin(&session_id);
     if run_flag.is_none() {
         if !attachments.is_empty() {
@@ -895,6 +925,67 @@ impl Drop for CancelRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本轮上下文取会话文件（工具调用/思考都在里面），只接上本条新用户消息。
+    /// 反例（本次修的真机 bug）：拿前端请求的 messages 当历史——它只有 role+content，
+    /// 于是每起一轮就把上一轮的工具卡/思考/用时从会话文件里抹掉，重启后全都展不开。
+    #[test]
+    fn file_history_wins_over_request_messages() {
+        let file = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"assistant","content":null,"reasoning_content":"想一下",
+                   "tool_calls":[{"id":"c1","type":"function","function":{"name":"settings","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"已改"}),
+            json!({"role":"assistant","content":"改好了"}),
+        ];
+        // 前端照旧只带气泡正文（工具记录不在其中）
+        let req = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"assistant","content":"改好了"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let merged = merge_file_history(file.clone(), &req, "打开终端面板");
+        assert_eq!(merged.len(), 5, "文件历史 4 条 + 新用户消息 1 条: {merged:?}");
+        assert_eq!(merged[3]["content"], "改好了", "上一轮的收尾文本还在");
+        assert!(merged[1].get("tool_calls").is_some(), "工具调用必须留在上下文里");
+        assert!(merged[1].get("reasoning_content").is_some(), "思考必须留在上下文里");
+        assert_eq!(merged[1]["tool_calls"], file[1]["tool_calls"]);
+        assert_eq!(merged[4]["role"], "user");
+        assert_eq!(merged[4]["content"], "打开终端面板");
+    }
+
+    /// 同一条消息重发（上一轮失败后重试）：文件末尾已经是它，不重复接。
+    #[test]
+    fn file_history_does_not_duplicate_the_same_user_message() {
+        let file = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let req = vec![
+            json!({"role":"user","content":"改名"}),
+            json!({"role":"user","content":"打开终端面板"}),
+        ];
+        let merged = merge_file_history(file, &req, "打开终端面板");
+        assert_eq!(merged.len(), 2, "同一条不该接第二遍: {merged:?}");
+    }
+
+    /// 文件没有历史（新会话）：原样用请求里的 messages。
+    #[test]
+    fn empty_file_falls_back_to_request_messages() {
+        let req = vec![json!({"role":"user","content":"第一条"})];
+        assert_eq!(merge_file_history(Vec::new(), &req, "第一条"), req);
+    }
+
+    /// 请求尾不是用户消息、但 message 有正文：用 message 补一条，别把这轮的话丢了。
+    #[test]
+    fn missing_user_tail_falls_back_to_message_field() {
+        let file = vec![json!({"role":"user","content":"上一轮"}),
+                        json!({"role":"assistant","content":"答完"})];
+        let req = vec![json!({"role":"user","content":"上一轮"}), json!({"role":"assistant","content":"答完"})];
+        let merged = merge_file_history(file, &req, "这轮的话");
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[2], json!({"role":"user","content":"这轮的话"}));
+    }
 
     #[test]
     fn attachment_save_and_decode() {
