@@ -20,3 +20,10 @@ desktop/target/
 # 发布打包产物（scripts/package_release.ps1 输出）
 /dist/
 target-smoke/
+
+# 本地探测/工具状态（不入库）
+/.probe-browser/
+/.zcode/
+/probe.xlsx
+/probe2.xlsx
+/settings.json.bak
