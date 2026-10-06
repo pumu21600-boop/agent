@@ -47,6 +47,48 @@ fn shadow_gitdir(ws: &Path) -> PathBuf {
     ws.join(".agent").join("shadow").join(".git")
 }
 
+/// 审查面板的数据源（对着 ZCode 审查面板的 source 选择器：未暂存 / 上一轮…）。
+/// - `Shadow`：影子仓库相对某个检查点 = 「本任务改动」（默认，产物/审查一直用这条）
+/// - `Workspace`：工作区自己的真仓库相对 HEAD = 「未提交改动」
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoOrigin {
+    Shadow,
+    Workspace,
+}
+
+impl RepoOrigin {
+    /// 查询串 → 枚举（认 "workspace"/"work"，其余一律影子仓库，保持旧行为）。
+    pub fn from_query(s: Option<&str>) -> Self {
+        match s.map(|x| x.trim()) {
+            Some("workspace") | Some("work") => Self::Workspace,
+            _ => Self::Shadow,
+        }
+    }
+
+    /// 对应的 git dir。None = 让 git 从工作区自己发现真仓库（与 `status()` 同一条路）。
+    fn gitdir(&self, ws: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Shadow => Some(shadow_gitdir(ws)),
+            Self::Workspace => None,
+        }
+    }
+
+    /// 基线形态校验。真仓库这一档额外放行 "HEAD"（工作树自身的最新提交）。
+    fn check_baseline(&self, baseline: &str) -> anyhow::Result<()> {
+        let bare = baseline.trim();
+        if bare.is_empty() {
+            bail!("缺少 baseline");
+        }
+        if *self == Self::Workspace && bare.eq_ignore_ascii_case("HEAD") {
+            return Ok(());
+        }
+        if !bare.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&bare.len()) {
+            bail!("非法基线 id: {bare}");
+        }
+        Ok(())
+    }
+}
+
 /// 排除目录：影子仓库永不跟踪（真仓库 ls-files 之外的第二道防线，防 IO 爆炸）。
 /// .attachments 是粘贴媒体的中转目录（turn.rs 会把它写进 .gitignore），同样不进影子仓库。
 const EXCLUDED_DIRS: &[&str] = &["node_modules", "target", "dist", "logs", ".agent", ".git", ".attachments"];
@@ -447,16 +489,29 @@ pub fn head_id(ws: &Path) -> anyhow::Result<Option<String>> {
 
 /// 工作树相对基线 commit 的统一 diff 文本（审查面板逐文件看改动用）。
 /// 上限 512KB，防长会话 diff 把面板撑爆；超限尾部标省略。
-pub fn diff_text(ws: &Path, baseline: &str, path: Option<&str>) -> anyhow::Result<String> {
-    if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
-        bail!("非法基线 id: {baseline}");
-    }
+/// `origin` 决定跑影子仓库还是工作区自己的真仓库（「未提交改动」档）。
+pub fn diff_text(
+    ws: &Path,
+    origin: RepoOrigin,
+    baseline: &str,
+    path: Option<&str>,
+) -> anyhow::Result<String> {
+    origin.check_baseline(baseline)?;
     let bin = git_bin()?;
-    let gitdir = shadow_gitdir(ws);
-    if !gitdir.exists() {
-        bail!("影子仓库不存在");
+    let gitdir = origin.gitdir(ws);
+    match (&origin, &gitdir) {
+        (RepoOrigin::Shadow, Some(g)) if !g.exists() => bail!("影子仓库不存在"),
+        (RepoOrigin::Workspace, _) => {
+            let inside = git_ok(&bin, None, ws, &["rev-parse", "--is-inside-work-tree"])
+                .map(|s| s.trim() == "true")
+                .unwrap_or(false);
+            if !inside {
+                bail!("工作区不在 git 仓库中");
+            }
+        }
+        _ => {}
     }
-    let mut args = vec!["diff".to_string(), baseline.to_string()];
+    let mut args = vec!["diff".to_string(), baseline.trim().to_string()];
     if let Some(p) = path {
         // 只做形态校验，**不 resolve 到磁盘**——已删除的文件（技能迁移/agent 删的）
         // 工作树里已不存在，但 diff 照样要能出「删除」段（真机实锤：os error 3）。
@@ -468,7 +523,7 @@ pub fn diff_text(ws: &Path, baseline: &str, path: Option<&str>) -> anyhow::Resul
         args.push("--".to_string());
         args.push(p.replace('\\', "/"));
     }
-    let out = git_ok(&bin, Some(&gitdir), ws, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let out = git_ok(&bin, gitdir.as_deref(), ws, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
     const MAX: usize = 512 * 1024;
     if out.len() > MAX {
         Ok(format!("{}…（diff 超过 512KB 已截断）", &out[..MAX]))
@@ -521,19 +576,31 @@ pub struct ChangedFile {
 /// **追加未跟踪文件**（`ls-files --others`）：任务里新建的文件不入 git diff
 /// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实锤根因——
 /// agent 造出的新文件必须原样出现在清单里。排除目录/大文件与检查点同一套规则。
-pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<ChangedFile>> {
-    if !baseline.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&baseline.len()) {
-        bail!("非法基线 id: {baseline}");
-    }
+pub fn changed_files(
+    ws: &Path,
+    origin: RepoOrigin,
+    baseline: &str,
+) -> anyhow::Result<Vec<ChangedFile>> {
+    origin.check_baseline(baseline)?;
     let bin = git_bin()?;
-    let gitdir = shadow_gitdir(ws);
-    if !gitdir.exists() {
-        bail!("影子仓库不存在");
+    let gitdir = origin.gitdir(ws);
+    match (&origin, &gitdir) {
+        (RepoOrigin::Shadow, Some(g)) if !g.exists() => bail!("影子仓库不存在"),
+        (RepoOrigin::Workspace, _) => {
+            let inside = git_ok(&bin, None, ws, &["rev-parse", "--is-inside-work-tree"])
+                .map(|s| s.trim() == "true")
+                .unwrap_or(false);
+            if !inside {
+                bail!("工作区不在 git 仓库中");
+            }
+        }
+        _ => {}
     }
+    let base = baseline.trim().to_string();
     // numstat：每行 "adds\tdels\tpath"
-    let numstat = git_ok(&bin, Some(&gitdir), ws, &["diff", "--numstat", baseline])?;
+    let numstat = git_ok(&bin, gitdir.as_deref(), ws, &["diff", "--numstat", &base])?;
     // name-status：每行 "M\tpath"（未跟踪不在此列）
-    let status = git_ok(&bin, Some(&gitdir), ws, &["diff", "--name-status", baseline])?;
+    let status = git_ok(&bin, gitdir.as_deref(), ws, &["diff", "--name-status", &base])?;
     let mut status_of = std::collections::HashMap::new();
     for line in status.lines() {
         let mut it = line.splitn(2, '\t');
@@ -567,7 +634,12 @@ pub fn changed_files(ws: &Path, baseline: &str) -> anyhow::Result<Vec<ChangedFil
     for dir in EXCLUDED_DIRS {
         others_cmd.push(format!("--exclude={dir}"));
     }
-    let others = git_ok(&bin, Some(&gitdir), ws, &others_cmd.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let others = git_ok(
+        &bin,
+        gitdir.as_deref(),
+        ws,
+        &others_cmd.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
     for entry in others.split('\0') {
         if entry.is_empty() {
             continue;
@@ -767,7 +839,7 @@ mod tests {
 
         std::fs::write(w.join("doc.txt"), "v2\n").unwrap();
         std::fs::write(w.join("made-by-agent.txt"), "new\n").unwrap();
-        let files = changed_files(w, &cp1.id).unwrap();
+        let files = changed_files(w, RepoOrigin::Shadow, &cp1.id).unwrap();
         assert!(files.iter().any(|f| f.path == "doc.txt"), "修改的文件要列出: {files:?}");
         assert!(files.iter().any(|f| f.path == "made-by-agent.txt"), "新建文件要列出: {files:?}");
 
@@ -777,6 +849,41 @@ mod tests {
         restore(w, &cp1.id).unwrap();
         assert_eq!(std::fs::read_to_string(w.join("doc.txt")).unwrap(), "v1\n");
         assert!(!w.join("made-by-agent.txt").exists(), "检查点后新建的文件已被影子仓库跟踪，回滚应删除");
+    }
+
+    #[test]
+    fn workspace_origin_reads_real_repo_against_head() {
+        // 审查面板「未提交改动」档（origin=workspace）：跑的是工作区自己的真仓库，
+        // 基线是 HEAD，不是影子仓库检查点。非 git 工作区要给「不在 git 仓库中」。
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("wsorigin");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::write(w.join("tracked.txt"), "v1\n").unwrap();
+        ws.git(&["add", "tracked.txt"]);
+        ws.git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "-m", "base"]);
+
+        // 工作树改动 + 未跟踪新文件
+        std::fs::write(w.join("tracked.txt"), "v2\n").unwrap();
+        std::fs::write(w.join("fresh.txt"), "new\n").unwrap();
+
+        let files = changed_files(w, RepoOrigin::Workspace, "HEAD").unwrap();
+        assert!(files.iter().any(|f| f.path == "tracked.txt"), "相对 HEAD 的改动要列出: {files:?}");
+        assert!(files.iter().any(|f| f.path == "fresh.txt" && f.status == '?'), "真仓库未跟踪文件也要列出: {files:?}");
+
+        let d = diff_text(w, RepoOrigin::Workspace, "HEAD", Some("tracked.txt")).unwrap();
+        assert!(d.contains("-v1") && d.contains("+v2"), "真仓库 diff 要出改动行: {d}");
+
+        // 非 git 工作区：不给影子仓库兜底，明确报「不在 git 仓库中」
+        let plain = temp_ws("wsorigin-plain");
+        let e = changed_files(plain.path(), RepoOrigin::Workspace, "HEAD").unwrap_err().to_string();
+        assert!(e.contains("不在 git 仓库"), "应说人话: {e}");
+        // 影子仓库这一档仍然只要检查点 id
+        assert!(RepoOrigin::from_query(Some("shadow")).eq(&RepoOrigin::Shadow));
+        assert!(RepoOrigin::from_query(Some("work")).eq(&RepoOrigin::Workspace));
+        assert!(RepoOrigin::from_query(None).eq(&RepoOrigin::Shadow));
     }
 
     #[test]

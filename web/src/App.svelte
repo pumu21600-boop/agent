@@ -945,14 +945,21 @@
   let rpArtifactsNote = '';
   // 「审查」标签用的基线（与产物同源：本会话任务起点）
   let rpReviewBaseline = '';
+  // —— 审查面板（整一套对齐 ZCode 的 git/review pane）——
+  // 来源选择器对应 ZCode 的 source selector：task=本任务改动（影子仓库检查点）、
+  // work=未提交改动（工作区自己的真仓库相对 HEAD，即 ZCode 默认的「未暂存」）
+  let rvSource = 'task';
+  let rvBaseline = ''; // source='task' 时的基线；变更条点「审查」会带上它自己的
+  let rvFiles = [];
+  let rvLoading = false;
+  let rvError = '';
+  let rvOpen = {}; // path → 是否展开 diff
+  let rvDiff = {}; // path → { loading, text, error }
+  let rvMenu = null; // 行右键菜单 { x, y, path }
   // 变更条展开的文件清单（用户 2026-10-02：「N 个文件已更改」要能展开看到文件）
   let cpFilesOpen = false;
   let cpFiles = [];
   let cpFilesLoading = false;
-  // 审查 diff 弹窗（对着 ZCode 审查：逐文件看 diff）
-  // 审查 diff（用户 2026-10-02 第四轮：diff 开在**右侧栏**跟 ZCode 一致，不要弹窗）
-  // ——以「标签」形式开：kind='diff'，激活时按需拉 /api/review/diff。
-  let diffCache = {}; // path → { loading, text, error }
   async function loadCpFiles() {
     if (!dockCp || !dockCp.id) return;
     cpFilesLoading = true;
@@ -968,28 +975,134 @@
     cpFilesOpen = !cpFilesOpen;
     if (cpFilesOpen && !cpFiles.length) loadCpFiles();
   }
-  function openDiffTab(baseline, path) {
-    if (!baseline) return;
-    const key = 'diff:' + path;
-    if (!rpTabs.some((t) => t.key === key)) {
-      rpTabs = [...rpTabs, { key, kind: 'diff', path, baseline, title: path.split('/').pop() || path }];
+  // 打开审查面板并把某个文件展开（变更条「审查」按钮、产物行共用）。
+  // 对齐 ZCode：审查不是另开的 diff 标签，就是审查面板里那一行展开。
+  function openReviewDiff(path, baseline) {
+    if (!path) return;
+    if (!rpTabs.some((t) => t.kind === 'review')) {
+      rpTabs = [...rpTabs, { key: 'review', kind: 'review', title: '审查' }];
     }
-    rpPreviewPath = path;
     rightPanelOpen = true;
     terminalOpen = false;
-    activateRpTab(key);
-  }
-  async function loadDiff(t) {
-    if (!t || t.kind !== 'diff') return;
-    const hit = diffCache[t.path] || {};
-    if (hit.loading || (hit.text !== undefined && !hit.error)) return;
-    diffCache = { ...diffCache, [t.path]: { loading: true } };
-    try {
-      const r = await fetch(`/api/review/diff?baseline=${encodeURIComponent(t.baseline || '')}&path=${encodeURIComponent(t.path)}`).then((r) => r.json());
-      diffCache = { ...diffCache, [t.path]: r.ok ? { loading: false, text: r.diff || '', error: '' } : { loading: false, text: '', error: r.error || '读取失败' } };
-    } catch (e) {
-      diffCache = { ...diffCache, [t.path]: { loading: false, text: '', error: e.message || String(e) } };
+    const needReload = rvSource === 'task' && baseline && baseline !== rvBaseline;
+    if (needReload) {
+      // 变更条的基线（dockCp.id）与审查面板当前用的不是同一个 → 换基线重拉，别拿旧的冒充
+      rvBaseline = baseline;
+      rvFiles = [];
+      rvOpen = { [path]: true };
+      loadReview();
+    } else {
+      rvOpen = { ...rvOpen, [path]: true };
+      const f = rvFiles.find((x) => x.path === path);
+      if (f) loadRvDiff(f);
     }
+    activateRpTab('review');
+  }
+  // 审查面板文件清单（ZCode 的 source 切换：本任务改动 / 未提交改动）
+  async function loadReview() {
+    rvLoading = true;
+    rvError = '';
+    if (rvSource === 'work') {
+      try {
+        const r = await fetch('/api/changes?origin=workspace').then((x) => x.json());
+        if (r.error) {
+          rvFiles = [];
+          rvError = r.error;
+        } else {
+          rvFiles = r.files || [];
+        }
+      } catch (e) {
+        rvFiles = [];
+        rvError = e.message || String(e);
+      }
+      rvLoading = false;
+      rvLoadOpenDiffs();
+      return;
+    }
+    // 本任务改动：没有基线先按 resolveBaseline 兜底一套（与产物同源）
+    if (!rvBaseline) {
+      const { id } = await resolveBaseline();
+      rvBaseline = id || '';
+    }
+    if (!rvBaseline) {
+      rvFiles = [];
+      rvLoading = false;
+      return;
+    }
+    try {
+      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(rvBaseline)}`).then((x) => x.json());
+      if (r.error) {
+        rvFiles = [];
+        rvError = r.error;
+      } else {
+        rvFiles = r.files || [];
+      }
+    } catch (e) {
+      rvFiles = [];
+      rvError = e.message || String(e);
+    }
+    rvLoading = false;
+    rvLoadOpenDiffs();
+  }
+  // 已被标记展开、但 diff 还没拉过的行补拉（变更条「审查」先置展开态、清单后到的情形）
+  function rvLoadOpenDiffs() {
+    for (const f of rvFiles) {
+      if (rvOpen[f.path] && !rvDiff[f.path]) loadRvDiff(f);
+    }
+  }
+  function toggleRv(f) {
+    const open = !rvOpen[f.path];
+    rvOpen = { ...rvOpen, [f.path]: open };
+    if (open) loadRvDiff(f);
+  }
+  async function loadRvDiff(f) {
+    if (!f || !f.path) return;
+    const hit = rvDiff[f.path] || {};
+    if (hit.loading || (hit.text !== undefined && !hit.error)) return;
+    rvDiff = { ...rvDiff, [f.path]: { loading: true } };
+    const url =
+      rvSource === 'work'
+        ? `/api/review/diff?origin=workspace&path=${encodeURIComponent(f.path)}`
+        : `/api/review/diff?baseline=${encodeURIComponent(rvBaseline)}&path=${encodeURIComponent(f.path)}`;
+    try {
+      const r = await fetch(url).then((x) => x.json());
+      rvDiff = { ...rvDiff, [f.path]: r.ok ? { loading: false, text: r.diff || '', error: '' } : { loading: false, text: '', error: r.error || '读取失败' } };
+    } catch (e) {
+      rvDiff = { ...rvDiff, [f.path]: { loading: false, text: '', error: e.message || String(e) } };
+    }
+  }
+  // 统一 diff 文本 → 带行号的渲染行（ZCode 的 diff 有左右两个行号列 + 增删着色）
+  function rvParse(text) {
+    const out = [];
+    let oldNo = 0;
+    let newNo = 0;
+    for (const ln of String(text || '').split('\n')) {
+      if (/^(diff --git|index |old mode|new mode|similarity index|dissimilarity index|rename from|rename to|copy from|copy to|deleted file|new file|--- |\+\+\+ )/.test(ln)) {
+        out.push({ t: 'meta', s: ln });
+        continue;
+      }
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(ln);
+      if (m) {
+        oldNo = Number(m[1]);
+        newNo = Number(m[3]);
+        out.push({ t: 'hunk', s: ln });
+        continue;
+      }
+      if (ln.startsWith('\\')) {
+        out.push({ t: 'meta', s: ln });
+      } else if (ln.startsWith('+')) {
+        out.push({ t: 'add', o: '', n: newNo, s: ln.slice(1) });
+        newNo += 1;
+      } else if (ln.startsWith('-')) {
+        out.push({ t: 'del', o: oldNo, n: '', s: ln.slice(1) });
+        oldNo += 1;
+      } else {
+        out.push({ t: 'ctx', o: oldNo, n: newNo, s: ln.startsWith(' ') ? ln.slice(1) : ln });
+        oldNo += 1;
+        newNo += 1;
+      }
+    }
+    return out;
   }
   let rpLoading = false;
   let rpPreviewPath = ''; // 最近预览的文件（产物列表高亮用）
@@ -1690,8 +1803,8 @@
     rpAddOpen = false;
     const t = rpTabs.find((x) => x.key === key);
     if (!t) return;
-    if (t.kind === 'artifacts' || t.kind === 'review') loadArtifacts();
-    if (t.kind === 'diff') loadDiff(t);
+    if (t.kind === 'artifacts') loadArtifacts();
+    if (t.kind === 'review') loadReview();
     if (t.kind === 'web') loadWebState();
     if (t.kind === 'file') loadPreview(t.path);
   }
@@ -2975,6 +3088,14 @@
         await loadSessions();
       }
       refreshDock();
+      // 审查面板开着时跟着换会话重拉（否则切了会话还显示上一个会话的改动清单）
+      if (rpTab === 'review') {
+        rvBaseline = '';
+        rvFiles = [];
+        rvOpen = {};
+        rvDiff = {};
+        loadReview();
+      }
     } catch (e) {
       // 加载失败不阻塞
     }
@@ -5164,7 +5285,10 @@
     <footer class="chat-input">
       {#if dockCp || (gitInfo && gitInfo.is_repo)}
         <div class="cp-dock">
-          <div class="cp-bar">
+          <!-- 一张卡：头部行 + 展开的改动清单同属一个盒子（对齐 ZCode 的 change-summary）。
+               清单是流内子元素，卡片向上长；宽度天然一致，也不会把文档撑出滚动条 -->
+          <div class="cp-card">
+            <div class="cp-bar">
             {#if gitInfo && gitInfo.is_repo}
               <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
                 <svg class="git-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
@@ -5202,9 +5326,9 @@
             </span>
           </div>
           {#if cpFilesOpen && dockCp && dockCp.files > 0}
-            <!-- 展开的改动文件清单（对齐 ZCode：条下方同宽、无重复头、状态图标、
-                 文件名粗体+目录暗色、增删行、审查/打开▾） -->
-            <div class="git-pop cp-files-pop">
+            <!-- 展开的改动文件清单（对齐 ZCode：卡内流内子块，贴头部行下沿同宽、
+                 无重复头、状态图标/文件名粗体+目录暗色、增删、审查/打开▾） -->
+            <div class="cp-files">
               <div class="git-pop-list">
                 {#if cpFilesLoading}
                   <div class="git-pop-more">加载中…</div>
@@ -5219,7 +5343,7 @@
                         {#if dir}<span class="review-dir" title={dir}>{dir}/</span>{/if}
                       </span>
                       {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
-                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(dockCp.id, f.path)}>审查</button>
+                      <button class="cp-undo" title="看这个文件的 diff（在审查面板展开）" on:click={() => openReviewDiff(f.path, dockCp.id)}>审查</button>
                       <button class="cp-commit review-open" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
                     </div>
                   {/each}
@@ -5246,6 +5370,7 @@
               </div>
             </div>
           {/if}
+          </div>
         </div>
       {/if}
       <div class="composer">
@@ -5608,6 +5733,22 @@
     {/if}
   </main>
 
+  {#if rvMenu}
+    <!-- 审查面板行的右键菜单（对齐 ZCode：预览 / 复制路径；行点击就地展开 diff） -->
+    <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+    <div class="rv-menu-back" on:click={() => (rvMenu = null)} role="presentation"></div>
+    <!-- svelte-ignore a11y-no-static-element-interactions -->
+    <div class="rv-menu" style="left:{rvMenu.x}px; top:{rvMenu.y}px" on:click|stopPropagation role="menu">
+      <button title="在右侧栏预览这个文件" on:click={() => { openPreviewTab(rvMenu.path); rvMenu = null; }}>预览文件</button>
+      <button
+        title="复制工作区相对路径"
+        on:click={() => {
+          putClipboard(rvMenu.path);
+          rvMenu = null;
+        }}>复制相对路径</button>
+    </div>
+  {/if}
+
   {#if rightPanelOpen}
     <aside class="right-panel" class:resizing={rpResizing} style="width:{rpWidth}px">
       <div class="rp-resize" title="拖拽调整宽度" on:mousedown={startRpResize}></div>
@@ -5725,32 +5866,91 @@
                   {/each}
                 {/if}
               {:else if t.kind === 'review'}
-                <!-- 用户 2026-10-02：侧栏「审查」标签——本会话相对任务起点的全部改动，
-                     完全套 ZCode 审查列表：头部「N 个文件已更改 +x -y」+「撤销」，
-                     行：状态图标 / 文件名粗体+目录暗 / 增删 / 审查 / 打开▾ -->
-                {#if rpLoading}
+                <!-- 审查面板（整一套对齐 ZCode 的 git/review pane）：
+                     头部 = 来源选择器 + 撤销 + 刷新；行 = 文件名/目录 + 增删 + 箭头，
+                     点行就地展开 diff（左右行号列 + 增删着色），不再开新标签 -->
+                <!-- svelte-ignore a11y-label-has-associated-control -->
+                <div class="rv-head">
+                  <select
+                    class="rv-src"
+                    aria-label="切换审查范围"
+                    bind:value={rvSource}
+                    title="切换审查范围"
+                    on:change={() => {
+                      rvFiles = [];
+                      rvOpen = {};
+                      rvDiff = {};
+                      loadReview();
+                    }}
+                  >
+                    <option value="task">本任务改动</option>
+                    <option value="work">未提交改动</option>
+                  </select>
+                  {#if rvFiles.length}
+                    <span class="rv-totals">
+                      <b>{rvFiles.length}</b> 个文件<span class="rv-tsep">·</span><span class="review-add">+{rvFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span><span class="rv-tsep">·</span><span class="review-del">-{rvFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span>
+                    </span>
+                  {/if}
+                  <span class="flex-sp"></span>
+                  {#if dockCp && rvSource === 'task' && rvBaseline === dockCp.id}
+                    <button class="rv-btn" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
+                  {/if}
+                  <button class="rv-btn" class:spin={rvLoading} title="重新读取改动清单" on:click={loadReview}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95" /><path d="M19 3.5V7h-3.5" /></svg>
+                  </button>
+                </div>
+                {#if rvLoading && !rvFiles.length}
                   <div class="trace-empty">加载中…</div>
-                {:else if !rpFiles.length}
-                  <div class="rp-empty">{rpArtifactsNote || '本会话还没有改动。'}<br />agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。</div>
-                {:else}
-                  <div class="review-head">
-                    <span><b>{rpFiles.length}</b> 个文件已更改 <span class="review-add">+{rpFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span> <span class="review-del">-{rpFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span></span>
-                    {#if dockCp}<button class="cp-undo" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>{/if}
+                {:else if rvError && !rvFiles.length}
+                  <div class="rp-empty">{rvError}</div>
+                {:else if !rvFiles.length}
+                  <div class="rv-empty">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><path d="M8.5 12h7" /></svg>
+                    <div class="rv-empty-t">{rvSource === 'work' ? '没有未提交的改动' : '本任务还没有改动'}</div>
+                    <div class="rv-empty-d">{rvSource === 'work' ? 'agent 或你自己改动文件后，这里会列出来（相对 HEAD）。' : 'agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。'}</div>
                   </div>
-                  {#each rpFiles as f (f.path)}
-                    {@const name = f.path.split('/').pop()}
-                    {@const dir = f.path.split('/').slice(0, -1).join('/')}
-                    <div class="review-row">
-                      <span class="git-st" class:added={f.status === 'A' || f.status === '?'} class:deleted={f.status === 'D'} title={gitStatusLabel(f.status === '?' ? '??' : f.status)}>{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
-                      <span class="review-file">
-                        <b class="review-name" title={f.path}>{name}</b>
-                        {#if dir}<span class="review-dir" title={dir}>{dir}/</span>{/if}
-                      </span>
-                      {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
-                      <button class="cp-undo" title="看这个文件的 diff" on:click={() => openDiffTab(rpReviewBaseline, f.path)}>审查</button>
-                      <button class="cp-commit review-open" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-                    </div>
-                  {/each}
+                {:else}
+                  <div class="rv-list">
+                    {#each rvFiles as f (f.path)}
+                      {@const name = f.path.split('/').pop()}
+                      {@const dir = f.path.split('/').slice(0, -1).join('/')}
+                      {@const dc = rvDiff[f.path] || {}}
+                      <div class="rv-row" class:open={!!rvOpen[f.path]}>
+                        <button
+                          class="rv-file"
+                          class:added={f.status === 'A' || f.status === '?'}
+                          class:deleted={f.status === 'D'}
+                          title={`${f.path}\n右键：预览 / 复制路径`}
+                          on:click={() => toggleRv(f)}
+                          on:contextmenu={(e) => {
+                            e.preventDefault();
+                            rvMenu = { x: e.clientX, y: e.clientY, path: f.path };
+                          }}
+                        >
+                          <svg class="rv-fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z" /><path d="M13.5 3.5V8H18" /></svg>
+                          <span class="rv-fname">{name}</span>
+                          {#if dir}<span class="rv-fdir">{dir}/</span>{/if}
+                          {#if f.status !== '?'}
+                            <span class="rv-stat"><span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span></span>
+                          {/if}
+                          <svg class="rv-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+                        </button>
+                        {#if rvOpen[f.path]}
+                          <div class="rv-diffwrap">
+                            {#if dc.loading}
+                              <div class="rv-diffnote">加载中…</div>
+                            {:else if dc.error}
+                              <div class="rv-diffnote">读取失败: {dc.error}</div>
+                            {:else if !dc.text}
+                              <div class="rv-diffnote">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
+                            {:else}
+                              <pre class="rv-diff">{#each rvParse(dc.text) as l, i (i)}<span class="rv-dl rv-dl-{l.t}">{#if l.t === 'add' || l.t === 'del' || l.t === 'ctx'}<span class="rv-dno">{l.o}</span><span class="rv-dno">{l.n}</span>{/if}<span class="rv-dtx">{l.s}</span></span>{/each}</pre>
+                            {/if}
+                          </div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
                 {/if}
               {:else if t.kind === 'file'}
                 <div class="rp-preview-head">
@@ -6805,7 +7005,7 @@
   :global(body.has-wallpaper) .tool-card,
   :global(body.has-wallpaper) .tool-preview,
   :global(body.has-wallpaper) .thinking-body,
-  :global(body.has-wallpaper) .cp-bar,
+  :global(body.has-wallpaper) .cp-card,
   :global(body.has-wallpaper) .approval-box,
   :global(body.has-wallpaper) .ctx-card {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
@@ -9100,17 +9300,28 @@
     margin-bottom: 8px;
     position: relative; /* 「待提交」明细气泡的定位基准 */
   }
-  .cp-dock .cp-bar {
+  /* 改动卡片：边框/底色/圆角挂在整张卡上，头部行与展开清单都是它的流内子元素——
+     展开后卡片向上长（.chat-input 是 bottom:0 的绝对定位），宽度永远等于收起态 */
+  .cp-dock .cp-card {
+    position: relative; /* 「N 处未提交」浮层以它为定位基准，宽度与卡片一致 */
     width: 100%;
     max-width: 880px;
+    box-sizing: border-box;
+    background: var(--g1);
+    border: 1px solid var(--g2);
+    border-radius: 8px;
+  }
+  /* 头部行只是卡内的一块流内内容：不自己带边框底色（那张皮在 .cp-card 上），
+     宽度由卡片定，所以收起态与展开态天然同宽 */
+  .cp-dock .cp-bar {
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
   }
   .cp-bar {
     display: flex;
     align-items: center;
     gap: 10px;
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 8px;
     padding: 8px 12px;
     font-size: 13px;
     color: var(--g6);
@@ -9319,6 +9530,9 @@
     border-radius: 6px;
     cursor: pointer;
     font-family: Consolas, monospace;
+    /* width:100% 含内边距才算一行——默认 content-box 会把 padding 再加出去，
+       审查行 padding 加大后整行比容器宽一截，底部白挨一条横向滑杆 */
+    box-sizing: border-box;
   }
   .git-pop-row:hover {
     background: var(--g2);
@@ -9361,20 +9575,301 @@
   button.cp-sum:hover {
     color: var(--g7);
   }
-  /* 展开的改动文件清单浮层（贴着变更条向上弹出，和 git-pop 同规矩；限高可滚） */
-  /* ZCode 是展开在变更条下面（用户 2026-10-02 第四轮实锤「要在下面」）；限高可滚 */
-  .cp-files-pop {
-    top: calc(100% + 4px);
-    bottom: auto;
-    left: 0;
-    right: 0;
+  /* 展开的改动文件清单：卡片内的流内子块（ZCode：清单跟头部同属一张卡，向下展开）。
+     不是绝对定位浮层——卡片向上长，既不撑出文档滚动条，宽度也和收起态天然一致 */
+  .cp-files {
+    border-top: 1px solid var(--g2);
     max-height: 320px;
-  }
-  .cp-files-pop .git-pop-list {
-    max-height: 240px;
     overflow-y: auto;
+    padding: 4px 0;
   }
-  /* 审查行（完全套 ZCode）：状态图标 / 文件名粗体+目录暗 / 增删 / 审查 / 打开▾ */
+  .cp-files .git-pop-list {
+    max-height: none;
+    overflow-y: visible;
+  }
+  .cp-files .review-row {
+    padding: 6px 12px;
+    border-radius: 0;
+  }
+  /* —— 审查面板（对齐 ZCode git pane）：头部（来源/撤销/刷新）+ 紧凑行 + 就地展开 diff —— */
+  .rv-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--g2);
+  }
+  .rv-src {
+    flex: none;
+    max-width: 100%;
+    background: var(--g1);
+    color: var(--g7);
+    border: 1px solid var(--g3);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .rv-src:hover {
+    border-color: var(--g4);
+  }
+  .rv-totals {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    color: var(--g5);
+    white-space: nowrap;
+  }
+  .rv-totals b {
+    color: var(--g6);
+  }
+  .rv-tsep {
+    flex: none;
+    color: var(--g4);
+    padding: 0 5px;
+  }
+  /* 刷新：转圈图标（ZCode 同款），加载中不重复点 */
+  .rv-btn {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: none;
+    color: var(--g6);
+    font-size: 12px;
+    font-family: inherit;
+    padding: 4px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .rv-btn:hover {
+    background: var(--g2);
+    color: var(--g7);
+  }
+  .rv-btn svg {
+    width: 15px;
+    height: 15px;
+  }
+  .rv-btn.spin svg {
+    animation: rv-spin 0.9s linear infinite;
+  }
+  @keyframes rv-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .rv-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 2px 0;
+  }
+  .rv-empty {
+    margin: auto;
+    text-align: center;
+    color: var(--g5);
+    font-size: 12.5px;
+    line-height: 1.7;
+    padding: 24px 16px;
+  }
+  .rv-empty svg {
+    width: 30px;
+    height: 30px;
+    color: var(--g4);
+    margin-bottom: 8px;
+  }
+  .rv-empty-t {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--g6);
+  }
+  .rv-empty-d {
+    font-size: 12px;
+    margin-top: 3px;
+  }
+  /* 行：ZCode 的 h-8 紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头 */
+  .rv-row {
+    border-bottom: 1px solid var(--g2);
+  }
+  .rv-row:last-child {
+    border-bottom: none;
+  }
+  .rv-file {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    min-width: 0;
+    height: 30px;
+    padding: 0 10px;
+    background: transparent;
+    border: none;
+    color: var(--g7);
+    font-size: 12.5px;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .rv-file:hover {
+    background: var(--g2);
+  }
+  .rv-row.open .rv-file {
+    background: var(--g2);
+  }
+  .rv-file .rv-fico {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    color: var(--g5);
+  }
+  .rv-file.added .rv-fico {
+    color: var(--tint-green-fg);
+  }
+  .rv-file.deleted .rv-fico {
+    color: var(--tint-red-fg);
+  }
+  .rv-fname {
+    flex: none;
+    font-weight: 650;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rv-fdir {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 11px;
+    color: var(--g5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rv-stat {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: monospace;
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .rv-chev {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    color: var(--g5);
+    transition: transform 0.12s;
+  }
+  .rv-row.open .rv-chev {
+    transform: rotate(180deg);
+  }
+  /* 就地展开的 diff：左右行号列 + 增删着色（ZCode 的 diff 预览） */
+  .rv-diffwrap {
+    background: var(--g0);
+    border-top: 1px solid var(--g2);
+    max-height: 460px;
+    overflow: auto;
+  }
+  .rv-diffnote {
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--g5);
+  }
+  .rv-diff {
+    margin: 0;
+    padding: 8px 0;
+    font-family: Consolas, 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    min-width: max-content;
+  }
+  .rv-dl {
+    display: flex;
+    align-items: stretch;
+  }
+  .rv-dno {
+    flex: none;
+    width: 38px;
+    padding-right: 9px;
+    text-align: right;
+    color: var(--g4);
+    user-select: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .rv-dtx {
+    white-space: pre;
+    padding-right: 14px;
+    color: var(--g6);
+  }
+  .rv-dl-add {
+    background: color-mix(in srgb, var(--tint-green-bg) 55%, transparent);
+  }
+  .rv-dl-add .rv-dtx {
+    color: var(--tint-green-fg);
+  }
+  .rv-dl-add .rv-dno {
+    color: color-mix(in srgb, var(--tint-green-fg) 55%, var(--g4));
+  }
+  .rv-dl-del {
+    background: color-mix(in srgb, var(--tint-red-bg) 55%, transparent);
+  }
+  .rv-dl-del .rv-dtx {
+    color: var(--tint-red-fg);
+  }
+  .rv-dl-del .rv-dno {
+    color: color-mix(in srgb, var(--tint-red-fg) 55%, var(--g4));
+  }
+  .rv-dl-hunk {
+    background: var(--g2);
+  }
+  .rv-dl-hunk .rv-dtx {
+    color: var(--tint-blue-fg);
+    padding-left: 4px;
+  }
+  .rv-dl-hunk .rv-dno {
+    color: var(--g4);
+  }
+  .rv-dl-meta .rv-dtx {
+    color: var(--g5);
+    padding-left: 4px;
+  }
+  /* 行右键菜单 */
+  .rv-menu-back {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+  }
+  .rv-menu {
+    position: fixed;
+    z-index: 91;
+    min-width: 132px;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    box-shadow: 0 10px 30px var(--overlay);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+  }
+  .rv-menu button {
+    background: transparent;
+    border: none;
+    color: var(--g7);
+    font-size: 12.5px;
+    font-family: inherit;
+    text-align: left;
+    padding: 6px 9px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .rv-menu button:hover {
+    background: var(--g2);
+  }
   .review-row {
     display: flex;
     align-items: center;
@@ -9383,6 +9878,7 @@
     border-radius: 6px;
     font-size: 12.5px;
     color: var(--g6);
+    box-sizing: border-box;
   }
   .review-row:hover {
     background: var(--g2);
