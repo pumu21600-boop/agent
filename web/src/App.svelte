@@ -8864,9 +8864,25 @@
     flex: 1;
     overflow-y: auto;
     padding: 20px 0 170px; /* 底部留出悬浮输入框 + 改动条的高度，最后一条消息不被遮挡 */
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+    /* 长会话性能（2026-10-07 用户实锤：7000+ 条消息的会话，拖侧栏调宽每帧 120ms+，
+       卡成一帧一顿）：这里**不能**用 flex 列——flex 子项不认 contain-intrinsic-size，
+       被 content-visibility 跳过的消息会按 0 高度占位，滚动条直接废掉。改 block 布局，
+       gap 用相邻 margin 补；空态（没有消息）才临时切回 flex 居中。 */
+    display: block;
+  }
+  .chat-body > * + * {
+    margin-top: 14px; /* 原 flex gap: 14px 的等价物 */
+  }
+  .chat-body:has(> .empty-hint) {
+    display: flex; /* 空态：没有消息，flex 居中不影响 content-visibility 的收益 */
+  }
+  /* 屏幕外的消息跳过布局与绘制——重排时只有可见的那几条参与。拖拽调宽 / 窗口
+     resize / 面板开关都不再整树重排，初次加载同样受益（以前 7778 条全排）。
+     contain-intrinsic-size 的 auto 关键字 = 渲染过就记住真实高度、没渲染过的按
+     140px 估位，滚动位置不跳。口径与「#each messages」一致：chat-body 直接子级 */
+  .chat-body > .msg {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 140px;
   }
   .empty-hint {
     margin: auto;
