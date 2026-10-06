@@ -4817,6 +4817,10 @@
 
   // —— 记忆库星云：每个光点 = 一次会话；搜索走向量检索 ——
   let galaxyOpen = false;
+  // 入口被关时（插件开关联动写 features.galaxy，事件经 settings_changed 回来）弹层跟着收——
+  // 否则侧栏按钮没了，星云弹层还开着，里面数据照样在跑，与「已停用」对不上。
+  // 与上面 roles 页签的让位同一套路（features 是异步回来的，晚于首屏）。
+  $: if (features && features.galaxy === false && galaxyOpen) galaxyOpen = false;
   function openSessionFromGalaxy(e) {
     galaxyOpen = false;
     loadSession(e.detail);

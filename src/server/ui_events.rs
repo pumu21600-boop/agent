@@ -41,6 +41,12 @@ pub(crate) fn emit(v: Value) {
     let _ = bus().send(v);
 }
 
+/// 测试专用：订一条事件流。无人订阅时发送即丢弃，不订阅就验不了「后端真推了」。
+#[cfg(test)]
+pub(crate) fn test_subscribe() -> broadcast::Receiver<Value> {
+    bus().subscribe()
+}
+
 /// 前端上报界面状态（POST /api/ui/state；任何来源的状态变化都该报，包括顶栏手点）。
 pub(crate) fn report_state(v: Value) {
     if let Ok(mut slot) = state_slot().write() {

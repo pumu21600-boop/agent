@@ -330,6 +330,7 @@ pub(super) async fn toggle_plugin(
     // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：停用的插件不贡献技能
+    emit_plugin_settings_changed(&synced_feature);
     observability::event(
         EventType::State,
         json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled, "synced_feature": synced_feature }),
@@ -337,6 +338,24 @@ pub(super) async fn toggle_plugin(
     // P18 二合一：回包清单含工具插件
     let list = crate::plugin::ui::scan_all(&s.disabled_plugins);
     (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
+}
+
+/// 插件开关落定后推给前端的 settings_changed。
+///
+/// 这个端点一直在写 settings（disabled_plugins，联动命中时还有 features），却曾是唯一
+/// 不推 settings_changed 的写入面：前端 toggleExt 只把回包的插件清单塞进 extList，
+/// settings 派生的界面状态就停在旧值。2026-10-06 用户实锤——关掉星云插件，
+/// 左下角「记忆库」按钮还在（它看的是 features.galaxy，那是联动写进去的）。
+///
+/// 前端 settings_changed 的 run 是 loadExt + loadSettings，所以事件一到，插件清单与
+/// features 一起重拉，入口该收就收。keys 带上联动命中的功能键：现在只作排查线索，
+/// 哪天前端要按 keys 做增量刷新，形状已经在这儿了。
+fn emit_plugin_settings_changed(synced_feature: &str) {
+    let mut keys = vec!["disabled_plugins".to_string()];
+    if !synced_feature.is_empty() {
+        keys.push(synced_feature.to_string());
+    }
+    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": keys }));
 }
 
 /// POST /api/plugins/draft —— 模型自产插件提交进 draft 隔离区（P18 027）。
@@ -654,5 +673,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(report.verdict, crate::plugin::review::Verdict::Pass);
         assert!(report.findings.is_empty(), "脚手架不该亮任何旗: {:?}", report.findings);
+    }
+
+    /// 插件开关必须推 settings_changed，且联动命中功能键时把它带在 keys 里。
+    ///
+    /// 回归的是 2026-10-06 的用户实锤：关掉星云插件，左下角「记忆库」按钮还在。
+    /// 后端联动早写对了 settings.features.galaxy（落盘为证），但这个端点是唯一
+    /// 不推事件的写入面——前端 toggleExt 只更新 extList，settings 派生的界面状态
+    /// （侧栏入口看 features.galaxy）停在旧值，直到重启才对上。
+    ///
+    /// 事件形状即前端契约：kind=settings_changed（UI_OPS 表里它的 run 是
+    /// loadExt + loadSettings）。keys 的顺序与内容是断言对象——换形状前端就刷不到。
+    ///
+    /// 注：这里钉的是事件本身的形状与「确实推了」；handler 里那次调用靠 code review 兜
+    /// （本仓无 HTTP 层测试基座，为一个 emit 造一套 AppState 不划算）。
+    #[test]
+    fn plugin_toggle_pushes_settings_changed_with_feature_key() {
+        // 事件总线是进程级广播，别的测试也可能在推：只认形状完全对上的那条
+        fn drain_for_galaxy(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> Option<Value> {
+            for _ in 0..64 {
+                match rx.try_recv() {
+                    Ok(v) => {
+                        let keys = v.get("keys").and_then(Value::as_array);
+                        let want = keys.is_some_and(|k| {
+                            k.iter().filter_map(Value::as_str).eq(["disabled_plugins", "galaxy"])
+                        });
+                        if v.get("kind").and_then(Value::as_str) == Some("settings_changed") && want {
+                            return Some(v);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            None
+        }
+
+        let mut rx = crate::server::ui_events::test_subscribe();
+        emit_plugin_settings_changed("galaxy");
+        let ev = drain_for_galaxy(&mut rx).expect("必须推 settings_changed：前端靠它重拉 settings（侧栏入口看 features.galaxy）");
+        assert_eq!(ev["kind"], "settings_changed");
+        assert_eq!(
+            ev["keys"].as_array().map(|a| a.len()).unwrap_or(0),
+            2,
+            "联动命中功能键时要带上它: {ev}"
+        );
+
+        // 没声明 feature 的普通插件也推（disabled_plugins 一直在变），只是 keys 只有一项
+        let mut plain = crate::server::ui_events::test_subscribe();
+        emit_plugin_settings_changed("");
+        let ev2 = plain.try_recv().expect("普通插件开关也要推 settings_changed");
+        assert_eq!(ev2["keys"].as_array().map(|a| a.len()).unwrap_or(0), 1, "无联动时 keys 只有 disabled_plugins: {ev2}");
     }
 }
