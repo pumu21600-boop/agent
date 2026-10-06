@@ -184,7 +184,7 @@
       approvalBySession = nextM;
     }
     if (curKey() === from) {
-      currentSessionId = to;
+      setCurSession(to);
       messages = arr;
     }
     syncCur();
@@ -405,7 +405,7 @@
       if (!r.ok || d.error) throw new Error(d.error || `HTTP ${r.status}`);
       wsModalOpen = false;
       // 工作区变了：会话/消息/圆环全部重置，重新拉列表（各会话缓冲与排队一并清掉）
-      currentSessionId = null;
+      setCurSession(null);
       // 在跑的流一并断开登记（服务端那轮继续跑——SSE 断 ≠ 取消，坑 26）。不清的话
       // 切回来 loadSession 走「本地缓冲」分支，拿到的是刚被清空的缓冲，历史全不见
       // （2026-09-27 用户实锤「切界面丢对话内容」）；断开后对账轮询会把跑完的内容补回来。
@@ -1282,23 +1282,22 @@
   let rpWidth = Number(localStorage.getItem('rpWidth')) || 420;
   let rpResizing = false;
   function startRpResize(e) {
+    if (e.button !== 0) return;
     e.preventDefault();
     rpResizing = true;
+    const handle = e.currentTarget;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* 捕获失败退回冒泡，不阻断 */
+    }
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-    // 合帧：同侧栏，一帧最多写一次宽度
-    let latestX = 0;
-    let rafId = 0;
-    const apply = () => {
-      rafId = 0;
-      rpWidth = Math.min(820, Math.max(320, Math.round(window.innerWidth - latestX)));
-    };
+    // 宽度直接应用（同侧栏：mousemove 按帧合并，不做 rAF 中转）
     const move = (ev) => {
-      latestX = ev.clientX;
-      if (!rafId) rafId = requestAnimationFrame(apply);
+      rpWidth = Math.min(820, Math.max(320, Math.round(window.innerWidth - ev.clientX)));
     };
     const up = () => {
-      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       rpResizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
@@ -1306,11 +1305,13 @@
       // 拖拽期间视口同步被让路（见 webSyncViewport），停手补发最后一次：
       // 面板最终宽度立刻通知到壳里 webview / 截图
       webQueueViewport();
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
     };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
   }
 
   $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
@@ -2937,6 +2938,9 @@
           );
         }
         loadSessions(); // 刷新会话列表（新会话出现/标题更新）
+        // 时间线面板跟着本轮走：它只显示当前对话（用户 2026-10-07 拍板），不广播
+        // 的话跑完一轮面板还是旧数据，得用户手点刷新
+        notifyExtsSession(skey);
         // 出队（027）：这一轮跑完了，把排在最前的排队消息自动发出去（发完它再发下一条）
         const q = outbox[skey] || [];
         if (q.length > 0 && !streams[skey]) {
@@ -3096,7 +3100,7 @@
     // 027：切会话不再被别的会话的运行挡住（不同对话互不影响）；
     // 该会话自己有在跑的流 → 直接用本地缓冲（服务端文件此刻还没有最新内容）
     if (streams[id]) {
-      currentSessionId = id;
+      setCurSession(id);
       currentTitle = sessions.find((x) => x.id === id)?.title ?? currentTitle;
       syncCur();
       restoreUsage(id); // 从按会话账本恢复（跑完的会话不重发事件，不恢复就显示 0）
@@ -3115,7 +3119,7 @@
         await confirmAsk(`打开会话失败：${r.error}`, true);
         return;
       }
-      currentSessionId = id;
+      setCurSession(id);
       currentTitle = r.title || (sessions.find((x) => x.id === id)?.title ?? '');
       // 服务端用量快照（会话文件里随事件落盘的那份）：重启/重开程序后圆环和缓存行
       // 从这里恢复，不用等下一轮请求再攒。活数据优先，这里只兜底
@@ -3161,7 +3165,7 @@
   // 同一项目已有一条空会话时后端会复用，连点不会堆出一排。
   async function startNewSession() {
     if (streams['@new']) return; // 还没落 id 的新会话正在跑：等它拿到 id 再说
-    currentSessionId = null;
+    setCurSession(null);
     currentTitle = '';
     dockCp = null;
     sessionMsgs = { ...sessionMsgs, '@new': [] };
@@ -3209,65 +3213,72 @@
   let sidebarW = Number(localStorage.getItem('sidebarW')) || 300; // 侧栏宽度（右缘拖拽可调，240–520）
   let resizing = false;
 
-  // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化
+  // 侧栏右缘拖拽调宽：按住手柄移动鼠标，松手持久化（240–720）。
+  // 指针事件 + setPointerCapture：捕获后所有 pointermove/pointerup/pointercancel
+  // 都路由到手柄元素——光标挪到 iframe 上、窗口外、别的元素上都不会丢事件。
+  // 早两版用 window 级 mousemove/mouseup 监听，真机（Tauri WebView2）实锤两类
+  // 症状：拖到某处像被卡住要来回蹭、松手后侧栏还跟着没按住的鼠标跑（mouseup 丢了）。
+  // 宽度在手柄里**直接**应用：Chromium 对 mousemove/pointermove 按帧合并（规范动作），
+  // 125Hz+ 鼠标也是一帧一次写入；不做 rAF 中转——rAF 在壳里可能被节流，中转一下
+  // 反而表现成「侧栏冻住不跟手」（同一批真机反馈）。
   function startResize(e) {
+    if (e.button !== 0) return; // 只认左键（触摸/笔的 button 也是 0，一并支持）
     e.preventDefault();
     resizing = true;
+    const handle = e.currentTarget;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* 捕获失败（极端环境）下退回 DOM 冒泡也能拖，不阻断 */
+    }
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-    // 合帧：125Hz+ 鼠标一帧里会来好几个 mousemove，每个都触发一次 Svelte flush =
-    // 一帧内强制布局好几次。只认每帧最后一个位置，一帧最多写一次宽度。
-    let latestX = 0;
-    let rafId = 0;
-    const apply = () => {
-      rafId = 0;
-      sidebarW = Math.min(520, Math.max(240, Math.round(latestX)));
-    };
     const move = (ev) => {
-      latestX = ev.clientX;
-      if (!rafId) rafId = requestAnimationFrame(apply);
+      sidebarW = Math.min(720, Math.max(240, Math.round(ev.clientX)));
     };
     const up = () => {
-      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       resizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       localStorage.setItem('sidebarW', String(sidebarW));
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
     };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
   }
   // 终端面板高度（上缘拖拽可调，120–560，持久化）——对齐 ZCode 的可调尺寸
   let termH = Number(localStorage.getItem('termH')) || 260;
   let termResizing = false;
   function startTermResize(e) {
+    if (e.button !== 0) return;
     e.preventDefault();
     termResizing = true;
+    const handle = e.currentTarget;
+    try {
+      handle.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* 捕获失败退回冒泡，不阻断 */
+    }
     document.body.style.cursor = 'row-resize';
     document.body.style.userSelect = 'none';
-    let latestY = 0;
-    let rafId = 0;
-    const apply = () => {
-      rafId = 0;
-      termH = Math.min(560, Math.max(120, Math.round(window.innerHeight - latestY)));
-    };
     const move = (ev) => {
-      latestY = ev.clientY;
-      if (!rafId) rafId = requestAnimationFrame(apply);
+      termH = Math.min(560, Math.max(120, Math.round(window.innerHeight - ev.clientY)));
     };
     const up = () => {
-      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       termResizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       localStorage.setItem('termH', String(termH));
-      window.removeEventListener('mousemove', move);
-      window.removeEventListener('mouseup', up);
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
     };
-    window.addEventListener('mousemove', move);
-    window.addEventListener('mouseup', up);
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
   }
   let sessMenuId = null; // 打开了操作菜单的会话 id
   let projMenuPath = null; // 打开了操作菜单的项目 path
@@ -4355,8 +4366,8 @@
       },
     },
     // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
-    // 服务端只返回**当前工作区**的任务（session_id → 会话文件的 workspace 映射）；
-    // 当前会话可能还没落盘，把 id 带上兜底。
+    // 时间线**只显示当前对话**（用户 2026-10-07 拍板）：session 参数就是过滤范围，
+    // 没有当前会话（新对话还没落 id）时后端返回空——不漏别会话的任务进来。
     'trace.recent': {
       bridge: true, title: '读最近任务事件流',
       async run({ reply, get, params }) {
@@ -4863,6 +4874,21 @@
     if (el && el.contentWindow) el.contentWindow.postMessage(msg, '*');
   }
 
+  /// 广播「当前会话变了」给所有已启用插件面板：时间线只显示当前对话
+  /// （用户 2026-10-07 拍板），切会话/切工作区/新对话后面板必须跟着换数据——
+  /// iframe 常驻不重载，不广播就还停在旧对话上。通用事件，不认的类型按插件
+  /// 契约忽略。
+  function notifyExtsSession(id) {
+    for (const e of enabledExts) {
+      postToName(e.name, { type: 'agent:event', event: 'session', id: id || '' });
+    }
+  }
+  /// 切换当前会话的唯一入口：赋值 + 广播。
+  function setCurSession(id) {
+    currentSessionId = id;
+    notifyExtsSession(id);
+  }
+
   /// 写剪贴板：插件 iframe 是 sandbox 不透明源（非安全上下文），navigator.clipboard 与
   /// execCommand 都不归它使——复制一律到宿主页执行（localhost 是真源）。用户右键触发，
   /// 权限 clipboard 在 manifest 声明；navigator.clipboard 失败回落 execCommand。
@@ -5134,7 +5160,7 @@
         <div class="side-version" title={`运行根：${appVersion.root}`}>v{appVersion.version}</div>
       {/if}
     </div>
-    <div class="resize-handle" on:mousedown={startResize}></div>
+    <div class="resize-handle" on:pointerdown={startResize}></div>
   </aside>
 
   <main class="chat" class:side-collapsed={sidebarCollapsed}>
@@ -5805,7 +5831,7 @@
     </div>
     {#if terminalOpen}
       <div class="term-panel" class:resizing={termResizing} style="height:{termH}px">
-        <div class="term-resize" title="拖拽调整高度" on:mousedown={startTermResize}></div>
+        <div class="term-resize" title="拖拽调整高度" on:pointerdown={startTermResize}></div>
         <div class="term-head">
           <span class="term-title">终端</span>
           <span class="term-hint">工作区内 · 沙箱执行</span>
@@ -5866,7 +5892,7 @@
 
   {#if rightPanelOpen}
     <aside class="right-panel" class:resizing={rpResizing} style="width:{rpWidth}px">
-      <div class="rp-resize" title="拖拽调整宽度" on:mousedown={startRpResize}></div>
+      <div class="rp-resize" title="拖拽调整宽度" on:pointerdown={startRpResize}></div>
       <div class="rp-tabs">
         <!-- 标签条可横向滚动（标签多了不挤爆），+ 号固定在条外不被滚走 -->
         <div class="rp-tabstrip" bind:this={rpStripEl} on:scroll={rpStripSync}>
@@ -7213,6 +7239,8 @@
     width: 6px;
     cursor: col-resize;
     z-index: 20;
+    /* 指针拖拽：禁掉触摸的滚动/缩放手势，pointermove 才会连续到手柄 */
+    touch-action: none;
   }
   .resize-handle:hover {
     background: var(--veil);
@@ -7970,6 +7998,7 @@
     height: 7px;
     cursor: row-resize;
     z-index: 6;
+    touch-action: none;
   }
   .term-panel.resizing {
     border-top-color: var(--g5);
@@ -8073,6 +8102,7 @@
     width: 7px;
     cursor: col-resize;
     z-index: 6;
+    touch-action: none;
   }
   .right-panel.resizing {
     border-left-color: var(--g5);

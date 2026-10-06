@@ -158,27 +158,15 @@
         font-size: 10.5px;
         font-weight: 600;
       }
-      /* 归属会话徽标：任务行一眼能看出是谁干的活。工作区范围的任务混排时，
-         用户此前的实锤反馈「像只加载了当前会话」——根因就是行上看不出归属。
-         标题超宽省略，全文在 title 里 */
-      .sess {
-        flex: none;
-        max-width: 45%;
-        padding: 1px 6px;
-        border-radius: 4px;
-        background: var(--t-blue-bg);
-        color: var(--t-blue-fg);
-        font-size: 11px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      /* 范围行：面板数据的口径（当前工作区 × N 个会话），一行小字说清，
-         别让用户猜「这是全部还是当前会话」 */
+      /* 范围行：面板数据口径。时间线**只显示当前对话**（用户 2026-10-07 拍板），
+         这里把对话标题摊开写，切会话后面板跟着换 */
       .scope {
         color: var(--dim);
         font-size: 12px;
         margin: -2px 0 8px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .meta {
         color: var(--dim);
@@ -288,6 +276,7 @@
       // 「展开着的那个任务」悄悄换成另一个；时间戳是任务的稳定身份。
       let expandedTs = null;
       let last = null; // 最近一次数据（展开切换时不重拉）
+      let loadSeq = 0; // 加载序号：连续切换会话时丢掉过期的响应，别让旧对话的数据覆盖新的
 
       function call(method, params) {
         return new Promise((resolve, reject) => {
@@ -310,6 +299,12 @@
           // 主题跟随宿主（init 里带已解析的 theme；宿主切主题会重发 init）
           document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
           if (!booted) { booted = true; load(); }
+          return;
+        }
+        // 宿主广播「当前会话变了」（切会话/新对话/切工作区/一轮跑完）：时间线只显示
+        // 当前对话，换个对话就得重拉，否则还停在旧对话的数据上
+        if (d.type === 'agent:event' && d.event === 'session') {
+          if (booted) load();
           return;
         }
         if (d.type === 'agent:response' && pending.has(d.id)) {
@@ -414,18 +409,17 @@
         const scope = document.getElementById('scope');
         const tasks = data.tasks || [];
         const note = data.note || '';
-        // 范围行：数据口径一眼可见（当前工作区 × 几个会话）。宿主只回当前工作区的
-        // 任务，但之前的实锤反馈是「像只加载了当前会话」——把会话数摊开写，
-        // 单会话就是单会话（日志只留了它），多会话就看得出工作区范围。
+        // 范围行：时间线只显示当前对话（宿主按当前会话过滤），把对话标题摊开写。
+        // 标题取不到（新对话还没落盘）就只写「当前对话」。
         if (tasks.length) {
-          const sessSet = new Set(tasks.map((t) => t.session).filter(Boolean));
-          scope.textContent = `当前工作区 · 来自 ${sessSet.size} 个会话`;
+          const t0 = tasks[0].session_title ? ` · ${tasks[0].session_title}` : '';
+          scope.textContent = `当前对话${t0}`;
         } else {
           scope.textContent = '';
         }
         if (!tasks.length) {
           body.className = 'empty';
-          body.textContent = note || '当前工作区还没有任务记录（跑一次对话后这里会出现事件流）';
+          body.textContent = note || '当前对话还没有任务记录（跑一次对话后这里会出现事件流）';
           return;
         }
         let html = note ? `<div class="note">${esc(note)}</div>` : '';
@@ -435,12 +429,9 @@
           const vis = task.events.map((ev, ei) => ({ ev, ei })).filter((x) => !isPlumbing(x.ev));
           const hidden = task.events.length - vis.length;
           const pairs = open ? pairDurations(task.events) : null;
-          // 归属会话：查不到标题 = 刚建还没落盘的兜底会话
-          const sessName = task.session_title || '新会话';
           html += `<div class="task"><button class="task-head" data-ts="${esc(task.start_ts)}">
             <span class="idx">#${ti + 1}</span>
             <span class="time">${esc(fmtClock(task.start_ts))}${task.lost_start ? '<span class="stale" title="任务起点事件被日志轮转冲掉了：这个时间是兜底边界的时刻，不是任务真正的开始">起点缺失</span>' : ''}</span>
-            <span class="sess" title="所属会话：${esc(sessName)}">${esc(sessName)}</span>
             <span class="meta">${esc(fmtDur(task.duration_ms))} · ${vis.length} 事件${hidden ? ` · 折叠 ${hidden}` : ''}</span>
             <svg class="caret${open ? ' open' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="m9 6 6 6-6 6"/></svg>
           </button>`;
@@ -477,10 +468,13 @@
         const body = document.getElementById('body');
         body.className = 'empty';
         body.textContent = '加载中…';
+        const my = ++loadSeq;
         try {
           last = await call('trace.recent', { limit: 10 });
+          if (my !== loadSeq) return; // 期间又触发过一次加载（切会话）：这份响应过期了
           render(last);
         } catch (e) {
+          if (my !== loadSeq) return;
           body.className = 'empty';
           body.textContent = `读取失败: ${e.message || e}`;
         }

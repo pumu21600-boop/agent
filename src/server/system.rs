@@ -81,7 +81,8 @@ pub struct TraceQuery {
     /// 最近任务数（1–50，默认 5）
     #[serde(default = "default_trace_limit")]
     pub limit: usize,
-    /// 当前会话 id（宿主带入兜底）：刚建的会话可能还没落盘，按工作区映射会漏掉它
+    /// 当前会话 id（宿主带入）：**时间线只显示当前对话**——这个参数就是过滤范围
+    /// 本身（用户 2026-10-07 拍板）。空 = 没有当前会话（新对话还没落 id）→ 空时间线。
     #[serde(default)]
     pub session: Option<String>,
 }
@@ -104,37 +105,37 @@ pub(super) async fn get_version() -> Json<Value> {
     }))
 }
 
-/// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
-/// **只展示当前工作区**的任务（用户 2026-10-01 要求）：日志行只有 session_id，
-/// 归属靠会话文件里的 workspace 映射；当前会话可能还没落盘，`session` 参数兜底。
-/// 每个任务带 `session`/`session_title`（归属会话 id + 标题）：面板要能看出
-/// 「这确实是整个工作区的任务、不是当前会话一个的」（用户 2026-10-07 实锤看不出来）。
-/// **只读解析** JSONL（payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；
-/// 坏行跳过；文件不存在/为空返回空 tasks 而非报错。
+/// GET /api/trace?limit=N&session=<当前会话id> —— 最近 N 个任务的事件流（时间线面板数据源）。
+/// **只展示当前对话**的任务（用户 2026-10-07 拍板，推翻 10-01 的「按工作区范围」）：
+/// `session` 参数就是范围本身，严格只放行该会话（10-01 时它是工作区映射之外的
+/// 兜底并集，现在当前会话即范围）。没有当前会话（新对话还没落 id）→ 空时间线：
+/// 新对话本来没有任务，别把别的会话的任务漏进来。
+/// 每个任务带 `session`/`session_title`（归属会话 id + 标题）。**只读解析** JSONL
+/// （payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；坏行跳过；
+/// 文件不存在/为空返回空 tasks 而非报错。
 pub(super) async fn get_trace(
     State(state): State<AppState>,
     Query(q): Query<TraceQuery>,
 ) -> (StatusCode, Json<Value>) {
     let Some(path) = observability::log_path() else {
-        return (StatusCode::OK, Json(json!({ "tasks": [], "note": "logger 未初始化" })));
+        return (StatusCode::OK, Json(json!({ "tasks": [], "scope": "session", "note": "logger 未初始化" })));
     };
     let limit = q.limit.clamp(1, 50);
-    let cur_ws = crate::tools::workspace_root().display().to_string();
-    // 工作区 → 会话映射一张表两用：既算过滤集，也当 id→标题 查表回给面板
-    // （用户 2026-10-07 实锤「时间线像只加载当前会话」：任务行看不出归属会话，
-    // 单会话内容就像被按会话过滤了。响应带上 session/session_title，范围可见）。
-    // 标题口径与侧栏一致（list() 已做「新会话」占位的首条用户消息回落）。
+    // 严格当前会话范围；没有当前会话 = 新对话还没落 id → 空时间线（照实说，
+    // 不漏别会话的任务进来）。标题查表顺带做：会话文件里拿标题给面板展示
+    // （查不到 = 刚建还没落盘，面板显示「新会话」）。
+    let allowed: std::collections::HashSet<String> = match q.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sid) => std::iter::once(sid.to_string()).collect(),
+        None => {
+            return (StatusCode::OK, Json(json!({ "tasks": [], "scope": "session", "note": "当前对话还没有任务记录" })));
+        }
+    };
     let titles: std::collections::HashMap<String, String> = state
         .session
         .list()
         .iter()
-        .filter(|m| super::workspace::same_workspace(&m.workspace, &cur_ws))
         .map(|m| (m.id.clone(), m.title.clone()))
         .collect();
-    let mut allowed: std::collections::HashSet<String> = titles.keys().cloned().collect();
-    if let Some(sid) = q.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        allowed.insert(sid.to_string());
-    }
     // 日志按体积轮转（<file>.1 最新 … <file>.N 最旧）：长对话的 task.start 落在归档、
     // 后续事件落在当前文件是真机常态——只读当前文件会把跨文件任务撕成孤儿事件
     // （时间线「怎么都刷不出来」的实锤根因）。按时间正序（最旧在前）喂给解析器，
@@ -160,8 +161,8 @@ pub(super) async fn get_trace(
                         "start_ts": t.start_ts,
                         "end_ts": t.end_ts,
                         "duration_ms": t.duration_ms(),
-                        // 归属会话：id + 标题（标题查不到 = 刚建还没落盘的兜底会话，
-                        // 前端显示「新会话」）；工作区范围的任务都带得出归属
+                        // 归属会话：id + 标题（标题查不到 = 刚建还没落盘的新对话，
+                        // 面板显示「新会话」）
                         "session": t.session,
                         "session_title": titles.get(&t.session).cloned().unwrap_or_default(),
                         // 起点被日志轮转吃掉时为 true：start_ts 是近似值（兜底边界那条
@@ -171,7 +172,7 @@ pub(super) async fn get_trace(
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(json!({ "tasks": list })))
+            (StatusCode::OK, Json(json!({ "tasks": list, "scope": "session" })))
         }
         Ok(Err(e)) => (StatusCode::OK, Json(json!({ "tasks": [], "note": format!("读取失败: {e}") }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
