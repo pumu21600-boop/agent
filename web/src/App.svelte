@@ -10383,11 +10383,11 @@
     background: var(--g2);
     color: var(--g7);
   }
+  /* 完全访问档只留红字作静态警示：边框去掉（用户 2026-10-07 实锤「把红色框
+     去掉」——整个输入栏就这一块挂红框太扎眼；档位含义有 title 与菜单说明讲）。 */
   .pill.danger {
     color: var(--tint-red-fg);
-    border: 1px solid var(--tint-red-bg);
   }
-  /* 完全访问档悬停不再垫红底：沿用 .pill:hover 的灰色高亮，红字红边只作静态警示 */
   .model-pill {
     font-family: Consolas, monospace;
   }
