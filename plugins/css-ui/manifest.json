@@ -1,1 +1,1 @@
-{"apiVersion":1,"source":"built_in","title":"css-ui注入","description":"界面微调引擎与手写 CSS：右键元素改样式、让 agent 直接调界面；工具本身在宿主侧执行（插件是不透明源，碰不到宿主界面）","version":"0.1.0","entry":"index.html","ui":[{"slot":"dock","id":"css-ui","title":"css-ui注入"}],"feature":"css_tool","permissions":["settings.feature"]}
+{"apiVersion":1,"source":"built_in","title":"css-ui工具","description":"界面微调引擎与手写 CSS：右键元素改样式、让 agent 直接调界面；工具本身在宿主侧执行（插件是不透明源，碰不到宿主界面）","version":"0.2.0","entry":"index.html","ui":[{"slot":"dock","id":"css-ui","title":"css-ui工具"}],"feature":"css_tool","permissions":["settings.feature"]}

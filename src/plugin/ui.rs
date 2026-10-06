@@ -282,7 +282,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
     if let Some(en) = v.get("entry").and_then(Value::as_str) {
         e.entry = en.to_string();
     }
-    // P21：插件自带设置页（如「用量」插件的价格设置页）；必须不出目录
+    // P21：插件自带设置页（如「用量价格」插件的价格设置页）；必须不出目录
     if let Some(se) = v.get("settings_entry").and_then(Value::as_str) {
         match resolve_in(dir, se) {
             Ok(p) if p.is_file() => e.settings_entry = se.to_string(),
@@ -956,7 +956,7 @@ mod tests {
     fn index_prompt_scans_real_builtin_plugins() {
         let idx = index_prompt();
         assert!(idx.contains("## 可用插件"), "索引为空说明扫描没跑通: {idx}");
-        for t in ["中枢", "记忆库", "断线取消", "功能桥接", "css-ui注入", "浏览器", "时间线", "用量", "项目文件"] {
+        for t in ["中枢", "记忆库", "断线取消", "功能桥接", "css-ui工具", "浏览器", "时间线", "用量价格", "项目文件"] {
             assert!(idx.contains(&format!("- /{t}: ")), "内置插件 {t} 没进索引: {idx}");
         }
         // 降级/移出的都不该再出现在插件索引里

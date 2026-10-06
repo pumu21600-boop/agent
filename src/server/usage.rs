@@ -1,11 +1,11 @@
 //! 用量台账报表与价格设置（P19 自 server.rs 按域拆出；P21 施工单 030 新增成本台账端点；
-//! P21 插件化：报表按会话过滤供「用量」插件面板用，价格表经 settings.json 读写）
+//! P21 插件化：报表按会话过滤供「用量价格」插件面板用，价格表经 settings.json 读写）
 
 use super::*;
 
 /// GET /api/usage?group=provider|model&range=today|7d|30d|all&session=<id>
 /// —— 台账聚合报表。数字全部来自 `<log_dir>/usage/ledger.jsonl`（网关单点记录，费用已冻结）。
-/// `session` 非空 = 只算该会话（「用量」插件的「当前对话」口径）；缺省 = 全量。
+/// `session` 非空 = 只算该会话（「用量价格」插件的「当前对话」口径）；缺省 = 全量。
 pub(super) async fn get_usage(State(state): State<AppState>, Query(q): Query<UsageQuery>) -> Json<Value> {
     // 缺省口径：按供应商、看全部（面板自己传 session + range）
     let group = if q.group.trim().is_empty() { crate::usage::GROUP_PROVIDER.to_string() } else { q.group };

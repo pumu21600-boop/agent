@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     crate::skills::set_disabled(&user_settings.disabled_skills); // 2026-10-02：技能启停名单贯通（index_prompt/composer 过滤）
     crate::plugin::trust::install(&user_settings.trusted_plugins); // P21 红线3：第三方插件验签（pin digest）
     crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
-    // P21 成本台账：价格表来自 settings.json（由「用量」插件的价格设置页维护），
+    // P21 成本台账：价格表来自 settings.json（由「用量价格」插件的价格设置页维护），
     // 初始化台账时扫一遍装入累计花费（费用已冻结在记录里，直接求和），最后装花费硬闸。
     usage::install_prices(&user_settings.cost.prices);
     usage::init(&log_dir.join("usage"));

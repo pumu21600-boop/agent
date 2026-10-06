@@ -18,10 +18,10 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
 - **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**第三方验签**：来源为 `user` 的插件（自装 / 工作区 / plugins 目录）要点「信任」固定内容指纹后才加载，文件被改动即停用；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
-- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量」插件**（`plugins/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
+- **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量价格」插件**（`plugins/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签含「插件 / 第三方」两组与「宿主能力」区——Git 运行时行（哪个 git 在生效 + 重新检测）与沙箱自检行，2026-10-06 插件重整后从插件搬家到这）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量价格」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签含「插件 / 第三方」两组与「宿主能力」区——Git 运行时行（哪个 git 在生效 + 重新检测）与沙箱自检行，2026-10-06 插件重整后从插件搬家到这）。
 - **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 229 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
@@ -50,7 +50,7 @@ agent/
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目文件、trace/ 时间线、usage/ 用量）
+├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目文件、trace/ 时间线、usage/ 用量价格）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
@@ -342,7 +342,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
   拒载并提示升级（不做 shim；v0.x 期间不保证插件兼容）。未知字段一律忽略（只增不删 = 向后兼容）。
 - **draft 隔离区**（模型自产，`source=model_generated`）：只在内存（重启即失）、权限一律清空；
   设置 → 插件 里「转正」（落盘持久化、来源改 user）或「丢弃」。
-- **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
+- **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量价格"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
 - **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮。
 - **插件自带技能**：manifest `skills: "skills"`（相对目录，每子目录一个 SKILL.md）→ 技能进系统提示索引，模型 read_skill 可读（返回头部带技能目录，脚本资产用绝对路径跑）。纯技能插件不需要 entry/ui（内置 GitHub / Word / 表格 / PDF / 演示文稿 / 浏览器 六个生态插件就是这么落的）；停用插件或未验签的第三方插件不贡献技能。技能页只列自己建的技能，插件技能的管理（启停/信任）都在插件页；composer 的 `$` 技能选择菜单含插件技能，新建同名技能可覆盖插件版。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
@@ -363,9 +363,9 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - **分计量**：prompt / completion / cache 三路分开；渠道不回 usage 的调用 token 记 0，但请求与延迟照记。
 - **费用冻结构**：`cost_usd` 在记账时按当时价格算定写进记录——之后改价只影响新请求，历史账一分不动（价格页有「按当前价格重算历史」的显式补救按钮）。
 - **`parent_session`**：P22 子代理的父任务归属字段（v1 恒为 null，子代理落地后填值即可按父任务聚合）。
-- **报表**：`GET /api/usage?group=provider|model&range=today|7d|30d|all&session=<id>`；`session` 非空 = 只算该会话（「用量」插件的「当前对话」口径），缺省 = 全量。
+- **报表**：`GET /api/usage?group=provider|model&range=today|7d|30d|all&session=<id>`；`session` 非空 = 只算该会话（「用量价格」插件的「当前对话」口径），缺省 = 全量。
 
-## 「用量」插件（随包内置试点，plugins/usage/）
+## 「用量价格」插件（随包内置试点，plugins/usage/）
 
 右侧面板在「产物 / 预览 / 网页」旁多一个**用量**页签（manifest 声明 `ui:[{slot:"dock"}]`；插件停用则页签与价格设置一起消失，**台账与硬闸照常跑**——内核不受插件停用影响）。插件经只读桥 `usage.session` 拉当前会话统计，显示输入 token（含缓存命中）/ 输出 token / 请求次数 / 本次对话费用，页脚一行累计花费与上限。
 

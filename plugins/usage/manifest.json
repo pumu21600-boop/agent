@@ -1,16 +1,16 @@
 {
   "apiVersion": 1,
   "source": "built_in",
-  "title": "用量",
+  "title": "用量价格",
   "description": "当前对话的 token 用量与费用",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "index.html",
   "settings_entry": "prices.html",
   "ui": [
     {
       "slot": "dock",
       "id": "usage",
-      "title": "用量"
+      "title": "用量价格"
     }
   ],
   "permissions": [

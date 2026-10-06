@@ -60,7 +60,7 @@ pub struct SettingsUpdate {
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
-    /// 内置功能开关（功能桥接/css-ui注入/记忆库）。Some = 整体替换
+    /// 内置功能开关（功能桥接/css-ui工具/记忆库）。Some = 整体替换
     #[serde(default)]
     pub features: Option<crate::config::settings::FeatureSettings>,
 }

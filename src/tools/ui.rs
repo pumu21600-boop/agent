@@ -15,7 +15,7 @@
 use serde_json::{Value, json};
 
 /// 侧栏面板白名单（与前端 RP_EXT_PANELS 同源；两边改动要同步）。
-const PANELS: &[(&str, &str)] = &[("trace", "时间线"), ("board", "项目文件"), ("usage", "用量")];
+const PANELS: &[(&str, &str)] = &[("trace", "时间线"), ("board", "项目文件"), ("usage", "用量价格")];
 
 /// 通用事件通道（2026-10-03 用户拍板「别一个一个加」）：新界面能力以后只加前端一条
 /// 分支 + 这里一行 kind，模型即可触达，不再为每个动作改 Rust 工具签名。

@@ -109,7 +109,7 @@ pub struct FeatureSettings {
     /// 全部回主渠道或默认退化（config.toml [roles] 一并不再生效）
     #[serde(default = "default_true")]
     pub roles: bool,
-    /// css-ui注入（界面微调引擎 + 手写 CSS）：关 = 收起工具入口，已调好的样式继续生效
+    /// css-ui工具（界面微调引擎 + 手写 CSS）：关 = 收起工具入口，已调好的样式继续生效
     #[serde(default = "default_true")]
     pub css_tool: bool,
     /// 星云入口（记忆库可视化/检索）：关 = 只藏入口，记忆功能本体不受影响
@@ -154,7 +154,7 @@ impl FeatureSettings {
     }
 }
 
-/// 成本台账设置（P21 插件化后由「用量」插件的价格设置页维护）。
+/// 成本台账设置（P21 插件化后由「用量价格」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

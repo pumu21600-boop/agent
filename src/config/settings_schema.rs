@@ -250,7 +250,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
     },
     SchemaEntry {
         path: "features.css_tool",
-        label: "css-ui 注入",
+        label: "css-ui 工具",
         ty: "bool",
         enum_values: &[],
         default: Some("true"),

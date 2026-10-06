@@ -45,7 +45,7 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写。dock/toolbar 面板插件的 entry 不再在设置→插件卡上给「打开」按钮（面板归侧边栏，用户 2026-10-03 拍板） |
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
 | settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它。dock 面板插件不给「设置」按钮——设置从侧边栏面板内进（如用量的价格表在面板里有入口） |
-| ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量」插件） |
+| ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量价格」插件） |
 | permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）；**未声明的一律拒绝** |
 | skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件或未过信任门的 user 插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
 

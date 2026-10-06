@@ -3850,7 +3850,7 @@
   const UI_OPS = {
     open_panel: {
       kind: 'open_panel', title: '打开右侧边栏面板', risk: 'safe', internal: false,
-      args: 'name: 面板插件 id（trace=时间线/board=项目文件/usage=用量）',
+      args: 'name: 面板插件 id（trace=时间线/board=项目文件/usage=用量价格）',
       run(m) { rpOpenExtByName(m.name); },
     },
     close_panel: {
@@ -4230,7 +4230,7 @@
         reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
       },
     },
-    // —— P21 只读桥：「用量」插件（plugins/usage 试点）拉当前会话的用量统计 ——
+    // —— P21 只读桥：「用量价格」插件（plugins/usage 试点）拉当前会话的用量统计 ——
     'usage.session': {
       bridge: true, title: '读当前会话用量',
       async run({ reply, get, params }) {
@@ -4546,7 +4546,7 @@
     });
   }
 
-  /// 打开插件的指定页（manifest settings_entry，如「用量」插件的价格设置页）
+  /// 打开插件的指定页（manifest settings_entry，如「用量价格」插件的价格设置页）
   function openExtPage(e, page) {
     const wasOpenSame = extOpen && extCurrent && extCurrent.name === e.name;
     extCurrent = { ...e, entry: page };
@@ -6756,7 +6756,7 @@
         {/if}
 
         <!-- 权限放开轮（用户 2026-10-02 拍板）：内置能力已全部插件化——Git/沙箱/功能桥接/
-             css-ui注入/星云/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
+             css-ui工具/记忆库/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
              host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行。
              2026-10-06 重整：git-panel / sandbox-panel 移出插件位（能力留在宿主），5 个纯
              技能插件降级成全局技能（住技能页），此行只剩 9 个插件 -->

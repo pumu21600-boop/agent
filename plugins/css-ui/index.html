@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>css-ui注入</title>
+<title>css-ui工具</title>
 <style>
   :root { scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
   body {
@@ -74,7 +74,7 @@ async function refresh() {
 function render(s) {
   const on = (s.features || {}).css_tool !== false;
   $('body').innerHTML = `
-    <h3>css-ui注入</h3>
+    <h3>css-ui工具</h3>
     <div class="card">
       <div class="row"><span>启用工具</span><button id="sw" class="sw ${on ? 'on' : ''}" aria-label="启用/停用"></button></div>
       <div class="dim">开：右键元素可改样式，也可以直接让 agent 调这个界面。关：只收工具入口，已调好的样式继续生效，重开即恢复。</div>
