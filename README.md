@@ -10,7 +10,7 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **核心循环**：模型带 `tools` 决策 → 本地执行 → 结果回填 → 直到纯文本回答；步数上限、**取消会话化**（停止只停当前会话的这一轮，别的会话不受影响）；同轮只读工具并行执行，同路径写冲突自动跳过并回喂模型。
 - **工具**：`read_file` / `read_page` / `search`(rg) / **`web_search`（联网搜索，无需 key：Bing RSS 主引擎 + HTML/DuckDuckGo 回退）** / `web_fetch` / **`browser`（内置无头浏览器一个工具全覆盖：navigate/snapshot/click/fill/scroll/wait_for…，语义定位为主、坐标兜底，快照带稳定 ref 与增量 diff；与右侧「网页」面板共享同一浏览器实例）** / `write_file` / **`edit_file`（局部替换，改大文件不必重写全文）** / `shell` / `git` / **`subagent_spawn`（P22-C 派发子代理：独立会话跑完子任务，最终回答回注父任务；一轮多个即并行，并发度受 `[subagent]` 限制；成本记父任务）**，外加动态挂载的 MCP（`mcp__<server>__<tool>`，声明了 resources/prompts 的还会挂 `list_resources`/`read_resource`/`list_prompts`/`get_prompt`）与插件工具（`wasm__<plugin>__<tool>`；契约 v1 起 WASM 是插件工具的一种实现，见 `docs/plugin-contract-v1.md`）。
 - **审批与 Plan**：四档 `read-only`（只读）`sandbox`（沙箱）`auto`（自动）`full-access`（完全访问）——只读=写/执行逐次询问；沙箱=只在沙箱内执行，工作区与电脑都不改（写文件直接驳回）；自动=可动工作区与整台电脑（越界写按高危先问，shell 仍在沙箱）；完全访问=全免审 + 本机直跑（需 `allow_unsandboxed`）。档位按会话记忆、运行中切换下一步即生效，风险分级引擎逐条判定，「本会话同类允许」记忆授权范围。Plan 档是**接口层能力**（请求级 `plan_mode`：只放行只读工具，写类操作不进审批弹窗、直接驳回并回喂模型调整计划，最终回答可产出结构化计划块）——P14 起**界面不再提供 Plan/Act 手动切换**（改由模型按系统约定在任务里自己列步骤），该档保留给 API 与 eval 使用。
-- **执行沙箱**：`SandboxTier` 统一接口包住三档——Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）为默认档；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网，探测链 canary 不过自动回退受限档并在 UI/审计注明）；**档位探测链**（快速探针跑在生效档上，解析结果进程内缓存）+ 设置 → 插件 → 运行状态「沙箱档位」卡明示当前档位（`GET /api/sandbox/info`）。浏览器工具走 Chromium 自带站点隔离，不进 Windows 沙箱。
+- **执行沙箱**：`SandboxTier` 统一接口包住三档——Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）为默认档；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网，探测链 canary 不过自动回退受限档并在 UI/审计注明）；**档位探测链**（快速探针跑在生效档上，解析结果进程内缓存）+ 设置 → 插件 →「宿主能力」区沙箱行明示当前生效档位（`GET /api/sandbox/info`，行上「检测」按钮真拉受限进程跑探针套件）。浏览器工具走 Chromium 自带站点隔离，不进 Windows 沙箱。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
 - **恢复与撤销**：danger≥1 工具执行前拍影子仓库检查点；撤销只回退本任务改过的文件（绝不整树 reset）；对话流内显示「N 个文件已更改 +x −y ↩ 撤销」。
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）；HANDOFF 交接文档（手动或上下文 ≥80% 自动）。
@@ -21,7 +21,7 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量」插件**（`plugins/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签底部含「运行状态」——沙箱档位卡、Git 运行时卡与沙箱自检）。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签含「插件 / 第三方」两组与「宿主能力」区——Git 运行时行（哪个 git 在生效 + 重新检测）与沙箱自检行，2026-10-06 插件重整后从插件搬家到这）。
 - **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 229 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
@@ -135,8 +135,9 @@ agent.exe run 批量清理 --approve --json     # 放行高危操作 + 输出完
   6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\agent\runtime\git` 再使用
      （只发生在没装 git 的机器上，解压一次记 `git.runtime_extracted`；之后启动直接复用）。
 - 覆盖 zip 位置可用环境变量 `AGENT_GIT_ZIP`（调试用）。
-- **界面上能看到**：设置 → 插件 分区顶部有「Git 运行时」卡片（设置 → 运行时），显示当前用的是系统 Git 还是内置 Git、
-  版本与路径，以及内置包是否随包携带（「重新检测」按钮手动刷新）。
+- **界面上能看到**：设置 → 插件 页的「宿主能力」区有「Git 运行时」一行（git 运行时状态卡片，
+  2026-10-06 插件重整后从 git 插件分区搬来），显示当前用的是系统 Git / 便携版 / 内置运行时、
+  版本与路径，「重新检测」按钮手动刷新；没检测到 git 时会明说「用不了」并给出安装方法。
 - 已知差异：MinGit 不带 git-lfs / bash / 图形界面——agent 的提交、diff、撤销、检查点都不需要它们；
   用户项目若使用 LFS，需另装完整版 git。
 
@@ -159,6 +160,23 @@ start.bat  stop.bat  README.md  LICENSE
 
 **验证过的用法**：把整个目录拷到任意位置（含没装 Rust/Node 的机器）双击 `start.bat` 即用——
 exe 同级就是运行根，配置、会话、日志、插件全落在那个目录里，不碰源码树。
+
+### 两种包：完整版 / 精简版（2026-10-06 用户拍板）
+
+发布产物分两档，区别只有一件事：**带不带内置 MinGit**。
+
+| | 完整版（默认，`agent-<版本>-win64`） | 精简版（`-Slim`，`agent-<版本>-win64-slim`） |
+|---|---|---|
+| 内置 MinGit | 带（`tools\git-runtime.zip`，zip 大约 +37MB） | 不带，包体更小 |
+| 机器没装 git 时 | 检查点/撤销/改动清单/时间线任务快照照常用（懒解压内置包） | 这些功能不可用；界面照实说「没检测到 git」并给出安装方法，不静默变样 |
+| 机器装了 git 时 | 与精简版完全一致（永远优先用系统 git） | 同左 |
+
+```powershell
+# 完整版（默认）
+powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
+# 精简版
+powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1 -Slim
+```
 
 ## CI
 
@@ -259,6 +277,8 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
 | GET | `/api/plugins` | 插件统一清单（面板 + 工具 + draft，一份列表）|
+| POST | `/api/plugins/create` | 新建插件脚手架（工作区 plugins/，不等于放行）|
+| POST | `/api/plugins/remove` | 删除插件（只删 user 来源，内置拒删；清停用名单/信任表残留）|
 | POST | `/api/plugins/toggle` | 启用/停用插件（停用 = 拒新调用 + 等完）|
 | POST | `/api/plugins/draft` / DELETE | 模型自产插件提交 draft 隔离区 / 丢弃 |
 | POST | `/api/plugins/promote` | draft 一键转正（落盘持久化、来源改 user）|

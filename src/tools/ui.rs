@@ -4,7 +4,7 @@
 //! /api/ui/events 事件流：open_panel/close_panel/open_file/open_memory 推事件，前端执行
 //! 与用户手点完全相同的函数（用户看着的界面即时变化）。
 //! 面板白名单与前端 RP_EXT_PANELS 对齐（trace 时间线 / board 项目文件 / usage 用量）。
-//! 除 list_panels（只读）外全部受「自改」插件闸；会话动作在 session 工具里。
+//! 除 list_panels（只读）外全部受「中枢」插件闸；会话动作在 session 工具里。
 //!
 //! 2026-10-03 重构轮：前端把 UI_OPS 注册表序列化成 ops 清单随 /api/ui/state 上报，
 //! fire_event 通用通道的准入改为「SAFE_EVENT_KINDS 白名单 ∪ 前端清单里登记且非破坏类」——

@@ -60,12 +60,9 @@ pub struct SettingsUpdate {
     /// 角色路由映射（摘要/标题/多模态旁路/降级链）
     #[serde(default)]
     pub roles: Option<crate::config::settings::RolesSettings>,
-    /// 内置功能开关（功能桥接/css-ui注入/星云）。Some = 整体替换
+    /// 内置功能开关（功能桥接/css-ui注入/记忆库）。Some = 整体替换
     #[serde(default)]
     pub features: Option<crate::config::settings::FeatureSettings>,
-    /// 沙箱整树 CPU 硬上限百分比（0=不限；Some = 覆盖）
-    #[serde(default)]
-    pub sandbox_cpu_percent: Option<u32>,
 }
 
 /// 供应商预设列表（数据驱动自 providers.json）。
@@ -218,10 +215,6 @@ pub(super) async fn put_settings(
 
     if let Some(features) = req.features {
         s.features = features;
-    }
-
-    if let Some(p) = req.sandbox_cpu_percent {
-        s.sandbox_cpu_percent = Some(p.min(100));
     }
 
     if let Err(e) = s.save() {
@@ -433,7 +426,6 @@ fn config_state_json(s: &Settings) -> Value {
         "thinking_style": effective_thinking_style(active, preset),
         "roles": s.roles,
         "features": s.features,
-        "sandbox_cpu_percent": s.sandbox_cpu_percent,
     })
 }
 

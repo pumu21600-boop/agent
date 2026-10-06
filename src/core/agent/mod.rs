@@ -308,7 +308,7 @@ pub async fn run_task(
     cancel: &CancelFlag,
     cfg: &AgentConfig,
     sandbox_cfg: &SandboxConfig,
-    // 沙箱整树 CPU 硬上限百分比（0=不限；settings.json 的 sandbox_cpu_percent）
+    // 沙箱整树 CPU 硬上限百分比（0=不限；2026-10-06 起为固定值 SANDBOX_CPU_PERCENT）
     cpu_percent: u32,
     ctx_cfg: &ContextConfig,
     rec_cfg: &RecoveryConfig,

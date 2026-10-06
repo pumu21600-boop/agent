@@ -296,6 +296,36 @@ pub(super) async fn create_plugin(
     )
 }
 
+/// POST /api/plugins/remove {name} —— 删除插件（2026-10-06 插件重整：补上「新建插件
+/// 只建不删」的缺口，与 create_plugin 对偶）。只让删 user/draft 来源，built_in 拒删
+/// 并说人话（内核见 plugin::ui::remove，agent 的 plugin 工具 action=remove 走同一份）。
+/// 删除类界面侧先弹 ConfirmModal（delete-class-confirm 纪律）。
+pub(super) async fn remove_plugin(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 name" })));
+    }
+    match crate::plugin::ui::remove(&name) {
+        Ok(dir) => {
+            // 目录没了 → 工具注册表重扫（它可能同时是个工具插件）+ 前端重拉清单
+            crate::plugin::wasm::rescan();
+            emit_plugin_settings_changed("");
+            let disabled = state
+                .settings
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .disabled_plugins
+                .clone();
+            let list = crate::plugin::ui::scan_all(&disabled);
+            (StatusCode::OK, Json(json!({ "ok": true, "dir": dir, "plugins": list })))
+        }
+        Err((code, msg)) => (code, Json(json!({ "error": msg }))),
+    }
+}
+
 /// POST /api/plugins/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
 pub(super) async fn toggle_plugin(
     State(state): State<AppState>,

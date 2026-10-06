@@ -55,12 +55,13 @@ pub(super) async fn review_diff(
 }
 
 /// GET /api/git/status —— 工作区 git 概览（分支/HEAD/脏文件数/上游领先落后/未提交明细）。
-/// 非 git 仓库返回 is_repo=false，前端隐藏该信息。
+/// is_repo=false 时分两种：git_missing=true = 机器没装 git（全套 git 功能不可用），
+/// false = 装了 git 但当前工作区不是仓库。前端都要照实说话，不许静默隐藏。
 pub(super) async fn git_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let _ = &state;
     let ws = crate::tools::workspace_root().to_path_buf();
     match tokio::task::spawn_blocking(move || crate::recovery::status(&ws)).await {
-        Ok(s) => (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_else(|_| json!({ "is_repo": false })))),
+        Ok(s) => (StatusCode::OK, Json(serde_json::to_value(s).unwrap_or_else(|_| json!({ "is_repo": false, "git_missing": true })))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
 }

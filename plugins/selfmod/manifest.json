@@ -1,9 +1,9 @@
 {
   "apiVersion": 1,
   "source": "built_in",
-  "title": "自改",
-  "description": "agent 自我管理总闸：改设置/渠道/插件技能启停/定时任务、会话管理、开关面板等自操作类动作都要这个开关开着才会执行；关着时 agent 只会一句话引导你来打开",
-  "version": "0.1.0",
+  "title": "中枢",
+  "description": "agent 自操作的总闸：改设置/渠道、插件技能启停、定时任务、会话管理、开关面板都要它开着才执行；关着时 agent 只引导你来打开",
+  "version": "0.2.0",
   "feature": "self_mod",
   "permissions": []
 }

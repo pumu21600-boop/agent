@@ -685,7 +685,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 &cancel,
                 &cfg,
                 &sandbox_cfg,
-                s.sandbox_cpu_percent.unwrap_or(crate::sandbox::DEFAULT_SANDBOX_CPU_PERCENT),
+                crate::sandbox::SANDBOX_CPU_PERCENT, // 固定值（2026-10-06 撤可调项）
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,

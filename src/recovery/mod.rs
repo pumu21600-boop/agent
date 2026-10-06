@@ -318,10 +318,14 @@ pub fn list(ws: &Path, limit: usize) -> anyhow::Result<Vec<Checkpoint>> {
 }
 
 /// 工作区 git 概览：是否仓库、当前分支、HEAD、脏文件数、上游领先/落后、未提交文件清单。
-/// 非仓库（或 git 不可用）返回 is_repo=false，不报错——前端据此隐藏 git 信息。
+/// `is_repo=false` 时分两种，前端要区别说话（缺 git 时报「没检测到 git」+ 安装指引，
+/// 不是静默隐藏——2026-10-06 用户拍板）：`git_missing=true` 是机器上没装 git（撤销/
+/// 检查点/改动/审查全都不可用），`git_missing=false` 是装了 git 但当前工作区不是仓库。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GitStatus {
     pub is_repo: bool,
+    /// git.exe 没找到（发现链六步全空）：机器缺 git，全套 git 功能不可用
+    pub git_missing: bool,
     pub branch: String,
     pub head: String,
     pub dirty: usize,
@@ -345,6 +349,7 @@ const GIT_FILES_CAP: usize = 500;
 pub fn status(ws: &Path) -> GitStatus {
     let blank = GitStatus {
         is_repo: false,
+        git_missing: true,
         branch: String::new(),
         head: String::new(),
         dirty: 0,
@@ -356,9 +361,10 @@ pub fn status(ws: &Path) -> GitStatus {
     let Ok(bin) = git_bin() else { return blank };
     match git_ok(&bin, None, ws, &["rev-parse", "--is-inside-work-tree"]) {
         Ok(t) if t.trim() == "true" => {}
-        _ => return blank,
+        // 装了 git、只是这目录不是仓库：git_missing=false（前端说「不是 git 仓库」）
+        _ => return GitStatus { git_missing: false, ..blank },
     }
-    let mut st = GitStatus { is_repo: true, ..blank };
+    let mut st = GitStatus { is_repo: true, git_missing: false, ..blank };
     st.branch = git_ok(&bin, None, ws, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
     if st.branch == "HEAD" {
         st.branch = "（分离头指针）".to_string();

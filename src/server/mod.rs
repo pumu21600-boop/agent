@@ -186,6 +186,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/version", get(get_version))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/create", post(create_plugin))
+        // 2026-10-06 插件重整：删除插件（与 create 对偶；只删 user 来源，内置拒删）
+        .route("/api/plugins/remove", post(remove_plugin))
         .route("/api/plugins/toggle", post(toggle_plugin))
         // 2026-10-03：服务端→前端 UI 事件流（ui 工具开/关侧栏面板、settings 变更即时刷新）
         .route("/api/ui/events", get(crate::server::ui_events::ui_events_stream))

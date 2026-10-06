@@ -470,6 +470,72 @@ fn skill_roots_in(disabled: &[String], ws: &Path, app: &Path) -> Vec<(PathBuf, S
     out
 }
 
+/// 删除一个 user 来源插件（2026-10-06 插件重整：「新建插件只建不删」缺口的收口，
+/// 与 create_plugin 对偶）。内置（built_in）拒删并说人话——内置随包分发，删了下一次
+/// 更新又回来，还会让「清单里的内置能力」对不上；草稿是内存态，重启即失，不用删。
+/// 删目录之外，停用名单与信任表里的同名残留一并清掉——否则删掉再建同名，会被
+/// 「已停用」和「内容指纹对不上」两道旧记忆拦住，界面像见了鬼。
+/// HTTP 端点（POST /api/plugins/remove）与 plugin 工具（action=remove）共用这一份，
+/// 不分叉第二套逻辑。Err 带 HTTP 状态码，工具侧只取消息。
+pub fn remove(name: &str) -> Result<String, (axum::http::StatusCode, String)> {
+    let bad = |m: String| (axum::http::StatusCode::BAD_REQUEST, m);
+    let name = name.trim();
+    if !safe_segment(name) {
+        return Err(bad("插件名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into()));
+    }
+    let list = scan_all(&disabled());
+    let Some(e) = list.iter().find(|e| e.name == name) else {
+        return Err((axum::http::StatusCode::NOT_FOUND, format!("没有名为 {name} 的插件")));
+    };
+    if e.draft {
+        return Err(bad("草稿插件是内存态（重启即失），用「丢弃」即可，不用删文件".into()));
+    }
+    if e.origin != contract::ORIGIN_USER {
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            format!("「{}」是内置插件，不能删：内置能力随包分发，删了更新又会回来；想停用把开关关掉即可", e.title),
+        ));
+    }
+    let dir = std::path::PathBuf::from(&e.dir);
+    if !dir.is_dir() {
+        return Err(bad("插件目录不存在（可能已被手工删掉）".into()));
+    }
+    let shown = dir.display().to_string();
+    std::fs::remove_dir_all(&dir).map_err(|err| bad(format!("删除目录失败: {err}")))?;
+    // 停用名单 / 信任表残留：清得到才落盘（没有残留就不动 settings.json）。
+    // 共享句柄缺失（只跑内核的单测）时跳过清理——目录已删，核心动作已完成。
+    if let Some(handle) = crate::config::settings::shared_settings() {
+        let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut cleaned: Vec<&str> = Vec::new();
+        if s.disabled_plugins.iter().any(|d| d == name) {
+            s.disabled_plugins.retain(|d| d != name);
+            cleaned.push("停用名单");
+        }
+        let key = trust::key_of(DIR, name);
+        if s.trusted_plugins.remove(&key).is_some() {
+            cleaned.push("信任记录");
+        }
+        if !cleaned.is_empty() {
+            s.save().map_err(|err| bad(format!("保存 settings.json 失败: {err}")))?;
+            crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+            set_disabled(&s.disabled_plugins);
+            crate::plugin::trust::install(&s.trusted_plugins);
+            *handle.write().unwrap_or_else(|e| e.into_inner()) = s;
+        }
+    }
+    observability_event_removed(name, &shown);
+    Ok(shown)
+}
+
+/// 删除落一条审计（kind=plugin.removed）。try_event：日志未初始化（单测/早启动）时
+/// 静默跳过，不因为审计把删除动作本身搞失败。
+fn observability_event_removed(name: &str, dir: &str) {
+    crate::observability::try_event(
+        crate::observability::EventType::State,
+        serde_json::json!({ "kind": "plugin.removed", "name": name, "dir": dir }),
+    );
+}
+
 /// 系统提示里的「可用插件」索引（与 skills::index_prompt 同哲学）：
 /// 「/」菜单点插件会往输入框插一个 `/插件标题` 引用（带技能的插件插的是技能名，
 /// 走技能索引），模型得知道这些前缀的含义——否则插进去的那串文本对它是死的。
@@ -803,6 +869,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// 2026-10-06 插件重整：删除内核的护栏——不存在的 404、内置拒删（FORBIDDEN + 人话）。
+    /// 真删 user 插件的 happy path 走真机冒烟（要动 workspace 全局根，并发测试里不安全）。
+    #[test]
+    fn remove_rejects_unknown_and_builtin() {
+        let (code, msg) = remove("no-such-plugin-xyz").unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{msg}");
+        assert!(msg.contains("没有名为"), "{msg}");
+        // board 是随包内置（测试形态 app_root = 源码根，目录真实存在）
+        let (code, msg) = remove("board").unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::FORBIDDEN, "{msg}");
+        assert!(msg.contains("内置插件，不能删"), "{msg}");
+        // 名字非法（穿越）在查目录前就被拦下
+        let (code, msg) = remove("../evil").unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "{msg}");
+        assert!(msg.contains("插件名非法"), "{msg}");
+    }
+
     /// 测试用的最小 UiExt（只填索引要用的字段，其余取默认）。
     fn mk_ext(title: &str, desc: &str, ok: bool, enabled: bool, draft: bool, skills: Vec<&str>) -> UiExt {
         UiExt {
@@ -867,13 +950,18 @@ mod tests {
     /// 引用键 = 标题去空白，与「/」菜单点插件插进输入框的那串一致。
     /// 停用名单只由启动/启停端点灌（测试不动它），工作区临时目录没有 plugins/，
     /// 所以这里的结果不受其他测试切工作区影响。
+    /// 2026-10-06 重整后内置插件 = 9 个：5 个纯技能插件降级成全局技能（技能索引列），
+    /// git-panel / sandbox-panel 移出插件位（能力留宿主）。
     #[test]
     fn index_prompt_scans_real_builtin_plugins() {
         let idx = index_prompt();
         assert!(idx.contains("## 可用插件"), "索引为空说明扫描没跑通: {idx}");
-        for t in ["Git", "星云", "沙箱", "断线取消", "功能桥接", "Word 文档", "表格", "时间线", "用量"] {
+        for t in ["中枢", "记忆库", "断线取消", "功能桥接", "css-ui注入", "浏览器", "时间线", "用量", "项目文件"] {
             assert!(idx.contains(&format!("- /{t}: ")), "内置插件 {t} 没进索引: {idx}");
         }
-        assert!(idx.contains("- /Word 文档: Word 文档（docx）生成、读取与保真增量改（自带技能：docx）"), "带技能的插件要注明技能名: {idx}");
+        // 降级/移出的都不该再出现在插件索引里
+        for gone in ["Git", "沙箱", "Word 文档", "表格", "PDF", "演示文稿", "GitHub", "星云", "自改", "网页"] {
+            assert!(!idx.contains(&format!("- /{gone}: ")), "{gone} 已不在插件位，索引里不该有: {idx}");
+        }
     }
 }

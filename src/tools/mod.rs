@@ -66,7 +66,7 @@ pub struct ExecConfig {
     /// 本机直跑（脱沙箱）：shell/git 用完整用户 token + 继承父环境
     /// （AppContainer / 网络出向不在此重复存——run_in_sandbox 按 sandbox.mode 现算）
     pub unsandboxed: bool,
-    /// 整树 CPU 硬上限百分比（0 = 不限；来自 settings.json 的 sandbox_cpu_percent）
+    /// 整树 CPU 硬上限百分比（0 = 不限；2026-10-06 起由调用方传固定值 SANDBOX_CPU_PERCENT）
     pub cpu_percent: u32,
     /// 文件工具是否允许越出工作区（auto / full-access 档=true；read-only / sandbox 档锁死工作区）。
     /// 相对路径永远以工作区为基准；放行的只是绝对路径与 `..` 出界。
@@ -274,11 +274,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。自改纪律：除 action=get（只读）与 schema/set_config 外全部动作要求插件页「自改」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=schema（只读，不受闸）：全部可改路径的自描述清单（每项路径/类型/可选值/默认/风险档/一句话说明）——set 之前先读它，别瞎猜键名。action=set 配 patch（可给顶层键，也可给点号子路径 features.<键>/roles.<字段>，如 features.galaxy=false、roles.summary=主力配置名）：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、sandbox_cpu_percent、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）2026-10-04 起与普通键同档（Normal，按审批档位走）。action=set_config 配 key（形如 agent.max_steps/cost.spend_cap_usd）+value：改 config.toml（toml_edit 保注释，重启服务后生效）；default_approval（审批档位的持久形态）任何档位必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（按档位问）。action=alias 配 name（path 省略=当前工作区）：给工作区改显示名（侧栏那一行字），只改显示名不动目录，与用户点侧栏项目「重命名项目」完全同一条路（按档位问）；name 留空=恢复文件夹名——用户说「把工作区名改成 X」「这个项目叫 X」就是这个动作，直接用它，别去动目录名、也别翻源码找接口。action=schedule_run 配 id：立即跑一条定时任务（真花钱，按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外（表外路径直接报错）：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）与 workspace（工作区边界）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件的信任走 plugin 工具。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。自改纪律：除 action=get（只读）与 schema/set_config 外全部动作要求插件页「中枢」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「中枢」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=schema（只读，不受闸）：全部可改路径的自描述清单（每项路径/类型/可选值/默认/风险档/一句话说明）——set 之前先读它，别瞎猜键名。action=set 配 patch（可给顶层键，也可给点号子路径 features.<键>/roles.<字段>，如 features.galaxy=false、roles.summary=主力配置名）：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）2026-10-04 起与普通键同档（Normal，按审批档位走）。action=set_config 配 key（形如 agent.max_steps/cost.spend_cap_usd）+value：改 config.toml（toml_edit 保注释，重启服务后生效）；default_approval（审批档位的持久形态）任何档位必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（按档位问）。action=alias 配 name（path 省略=当前工作区）：给工作区改显示名（侧栏那一行字），只改显示名不动目录，与用户点侧栏项目「重命名项目」完全同一条路（按档位问）；name 留空=恢复文件夹名——用户说「把工作区名改成 X」「这个项目叫 X」就是这个动作，直接用它，别去动目录名、也别翻源码找接口。action=schedule_run 配 id：立即跑一条定时任务（真花钱，按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外（表外路径直接报错）：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）与 workspace（工作区边界）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件的信任走 plugin 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["schema", "get", "set", "set_config", "config", "mcp", "workspace", "alias", "schedule_run", "memory"], "description": "get/set/set_config/config/mcp/workspace/alias/schedule_run/memory；除 get/schema/set_config 外都要「自改」插件开着" },
+                    "action": { "type": "string", "enum": ["schema", "get", "set", "set_config", "config", "mcp", "workspace", "alias", "schedule_run", "memory"], "description": "get/set/set_config/config/mcp/workspace/alias/schedule_run/memory；除 get/schema/set_config 外都要「中枢」插件开着" },
                     "patch": { "type": "object", "description": "set 时必填：要改的键与新值。顶层键 + 点号子路径均可（点号如 features.galaxy / roles.summary；合法路径全集见 action=schema）；整表替换的键（mcp_servers/schedules/roles/features）先 get 拿现状" },
                     "key": { "type": "string", "description": "set_config：config.toml 的键路径（形如 agent.max_steps，section.field）" },
                     "value": { "description": "set_config：新值（字符串/数字/布尔/一维数组）" },
@@ -293,7 +293,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「自改」开关开着——没开就在回复里引导用户去 设置→插件 打开「自改」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS，以及 ops 界面动作自报清单：每项 kind/title/risk/args）——投 fire_event 前先读它看界面认哪些 kind。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——准入 = 白名单 ∪ 当前界面自报的 ops 清单：先 method=state 读上报里的 ops（每项 kind/title/risk/args 参数说明）就知道此刻界面认哪些 kind；白名单（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）之外的新界面能力，只要登记在清单里且 risk 标 safe/normal 就能直接投递，不用等后端逐个收；破坏类（delete_session/undo_checkpoint）永远不收——必须走具名方法（删会话走 session 工具、撤销检查点走 undo_checkpoint），审批分级不为它从通用通道开口子；清单没登记这个 kind、或没有页面在报清单时按未登记拒绝并回带当前可用清单。能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
+            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「中枢」开关开着——没开就在回复里引导用户去 设置→插件 打开「中枢」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/review=审查/web=网页）；close_tab 配 key（artifacts/review/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖 css-ui 插件开没开；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS，以及 ops 界面动作自报清单：每项 kind/title/risk/args）——投 fire_event 前先读它看界面认哪些 kind。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——准入 = 白名单 ∪ 当前界面自报的 ops 清单：先 method=state 读上报里的 ops（每项 kind/title/risk/args 参数说明）就知道此刻界面认哪些 kind；白名单（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）之外的新界面能力，只要登记在清单里且 risk 标 safe/normal 就能直接投递，不用等后端逐个收；破坏类（delete_session/undo_checkpoint）永远不收——必须走具名方法（删会话走 session 工具、撤销检查点走 undo_checkpoint），审批分级不为它从通用通道开口子；清单没登记这个 kind、或没有页面在报清单时按未登记拒绝并回带当前可用清单。能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -313,7 +313,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "session",
-            description: "会话管理：method=list 列出全部会话（id/标题/工作区/置顶归档态，只读不受闸）；new=新建会话并切过去；open+id=切换到某条会话；rename+id+title=改标题；fork+id=分叉；delete+id=删除（不可逆，必问）；pin/archive+id(+on)=置顶/归档。自改纪律：除 list 外全部动作要求插件页「自改」开关开着——没开就引导用户去 设置→插件 打开「自改」，别硬试。注意：切换/新建后 agent 自己的回复仍落在原会话，结果里要向用户交代这一点。",
+            description: "会话管理：method=list 列出全部会话（id/标题/工作区/置顶归档态，只读不受闸）；new=新建会话并切过去；open+id=切换到某条会话；rename+id+title=改标题；fork+id=分叉；delete+id=删除（不可逆，必问）；pin/archive+id(+on)=置顶/归档。自改纪律：除 list 外全部动作要求插件页「中枢」开关开着——没开就引导用户去 设置→插件 打开「中枢」，别硬试。注意：切换/新建后 agent 自己的回复仍落在原会话，结果里要向用户交代这一点。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -328,7 +328,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "plugin",
-            description: "第三方插件安装与信任（2026-10-04 放开权限轮；自改纪律：install/unpin 要求「自改」插件开着，review 只读不受闸）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）装第三方插件：宿主先落位再跑静态审查（外联/密钥/动态执行等红线项为 blocker）——审查通过自动信任并即时生效，用户可在界面看到；有 blocker 会停下不信任（插件休眠不加载），返回完整报告：把 blocked 里的问题逐条讲给用户听，用户同意继续就带 force=true 重试（会弹审批卡让用户亲自拍板，别替用户做这个决定）。action=review 配 key（形如 plugins:名字）只审不信返回完整报告——装之前想先看审查结论就用它。action=unpin 配 key 撤回信任（插件停载、文件保留，可逆）。审查由宿主统一执行，不要用 shell 自己审也不要绕过这个工具。",
+            description: "第三方插件安装与信任（2026-10-04 放开权限轮；自改纪律：install/unpin 要求「中枢」插件开着，review 只读不受闸）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）装第三方插件：宿主先落位再跑静态审查（外联/密钥/动态执行等红线项为 blocker）——审查通过自动信任并即时生效，用户可在界面看到；有 blocker 会停下不信任（插件休眠不加载），返回完整报告：把 blocked 里的问题逐条讲给用户听，用户同意继续就带 force=true 重试（会弹审批卡让用户亲自拍板，别替用户做这个决定）。action=review 配 key（形如 plugins:名字）只审不信返回完整报告——装之前想先看审查结论就用它。action=unpin 配 key 撤回信任（插件停载、文件保留，可逆）。action=remove 配 name 删除插件（连目录带文件一起删，不可恢复，判 Dangerous 必弹审批卡；只删 user 来源，内置拒删并说人话——想停用内置插件就引导用户关它的开关，别删）。删除前把插件名念给用户确认，别把 unpin（停载可逆）和 remove（删文件不可逆）混为一谈。审查由宿主统一执行，不要用 shell 自己审也不要绕过这个工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -466,10 +466,10 @@ fn cap(s: &str, max: usize) -> String {
     crate::context::compress(s, max)
 }
 
-/// 自改插件闸（2026-10-03 用户拍板 B/A/A/A）：所有「改自身」动作要求插件页「自改」
-/// 开关打开；读（settings get / skill list / ui list_panels / session list）不闸。
-/// 插件关着时给人话指路（Q4=A 口头引导，agent 不能自己开自己的闸）。
-/// 放行后的审批仍走原档位规则（Q2=A 跟随档位），红线照旧必问（Q3=A）。
+/// 自改插件闸（2026-10-03 用户拍板 B/A/A/A；插件名「中枢」，2026-10-06 改名）：
+/// 所有「改自身」动作要求插件页「中枢」开关打开；读（settings get / skill list /
+/// ui list_panels / session list）不闸。插件关着时给人话指路（Q4=A 口头引导，
+/// agent 不能自己开自己的闸）。放行后的审批仍走原档位规则（Q2=A 跟随档位），红线照旧必问（Q3=A）。
 pub(crate) fn selfmod_gate() -> Result<(), String> {
     let on = crate::config::settings::shared_settings()
         .map(|h| h.read().map(|s| s.features.self_mod).unwrap_or(false))
@@ -478,7 +478,7 @@ pub(crate) fn selfmod_gate() -> Result<(), String> {
         return Ok(());
     }
     Err(
-        "「自改」插件没开，我做不了这件事。请到 设置→插件 找到「自改」一行把开关打开，然后再叫我重做即可。"
+        "「中枢」插件没开，我做不了这件事。请到 设置→插件 找到「中枢」一行把开关打开，然后再叫我重做即可。"
             .to_string(),
     )
 }
@@ -1006,10 +1006,10 @@ mod tests {
         }
         let h = Arc::new(RwLock::new(crate::config::settings::Settings::default()));
         install_shared_settings(h.clone());
-        // 关：拒，且指路「设置→插件」开自改（Q4=A 口头引导，不许 agent 自开闸）
+        // 关：拒，且指路「设置→插件」开中枢（Q4=A 口头引导，不许 agent 自开闸）
         h.write().unwrap().features.self_mod = false;
         let e = selfmod_gate().unwrap_err();
-        assert!(e.contains("自改") && e.contains("设置→插件"), "{e}");
+        assert!(e.contains("中枢") && e.contains("设置→插件"), "{e}");
         // 开：放行（放行后的审批仍走档位规则，这里只验闸本身）
         h.write().unwrap().features.self_mod = true;
         assert!(selfmod_gate().is_ok());

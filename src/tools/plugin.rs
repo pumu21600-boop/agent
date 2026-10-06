@@ -25,7 +25,12 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             super::selfmod_gate()?;
             unpin(&v).await
         }
-        _ => Err("未知 action（install/review/unpin）".into()),
+        // 删除同样受闸（删插件=改插件面，且不可恢复）；内核与 HTTP 端点同一份
+        "remove" => {
+            super::selfmod_gate()?;
+            remove_one(&v).await
+        }
+        _ => Err("未知 action（install/review/unpin/remove）".into()),
     }
 }
 
@@ -102,6 +107,21 @@ async fn unpin(v: &Value) -> Result<String, String> {
     crate::plugin::wasm::rescan();
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["trusted_plugins"] }));
     Ok(format!("已取消信任 {key}（插件停载，文件保留，可重新 install 恢复）"))
+}
+
+/// action=remove：{ name }。删除 user 来源插件（删目录，不可恢复）。内置拒删并说人话
+/// （内核与 HTTP 端点同一份：plugin::ui::remove）。unpin 是「停载不删文件」的可逆路，
+/// remove 是连文件一起删的不可逆路——用户说「删掉/卸掉」且指向具体插件时才用它。
+async fn remove_one(v: &Value) -> Result<String, String> {
+    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("remove 需要 name（插件名，仅字母数字与 - _ .）".into());
+    }
+    let dir = crate::plugin::ui::remove(name).map_err(|(_, msg)| msg)?;
+    // 目录没了 → 工具注册表重扫（它可能同时是个工具插件）；事件内核里已落
+    crate::plugin::wasm::rescan();
+    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["disabled_plugins"] }));
+    Ok(json!({ "removed": name, "dir": dir }).to_string())
 }
 
 /// pin 落信任表并即时生效（与 HTTP trust_plugin 的 pin 分支同语义）。

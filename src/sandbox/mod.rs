@@ -15,11 +15,12 @@ mod token;
 
 pub use proc::{register_path_dir, SandboxChild};
 
-/// 沙箱整树 CPU 硬上限的默认值（单核百分比）：用户未在插件页设置时生效。
-/// 80 = 留两成核兜底交互响应；嫌拖慢构建可在插件页改 0（不限）。
-pub const DEFAULT_SANDBOX_CPU_PERCENT: u32 = 80;
+/// 沙箱整树 CPU 硬上限的固定值（单核百分比）：用户 2026-10-06 拍板「设置一个合适
+/// 的数值然后不留」——可调滑块（sandbox_cpu_percent 设置键）已撤，这个值直接生效。
+/// 80 = 单核八成、留两成兜底交互响应；改它是一个代码决定，不再面向用户。
+pub const SANDBOX_CPU_PERCENT: u32 = 80;
 
-/// 沙箱资源上限（config.toml [sandbox]；cpu_percent 来自 settings.json 覆盖）。
+/// 沙箱资源上限（config.toml [sandbox]；cpu_percent 现为固定值，见 SANDBOX_CPU_PERCENT）。
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxLimits {
     /// 墙钟超时：到点整树击杀
@@ -28,7 +29,7 @@ pub struct SandboxLimits {
     pub memory_mb: u32,
     /// 进程树内活跃进程数上限
     pub active_processes: u32,
-    /// 整树 CPU 硬上限（单核的百分比，0 = 不限；未设时取 DEFAULT_SANDBOX_CPU_PERCENT）
+    /// 整树 CPU 硬上限（单核的百分比，0 = 不限；调用方传 SANDBOX_CPU_PERCENT）
     pub cpu_percent: u32,
 }
 

@@ -394,7 +394,7 @@ pub(crate) async fn run_headless_inner(
                 &cancel,
                 &cfg,
                 &sandbox_cfg,
-                s.sandbox_cpu_percent.unwrap_or(crate::sandbox::DEFAULT_SANDBOX_CPU_PERCENT),
+                crate::sandbox::SANDBOX_CPU_PERCENT, // 固定值（2026-10-06 撤可调项）
                 &ctx_cfg,
                 &rec_cfg,
                 &mem,

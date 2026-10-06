@@ -13,9 +13,17 @@
 #     start.bat stop.bat   double-click entries
 #     README.md LICENSE
 #
+# Two flavors (user decision 2026-10-06, "say it plainly"):
+#   full (default)  - ships tools\git-runtime.zip (bundled MinGit). On machines with no
+#                     system git, checkpoints / undo / change list / review still work.
+#   -Slim           - leaves that zip out (smaller download). On machines with no system
+#                     git those features are unavailable and the UI says so with install
+#                     instructions (no silent degradation).
+#
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 #   powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1 -SkipBuild -SkipZip
+#   powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1 -Slim
 #
 # NOTE: keep this file ASCII-only (PS 5.1 reads .ps1 in the system ANSI codepage).
 
@@ -23,6 +31,7 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipFrontend,
     [switch]$SkipZip,
+    [switch]$Slim,
     [string]$OutRoot = "dist"
 )
 
@@ -63,6 +72,7 @@ if (-not (Test-Path (Join-Path $distSrc "index.html"))) { throw "web\dist\index.
 
 # --- 3. assemble ---
 $name = "agent-$version-win64"
+if ($Slim) { $name = "$name-slim" }
 $out = Join-Path $root (Join-Path $OutRoot $name)
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
@@ -82,7 +92,9 @@ foreach ($dir in @("prompts", "plugins", "ui-ext")) {
 
 # bundled MinGit (skip quietly when the project has not fetched it)
 $zip = Join-Path $root "runtime\git-runtime.zip"
-if (Test-Path $zip) {
+if ($Slim) {
+    Info "slim build: bundled MinGit NOT included (machines without system git lose checkpoints/undo/change-list/review; UI says so)"
+} elseif (Test-Path $zip) {
     New-Item -ItemType Directory -Path (Join-Path $out "tools") -Force | Out-Null
     Copy-Item $zip (Join-Path $out "tools\git-runtime.zip")
     Info ("bundled git: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB))

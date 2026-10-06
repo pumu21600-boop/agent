@@ -61,7 +61,6 @@
   let roles = {}; // P8.5 角色路由映射
   // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
   let features = { roles: true, css_tool: true, galaxy: true };
-  let sandboxCpu = 80; // 沙箱整树 CPU 硬上限（单核 %；settings.sandbox_cpu_percent，缺省 80）
   // —— P8.2 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
@@ -572,7 +571,6 @@
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
     roles = s.roles || {};
     features = s.features || { roles: true, css_tool: true, galaxy: true };
-    sandboxCpu = s.sandbox_cpu_percent ?? 80;
     workspaceAliases = s.workspace_aliases || {};
     workspace = s.workspace || '';
     recentWorkspaces = s.recent_workspaces || [];
@@ -2014,7 +2012,7 @@
   // 基线优先取**本会话自己的**检查点（检查点带 Agent-Session 归属），没有才用全局最新一个
   // —— 同一项目里多条会话来回切时，各自的改动条不会互相串。
   let dockCp = null; // { id, files, additions, deletions } additions/deletions 可为 null（旧会话未知）
-  let gitInfo = null; // { is_repo, branch, head, dirty, upstream, ahead, behind, files: [{status, path}] }
+  let gitInfo = null; // { is_repo, git_missing, branch, head, dirty, upstream, ahead, behind, files: [{status, path}] }
   let gitPopOpen = false; // 「N 处未提交」点开后的待提交明细
   async function refreshGit() {
     try {
@@ -2023,6 +2021,13 @@
       gitInfo = null;
     }
   }
+  // 缺 git（git.exe 六步发现链全空）与「工作区不是 git 仓库」是两回事，界面都要照实说
+  // （2026-10-06 用户拍板：没检测到 git 时不许静默变样，要连安装方法一起讲）
+  $: gitMissing = !!(gitInfo && gitInfo.git_missing);
+  function gitSourceLabel(s) {
+    return s === 'system' ? '系统安装' : s === 'portable' ? '便携版（exe 同级）' : s === 'bundled' ? '内置运行时' : s || '未知';
+  }
+  const GIT_INSTALL_HINT = '装一个 Git for Windows（https://git-scm.com/downloads）后重启本软件即可恢复';
   // porcelain 状态码 → 人看的短标签
   // 点文件 → 右侧边栏新开预览标签（改动条里的路径同样可读）
   function openGitFile(path) {
@@ -3757,20 +3762,15 @@
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
 
   // 内置插件的图标（24×24 stroke 内联标记，画在 .plug-ico 里；未知插件回退首字）
+  // 2026-10-06 插件重整：5 个纯技能插件（Word/PDF/演示/表格/GitHub）降级成全局技能、
+  // git-panel/sandbox-panel 移出插件位，它们的图标一并收掉；「中枢」（原自改）补图标
   const EXT_ICONS = {
     board: '<path d="M4.6 16.5a7.6 7.6 0 1 1 14.8 0"/><path d="M12 14.5 15.5 9.5"/><circle cx="12" cy="15" r="0.9" fill="currentColor" stroke="none"/>',
     trace: '<path d="M5 6.5h11.5M5 12h6.5M5 17.5h13.5"/><circle cx="19.6" cy="6.5" r="1.4"/><circle cx="14.4" cy="12" r="1.4"/><circle cx="21.4" cy="17.5" r="1.4"/>',
     usage: '<circle cx="12" cy="12" r="8.4"/><path d="M8.8 7.5 12 12l3.2-4.5"/><path d="M12 12v5.2"/><path d="M9.3 13.8h5.4"/>',
     browser: '<circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/>',
-    documents: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5M9.5 18h3"/>',
-    github: '<circle cx="6" cy="6" r="2.3"/><path d="M6 8.3V21"/><circle cx="18" cy="18" r="2.3"/><path d="M13 6h2.5A2.5 2.5 0 0 1 18 8.5v7.2"/>',
-    pdf: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 15.5c1.7 0 1.7-2.8 3.4-2.8s1.7 2.8 3.4 2.8"/>',
-    presentations: '<path d="M3 3.5h18"/><path d="M20 3.5V13a1.8 1.8 0 0 1-1.8 1.8H5.8A1.8 1.8 0 0 1 4 13V3.5"/><path d="M12 14.8V18"/><path d="M8.5 21 12 18l3.5 3"/>',
-    spreadsheets: '<rect x="4" y="5" width="16" height="14" rx="1.5"/><path d="M4 10.2h16"/><path d="M10.2 5v14"/><path d="M4 15h16"/>',
-    // 权限放开轮插件化的 6 项内置能力（图标沿用原设置页特例行的标识，搬壳不换脸）
-    'git-panel': '<circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/>',
-    'sandbox-panel': '<path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/>',
-    roles: '<circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="12" r="2.6"/><path d="M8.6 12h6.8M8.6 12l2.2-2.2M8.6 12l2.2 2.2M15.4 12l-2.2-2.2M15.4 12l-2.2 2.2"/>',
+    selfmod: '<circle cx="12" cy="12" r="3.2"/><path d="M12 3.2v3M12 17.8v3M3.2 12h3M17.8 12h3M5.8 5.8l2.1 2.1M16.1 16.1l2.1 2.1M18.2 5.8l-2.1 2.1M7.9 16.1l-2.1 2.1"/>',
+    roles: '<circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="12" r="2.6"/><path d="M8.6 12h6.8M8.6 12l2.2-2.2M8.6 12l2.2 2.2M15.4 12l-2.2-2.2M15.4 12l2.2 2.2"/>',
     'css-ui': '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14.5 6.5l3 3"/>',
     nebula: '<circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="8.4" ry="3.2" transform="rotate(-24 12 12)"/><circle cx="18.8" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="5.6" cy="14.8" r="0.9" fill="currentColor" stroke="none"/>',
     'disconnect-cancel': '<path d="M10 13a4 4 0 0 0 5.7 0l2.3-2.3a4 4 0 0 0-5.7-5.7L11 6.3"/><path d="M14 11a4 4 0 0 0-5.7 0L6 13.3a4 4 0 0 0 5.7 5.7l1.3-1.3"/><path d="M4 4l16 16"/>',
@@ -4303,15 +4303,14 @@
     },
     // —— 权限放开轮（用户 2026-10-02 拍板）：功能类插件读自己的功能状态、改自己的
     //    功能设置、触发宿主动作。三道口子都白名单化：能读的只有脱敏快照，能改的只有
-    //    settings.features / roles / 沙箱 CPU（密钥/渠道/审批档/对外发送永不开放），
-    //    能触发的只有 action.run 里枚举的那几个动作 ——
+    //    settings.features / roles（密钥/渠道/审批档/对外发送永不开放），
+    //    能触发的只有 action.run 里枚举的那几个动作（2026-10-06：沙箱 CPU 可调项已撤）——
     'features.get': {
       bridge: true, title: '读功能脱敏快照',
       run({ reply }) {
         reply(true, {
           features,
           roles: roles || {},
-          sandbox_cpu_percent: sandboxCpu,
           // 只给渠道的 id/名字/模型——密钥、base_url 一个字节都不出这道门
           configs: configs.map((c) => ({ id: c.id, label: configLabel(c), model: c.model || '' })),
           git: gitRuntime,
@@ -4347,13 +4346,9 @@
           }
           patch.roles = next;
         }
-        if (params.sandbox_cpu_percent !== undefined) {
-          patch.sandbox_cpu_percent = Math.max(0, Math.min(100, Math.round(Number(params.sandbox_cpu_percent) || 80)));
-          sandboxCpu = patch.sandbox_cpu_percent;
-        }
         if (!Object.keys(patch).length) return reply(false, '没有可写的字段');
         autoSave(patch, 0);
-        reply(true, { roles: patch.roles ?? roles, sandbox_cpu_percent: patch.sandbox_cpu_percent ?? sandboxCpu });
+        reply(true, { roles: patch.roles ?? roles });
       },
     },
     'action.run': {
@@ -4621,6 +4616,29 @@
       if (r.plugins) extList = r.plugins;
     } catch (err) {
       extMsg = `丢弃失败: ${err.message || err}`;
+    }
+  }
+
+  // 2026-10-06 插件重整：插件删除三件套的界面半边（「新建只建不删」缺口的收口）。
+  // 删除类一律先弹确认（delete-class-confirm 纪律）；只有 user/draft 来源能删，built_in
+  // 后端拒删并说人话。停用名单/信任表里的残留由后端一并清掉。
+  async function removeExt(e) {
+    if (!(await confirmAsk(`删除插件「${e.title || e.name}」？\n插件目录与全部文件会一并删除，不可恢复。`))) return;
+    try {
+      const r = await fetch('/api/plugins/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: e.name }),
+      }).then((r) => r.json());
+      if (r.error) {
+        extMsg = `删除失败: ${r.error}`;
+        return;
+      }
+      extMsg = `已删除插件「${e.title || e.name}」（目录 ${r.dir || ''}）`;
+      if (r.plugins) extList = r.plugins;
+      else await loadExt();
+    } catch (err) {
+      extMsg = `删除失败: ${err.message || err}`;
     }
   }
 
@@ -5308,11 +5326,16 @@
     {/if}
 
     <footer class="chat-input">
-      {#if dockCp || (gitInfo && gitInfo.is_repo)}
+      {#if dockCp || (gitInfo && gitInfo.is_repo) || gitMissing}
         <div class="cp-dock">
           <!-- 一张卡：头部行 + 展开的改动清单同属一个盒子（对齐 ZCode 的 change-summary）。
                清单是流内子元素，卡片向上长；宽度天然一致，也不会把文档撑出滚动条 -->
           <div class="cp-card">
+            {#if gitMissing}
+              <!-- 缺 git 明说（2026-10-06 用户拍板）：以前这里整条静默消失，用户根本不知道
+                   撤销/检查点/改动/审查为什么没了。连安装方法一起给 -->
+              <div class="git-missing-note">没检测到 git：撤销、检查点、改动清单、提交、审查 diff 都用不了。{GIT_INSTALL_HINT}。</div>
+            {/if}
             <div class="cp-bar">
             {#if gitInfo && gitInfo.is_repo}
               <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
@@ -6734,7 +6757,9 @@
 
         <!-- 权限放开轮（用户 2026-10-02 拍板）：内置能力已全部插件化——Git/沙箱/功能桥接/
              css-ui注入/星云/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
-             host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行 -->
+             host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行。
+             2026-10-06 重整：git-panel / sandbox-panel 移出插件位（能力留在宿主），5 个纯
+             技能插件降级成全局技能（住技能页），此行只剩 9 个插件 -->
         <div class="group-label">插件 {builtInExts.length}</div>
 
         {#each builtInExts as e}
@@ -6765,16 +6790,8 @@
               {/if}
               {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
               {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
-              {#if e.name === 'sandbox-panel'}
-                <!-- 用户 2026-10-03：沙箱不给界面了，行上就一个「检测」——真拉受限进程跑探针，结果落在本行 chip -->
-                <button class="btn ghost" disabled={sandboxProbeBusy || !e.ok || e.enabled === false} on:click={runSandboxProbe} title="真拉起受限进程跑探针套件">{sandboxProbeBusy ? '检测中…' : '检测'}</button>
-                {#if sandboxProbe}
-                  {#if sandboxProbe.error}
-                    <span class="plug-chip warn" title={sandboxProbe.error}>检测失败</span>
-                  {:else}
-                    <span class="plug-chip" class:ok={sandboxProbe.ok} class:warn={!sandboxProbe.ok} title={sandboxProbeTip(sandboxProbe)}>{sandboxProbe.ok ? '通过' : '有失败'}</span>
-                  {/if}
-                {/if}
+              {#if e.origin === 'user'}
+                <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录（不可恢复）">删除</button>
               {/if}
               <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
             {/if}
@@ -6816,6 +6833,9 @@
                 {/if}
                 {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
                 {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
+                {#if e.origin === 'user'}
+                  <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录，不可恢复">删除</button>
+                {/if}
                 <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
               {/if}
             </div>
@@ -6827,6 +6847,49 @@
             下建目录（内含 manifest.json 与 index.html）。
           </div>
         {/if}
+        <!-- 宿主能力（2026-10-06 重整后不再是插件，留在设置页）：Git 运行时状态卡片从
+             git-panel 插件分区搬来（哪个 git 在生效 + 重新检测）；沙箱自检同理 -->
+        <div class="group-label">宿主能力</div>
+        <div class="plug-row" title="git.exe 发现链：环境变量 AGENT_GIT_PATH → PATH → 注册表 → 常见安装位置 → exe 同级 tools/git → 内置 zip 懒解压">
+          <div class="plug-ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg>
+          </div>
+          <div class="plug-meta">
+            <div class="plug-title">Git 运行时</div>
+            {#if gitRuntime && gitRuntime.ok}
+              <div class="plug-desc">{gitSourceLabel(gitRuntime.source)}{gitRuntime.version ? ' ' + gitRuntime.version : ''} · {gitRuntime.path}</div>
+            {:else if gitRuntime}
+              <!-- 缺 git 不许静默：这条就是安装指引 -->
+              <div class="plug-desc warn-text">没检测到 git，撤销/检查点/改动/审查用不了。{GIT_INSTALL_HINT}。</div>
+            {:else}
+              <div class="plug-desc">读取中…</div>
+            {/if}
+          </div>
+          <span class="flex-sp"></span>
+          <button class="btn ghost" disabled={!gitRuntime} on:click={() => loadGitRuntime(true)} title="重新跑一遍 git.exe 发现链">重新检测</button>
+        </div>
+        <div class="plug-row" title="沙箱执行机制归内核（Job Objects 整树击杀 + 受限 token）；这里看生效档位、跑自检">
+          <div class="plug-ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/><path d="M9.2 12l2 2 3.6-3.8"/></svg>
+          </div>
+          <div class="plug-meta">
+            <div class="plug-title">沙箱自检</div>
+            {#if sandboxInfo}
+              <div class="plug-desc">生效档位：{sandboxInfo.label || sandboxInfo.effective}{sandboxInfo.fallback_reason ? `（${sandboxInfo.fallback_reason}）` : ''}</div>
+            {:else}
+              <div class="plug-desc">读取中…</div>
+            {/if}
+          </div>
+          <span class="flex-sp"></span>
+          <button class="btn ghost" disabled={sandboxProbeBusy} on:click={runSandboxProbe} title="真拉起受限进程跑探针套件，验证隔离机制（Job Objects / 受限 token）">{sandboxProbeBusy ? '检测中…' : '检测'}</button>
+          {#if sandboxProbe}
+            {#if sandboxProbe.error}
+              <span class="plug-chip warn" title={sandboxProbe.error}>检测失败</span>
+            {:else}
+              <span class="plug-chip" class:ok={sandboxProbe.ok} class:warn={!sandboxProbe.ok} title={sandboxProbeTip(sandboxProbe)}>{sandboxProbe.ok ? '通过' : '有失败'}</span>
+            {/if}
+          {/if}
+        </div>
         <div class="param-hint">目录：内置 {extInfo.app_dir || '（读取中）'} ｜ 工作区 {extInfo.workspace_dir || '（读取中）'}</div>
       {/if}
 
@@ -9342,6 +9405,18 @@
     width: 100%;
     max-width: none;
     box-sizing: border-box;
+  }
+  /* 缺 git 明说条（2026-10-06）：以前整条 dock 静默消失，用户不知道功能为什么没了 */
+  .git-missing-note {
+    padding: 8px 12px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--tint-orange-fg);
+    border-bottom: 1px solid var(--g2);
+  }
+  /* 插件行描述里的警示色（宿主能力行缺 git 提示用，与 plug-chip.warn 同一只色） */
+  .plug-desc.warn-text {
+    color: var(--tint-orange-fg);
   }
   .cp-bar {
     display: flex;

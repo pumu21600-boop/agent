@@ -47,9 +47,7 @@ pub(crate) struct SettingsPatch {
     // —— 普通：子系统配置 ——
     pub roles: Option<RolesSettings>,
     pub features: Option<FeatureSettings>,
-    pub sandbox_cpu_percent: Option<u32>,
-    /// 整表替换（先 get 拿现状再改）。新 server / 配置有改动的 server 会被强制回
-    /// 「未确认」——工具清单要用户在界面上重新确认后才放行，模型不能自装自确认。
+    /// 整表替换（先 get 拿现状再改）。2026-10-04 起装了就能用、无首装确认
     pub mcp_servers: Option<Vec<McpServerCfg>>,
     pub disabled_plugins: Option<Vec<String>>,
     pub disabled_skills: Option<Vec<String>>,
@@ -172,29 +170,11 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
         s.features = features;
         changed.push("features".into());
     }
-    if let Some(cpu) = p.sandbox_cpu_percent {
-        s.sandbox_cpu_percent = Some(cpu.min(100));
-        changed.push("sandbox_cpu_percent".into());
-    }
 
-    // 3) MCP 整表替换：配置没变的条目保留用户已确认状态；新条目或配置有改动的条目
-    //    强制回未确认——工具清单必须用户重新确认才放行（总架构 §7 tool poisoning 防线）
+    // 3) MCP 整表替换。2026-10-04 放开权限轮起「装了就能用、无首装确认」，不再有
+    //    逐服务的确认态需要保留（早先按 same_config 保留确认状的分支随确认制一起退役）
     if let Some(servers) = &p.mcp_servers {
-        let mut next: Vec<McpServerCfg> = Vec::with_capacity(servers.len());
-        for srv in servers {
-            let mut c = srv.clone();
-            let old = s.mcp_servers.iter().find(|o| o.name == c.name);
-            let same_config = matches!(&old, Some(o)
-                if o.transport == c.transport
-                    && o.command == c.command
-                    && o.args == c.args
-                    && o.env == c.env
-                    && o.url == c.url
-                    && o.headers == c.headers
-                    && o.oauth == c.oauth);
-            next.push(c);
-        }
-        s.mcp_servers = next;
+        s.mcp_servers = servers.clone();
         changed.push("mcp_servers".into());
     }
 
@@ -276,7 +256,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             let s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
             Ok(crate::context::compress(&snapshot_json(&s), 8000))
         }
-        // —— 以下全部受「自改」插件闸（闸在分发层；助手函数保持纯净供测试直达） ——
+        // —— 以下全部受「中枢」插件闸（闸在分发层；助手函数保持纯净供测试直达） ——
         "set" => {
             super::selfmod_gate()?;
             let raw = v.get("patch").cloned().unwrap_or(Value::Null);
@@ -574,7 +554,6 @@ fn snapshot_json(s: &settings::Settings) -> String {
         }).collect::<Vec<Value>>(),
         "roles": s.roles,
         "features": s.features,
-        "sandbox_cpu_percent": s.sandbox_cpu_percent,
         "mcp_servers": s.mcp_servers.iter().map(|c| json!({
             "name": c.name,
             "transport": c.transport,

@@ -4,7 +4,7 @@
 //! 会话是「用户看着的界面实体」：切换、侧栏刷新、顶栏同步都在前端，所以 new/open/
 //! rename/fork/delete/pin/archive 走 /api/ui/events 事件流，前端执行与用户手点完全
 //! 相同的函数（同一扇门，界面永远不会和实际状态对不上）；list 走共享 AppState 直读。
-//! 全部方法受「自改」插件闸（list 只读除外）；删除不可逆 → Dangerous 必问。
+//! 全部方法受「中枢」插件闸（list 只读除外）；删除不可逆 → Dangerous 必问。
 
 use serde_json::{Value, json};
 

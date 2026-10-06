@@ -1,8 +1,0 @@
-{
-  "apiVersion": 1,
-  "source": "built_in",
-  "title": "PDF",
-  "description": "PDF 文本提取、合并拆分与 HTML 转 PDF",
-  "version": "0.1.0",
-  "skills": "skills"
-}

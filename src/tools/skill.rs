@@ -6,7 +6,7 @@
 //! （skills::index_prompt 只列自建技能）一起堵：建技能有了正门，模型不再需要找文件。
 //! save 落全局技能根（app_root/skills，2026-10-02 拍板的唯一技能根）；插件自带技能
 //! 不可删（skills::delete 已拒，想覆盖走同名 save）。
-//! save/delete 受「自改」插件闸（list 只读不受）；闸在 run() 层，内层函数供测试直达。
+//! save/delete 受「中枢」插件闸（list 只读不受）；闸在 run() 层，内层函数供测试直达。
 
 use serde_json::{Value, json};
 
@@ -14,7 +14,7 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     match v.get("action").and_then(|x| x.as_str()).unwrap_or("") {
         "list" => list_skills(),
-        // —— 受「自改」插件闸 ——
+        // —— 受「中枢」插件闸 ——
         "save" => {
             super::selfmod_gate()?;
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
@@ -98,15 +98,15 @@ mod tests {
         assert!(e.contains("content"), "{e}");
     }
 
-    /// 自改闸：测试环境共享设置未安装 = 闸关着，改动动作给人话指路，list 照常。
+    /// 中枢闸：测试环境共享设置未安装 = 闸关着，改动动作给人话指路，list 照常。
     #[tokio::test]
     async fn gate_blocks_mutations_without_plugin() {
         let e = run(r#"{"action":"save","name":"zz-gate","description":"x","content":"y"}"#)
             .await
             .unwrap_err();
-        assert!(e.contains("自改") && e.contains("设置→插件"), "{e}");
+        assert!(e.contains("中枢") && e.contains("设置→插件"), "{e}");
         let e = run(r#"{"action":"delete","name":"zz-gate"}"#).await.unwrap_err();
-        assert!(e.contains("自改"), "{e}");
+        assert!(e.contains("中枢"), "{e}");
         // list 只读不受闸（共享未安装时是空清单，但不应报闸错）
         let r = run(r#"{"action":"list"}"#).await.unwrap();
         assert!(r.contains("skills"), "{r}");

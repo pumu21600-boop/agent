@@ -194,22 +194,13 @@ pub const SCHEMA: &[SchemaEntry] = &[
         desc: "内置功能开关整表替换。单个开关优先用点号路径 features.<键>",
     },
     SchemaEntry {
-        path: "sandbox_cpu_percent",
-        label: "沙箱 CPU 上限",
-        ty: "integer",
-        enum_values: &[],
-        default: Some("0=不限"),
-        risk: "normal",
-        desc: "整树 CPU 硬上限百分比（0=不限；上限 100 截断）",
-    },
-    SchemaEntry {
         path: "mcp_servers",
         label: "MCP server 清单",
         ty: "object",
         enum_values: &[],
         default: None,
         risk: "normal",
-        desc: "整表替换（先 get 拿现状）。新/有改动的 server 会被强制回未确认——工具清单要用户在界面上重新确认，模型不能自装自确认",
+        desc: "整表替换（先 get 拿现状）。2026-10-04 起装了就能用、无首装确认",
     },
     SchemaEntry {
         path: "disabled_plugins",
@@ -530,11 +521,6 @@ pub(crate) fn apply_entry_value(s: &mut Settings, path: &str, v: &Value) -> Resu
                 s.features.set(k, on)?;
             }
             Ok("features".into())
-        }
-        "sandbox_cpu_percent" => {
-            let p = v.as_u64().ok_or("sandbox_cpu_percent 需要整数（0-100）")?;
-            s.sandbox_cpu_percent = Some((p.min(100)) as u32);
-            Ok("sandbory_cpu_percent".into())
         }
         "mcp_servers" | "disabled_plugins" | "disabled_skills" | "schedules" => {
             // 整表替换带校验/联动，主体在 settings 工具侧（apply_patch 全表分支），

@@ -1,8 +1,0 @@
-{
-  "apiVersion": 1,
-  "source": "built_in",
-  "title": "GitHub",
-  "description": "GitHub 仓库/PR/issue/CI 操作纪律（gh CLI）",
-  "version": "0.1.0",
-  "skills": "skills"
-}
