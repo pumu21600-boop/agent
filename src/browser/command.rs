@@ -207,7 +207,14 @@ pub(crate) const CHECK_JS: &str = r#"((sel, checked) => {
 })"#;
 
 /// 统一命令分发：agent 工具唯一入口。缺省 tab = agent 专用页。
+///
+/// 能力总闸（用户 2026-10-06 拍板「插件开关就是能力总闸，关掉就是没有了」）：
+/// 「浏览器」插件被停用时 agent 一律拒动。此前只有技能被收回（agent 少了说明书），
+/// 工具本身照旧能跑——于是「停了还能用」，与用户看到的开关语义对不上。
 pub async fn command(args: &str, max_chars: usize) -> Result<String, String> {
+    if !capability_on() {
+        return Err(BROWSER_OFF_MSG.to_string());
+    }
     let cmd = commands::parse(args).map_err(String::from)?;
     let out = dispatch(cmd, max_chars).await.map_err(String::from);
     // agent 碰过浏览器（不论成败）就记时间戳——面板据此自动唤起右侧栏（用户要求）。

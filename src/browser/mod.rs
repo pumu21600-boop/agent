@@ -51,6 +51,22 @@ pub(crate) use panel::*;
 pub(crate) use session::*;
 pub(crate) use snapshot::*;
 
+/// 内置浏览器能力的载体插件名（manifest `source:"built_in"`，只带 skills 不带界面）。
+pub(crate) const BROWSER_PLUGIN: &str = "browser";
+
+/// 能力闸关掉时给的人话。agent 工具与面板接口共用——用户在两处看到同一句，
+/// 才知道去哪儿把它打开。
+pub(crate) const BROWSER_OFF_MSG: &str =
+    "内置浏览器已停用：去 设置→插件 打开「浏览器」后才能用（停用时 agent 与面板都调不动）";
+
+/// 浏览器能力是否在线 = 「浏览器」插件是否被停用。
+///
+/// 能力总闸（用户 2026-10-06 拍板）：插件开关 = 这个能力在不在。停用名单由
+/// `plugin::ui::set_disabled` 在启动与启停端点两处灌入，与技能停用同一份数据源。
+pub(crate) fn capability_on() -> bool {
+    !crate::plugin::ui::disabled().iter().any(|d| d == BROWSER_PLUGIN)
+}
+
 use std::{
     collections::HashMap,
     os::windows::process::CommandExt,
@@ -698,5 +714,40 @@ mod tests {
         assert_eq!(modifier_mask(&ctrl), 2);
         let ctrl_shift = Some(vec![KeyModifier::Control, KeyModifier::Shift]);
         assert_eq!(modifier_mask(&ctrl_shift), 10);
+    }
+
+    /// 能力总闸：停用名单里有 browser 就全线拒动，没有就放行。
+    ///
+    /// 回归 2026-10-06 用户实锤：插件开关拨到停用，agent 用 shell curl 照样能驱动
+    /// 内置浏览器——因为停用只收回技能，command() 和 /api/browser/* 都没有关卡。
+    /// 这个测试钉住「名单 → 判定」这一跳（判定 put 在 mod.rs 顶部那段注释旁边）。
+    #[test]
+    fn capability_follows_disabled_list() {
+        // 存档现名单，测完还原——DISABLED 是进程级静态量，别把别人的测试带沟里
+        let saved = crate::plugin::ui::disabled();
+        let had_browser = saved.iter().any(|d| d == BROWSER_PLUGIN);
+        let mut off = saved.clone();
+        off.retain(|d| d != BROWSER_PLUGIN);
+        off.push(BROWSER_PLUGIN.to_string());
+        crate::plugin::ui::set_disabled(&off);
+        assert!(!capability_on(), "停用名单里有 browser 时必须判定为关");
+        assert!(
+            BROWSER_OFF_MSG.contains("设置→插件"),
+            "拒信要说人去哪儿打开: {BROWSER_OFF_MSG}"
+        );
+
+        let mut on = saved.clone();
+        on.retain(|d| d != BROWSER_PLUGIN);
+        crate::plugin::ui::set_disabled(&on);
+        assert!(capability_on(), "没停用时必须判定为开");
+
+        // 还原（含原本就没停用的情形）
+        let mut restore = saved.clone();
+        if !had_browser {
+            restore.retain(|d| d != BROWSER_PLUGIN);
+        } else if !restore.iter().any(|d| d == BROWSER_PLUGIN) {
+            restore.push(BROWSER_PLUGIN.to_string());
+        }
+        crate::plugin::ui::set_disabled(&restore);
     }
 }

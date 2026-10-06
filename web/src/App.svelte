@@ -1367,6 +1367,9 @@
   let webAgentWatch = null;
   let webAgentSeen = 0; // 已响应过的 agent 触碰时间戳（防同一动作反复弹跳）
   function webStartAgentWatch() {
+    // 浏览器插件停用时不开这条常驻轮询：能力已经关了，还每 2s 去撞 403 是白跑
+    // （用户 2026-10-06：插件开关=能力总闸，关了就什么都不该动）
+    if (!browserOn) return;
     if (webAgentWatch) return;
     webAgentWatch = setInterval(async () => {
       try {
@@ -1425,6 +1428,14 @@
     }, 2000);
   }
   webStartAgentWatch();
+  // 能力开着→关的过渡：已在跑的轮询要收掉，不然插件停用后它还在撞 403。
+  // 开着的反向不用管（webStartAgentWatch 幂等，面板那侧的响应式会再拉）。
+  $: if (!browserOn && webAgentWatch) {
+    clearInterval(webAgentWatch);
+    webAgentWatch = null;
+  } else if (browserOn && !webAgentWatch) {
+    webStartAgentWatch();
+  }
   onDestroy(() => {
     if (webAgentWatch) clearInterval(webAgentWatch); // N2：常开轮询随组件销毁收掉
   });
@@ -3911,6 +3922,10 @@
       kind: 'open_tab', title: '打开内置标签页', risk: 'safe', internal: false,
       args: 'key: artifacts=产物/review=审查/web=网页（白名单 RP_BUILTIN，别开乱七八糟的标签）',
       run(m) {
+        // web 也受能力闸管：浏览器插件停用时 agent 开不出「网页」标签
+        //（用户 2026-10-06：插件开关=能力总闸）。这里不加的话，rpVisibleTabs 会在
+        // 渲染时把它滤掉，agent 侧却收到成功——「说做了其实没做」。
+        if (m.key === 'web' && !browserOn) return;
         const b = RP_BUILTIN.find((x) => x.key === m.key);
         if (b) {
           addRpTab(b);
@@ -4444,9 +4459,15 @@
   // 其余插件不再进侧栏——+ 菜单与选择页都不出（用户 2026-10-03 拍板：六个够了）。
   // 停用插件的标签渲染时隐藏；插件清单没到手（extList 空）时不判 ext 标签失效——
   // 那只是「还没加载」，不是「被停用」；否则默认激活的时间线标签会被提前顶成「产物」（真机冒烟实锤）。
-  $: rpVisibleTabs = rpTabs.filter((t) => t.kind !== 'ext' || (RP_EXT_PANELS.has(t.name) && (!extList.length || enabledExts.some((e) => e.name === t.name))));
+  // 「网页」是宿主内置面板，但能力归「浏览器」插件管（用户 2026-10-06：插件开关=能力总闸，
+  // 关掉浏览器 = agent 调不动 + 面板入口也没了）。同一套 extList 空载豁免也适用于它。
+  $: browserOn = extList.length === 0 || enabledExts.some((e) => e.name === 'browser');
+  $: rpVisibleTabs = rpTabs.filter((t) => {
+    if (t.kind === 'web') return browserOn;
+    return t.kind !== 'ext' || (RP_EXT_PANELS.has(t.name) && (!extList.length || enabledExts.some((e) => e.name === t.name)));
+  });
   $: rpAddable = [
-    ...RP_BUILTIN,
+    ...RP_BUILTIN.filter((b) => (b.kind !== 'web' || browserOn)),
     ...enabledExts
       .filter((e) => RP_EXT_PANELS.has(e.name))
       .flatMap((e) =>

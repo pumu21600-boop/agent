@@ -261,7 +261,29 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
     // 来源校验在最外层：非本机来源的请求在进任何 handler 之前就被挡掉
     app = app.layer(middleware::from_fn(no_cache_html));
     app = app.layer(middleware::from_fn(guard_local_only));
+    // 浏览器能力闸：与 guard_local_only 同层，挡在 handler 之前
+    app = app.layer(middleware::from_fn(guard_browser_plugin));
     app
+}
+
+/// 内置浏览器能力闸（用户 2026-10-06 拍板：插件开关 = 能力总闸）。
+///
+/// 「浏览器」插件被停用时，`/api/browser/*` 一律 403。此前这里毫无阻拦：停用只收回
+/// 了技能（agent 少了说明书），可 agent 用 shell curl 照样能驱动浏览器，用户看到的
+/// 就是「开关拨了，能力还在」。走中间件而不是逐个 handler 加判断——19 个端点漏一个
+/// 就是假闸，以后新加端点也自动收编。
+///
+/// `screenshot`/`frame` 返回图片，拒信统一用 JSON：前端那两处本来就走 fetch 拿 blob，
+/// 403 时按 error 文案显示即可（正常路径不受影响）。
+async fn guard_browser_plugin(req: Request, next: Next) -> Response {
+    if req.uri().path().starts_with("/api/browser/") && !crate::browser::capability_on() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": crate::browser::BROWSER_OFF_MSG })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// 本机服务的来源校验（施工单 022）。
