@@ -120,7 +120,10 @@
                 <div class="plug-title">{s.name}</div>
                 <div class="plug-desc">{s.description || '（无描述）'}</div>
               </div>
-              <span class="plug-chip">{s.source === 'project' ? '项目级' : s.source === 'plugin' ? (s.plugin ? `插件 · ${s.plugin}` : '插件') : '全局'}</span>
+              <!-- 来源徽标只标例外：全局技能是这页的常态（每行都挂「全局」= 纯噪音，
+                  用户 2026-10-07 实锤「这些全局按钮可以去掉」）；只有项目级这种
+                  少数情况值得亮出来。插件来源的技能本就被上面过滤掉，无需分支 -->
+              {#if s.source === 'project'}<span class="plug-chip">项目级</span>{/if}
               <span class="flex-sp"></span>
               <button class="btn ghost" on:click={() => editSkill(s)}>编辑</button>
               <button class="btn ghost danger" on:click={() => deleteSkill(s.name)}>删除</button>
