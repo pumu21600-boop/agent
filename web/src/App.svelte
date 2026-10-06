@@ -369,6 +369,10 @@
     await loadProviders();
     await loadSettings();
     await loadSessions(true);
+    // 手风琴启动归一（用户 2026-10-07：同时只展开一个工作区）：老配置里可能存着
+    // 多个展开态（改版前的行为），启动收敛成只展开当前项目
+    expandedFlags = workspace ? { [workspace]: true } : { __ungrouped__: true };
+    localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
     refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
     loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
     loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
@@ -423,6 +427,10 @@
       restoreUsage('@new');
       await loadSettings();
       await loadSessions(true);
+      // 手风琴（用户 2026-10-07）：切过来的项目独占展开态，其余工作区的对话
+      // 列表一并收起——侧栏同时只显示当前项目的会话
+      expandedFlags = workspace ? { [workspace]: true } : {};
+      localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
     } catch (e) {
       // wsMsg 只渲染在 WorkspaceModal 里，而那个弹窗没有任何置 true 的入口（死代码）——
       // 切换失败一直是静默的。改应用内提示弹窗，壳内外都可见。
@@ -3177,8 +3185,9 @@
         rekey('@new', r.id);
         currentTitle = r.title || '';
         if (workspace) {
-          // 新会话就在当前项目下：展开该项目，马上能看到这条空会话
-          expandedFlags = { ...expandedFlags, [workspace]: true };
+          // 新会话就在当前项目下：展开该项目，马上能看到这条空会话（手风琴：
+          // 只留当前项目展开，其余工作区的列表收起）
+          expandedFlags = { [workspace]: true };
           localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
         }
         await loadSessions();
@@ -3294,8 +3303,14 @@
   }
   const CONV_PREVIEW = 5; // 项目收起态先显 5 条，其余走「展开其余 N 个会话」
 
-  $: if (workspace && !(workspace in expandedFlags)) {
-    expandedFlags = { ...expandedFlags, [workspace]: true };
+  // 当前工作区**变化**时独占展开它的分组（切项目/外部改工作区）：手风琴语义下
+  // 一次只展开一个组，新工作区上线、其余工作区的对话列表一并收起。
+  // 只在 workspace 真的变了时展开——早先的版本是「当前工作区不在展开集里就补上」，
+  // 用户手风琴点开别的组时会把它立刻加回来，两个组同时展开（实锤过）。
+  let lastExpandedWs = workspace;
+  $: if (workspace && workspace !== lastExpandedWs) {
+    lastExpandedWs = workspace;
+    expandedFlags = { [workspace]: true };
   }
 
 
@@ -3367,7 +3382,11 @@
 
   function toggleProjectRow(path) {
     if (searchQ) return; // 搜索态全展开
-    expandedFlags = { ...expandedFlags, [path]: !expandedFlags[path] };
+    // 手风琴（用户 2026-10-07：选了一个工作区，其他工作区取消选中状态并自动收起
+    // 对话）：展开一个就收起其余——侧栏同时只看到一个项目的会话列表。
+    // showAllFlags 不动：重新展开时恢复「显示全部」，收起不等于忘掉看过。
+    const willExpand = !expandedFlags[path];
+    expandedFlags = willExpand ? { [path]: true } : { ...expandedFlags, [path]: false };
     localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
   }
 
