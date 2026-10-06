@@ -3,7 +3,7 @@
 use super::*;
 
 /// GET /api/changes?baseline=xx[&origin=shadow|workspace] —— 本任务相对基线的改动文件清单
-/// （「产物」/「审查」标签数据源）files: [{ path, status, adds, dels }]；未跟踪文件也在内
+/// （「产物」/「git」标签数据源）files: [{ path, status, adds, dels }]；未跟踪文件也在内
 /// （agent 新建的文件必现）。origin=workspace 且不传 baseline = 真仓库相对 HEAD（「未提交改动」档）。
 pub(super) async fn list_changes(
     Query(params): Query<std::collections::HashMap<String, String>>,
@@ -27,7 +27,7 @@ pub(super) async fn list_changes(
 }
 
 /// GET /api/review/diff?baseline=xx[&path=xx][&origin=shadow|workspace] —— 相对基线的统一 diff 文本
-/// （审查面板逐文件看具体改动用；path 缺省 = 全量）。
+/// （git 面板逐文件看具体改动用；path 缺省 = 全量）。
 pub(super) async fn review_diff(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

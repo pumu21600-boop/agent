@@ -222,25 +222,25 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             crate::server::ui_events::emit(json!({ "kind": "theme", "mode": mode }));
             Ok(format!("已切换主题：{mode}"))
         }
-        // 内置标签页（产物/审查/网页）开在右侧边栏
+        // 内置标签页（产物/git/网页）开在右侧边栏
         "open_tab" => {
             super::selfmod_gate()?;
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
             let (title, key) = match name {
                 "artifacts" => ("产物", "artifacts"),
-                "review" => ("审查", "review"),
+                "git" => ("git", "git"),
                 "web" => ("网页", "web"),
-                other => return Err(format!("未知标签: {other:?}（artifacts / review / web）")),
+                other => return Err(format!("未知标签: {other:?}（artifacts / git / web）")),
             };
             crate::server::ui_events::emit(json!({ "kind": "open_tab", "key": key }));
             Ok(format!("已在右侧边栏打开「{title}」标签"))
         }
-        // 关标签：key 形如 artifacts/review/web、ext:usage、file:<路径>（先 state 看 tabs_open/active_tab）
+        // 关标签：key 形如 artifacts/git/web、ext:usage、file:<路径>（先 state 看 tabs_open/active_tab）
         "close_tab" => {
             super::selfmod_gate()?;
             let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
             if key.is_empty() {
-                return Err("缺少 key（artifacts / review / web / ext:usage / file:<路径>）".into());
+                return Err("缺少 key（artifacts / git / web / ext:usage / file:<路径>）".into());
             }
             crate::server::ui_events::emit(json!({ "kind": "close_tab", "key": key }));
             Ok(format!("已请求关闭标签 {key}（本来就没开会没反应，如实告知用户）"))

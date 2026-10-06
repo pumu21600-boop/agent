@@ -47,8 +47,8 @@ fn shadow_gitdir(ws: &Path) -> PathBuf {
     ws.join(".agent").join("shadow").join(".git")
 }
 
-/// 审查面板的数据源（对着 ZCode 审查面板的 source 选择器：未暂存 / 上一轮…）。
-/// - `Shadow`：影子仓库相对某个检查点 = 「本任务改动」（默认，产物/审查一直用这条）
+/// git 面板的数据源（对着 ZCode git 面板的 source 选择器：未暂存 / 上一轮…）。
+/// - `Shadow`：影子仓库相对某个检查点 = 「本任务改动」（默认，产物/git 一直用这条）
 /// - `Workspace`：工作区自己的真仓库相对 HEAD = 「未提交改动」
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoOrigin {
@@ -493,7 +493,7 @@ pub fn head_id(ws: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// 工作树相对基线 commit 的统一 diff 文本（审查面板逐文件看改动用）。
+/// 工作树相对基线 commit 的统一 diff 文本（git 面板逐文件看改动用）。
 /// 上限 512KB，防长会话 diff 把面板撑爆；超限尾部标省略。
 /// `origin` 决定跑影子仓库还是工作区自己的真仓库（「未提交改动」档）。
 pub fn diff_text(

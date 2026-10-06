@@ -387,14 +387,13 @@
   });
 
   function closeMenusOnOutside(e) {
-    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more') || e.target.closest('.git-dirty') || e.target.closest('.git-pop'))) return;
+    if (e.target && e.target.closest && (e.target.closest('.bar-menu') || e.target.closest('.side-menu') || e.target.closest('.row-btn') || e.target.closest('.conv-more'))) return;
     modelMenuOpen = false;
     thinkMenuOpen = false;
     approvalMenuOpen = false;
     viewMenuOpen = false;
     sessMenuId = null;
     projMenuPath = null;
-    gitPopOpen = false;
   }
 
   // —— P8.2 工作区切换 ——
@@ -933,9 +932,11 @@
   // 产物/网页/插件面板（时间线/项目速览/用量）/文件预览全在这里开标签页；标签可关、
   // 尾部 + 号加面板、关光了显示「打开标签页」选择页。首启把用户点名的五个面板开好
   // （插件没启用的话渲染时自然消失）。持久化：rpTabs（开着哪些）+ rpTab（激活 key）。
+  // 「git」= 审查 + 提交合成一个标签（用户 2026-10-07 拍板：git 提交放进侧边栏跟审查一起，
+  // 聊天区底部那根常驻条撤掉）。key 从老 'review' 迁过来，见下面 rpTabs 加载处的迁移。
   const RP_BUILTIN = [
     { key: 'artifacts', kind: 'artifacts', title: '产物' },
-    { key: 'review', kind: 'review', title: '审查' },
+    { key: 'git', kind: 'git', title: 'git' },
     { key: 'web', kind: 'web', title: '网页' },
   ];
   // 侧栏只收编这三个宿主面板插件（时间线/项目文件/用量）——其余插件哪怕 manifest 声明
@@ -953,14 +954,19 @@
   let rpTabs = (() => {
     try {
       const raw = JSON.parse(localStorage.getItem('rpTabs') || 'null');
-      if (Array.isArray(raw) && raw.length) return raw.filter((t) => t && t.key && t.kind && (t.kind !== 'ext' || RP_EXT_PANELS.has(t.name)));
+      if (Array.isArray(raw) && raw.length) {
+        // 老存档里的「审查」标签（key=review）迁成 git（同位置不改用户其余标签）
+        return raw
+          .map((t) => (t && t.key === 'review' ? { ...t, key: 'git', kind: 'git', title: 'git' } : t))
+          .filter((t) => t && t.key && t.kind && (t.kind !== 'ext' || RP_EXT_PANELS.has(t.name)));
+      }
     } catch {}
     return rpDefaultTabs();
   })();
   // 老 localStorage（单 rpTab：'preview'/'ext:x'/'web'）迁移：'preview' 已撤（预览改为
   // 按文件开标签），插件 key 不在列表就补一条，实在对不上就用第一个标签。
   let rpTab = (() => {
-    const want = localStorage.getItem('rpTab') || '';
+    const want = (localStorage.getItem('rpTab') || '').replace(/^review$/, 'git'); // 老「审查」激活标签跟着迁
     if (rpTabs.some((t) => t.key === want)) return want;
     if (want.startsWith('ext:') && RP_EXT_PANELS.has(want.slice(4))) {
       const name = want.slice(4);
@@ -973,50 +979,29 @@
   let rpFiles = [];
   // 「产物」空态/失败的原因（resolveBaseline 没基线、读取出错）——空也要说人话
   let rpArtifactsNote = '';
-  // 「审查」标签用的基线（与产物同源：本会话任务起点）
-  let rpReviewBaseline = '';
-  // —— 审查面板（整一套对齐 ZCode 的 git/review pane）——
-  // 来源选择器对应 ZCode 的 source selector：task=本任务改动（影子仓库检查点）、
-  // work=未提交改动（工作区自己的真仓库相对 HEAD，即 ZCode 默认的「未暂存」）
+  // —— git 面板（用户 2026-10-07：审查+提交合成一个标签）——
+  // 范围选择器对应 ZCode 的 source selector：task=本任务改动（影子仓库检查点）、
+  // work=未提交改动（工作区真仓库相对 HEAD）——同时是提交的暂存区（勾选即入选）
   let rvSource = 'task';
-  let rvBaseline = ''; // source='task' 时的基线；变更条点「审查」会带上它自己的
+  let rvBaseline = ''; // source='task' 时的基线；点「审查」进面板会带上它自己的
   let rvFiles = [];
   let rvLoading = false;
   let rvError = '';
   let rvOpen = {}; // path → 是否展开 diff
   let rvDiff = {}; // path → { loading, text, error }
   let rvMenu = null; // 行右键菜单 { x, y, path }
-  // 变更条展开的文件清单（用户 2026-10-02：「N 个文件已更改」要能展开看到文件）
-  let cpFilesOpen = false;
-  let cpFiles = [];
-  let cpFilesLoading = false;
-  async function loadCpFiles() {
-    if (!dockCp || !dockCp.id) return;
-    cpFilesLoading = true;
-    try {
-      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(dockCp.id)}`).then((r) => r.json());
-      cpFiles = r.ok ? r.files || [] : [];
-    } catch (e) {
-      cpFiles = [];
-    }
-    cpFilesLoading = false;
-  }
-  function toggleCpFiles() {
-    cpFilesOpen = !cpFilesOpen;
-    if (cpFilesOpen && !cpFiles.length) loadCpFiles();
-  }
-  // 打开审查面板并把某个文件展开（变更条「审查」按钮、产物行共用）。
-  // 对齐 ZCode：审查不是另开的 diff 标签，就是审查面板里那一行展开。
+  // 打开 git 面板并把某个文件展开（产物行「审查」按钮用；变更条撤了，入口只剩产物行）。
+  // 对齐 ZCode：审查不是另开的 diff 标签，就是面板里那一行展开。
   function openReviewDiff(path, baseline) {
     if (!path) return;
-    if (!rpTabs.some((t) => t.kind === 'review')) {
-      rpTabs = [...rpTabs, { key: 'review', kind: 'review', title: '审查' }];
+    if (!rpTabs.some((t) => t.kind === 'git')) {
+      rpTabs = [...rpTabs, { key: 'git', kind: 'git', title: 'git' }];
     }
     rightPanelOpen = true;
     terminalOpen = false;
     const needReload = rvSource === 'task' && baseline && baseline !== rvBaseline;
     if (needReload) {
-      // 变更条的基线（dockCp.id）与审查面板当前用的不是同一个 → 换基线重拉，别拿旧的冒充
+      // 带来的基线与面板当前用的不是同一个 → 换基线重拉，别拿旧的冒充
       rvBaseline = baseline;
       rvFiles = [];
       rvOpen = { [path]: true };
@@ -1026,9 +1011,9 @@
       const f = rvFiles.find((x) => x.path === path);
       if (f) loadRvDiff(f);
     }
-    activateRpTab('review');
+    activateRpTab('git');
   }
-  // 审查面板文件清单（ZCode 的 source 切换：本任务改动 / 未提交改动）
+  // git 面板文件清单（source 切换：本任务改动 / 未提交改动；未提交档即提交暂存区）
   async function loadReview() {
     rvLoading = true;
     rvError = '';
@@ -1040,6 +1025,7 @@
           rvError = r.error;
         } else {
           rvFiles = r.files || [];
+          initCommitSel(rvFiles); // 清单换了，勾选态跟着重建（新文件默认按未跟踪不勾）
         }
       } catch (e) {
         rvFiles = [];
@@ -1862,7 +1848,10 @@
     const t = rpTabs.find((x) => x.key === key);
     if (!t) return;
     if (t.kind === 'artifacts') loadArtifacts();
-    if (t.kind === 'review') loadReview();
+    if (t.kind === 'git') {
+      loadReview();
+      refreshGit(); // 状态行（分支/HEAD/脏数）要跟清单一起新
+    }
     if (t.kind === 'web') loadWebState();
     if (t.kind === 'file') loadPreview(t.path);
   }
@@ -2056,13 +2045,11 @@
     if (t) activateRpTab(t.key);
   }
 
-  // —— 改动条：钉在输入框上方。实时会话用消息流里的检查点；
-  // 旧会话（消息流无检查点）回退到影子仓库基线 + diff 文件数。
-  // 基线优先取**本会话自己的**检查点（检查点带 Agent-Session 归属），没有才用全局最新一个
-  // —— 同一项目里多条会话来回切时，各自的改动条不会互相串。
+  // —— git 面板数据：dockCp = 「本任务改动」的基线（实时会话用消息流里的检查点；
+  // 旧会话回退到影子仓库基线）。基线优先取**本会话自己的**检查点（带 Agent-Session
+  // 归属），没有才用全局最新一个——同一项目多条会话来回切时互不串。
   let dockCp = null; // { id, files, additions, deletions } additions/deletions 可为 null（旧会话未知）
   let gitInfo = null; // { is_repo, git_missing, branch, head, dirty, upstream, ahead, behind, files: [{status, path}] }
-  let gitPopOpen = false; // 「N 处未提交」点开后的待提交明细
   async function refreshGit() {
     try {
       gitInfo = await fetch('/api/git/status').then((r) => r.json());
@@ -2077,49 +2064,42 @@
     return s === 'system' ? '系统安装' : s === 'portable' ? '便携版（exe 同级）' : s === 'bundled' ? '内置运行时' : s || '未知';
   }
   const GIT_INSTALL_HINT = '装一个 Git for Windows（https://git-scm.com/downloads）后重启本软件即可恢复';
-  // porcelain 状态码 → 人看的短标签
-  // 点文件 → 右侧边栏新开预览标签（改动条里的路径同样可读）
-  function openGitFile(path) {
-    gitPopOpen = false;
-    openPreviewTab(path);
-  }
 
-  // —— 手动提交（界面上直接 commit，不必让 AI 代劳）——
-  // 默认勾选已跟踪的改动；未跟踪文件（日志、构建产物等）默认不勾，由用户自己决定
-  let commitModal = null; // { msg, files: [{ path, status, sel }], busy, err }
-  function openCommit() {
-    if (!gitInfo || !gitInfo.is_repo) return;
-    commitModal = {
-      msg: '',
-      files: (gitInfo.files || []).map((f) => ({ path: f.path, status: f.status, sel: !f.status.includes('?') })),
-      busy: false,
-      err: '',
-    };
+  // —— 手动提交（git 面板「未提交改动」档内联完成，不必弹窗、不必让 AI 代劳）——
+  // 勾选态挂在未提交清单上：已跟踪改动默认勾，未跟踪文件（日志、构建产物等）默认不勾
+  let commitMsg = '';
+  let commitSel = {}; // path → 是否勾选（暂存）
+  let commitBusy = false;
+  let commitErr = '';
+  // 清单重拉后按 path 沿用旧勾选；新出现的文件按上面的默认规则补
+  function initCommitSel(files) {
+    const next = {};
+    for (const f of files || []) {
+      next[f.path] = f.path in commitSel ? commitSel[f.path] : !f.status.includes('?');
+    }
+    commitSel = next;
   }
   function toggleCommitFile(path) {
-    if (!commitModal) return;
-    commitModal = {
-      ...commitModal,
-      files: commitModal.files.map((f) => (f.path === path ? { ...f, sel: !f.sel } : f)),
-    };
+    commitSel = { ...commitSel, [path]: !commitSel[path] };
+    commitErr = '';
   }
-  function commitSelCount() {
-    return (commitModal?.files || []).filter((f) => f.sel).length;
-  }
+  // Svelte4 坑：模板里调函数不建立函数体内变量的依赖——计数必须用 $: 派生，
+  // 直接调 commitSelCount() 的话勾选变了按钮文字不重算（真机实锤）
+  $: commitSelN = rvSource === 'work' ? rvFiles.filter((f) => commitSel[f.path]).length : 0;
   async function doCommit() {
-    const m = commitModal;
-    if (!m || m.busy) return;
-    const msg = m.msg.trim();
+    if (commitBusy) return;
+    const msg = commitMsg.trim();
     if (!msg) {
-      commitModal = { ...m, err: '写一句提交信息' };
+      commitErr = '写一句提交信息';
       return;
     }
-    const files = m.files.filter((f) => f.sel).map((f) => f.path);
+    const files = rvFiles.filter((f) => commitSel[f.path]).map((f) => f.path);
     if (!files.length) {
-      commitModal = { ...m, err: '至少勾一个文件' };
+      commitErr = '至少勾一个文件';
       return;
     }
-    commitModal = { ...m, busy: true, err: '' };
+    commitBusy = true;
+    commitErr = '';
     try {
       const r = await fetch('/api/git/commit', {
         method: 'POST',
@@ -2127,19 +2107,24 @@
         body: JSON.stringify({ message: msg, files }),
       }).then((x) => x.json());
       if (!r.ok) {
-        commitModal = { ...commitModal, busy: false, err: r.error || '提交失败' };
+        commitBusy = false;
+        commitErr = r.error || '提交失败';
         return;
       }
-      commitModal = null;
-      pushMsg(curKey(), { id: nextId(), role: 'system', content: `已提交 ${r.id}（${files.length} 个文件）: ${msg}` });
+      // 用户 2026-10-07：提交成功不再往聊天区塞「已提交 xxx」提示——面板状态行自己会变
+      commitBusy = false;
+      commitMsg = '';
+      commitErr = '';
       await refreshGit();
       refreshDock();
+      if (rpTabs.some((t) => t.kind === 'git')) loadReview(); // 提完清单重拉：勾选态按新清单重建
     } catch (e) {
-      commitModal = { ...commitModal, busy: false, err: `提交失败: ${e.message || e}` };
+      commitBusy = false;
+      commitErr = `提交失败: ${e.message || e}`;
     }
   }
   async function refreshDock() {
-    refreshGit(); // 分支/脏文件数一并刷新（不阻塞改动条）
+    refreshGit(); // git 面板状态行（分支/脏数）一并刷新
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].cp && messages[i].cp.id) {
         dockCp = messages[i].cp;
@@ -2867,7 +2852,9 @@
                 );
               else if (d.checkpoint) {
                 pushMsg(skey, { id: nextId(), role: 'cp', cp: d.checkpoint });
-                refreshDock(); // 改动条数据更新
+                refreshDock(); // git 面板数据（基线/分支/脏数）更新
+                // git 面板正开着（且看的是本任务档）：新检查点到了就地重拉，跑完就能看见
+                if (rpTabs.some((t) => t.kind === 'git') && rvSource === 'task') loadReview();
               }
               else if (d.notice)
                 pushMsg(skey, { id: nextId(), role: 'system', content: '[通知] ' + d.notice });
@@ -3156,8 +3143,8 @@
         await loadSessions();
       }
       refreshDock();
-      // 审查面板开着时跟着换会话重拉（否则切了会话还显示上一个会话的改动清单）
-      if (rpTab === 'review') {
+      // git 面板开着时跟着换会话/换工作区重拉（否则还显示上一个范围的清单）
+      if (rpTab === 'git') {
         rvBaseline = '';
         rvFiles = [];
         rvOpen = {};
@@ -3878,7 +3865,7 @@
   const RP_TAB_ICONS = {
     artifacts:
       '<path d="M21 8.2 12 3.4 3 8.2v7.6l9 4.8 9-4.8z"/><path d="M3 8.2l9 4.8 9-4.8"/><path d="M12 13v7.6"/>',
-    review: '<circle cx="12" cy="12" r="8.4"/><path d="M8.4 12.3l2.5 2.5 4.7-5.6"/>',
+    git: '<circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/>',
     web: '<circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/>',
     file: '<path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/>',
     diff: '<rect x="3.5" y="4.5" width="7" height="15" rx="1.2"/><rect x="13.5" y="4.5" width="7" height="15" rx="1.2"/><path d="M5.3 12h3.4"/><path d="M15.3 12h3.4M17 10.3v3.4"/>',
@@ -4014,7 +4001,7 @@
     },
     open_tab: {
       kind: 'open_tab', title: '打开内置标签页', risk: 'safe', internal: false,
-      args: 'key: artifacts=产物/review=审查/web=网页（白名单 RP_BUILTIN，别开乱七八糟的标签）',
+      args: 'key: artifacts=产物/git=git（审查+提交）/web=网页（白名单 RP_BUILTIN，别开乱七八糟的标签）',
       run(m) {
         // web 也受能力闸管：浏览器插件停用时 agent 开不出「网页」标签
         //（用户 2026-10-06：插件开关=能力总闸）。这里不加的话，rpVisibleTabs 会在
@@ -4030,7 +4017,7 @@
     },
     close_tab: {
       kind: 'close_tab', title: '关闭标签页', risk: 'safe', internal: false,
-      args: 'key: artifacts/review/web/ext:usage/file:<路径>',
+      args: 'key: artifacts/git/web/ext:usage/file:<路径>',
       run(m) { if (m.key) closeRpTab(m.key); },
     },
     open_file: {
@@ -5446,101 +5433,6 @@
     {/if}
 
     <footer class="chat-input">
-      {#if dockCp || (gitInfo && gitInfo.is_repo) || gitMissing}
-        <div class="cp-dock">
-          <!-- 一张卡：头部行 + 展开的改动清单同属一个盒子（对齐 ZCode 的 change-summary）。
-               清单是流内子元素，卡片向上长；宽度天然一致，也不会把文档撑出滚动条 -->
-          <div class="cp-card">
-            {#if gitMissing}
-              <!-- 缺 git 明说（2026-10-06 用户拍板）：以前这里整条静默消失，用户根本不知道
-                   撤销/检查点/改动/审查为什么没了。连安装方法一起给 -->
-              <div class="git-missing-note">没检测到 git：撤销、检查点、改动清单、提交、审查 diff 都用不了。{GIT_INSTALL_HINT}。</div>
-            {/if}
-            <div class="cp-bar">
-            {#if gitInfo && gitInfo.is_repo}
-              <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
-                <svg class="git-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
-                <b>{gitInfo.branch}</b>{#if gitInfo.head}<span class="git-head">@{gitInfo.head}</span>{/if}
-              </span>
-              {#if gitInfo.ahead || gitInfo.behind}
-                <span class="git-ab" title="相对上游的领先/落后提交数">{#if gitInfo.ahead}↑{gitInfo.ahead}{/if}{#if gitInfo.behind}↓{gitInfo.behind}{/if}</span>
-              {/if}
-              {#if gitInfo.dirty}
-                <button
-                  class="git-dirty"
-                  class:on={gitPopOpen}
-                  title="点开看待提交文件清单（{gitInfo.dirty} 处）"
-                  on:click={() => (gitPopOpen = !gitPopOpen)}
-                >{gitInfo.dirty} 处未提交</button>
-              {/if}
-            {/if}
-            {#if dockCp && dockCp.files > 0}
-              <!-- 用户 2026-10-02：点「N 个文件已更改」展开文件清单（审查/打开），别再只给个数 -->
-              <button class="cp-sum" class:on={cpFilesOpen} title="展开改动文件清单" on:click={toggleCpFiles}>
-                {cpFilesOpen ? '▾' : '›'} <b>{dockCp.files}</b> 个文件已更改
-              </button>
-              {#if dockCp.additions != null}
-                <span class="cp-add">+{dockCp.additions}</span>
-                <span class="cp-del">-{dockCp.deletions}</span>
-              {/if}
-            {/if}
-            <span class="cp-actions">
-              {#if dockCp && dockCp.files > 0}
-                <button class="cp-undo" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
-              {/if}
-              {#if gitInfo && gitInfo.is_repo && gitInfo.dirty > 0}
-                <button class="cp-commit" on:click={openCommit}>提交</button>
-              {/if}
-            </span>
-          </div>
-          {#if cpFilesOpen && dockCp && dockCp.files > 0}
-            <!-- 展开的改动文件清单（对齐 ZCode：卡内流内子块，贴头部行下沿同宽、
-                 无重复头、状态图标/文件名粗体+目录暗色、增删、审查/打开▾） -->
-            <div class="cp-files">
-              <div class="git-pop-list">
-                {#if cpFilesLoading}
-                  <div class="git-pop-more">加载中…</div>
-                {:else}
-                  {#each cpFiles as f (f.path)}
-                    {@const name = f.path.split('/').pop()}
-                    {@const dir = f.path.split('/').slice(0, -1).join('/')}
-                    <div class="git-pop-row review-row">
-                      <span class="git-st" class:added={f.status === 'A' || f.status === '?'} class:deleted={f.status === 'D'}>{gitStatusLabel(f.status === '?' ? '??' : f.status)}</span>
-                      <span class="review-file">
-                        <b class="review-name" title={f.path}>{name}</b>
-                        {#if dir}<span class="review-dir" title={dir}>{dir}/</span>{/if}
-                      </span>
-                      {#if f.status !== '?'}<span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span>{/if}
-                      <button class="cp-undo" title="看这个文件的 diff（在审查面板展开）" on:click={() => openReviewDiff(f.path, dockCp.id)}>审查</button>
-                      <button class="cp-commit review-open" title="预览文件内容" on:click={() => openPreviewTab(f.path)}>打开<svg class="menu-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg></button>
-                    </div>
-                  {/each}
-                {/if}
-              </div>
-            </div>
-          {/if}
-          {#if gitPopOpen && gitInfo && gitInfo.is_repo}
-            <div class="git-pop">
-              <div class="git-pop-head">
-                <b>{gitInfo.dirty}</b> 处未提交改动
-                <span class="git-pop-hint">点文件名看内容</span>
-              </div>
-              <div class="git-pop-list">
-                {#each gitInfo.files as f (f.path + f.status)}
-                  <button class="git-pop-row" title={f.path} on:click={() => openGitFile(f.path)}>
-                    <span class="git-st">{gitStatusLabel(f.status)}</span>
-                    <span class="git-path">{f.path}</span>
-                  </button>
-                {/each}
-                {#if gitInfo.dirty > gitInfo.files.length}
-                  <div class="git-pop-more">还有 {gitInfo.dirty - gitInfo.files.length} 处未列出</div>
-                {/if}
-              </div>
-            </div>
-          {/if}
-          </div>
-        </div>
-      {/if}
       <div class="composer">
         {#if pendingAttachments.length > 0}
           <div class="composer-attachments">
@@ -5894,7 +5786,7 @@
   </main>
 
   {#if rvMenu}
-    <!-- 审查面板行的右键菜单（对齐 ZCode：预览 / 复制路径；行点击就地展开 diff） -->
+    <!-- git 面板行的右键菜单（对齐 ZCode：预览 / 复制路径；行点击就地展开 diff） -->
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="rv-menu-back" on:click={() => (rvMenu = null)} role="presentation"></div>
     <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -5954,6 +5846,8 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(p.name)}</svg>
                   {:else if p.kind === 'web'}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/></svg>
+                  {:else if p.kind === 'git'}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
                   {:else}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/></svg>
                   {/if}
@@ -6002,6 +5896,8 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(p.name)}</svg>
                   {:else if p.kind === 'web'}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/><path d="M3.6 12h16.8"/><ellipse cx="12" cy="12" rx="3.8" ry="8.4"/></svg>
+                  {:else if p.kind === 'git'}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
                   {:else}
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z"/><path d="M13.5 3.5V8H18"/><path d="M9.5 12h5M9.5 15h5"/></svg>
                   {/if}
@@ -6025,93 +5921,140 @@
                     </button>
                   {/each}
                 {/if}
-              {:else if t.kind === 'review'}
-                <!-- 审查面板（整一套对齐 ZCode 的 git/review pane）：
-                     头部 = 来源选择器 + 撤销 + 刷新；行 = 文件名/目录 + 增删 + 箭头，
-                     点行就地展开 diff（左右行号列 + 增删着色），不再开新标签 -->
-                <!-- svelte-ignore a11y-label-has-associated-control -->
-                <div class="rv-head">
-                  <select
-                    class="rv-src"
-                    aria-label="切换审查范围"
-                    bind:value={rvSource}
-                    title="切换审查范围"
-                    on:change={() => {
-                      rvFiles = [];
-                      rvOpen = {};
-                      rvDiff = {};
-                      loadReview();
-                    }}
-                  >
-                    <option value="task">本任务改动</option>
-                    <option value="work">未提交改动</option>
-                  </select>
-                  {#if rvFiles.length}
-                    <span class="rv-totals">
-                      <b>{rvFiles.length}</b> 个文件<span class="rv-tsep">·</span><span class="review-add">+{rvFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span><span class="rv-tsep">·</span><span class="review-del">-{rvFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span>
-                    </span>
+              {:else if t.kind === 'git'}
+                <!-- git 面板（用户 2026-10-07 拍板：提交跟审查合成一个标签，聊天区底部
+                     那根常驻条撤掉）。自上而下：状态行（分支/HEAD/领先落后）→ 范围选择器
+                     （本任务改动 = 影子仓库检查点 / 未提交改动 = 工作区相对 HEAD）→ 提交盒
+                     （未提交档：清单行前的勾选即暂存）→ 文件行点开就地看 diff -->
+                <div class="git-pane">
+                  {#if gitMissing}
+                    <!-- 缺 git 明说（2026-10-06 用户拍板）：撤销/检查点/改动/提交/审查 diff 都用不了 -->
+                    <div class="git-missing-note">没检测到 git：撤销、检查点、改动清单、提交、审查 diff 都用不了。{GIT_INSTALL_HINT}。</div>
+                  {:else if gitInfo && !gitInfo.is_repo}
+                    <div class="git-missing-note">当前工作区不是 git 仓库：撤销、改动清单、提交、审查 diff 都用不了。</div>
+                  {:else if gitInfo && gitInfo.is_repo}
+                    <div class="git-status">
+                      <span class="git-ref" title={gitInfo.upstream ? `上游：${gitInfo.upstream}` : '未设置上游分支'}>
+                        <svg class="git-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="6" r="2.5"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="12" r="2.5"/><path d="M6.5 8.5v7M9 6h3.5a3 3 0 0 1 3 3v1"/></svg>
+                        <b>{gitInfo.branch}</b>{#if gitInfo.head}<span class="git-head">@{gitInfo.head}</span>{/if}
+                      </span>
+                      {#if gitInfo.ahead || gitInfo.behind}
+                        <span class="git-ab" title="相对上游的领先/落后提交数">{#if gitInfo.ahead}↑{gitInfo.ahead}{/if}{#if gitInfo.behind}↓{gitInfo.behind}{/if}</span>
+                      {/if}
+                    </div>
                   {/if}
-                  <span class="flex-sp"></span>
-                  {#if dockCp && rvSource === 'task' && rvBaseline === dockCp.id}
-                    <button class="rv-btn" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
-                  {/if}
-                  <button class="rv-btn" class:spin={rvLoading} title="重新读取改动清单" on:click={loadReview}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95" /><path d="M19 3.5V7h-3.5" /></svg>
-                  </button>
-                </div>
-                {#if rvLoading && !rvFiles.length}
-                  <div class="trace-empty">加载中…</div>
-                {:else if rvError && !rvFiles.length}
-                  <div class="rp-empty">{rvError}</div>
-                {:else if !rvFiles.length}
-                  <div class="rv-empty">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><path d="M8.5 12h7" /></svg>
-                    <div class="rv-empty-t">{rvSource === 'work' ? '没有未提交的改动' : '本任务还没有改动'}</div>
-                    <div class="rv-empty-d">{rvSource === 'work' ? 'agent 或你自己改动文件后，这里会列出来（相对 HEAD）。' : 'agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。'}</div>
+                  <!-- svelte-ignore a11y-label-has-associated-control -->
+                  <div class="rv-head">
+                    <select
+                      class="rv-src"
+                      aria-label="切换范围"
+                      bind:value={rvSource}
+                      title="切换范围"
+                      on:change={() => {
+                        rvFiles = [];
+                        rvOpen = {};
+                        rvDiff = {};
+                        loadReview();
+                      }}
+                    >
+                      <option value="task">本任务改动</option>
+                      <option value="work">未提交改动</option>
+                    </select>
+                    {#if rvFiles.length}
+                      <span class="rv-totals">
+                        <b>{rvFiles.length}</b> 个文件<span class="rv-tsep">·</span><span class="review-add">+{rvFiles.reduce((s, f) => s + (f.adds || 0), 0)}</span><span class="rv-tsep">·</span><span class="review-del">-{rvFiles.reduce((s, f) => s + (f.dels || 0), 0)}</span>
+                      </span>
+                    {/if}
+                    <span class="flex-sp"></span>
+                    {#if dockCp && rvSource === 'task' && rvBaseline === dockCp.id}
+                      <button class="rv-btn" title="回滚到本任务起点（删除其后新建的已跟踪文件）" on:click={() => undoCheckpoint(dockCp)}>撤销</button>
+                    {/if}
+                    <button class="rv-btn" class:spin={rvLoading} title="重新读取（清单 + 分支状态）" on:click={() => { loadReview(); refreshGit(); }}>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95" /><path d="M19 3.5V7h-3.5" /></svg>
+                    </button>
                   </div>
-                {:else}
-                  <div class="rv-list">
-                    {#each rvFiles as f (f.path)}
-                      {@const name = f.path.split('/').pop()}
-                      {@const dir = f.path.split('/').slice(0, -1).join('/')}
-                      {@const dc = rvDiff[f.path] || {}}
-                      <div class="rv-row" class:open={!!rvOpen[f.path]}>
-                        <button
-                          class="rv-file"
-                          class:added={f.status === 'A' || f.status === '?'}
-                          class:deleted={f.status === 'D'}
-                          title={`${f.path}\n右键：预览 / 复制路径`}
-                          on:click={() => toggleRv(f)}
-                          on:contextmenu={(e) => {
-                            e.preventDefault();
-                            rvMenu = { x: e.clientX, y: e.clientY, path: f.path };
-                          }}
-                        >
-                          <svg class="rv-fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z" /><path d="M13.5 3.5V8H18" /></svg>
-                          <span class="rv-fname">{name}</span>
-                          {#if dir}<span class="rv-fdir">{dir}/</span>{/if}
-                          {#if f.status !== '?'}
-                            <span class="rv-stat"><span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span></span>
-                          {/if}
-                          <svg class="rv-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+                  {#if rvSource === 'work' && gitInfo && gitInfo.is_repo && !gitMissing && rvFiles.length}
+                    <!-- 提交盒：跟清单同档出现（未提交改动 = 暂存区），勾选即「这次提交带上它」 -->
+                    <div class="commit-box">
+                      <textarea
+                        class="agents-editor commit-msg"
+                        rows="2"
+                        spellcheck="false"
+                        placeholder="提交信息（一句话说清这次改了什么）"
+                        bind:value={commitMsg}
+                      ></textarea>
+                      <div class="commit-bar">
+                        <button class="commit-go" disabled={commitBusy} on:click={doCommit}>
+                          {commitBusy ? '提交中…' : `提交 ${commitSelN} 个文件`}
                         </button>
-                        {#if rvOpen[f.path]}
-                          <div class="rv-diffwrap">
-                            {#if dc.loading}
-                              <div class="rv-diffnote">加载中…</div>
-                            {:else if dc.error}
-                              <div class="rv-diffnote">读取失败: {dc.error}</div>
-                            {:else if !dc.text}
-                              <div class="rv-diffnote">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
-                            {:else}
-                              <pre class="rv-diff">{#each rvParse(dc.text) as l, i (i)}<span class="rv-dl rv-dl-{l.t}">{#if l.t === 'add' || l.t === 'del' || l.t === 'ctx'}<span class="rv-dno">{l.o}</span><span class="rv-dno">{l.n}</span>{/if}<span class="rv-dtx">{l.s}</span></span>{/each}</pre>
-                            {/if}
-                          </div>
-                        {/if}
+                        <span class="commit-hint">只做本地 commit，不推送；未跟踪文件默认不勾</span>
                       </div>
-                    {/each}
-                  </div>
-                {/if}
+                      {#if commitErr}<div class="commit-err">{commitErr}</div>{/if}
+                    </div>
+                  {/if}
+                  {#if rvLoading && !rvFiles.length}
+                    <div class="trace-empty">加载中…</div>
+                  {:else if rvError && !rvFiles.length}
+                    <div class="rp-empty">{rvError}</div>
+                  {:else if !rvFiles.length}
+                    <div class="rv-empty">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9" /><path d="M8.5 12h7" /></svg>
+                      <div class="rv-empty-t">{rvSource === 'work' ? '没有未提交的改动' : '本任务还没有改动'}</div>
+                      <div class="rv-empty-d">{rvSource === 'work' ? 'agent 或你自己改动文件后，这里会列出来（相对 HEAD）。' : 'agent 修改/创建文件后，这里会列出改动清单（相对本次任务起点）。'}</div>
+                    </div>
+                  {:else}
+                    <div class="rv-list">
+                      {#each rvFiles as f (f.path)}
+                        {@const name = f.path.split('/').pop()}
+                        {@const dir = f.path.split('/').slice(0, -1).join('/')}
+                        {@const dc = rvDiff[f.path] || {}}
+                        <div class="rv-row" class:open={!!rvOpen[f.path]}>
+                          {#if rvSource === 'work'}
+                            <input
+                              class="rv-check"
+                              type="checkbox"
+                              checked={!!commitSel[f.path]}
+                              title={`提交这个文件（${gitStatusLabel(f.status)}）`}
+                              on:change={() => toggleCommitFile(f.path)}
+                            />
+                          {/if}
+                          <button
+                            class="rv-file"
+                            class:added={f.status === 'A' || f.status === '?'}
+                            class:deleted={f.status === 'D'}
+                            title={`${f.path}\n${gitStatusLabel(f.status)}\n右键：预览 / 复制路径`}
+                            on:click={() => toggleRv(f)}
+                            on:contextmenu={(e) => {
+                              e.preventDefault();
+                              rvMenu = { x: e.clientX, y: e.clientY, path: f.path };
+                            }}
+                          >
+                            <svg class="rv-fico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.5h6.5L18 8v12.5H7z" /><path d="M13.5 3.5V8H18" /></svg>
+                            <span class="rv-fname">{name}</span>
+                            {#if dir}<span class="rv-fdir">{dir}/</span>{/if}
+                            {#if f.status !== '?'}
+                              <span class="rv-stat"><span class="review-add">+{f.adds}</span><span class="review-del">-{f.dels}</span></span>
+                            {/if}
+                            <svg class="rv-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg>
+                          </button>
+                          {#if rvOpen[f.path]}
+                            <div class="rv-diffwrap">
+                              {#if dc.loading}
+                                <div class="rv-diffnote">加载中…</div>
+                              {:else if dc.error}
+                                <div class="rv-diffnote">读取失败: {dc.error}</div>
+                              {:else if !dc.text}
+                                <div class="rv-diffnote">没有可显示的 diff（该文件是未跟踪新增或无文本改动）。</div>
+                              {:else}
+                                <pre class="rv-diff">{#each rvParse(dc.text) as l, i (i)}<span class="rv-dl rv-dl-{l.t}">{#if l.t === 'add' || l.t === 'del' || l.t === 'ctx'}<span class="rv-dno">{l.o}</span><span class="rv-dno">{l.n}</span>{/if}<span class="rv-dtx">{l.s}</span></span>{/each}</pre>
+                              {/if}
+                            </div>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
               {:else if t.kind === 'file'}
                 <div class="rp-preview-head">
                   <span class="rp-preview-path" title={t.path}>{t.path}</span>
@@ -7116,49 +7059,6 @@
   <Galaxy currentSessionId={currentSessionId || ''} on:close={() => (galaxyOpen = false)} on:open={openSessionFromGalaxy} />
 {/if}
 
-{#if commitModal}
-  <div class="modal-backdrop" on:click={() => (commitModal = null)}>
-    <div class="modal commit-modal" on:click|stopPropagation>
-      <div class="modal-head">
-        <b>提交改动</b>
-        <span class="hint">{gitInfo?.branch || ''}{gitInfo?.head ? '@' + gitInfo.head : ''}</span>
-        <button class="btn ghost" on:click={() => (commitModal = null)}>关闭</button>
-      </div>
-      <div class="commit-body">
-        <div class="commit-files">
-          <div class="commit-files-head">
-            已选 {commitSelCount()} / {commitModal.files.length} 个文件
-            <span class="param-hint">未跟踪文件默认不勾（日志/构建产物等），需要就自己勾上</span>
-          </div>
-          <div class="commit-files-list">
-            {#each commitModal.files as f (f.path)}
-              <label class="commit-file" title={f.path}>
-                <input type="checkbox" checked={f.sel} on:change={() => toggleCommitFile(f.path)} />
-                <span class="git-st">{gitStatusLabel(f.status)}</span>
-                <span class="git-path">{f.path}</span>
-              </label>
-            {/each}
-          </div>
-        </div>
-        <textarea
-          class="agents-editor commit-msg"
-          rows="3"
-          spellcheck="false"
-          placeholder="提交信息（一句话说清这次改了什么）"
-          bind:value={commitModal.msg}
-        ></textarea>
-        {#if commitModal.err}<div class="commit-err">{commitModal.err}</div>{/if}
-        <div class="sub-row">
-          <button class="btn primary" disabled={commitModal.busy} on:click={doCommit}>
-            {commitModal.busy ? '提交中…' : `提交 ${commitSelCount()} 个文件`}
-          </button>
-          <span class="param-hint" style="align-self:center">只做本地 commit，不推送。</span>
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
-
 <style>
 
   .app {
@@ -7200,7 +7100,6 @@
   :global(body.has-wallpaper) .tool-card,
   :global(body.has-wallpaper) .tool-preview,
   :global(body.has-wallpaper) .thinking-body,
-  :global(body.has-wallpaper) .cp-card,
   :global(body.has-wallpaper) .approval-box,
   :global(body.has-wallpaper) .ctx-card {
     background: color-mix(in srgb, var(--g1) 66%, transparent);
@@ -9514,32 +9413,7 @@
     border-radius: 4px;
   }
 
-  /* 图片预览模态框 */
-  .cp-dock {
-    display: flex;
-    justify-content: center;
-    margin-bottom: 8px;
-    position: relative; /* 「待提交」明细气泡的定位基准 */
-  }
-  /* 改动卡片：边框/底色/圆角挂在整张卡上，头部行与展开清单都是它的流内子元素——
-     展开后卡片向上长（.chat-input 是 bottom:0 的绝对定位），宽度永远等于收起态 */
-  .cp-dock .cp-card {
-    position: relative; /* 「N 处未提交」浮层以它为定位基准，宽度与卡片一致 */
-    width: 100%;
-    max-width: 880px;
-    box-sizing: border-box;
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 8px;
-  }
-  /* 头部行只是卡内的一块流内内容：不自己带边框底色（那张皮在 .cp-card 上），
-     宽度由卡片定，所以收起态与展开态天然同宽 */
-  .cp-dock .cp-bar {
-    width: 100%;
-    max-width: none;
-    box-sizing: border-box;
-  }
-  /* 缺 git 明说条（2026-10-06）：以前整条 dock 静默消失，用户不知道功能为什么没了 */
+  /* 缺 git 明说条（2026-10-06）：git 面板顶部直接讲清楚功能为什么没了 */
   .git-missing-note {
     padding: 8px 12px;
     font-size: 12.5px;
@@ -9550,112 +9424,6 @@
   /* 插件行描述里的警示色（宿主能力行缺 git 提示用，与 plug-chip.warn 同一只色） */
   .plug-desc.warn-text {
     color: var(--tint-orange-fg);
-  }
-  .cp-bar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 12px;
-    font-size: 13px;
-    color: var(--g6);
-    max-width: 720px;
-  }
-  .cp-sum b {
-    color: var(--tint-blue-fg);
-  }
-  .cp-add {
-    color: var(--tint-green-fg);
-    font-family: monospace;
-    font-size: 12px;
-  }
-  .cp-del {
-    color: var(--tint-red-fg);
-    font-family: monospace;
-    font-size: 12px;
-  }
-  /* 右侧动作组：撤销 / 提交（margin-left:auto 只加在容器上，两个按钮才不会各分一半空白） */
-  .cp-actions {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .cp-undo {
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    font-size: 12px;
-    cursor: pointer;
-    padding: 2px 4px;
-    font-family: inherit;
-  }
-  .cp-undo:hover {
-    color: var(--g7);
-  }
-  .cp-commit {
-    background: var(--g3);
-    border: 1px solid var(--g5);
-    color: var(--g7);
-    font-size: 12px;
-    font-weight: 650;
-    cursor: pointer;
-    padding: 3px 10px;
-    border-radius: 6px;
-    font-family: inherit;
-  }
-  .cp-commit:hover {
-    background: var(--g4);
-    border-color: var(--g6);
-  }
-  /* 提交弹窗 */
-  .commit-modal {
-    width: 560px;
-  }
-  .commit-body {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    margin-top: 10px;
-  }
-  .commit-files {
-    border: 1px solid var(--g2);
-    border-radius: 8px;
-    overflow: hidden;
-  }
-  .commit-files-head {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
-    padding: 8px 10px;
-    font-size: 12px;
-    color: var(--g6);
-    border-bottom: 1px solid var(--g2);
-  }
-  .commit-files-list {
-    max-height: 240px;
-    overflow-y: auto;
-    padding: 4px;
-  }
-  .commit-file {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 8px;
-    border-radius: 6px;
-    font-size: 12px;
-    color: var(--g6);
-    font-family: Consolas, monospace;
-    cursor: pointer;
-  }
-  .commit-file:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .commit-file input {
-    flex: none;
-    cursor: pointer;
-    accent-color: var(--g5);
   }
   .commit-msg {
     width: 100%;
@@ -9668,7 +9436,7 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
-  /* —— git 概览（分支 / 领先落后 / 未提交数），钉在改动条左侧 —— */
+  /* —— git 面板状态行（分支 / HEAD / 领先落后）—— */
   .git-ref {
     display: inline-flex;
     align-items: center;
@@ -9699,132 +9467,64 @@
     font-family: monospace;
     font-size: 11px;
   }
-  /* 「N 处未提交」可点开：待提交文件明细 */  .git-dirty {
-    color: var(--tint-yellow-fg);
-    font-size: 11.5px;
-    background: transparent;
-    border: none;
-    padding: 2px 4px;
-    border-radius: 5px;
+  /* —— git 面板（状态行 + 范围选择 + 提交盒 + 文件行）—— */
+  .git-pane {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .git-status {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 6px;
+  }
+  /* 提交盒：未提交档顶部——一句话 + 「提交 N 个文件」；勾选在下面清单行上 */
+  .commit-box {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--g2);
+    background: var(--g1);
+  }
+  .commit-msg {
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .commit-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .commit-go {
+    flex: none;
+    background: var(--g3);
+    border: 1px solid var(--g5);
+    color: var(--g7);
+    font-size: 12px;
+    font-weight: 650;
     cursor: pointer;
+    padding: 4px 12px;
+    border-radius: 6px;
     font-family: inherit;
   }
-  .git-dirty:hover,
-  .git-dirty.on {
-    background: var(--g2);
+  .commit-go:hover:not(:disabled) {
+    background: var(--g4);
+    border-color: var(--g6);
   }
-  .git-pop {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: calc(100% + 6px);
-    margin: 0 auto;
-    max-width: 880px;
-    background: var(--g1);
-    border: 1px solid var(--g3);
-    border-radius: 10px;
-    box-shadow: 0 10px 30px var(--overlay);
-    z-index: 30;
-    overflow: hidden;
+  .commit-go:disabled {
+    opacity: 0.55;
+    cursor: default;
   }
-  .git-pop-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    font-size: 12px;
-    color: var(--g6);
-    border-bottom: 1px solid var(--g2);
-  }
-  .git-pop-head b {
-    color: var(--g7);
-  }
-  .git-pop-hint {
-    margin-left: auto;
-    color: var(--g5);
-    font-size: 11px;
-  }
-  .git-pop-list {
-    max-height: 240px;
-    overflow-y: auto;
-    padding: 4px;
-  }
-  .git-pop-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    text-align: left;
-    background: transparent;
-    border: none;
-    color: var(--g6);
-    font-size: 12px;
-    padding: 5px 8px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: Consolas, monospace;
-    /* width:100% 含内边距才算一行——默认 content-box 会把 padding 再加出去，
-       审查行 padding 加大后整行比容器宽一截，底部白挨一条横向滑杆 */
-    box-sizing: border-box;
-  }
-  .git-pop-row:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .git-st {
-    flex: 0 0 auto;
-    min-width: 42px;
-    text-align: center;
-    font-size: 10.5px;
-    font-family: sans-serif;
-    color: var(--g5);
-    border: 1px solid var(--g3);
-    border-radius: 4px;
-    padding: 0 4px;
-    line-height: 16px;
-  }
-  .git-path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .git-pop-more {
-    padding: 6px 10px;
+  .commit-hint {
     font-size: 11px;
     color: var(--g5);
   }
-  .cp-bar .cp-sum {
-    margin-left: 4px;
-  }
-  /* 「N 个文件已更改」是可点按钮（展开清单，2026-10-02）——去掉按钮默认外观 */
-  button.cp-sum {
-    background: none;
-    border: none;
-    padding: 0 2px;
-    font: inherit;
-    color: inherit;
-    cursor: pointer;
-  }
-  button.cp-sum:hover {
-    color: var(--g7);
-  }
-  /* 展开的改动文件清单：卡片内的流内子块（ZCode：清单跟头部同属一张卡，向下展开）。
-     不是绝对定位浮层——卡片向上长，既不撑出文档滚动条，宽度也和收起态天然一致 */
-  .cp-files {
-    border-top: 1px solid var(--g2);
-    max-height: 320px;
-    overflow-y: auto;
-    padding: 4px 0;
-  }
-  .cp-files .git-pop-list {
-    max-height: none;
-    overflow-y: visible;
-  }
-  .cp-files .review-row {
-    padding: 6px 12px;
-    border-radius: 0;
-  }
-  /* —— 审查面板（对齐 ZCode git pane）：头部（来源/撤销/刷新）+ 紧凑行 + 就地展开 diff —— */
+  /* —— git 面板（对齐 ZCode git pane）：范围选择/撤销/刷新 + 紧凑行 + 就地展开 diff —— */
   .rv-head {
     flex: none;
     display: flex;
@@ -9864,6 +9564,19 @@
     flex: none;
     color: var(--g4);
     padding: 0 5px;
+  }
+  /* 增删计数（git 面板行与合计行共用） */
+  .review-add {
+    flex: none;
+    color: var(--tint-green-fg);
+    font-family: monospace;
+    font-size: 11.5px;
+  }
+  .review-del {
+    flex: none;
+    color: var(--tint-red-fg);
+    font-family: monospace;
+    font-size: 11.5px;
   }
   /* 刷新：转圈图标（ZCode 同款），加载中不重复点 */
   .rv-btn {
@@ -9925,14 +9638,26 @@
     font-size: 12px;
     margin-top: 3px;
   }
-  /* 行：ZCode 的 h-8 紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头 */
+  /* 行：ZCode 的 h-8 紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头。
+     未提交档行首多一个提交勾选框：行改 flex，勾选框不参与伸缩、文件按钮吃掉余量、
+     diff 展开块整行换行（flex-basis:100%），收起/展开两种态都不破版 */
   .rv-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     border-bottom: 1px solid var(--g2);
   }
   .rv-row:last-child {
     border-bottom: none;
   }
+  .rv-check {
+    flex: none;
+    margin: 0 2px 0 8px;
+    cursor: pointer;
+    accent-color: var(--g5);
+  }
   .rv-file {
+    flex: 1 1 auto;
     display: flex;
     align-items: center;
     gap: 7px;
@@ -10003,6 +9728,7 @@
   }
   /* 就地展开的 diff：左右行号列 + 增删着色（ZCode 的 diff 预览） */
   .rv-diffwrap {
+    flex: 1 1 100%; /* 父行是 flex-wrap：展开的 diff 独占一行，不跟勾选框/文件名并排 */
     background: var(--g0);
     border-top: 1px solid var(--g2);
     max-height: 460px;
@@ -10102,105 +9828,6 @@
   }
   .rv-menu button:hover {
     background: var(--g2);
-  }
-  .review-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 12.5px;
-    color: var(--g6);
-    box-sizing: border-box;
-  }
-  .review-row:hover {
-    background: var(--g2);
-    color: var(--g7);
-  }
-  .review-row .git-st {
-    flex: none;
-    font-weight: 700;
-    font-size: 11px;
-    width: 16px;
-    text-align: center;
-    color: var(--g5);
-  }
-  .review-row .git-st.added { color: var(--tint-green-fg); }
-  .review-row .git-st.deleted { color: var(--tint-red-fg); }
-  .review-file {
-    flex: 1 1 auto;
-    min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    overflow: hidden;
-  }
-  .review-name {
-    font-weight: 650;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .review-dir {
-    font-size: 11px;
-    color: var(--g5);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    direction: rtl;
-    text-align: left;
-  }
-  .review-add {
-    flex: none;
-    color: var(--tint-green-fg);
-    font-family: monospace;
-    font-size: 11.5px;
-  }
-  .review-del {
-    flex: none;
-    color: var(--tint-red-fg);
-    font-family: monospace;
-    font-size: 11.5px;
-  }
-  .review-row .cp-undo,
-  .review-row .cp-commit {
-    flex: none;
-    padding: 3px 9px;
-    font-size: 11.5px;
-  }
-  .review-open {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-  }
-  .review-open .menu-caret {
-    width: 11px;
-    height: 11px;
-  }
-  .review-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    padding: 7px 12px;
-    font-size: 12px;
-    color: var(--g6);
-  }
-  .review-modal {
-    max-width: 860px;
-    width: 92%;
-  }
-  .review-diff {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    margin: 0;
-    padding: 12px;
-    font-family: Consolas, 'Courier New', monospace;
-    font-size: 12px;
-    line-height: 1.55;
-    white-space: pre;
-    tab-size: 4;
   }
   .tool-head {
     display: flex;
