@@ -107,6 +107,8 @@ pub(super) async fn get_version() -> Json<Value> {
 /// GET /api/trace?limit=N —— 最近 N 个任务的事件流（时间线面板数据源）。
 /// **只展示当前工作区**的任务（用户 2026-10-01 要求）：日志行只有 session_id，
 /// 归属靠会话文件里的 workspace 映射；当前会话可能还没落盘，`session` 参数兜底。
+/// 每个任务带 `session`/`session_title`（归属会话 id + 标题）：面板要能看出
+/// 「这确实是整个工作区的任务、不是当前会话一个的」（用户 2026-10-07 实锤看不出来）。
 /// **只读解析** JSONL（payload 原样透传，6 类 schema 不动）；连续 model_chunk 聚合；
 /// 坏行跳过；文件不存在/为空返回空 tasks 而非报错。
 pub(super) async fn get_trace(
@@ -118,13 +120,18 @@ pub(super) async fn get_trace(
     };
     let limit = q.limit.clamp(1, 50);
     let cur_ws = crate::tools::workspace_root().display().to_string();
-    let mut allowed: std::collections::HashSet<String> = state
+    // 工作区 → 会话映射一张表两用：既算过滤集，也当 id→标题 查表回给面板
+    // （用户 2026-10-07 实锤「时间线像只加载当前会话」：任务行看不出归属会话，
+    // 单会话内容就像被按会话过滤了。响应带上 session/session_title，范围可见）。
+    // 标题口径与侧栏一致（list() 已做「新会话」占位的首条用户消息回落）。
+    let titles: std::collections::HashMap<String, String> = state
         .session
         .list()
         .iter()
         .filter(|m| super::workspace::same_workspace(&m.workspace, &cur_ws))
-        .map(|m| m.id.clone())
+        .map(|m| (m.id.clone(), m.title.clone()))
         .collect();
+    let mut allowed: std::collections::HashSet<String> = titles.keys().cloned().collect();
     if let Some(sid) = q.session.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         allowed.insert(sid.to_string());
     }
@@ -153,6 +160,10 @@ pub(super) async fn get_trace(
                         "start_ts": t.start_ts,
                         "end_ts": t.end_ts,
                         "duration_ms": t.duration_ms(),
+                        // 归属会话：id + 标题（标题查不到 = 刚建还没落盘的兜底会话，
+                        // 前端显示「新会话」）；工作区范围的任务都带得出归属
+                        "session": t.session,
+                        "session_title": titles.get(&t.session).cloned().unwrap_or_default(),
                         // 起点被日志轮转吃掉时为 true：start_ts 是近似值（兜底边界那条
                         // 事件的时刻），面板要照实说，别让用户以为那就是任务开始时间
                         "lost_start": t.lost_start,

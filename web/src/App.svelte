@@ -95,6 +95,21 @@
   // 每个会话各有自己的消息缓冲与运行流：A 会话在跑不影响切到 B 会话发消息，
   // A 的流式内容也只写回 A 的缓冲（切走再切回不丢、不串台）。
   let messages = []; // 当前显示会话的消息（sessionMsgs 的镜像）
+  // 消息分块（2026-10-07 用户实锤「拖侧栏巨卡」，CDP trace 定位）：content-visibility
+  // 的每个盒子都会被浏览器内部 IntersectionObserver 跟踪，7778 条消息 = 7778 个盒，
+  // 侧栏一变宽全部盒位移，每帧重算交叉就要 18ms+。按固定条数收拢成块后，IO 要跟踪的
+  // 盒降到几十分之一，每帧开销回到 1ms 级；块内消息仍是独立 keyed 节点，流式增量
+  // 只更新变动的那一条，初次加载同样受益（只有可见块参与布局绘制）。
+  // 块的估位高度 = 块内条数 × 140px（沿用单条消息的估位口径，滚动条不跳）。
+  const CV_CHUNK = 20;
+  $: messageChunks = (() => {
+    const out = [];
+    for (let i = 0; i < messages.length; i += CV_CHUNK) {
+      const msgs = messages.slice(i, i + CV_CHUNK);
+      out.push({ key: msgs[0].id, n: msgs.length, msgs });
+    }
+    return out;
+  })();
   let sessionMsgs = {}; // key（会话 id 或 '@new'）→ 消息数组
   let streams = {}; // key → { asstId, controller } 正在跑的那条流
   let outbox = {}; // key → [{ id, text, atts }] 排队待发（本轮结束后自动按序发出）
@@ -332,6 +347,12 @@
   onMount(() => {
     adoptWinApi();
     window.addEventListener('agentwinready', adoptWinApi);
+    // 插件桥监听必须**同步**挂：右栏面板（trace/board/usage 等）iframe 一 load 完就发
+    // agent:hello/agent:request，而下面那个 onMount 的启动流水线要 await
+    // loadProviders→loadSettings→loadSessions（重会话恢复要几秒）。监听挂晚了，
+    // 这期间到的消息全部丢失，面板卡「桥调用超时」且不重试（headless 全新 profile +
+    // 7778 条消息会话必现；用户机器上偶发）。监听体不依赖这些数据，只管先接住。
+    window.addEventListener('message', onExtMessage);
     // 兜底轮询：注入事件若在监听注册前已发过（首屏加载竞态），靠它接住
     const t = setInterval(() => {
       adoptWinApi();
@@ -351,8 +372,6 @@
     refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
     loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
     loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
-    // 021：扩展 iframe 的数据桥（只认自己那个 iframe 的消息）
-    window.addEventListener('message', onExtMessage);
     // 点工具栏菜单外部 → 全部收起（问题1）
     document.addEventListener('click', closeMenusOnOutside);
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
@@ -412,10 +431,15 @@
   }
 
   afterUpdate(() => {
-    // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断
-    if (chatPinned && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
+    // 只有用户本来就钉在底部时才自动滚屏；上滑阅读时不打断。
+    // 拖拽期（侧栏/右面板/终端三个手柄）整个跳过：这行读 scrollHeight 会把刚写进的
+    // 宽度样式再强制同步布局一遍（写完读→写完还触发 scroll 事件再读），每帧多出一轮
+    // 全量 reflow，拖拽就跟不上手——真机实测拖拽帧 p95 41ms、22% 掉到 30fps 以下。
+    // 拖拽中用户也不看消息区，停手后下一次 flush 自然补上滚动位置与微调标记。
+    const dragging = resizing || rpResizing || termResizing;
+    if (!dragging && chatPinned && chatBody) chatBody.scrollTop = chatBody.scrollHeight;
     // 单元素微调标记：Svelte 重渲染会重建节点，这里按存下的路径补盖 data-mt
-    stampMicroUids();
+    if (!dragging) stampMicroUids();
   });
 
   function onChatScroll() {
@@ -1262,14 +1286,26 @@
     rpResizing = true;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
+    // 合帧：同侧栏，一帧最多写一次宽度
+    let latestX = 0;
+    let rafId = 0;
+    const apply = () => {
+      rafId = 0;
+      rpWidth = Math.min(820, Math.max(320, Math.round(window.innerWidth - latestX)));
+    };
     const move = (ev) => {
-      rpWidth = Math.min(820, Math.max(320, Math.round(window.innerWidth - ev.clientX)));
+      latestX = ev.clientX;
+      if (!rafId) rafId = requestAnimationFrame(apply);
     };
     const up = () => {
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       rpResizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       localStorage.setItem('rpWidth', String(rpWidth));
+      // 拖拽期间视口同步被让路（见 webSyncViewport），停手补发最后一次：
+      // 面板最终宽度立刻通知到壳里 webview / 截图
+      webQueueViewport();
       window.removeEventListener('mousemove', move);
       window.removeEventListener('mouseup', up);
     };
@@ -1545,6 +1581,10 @@
   }
   function webSyncViewport() {
     if (!webActive || rpTab !== 'web') return;
+    // 拖右面板手柄期间让路：每拖一帧 ResizeObserver 就开火一次，这里会 POST 视口 +
+    // 触发截图重拉，网络往返全卡在主线程同一批任务里，拖拽一顿一顿的。
+    // 停手时 startRpResize 的 up 会补发最后一次（下面的去重键保证不会重复发）。
+    if (rpResizing) return;
     // 就绪门：浏览器状态没到手前，web-tabbar 行未定型（有标签=多一行 / 无标签=整行消失），
     // 量的矩形是瞬态——发出去 webview 会先跳错位再跳回。等 loadWebState 就绪后补发。
     if (!webStateReady) return;
@@ -3175,10 +3215,20 @@
     resizing = true;
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
+    // 合帧：125Hz+ 鼠标一帧里会来好几个 mousemove，每个都触发一次 Svelte flush =
+    // 一帧内强制布局好几次。只认每帧最后一个位置，一帧最多写一次宽度。
+    let latestX = 0;
+    let rafId = 0;
+    const apply = () => {
+      rafId = 0;
+      sidebarW = Math.min(520, Math.max(240, Math.round(latestX)));
+    };
     const move = (ev) => {
-      sidebarW = Math.min(520, Math.max(240, Math.round(ev.clientX)));
+      latestX = ev.clientX;
+      if (!rafId) rafId = requestAnimationFrame(apply);
     };
     const up = () => {
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       resizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
@@ -3197,10 +3247,18 @@
     termResizing = true;
     document.body.style.cursor = 'row-resize';
     document.body.style.userSelect = 'none';
+    let latestY = 0;
+    let rafId = 0;
+    const apply = () => {
+      rafId = 0;
+      termH = Math.min(560, Math.max(120, Math.round(window.innerHeight - latestY)));
+    };
     const move = (ev) => {
-      termH = Math.min(560, Math.max(120, Math.round(window.innerHeight - ev.clientY)));
+      latestY = ev.clientY;
+      if (!rafId) rafId = requestAnimationFrame(apply);
     };
     const up = () => {
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; apply(); }
       termResizing = false;
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
@@ -3799,7 +3857,11 @@
     return t.kind === 'ext' ? menuExtIcon(t.name) : RP_TAB_ICONS[t.kind] || RP_TAB_ICONS.file;
   }
 
-  async function loadExt() {
+  // 插件清单加载中的 promise（含失败重试的那几次）：早到的桥调用等它落地再判
+  // 启用/权限，否则空清单会把 perm 类方法误判成「未声明权限」
+  let extListPromise = null;
+  function loadExt() {
+    extListPromise = (async () => {
     try {
       const r = await fetch('/api/plugins', { cache: 'no-store' }).then((r) => r.json());
       extList = r.plugins || [];
@@ -3815,6 +3877,8 @@
         setTimeout(loadExt, 2000);
       }
     }
+    })();
+    return extListPromise;
   }
   let extLoadRetry = 0;
 
@@ -4827,6 +4891,12 @@
   async function onExtMessage(ev) {
     const from = extWindowName(ev.source);
     if (!from) return; // 只认我们挂出去的扩展 iframe
+    // 早到的桥调用常比插件清单先到（面板一拿到 init 就 call，宿主启动流水线还在
+    // await）：空清单会把 perm 类方法误判「未声明权限」。等清单落地再判；
+    // 从未触发或已失败时 promise 已落定，不卡。
+    if (!extList.length && extListPromise) {
+      try { await extListPromise; } catch (e) { /* 加载失败也照常判，别卡死桥 */ }
+    }
     const ext = extList.find((e) => e.name === from) || {};
     if (ext.enabled === false) return; // 停用的扩展不服务
     const perms = ext.permissions || [];
@@ -5148,7 +5218,10 @@
       {#if messages.length === 0}
         <div class="empty-hint"><div class="empty-title">开始新的对话</div><div class="empty-sub">输入消息后按 Enter 发送，支持粘贴截图与拖拽文件</div></div>
       {/if}
-      {#each messages as m (m.id)}
+      {#each messageChunks as c (c.key)}
+        <!-- 块级 content-visibility（单条 .msg 的规则已挪到 .cv-chunk） -->
+        <div class="cv-chunk" style:contain-intrinsic-size={`auto ${c.n * 140}px`}>
+          {#each c.msgs as m (m.id)}
         {#if m.role === 'user'}
           <div class="msg user">
             <div class="bubble user-bubble">
@@ -5318,6 +5391,8 @@
         {:else}
           <div class="msg system"><div class="sys-text">{m.content ?? ''}</div></div>
         {/if}
+        {/each}
+        </div>
       {/each}
     </div>
 
@@ -8876,13 +8951,19 @@
   .chat-body:has(> .empty-hint) {
     display: flex; /* 空态：没有消息，flex 居中不影响 content-visibility 的收益 */
   }
-  /* 屏幕外的消息跳过布局与绘制——重排时只有可见的那几条参与。拖拽调宽 / 窗口
+  /* 屏幕外的消息块跳过布局与绘制——重排时只有可见的那几条参与。拖拽调宽 / 窗口
      resize / 面板开关都不再整树重排，初次加载同样受益（以前 7778 条全排）。
-     contain-intrinsic-size 的 auto 关键字 = 渲染过就记住真实高度、没渲染过的按
-     140px 估位，滚动位置不跳。口径与「#each messages」一致：chat-body 直接子级 */
-  .chat-body > .msg {
+     「块」而不是「条」：content-visibility 的每个盒都被浏览器内部
+     IntersectionObserver 跟踪，7778 个盒 = 每帧重算交叉 18ms+（CDP trace 实锤），
+     收拢成 20 条一块后 IO 开销降一个数量级。块的估位高度由模板按块内条数内联
+     （contain-intrinsic-size: auto <条数×140>px，沿用单条 140px 估位口径）。
+     口径与「#each messageChunks」一致：cv-chunk 是 chat-body 直接子级 */
+  .cv-chunk {
     content-visibility: auto;
-    contain-intrinsic-size: auto 140px;
+  }
+  /* 原 flex gap: 14px 的块内等价物 */
+  .cv-chunk > .msg + .msg {
+    margin-top: 14px;
   }
   .empty-hint {
     margin: auto;
