@@ -48,9 +48,36 @@ use crate::plugin::{contract, ToolBrief};
 pub const PREFIX: &str = "wasm__";
 pub const SEP: &str = "__";
 
+/// 插件实例资源闸（2026-10-08 修）：此前 Store 无任何资源上限——插件导出超大
+/// memory 时 read_cstr 会跟着分配；死循环只能等 30s 墙钟超时，而 spawn_blocking
+/// 的任务超时后仍在跑，反复调用可耗尽 blocking 池。两道闸：
+/// ① StoreLimits：memory 64MB / 1 个实例 / 1 个 memory / 表 1 万元素，超限的
+///    grow 按 spec 返回 -1（不 trap 不崩，实测）；
+/// ② 并发信号量：同时最多 4 个 WASM 调用占 blocking 池（见 call_tool）。
+///
+/// **为什么不设燃料 / epoch 中断**（实测结论，2026-10-08，勿「顺手修好」）：
+/// wasmtime 24.0.13 在本机（Windows）上，`consume_fuel` 耗尽与 `epoch_interruption`
+/// 触发都走 libcall 陷阱路径，会以 "panic in a function that cannot unwind" 直接
+/// 炸掉整个进程（debug/release 均复现；内联陷阱如 unreachable 正常）。开燃料
+/// =死循环插件从「空转 30s」升级为「炸宿主」，比不加更糟，故弃用。死循环的兜底
+/// 是 30s 墙钟超时 + 信号量封顶（最坏 4 条 blocking 线程被占，每条 30s 自终）。
+const WASM_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+/// 0 终止返回值最多扫 1MB（len==0 的老路径；v1 ABI 都带显式长度）。
+const WASM_CSTR_SCAN_MAX: usize = 1024 * 1024;
+/// 同时执行的 WASM 调用上限（纯计算沙箱，4 并发对合法插件绰绰有余；
+/// 封顶则恶意插件最坏也只能占住 4 条 blocking 线程，每条 30s 自终）。
+const WASM_MAX_CONCURRENT: usize = 4;
+
 fn engine() -> &'static Engine {
     static E: OnceLock<Engine> = OnceLock::new();
     E.get_or_init(Engine::default)
+}
+
+/// WASM 调用并发闸（进程级）：拿不到许可的调用在 async 侧排队等待，
+/// 不占 blocking 池线程（等待期间父任务取消也能立即返回，见 call_tool）。
+fn wasm_semaphore() -> &'static tokio::sync::Semaphore {
+    static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    S.get_or_init(|| tokio::sync::Semaphore::new(WASM_MAX_CONCURRENT))
 }
 
 /// 已加载插件条目。
@@ -371,11 +398,19 @@ pub fn remove_inline(stem: &str) {
 }
 
 /// 实例化并执行（每次调用全新 Store/Instance：无状态、无并发、崩不连坐）。
+/// 资源闸：StoreLimits 钉死内存/实例数（燃料不可用，见常量区注释）。
 fn with_instance<T>(
     module: &Module,
-    f: impl FnOnce(&mut wasmtime::Store<()>, &Instance) -> Result<T, String>,
+    f: impl FnOnce(&mut wasmtime::Store<wasmtime::StoreLimits>, &Instance) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut store = Store::new(engine(), ());
+    let limits = wasmtime::StoreLimitsBuilder::new()
+        .instances(1)
+        .memories(1)
+        .table_elements(10_000)
+        .memory_size(WASM_MEMORY_LIMIT)
+        .build();
+    let mut store = Store::new(engine(), limits);
+    store.limiter(|l| l); // StoreLimits: ResourceLimiter——超限的 grow/实例化直接失败
     let linker = wasmtime::Linker::new(engine()); // v0：零 host function = 纯计算沙箱
     let instance = linker
         .instantiate(&mut store, module)
@@ -410,6 +445,12 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
     };
     let payload = json!({ "tool": tool, "args": args }).to_string();
 
+    // 并发闸：最多 WASM_MAX_CONCURRENT 个调用同时占 blocking 池（恶意插件写死
+    // 循环时最坏也只拖住 4 条线程，每条 30s 自终）。许可在 async 侧等，不占线程。
+    let _permit = wasm_semaphore()
+        .acquire()
+        .await
+        .map_err(|e| format!("WASM 并发闸已关闭: {e}"))?;
     // 阻塞执行（WASM 纯计算）丢 blocking 池 + 超时 30s
     let fut = tokio::task::spawn_blocking(move || {
         with_instance(&module, |store, inst| {
@@ -459,19 +500,21 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
 }
 
 /// 插件 memory 写入辅助。
-fn pipe_write(mem: &wasmtime::Memory, store: &mut wasmtime::Store<()>, ptr: i32, bytes: &[u8]) -> Result<(), String> {
+fn pipe_write<T>(mem: &wasmtime::Memory, store: &mut wasmtime::Store<T>, ptr: i32, bytes: &[u8]) -> Result<(), String> {
     mem.write(store, ptr as usize, bytes).map_err(|e| format!("memory.write: {e}"))
 }
 
 /// 读插件内存字符串：len>0 按长度；len==0 按 0 终止扫描。
-fn read_cstr(mem: &wasmtime::Memory, store: &wasmtime::Store<()>, ptr: i32, len: i32) -> Result<String, String> {
+fn read_cstr<T>(mem: &wasmtime::Memory, store: &wasmtime::Store<T>, ptr: i32, len: i32) -> Result<String, String> {
     let (mut buf, start) = if len > 0 {
         (vec![0u8; len as usize], ptr as usize)
     } else {
-        // 0 终止：从 ptr 读到页尾，找 0
+        // 0 终止：从 ptr 读到页尾，找 0（扫描窗封顶 1MB——插件导出 64MB memory
+        // 时不再一次性分配整个内存，2026-10-08 修）
         let size = mem.size(store) as usize * 65536;
         let start = ptr as usize;
-        (vec![0u8; size.saturating_sub(start)], start)
+        let want = size.saturating_sub(start).min(WASM_CSTR_SCAN_MAX);
+        (vec![0u8; want], start)
     };
     mem.read(store, start, &mut buf)
         .map_err(|e| format!("memory.read: {e}"))?;
@@ -811,4 +854,63 @@ mod tests {
         crate::plugin::trust::install(&std::collections::BTreeMap::new()); // 清场
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
+    /// 2026-10-08 修：StoreLimits 内存闸。插件 grow 超过 64MB 时按 spec 返回 -1
+    /// （不 trap 不崩——实测；燃料/epoch 在本平台会炸进程，见常量区注释故不设）。
+    /// 直接走 with_instance 验证限额接线，不经插件注册表。
+    #[test]
+    fn memory_limit_denies_growth_past_64mb() {
+        let wat = "(module (memory (export \"memory\") 1) \
+             (func (export \"grow\") (param $n i32) (result i32) (memory.grow (local.get $n))) \
+             (func (export \"size\") (result i32) (memory.size)))";
+        let module = Module::new(engine(), wat).unwrap();
+        with_instance(&module, |store, inst| {
+            let grow = inst
+                .get_typed_func::<i32, i32>(&mut *store, "grow")
+                .map_err(|e| e.to_string())?;
+            let size = inst
+                .get_typed_func::<(), i32>(&mut *store, "size")
+                .map_err(|e| e.to_string())?;
+            // 限额内：成功，返回旧大小（页）
+            let old = grow.call(&mut *store, 100).map_err(|e| e.to_string())?;
+            assert!(old >= 0, "限额内 grow 应成功: {old}");
+            // 超上限（再要 10 万页 = 640MB）：按 spec 返回 -1，不 trap
+            let denied = grow.call(&mut *store, 100_000).map_err(|e| e.to_string())?;
+            assert_eq!(denied, -1, "超 64MB 的 grow 必须被拒（返回 -1）");
+            // memory 实际没涨上去
+            let pages = size.call(&mut *store, ()).map_err(|e| e.to_string())?;
+            assert!(pages < 1000, "memory 页数应停在限额内: {pages}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// 并发闸不泄滞：超过 WASM_MAX_CONCURRENT 的并发调用应全部正常完成
+    /// （许可 acquire/释放配对；漏释放会在这里挂死）。
+    #[tokio::test]
+    async fn concurrent_calls_all_complete_without_deadlock() {
+        let _g = lock();
+        let _t = crate::plugin::trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("agent-wasm-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
+        pin_plugins_dir(&dir);
+        assert_eq!(scan_and_load(&dir), 1);
+        let mut handles = Vec::new();
+        for _ in 0..WASM_MAX_CONCURRENT * 3 {
+            handles.push(tokio::spawn(async {
+                tokio::time::timeout(std::time::Duration::from_secs(20), call_tool("wasm__echo__echo", r#"{"x":1}"#)).await
+            }));
+        }
+        for h in handles {
+            let r = h.await.unwrap().expect("并发调用超时（许可泄漏？）");
+            assert!(r.is_ok(), "并发调用应成功: {:?}", r.err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+
+
