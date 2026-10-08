@@ -1,6 +1,6 @@
 //! 记忆系统 v1 —— 总架构 §9 / 施工单 009
 //!
-//! 双层存储：全局 `~/.agent/` + 项目 `<workspace>/.agent/memory/`（与影子仓库同根）。
+//! 双层存储：全局 `<app_root>/.agent/` + 项目 `<workspace>/.agent/memory/`（与影子仓库同根）。
 //! - index.json（全局层）：项目身份登记（git remote 优先，无则 git 根路径），防串项目。
 //! - events.log（项目层）：任务/工具/交接/检查点的事件流水，跟 git 仓库走沉淀"经验"；
 //!   默认脱敏（sk-/Bearer/api_key 打码），`persist_sensitive=true` 才存原文。
@@ -18,12 +18,49 @@ use serde_json::{Value, json};
 
 use crate::config::MemoryConfig;
 
-/// 全局层目录：HOME（Windows 回退 USERPROFILE）下的 `.agent`。
+/// 全局层目录：应用自己目录下的 `.agent`（2026-10-09 搬根，原在 `~/.agent`）。
+///
+/// 原根按 Windows 用户算，同一台电脑跑几份 agent 会共享一份 AGENTS.md/index.json，
+/// 而会话索引（log_dir）本就按安装目录各一份——两层口径不一致，A 里记的用户印象
+/// 在 B 里也看得到。技能根（app_root/skills）一直是按安装算的，搬过来才统一。
 pub fn global_dir() -> PathBuf {
+    crate::config::app_root().join(".agent")
+}
+
+/// 搬根前的旧全局根（`~/.agent`）：只用于迁移与遗留副本查找，不再写入。
+pub fn legacy_global_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".agent")
+}
+
+/// 把旧全局根里的记忆文件并到新根（AGENTS.md / index.json 两个，别的一概不碰）。
+/// 只搬「新根没有」的——新根已有的，那是这份安装自己的记忆，绝不覆盖。
+/// 旧根永不删：什么时候清理由用户决定。返回本次搬过来的文件名。
+pub fn migrate_legacy_global(new_dir: &Path) -> Vec<&'static str> {
+    migrate_legacy_global_at(new_dir, &legacy_global_dir())
+}
+
+fn migrate_legacy_global_at(new_dir: &Path, old_dir: &Path) -> Vec<&'static str> {
+    if old_dir == new_dir {
+        return Vec::new();
+    }
+    let mut moved = Vec::new();
+    for name in ["AGENTS.md", "index.json"] {
+        let src = old_dir.join(name);
+        let dst = new_dir.join(name);
+        if dst.exists() || !src.is_file() {
+            continue;
+        }
+        if std::fs::create_dir_all(new_dir).is_err() {
+            continue;
+        }
+        if std::fs::copy(&src, &dst).is_ok() {
+            moved.push(name);
+        }
+    }
+    moved
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +108,12 @@ pub struct Memory {
 impl Memory {
     /// 计算项目身份、建目录、登记 index.json（enabled 时）。
     pub fn open(ws: &Path, cfg: &MemoryConfig) -> Self {
-        Self::open_at(ws, cfg, global_dir())
+        let dir = global_dir();
+        // 搬根迁移：只在记忆开着时做——关着时不落任何文件（含迁移）
+        if cfg.enabled {
+            migrate_legacy_global(&dir);
+        }
+        Self::open_at(ws, cfg, dir)
     }
 
     /// 指定全局层目录（测试隔离用；生产走 open()）。
@@ -431,6 +473,52 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
+    }
+
+    /// 2026-10-09 搬根：全局层从 `~/.agent`（按 Windows 用户）搬到 `app_root/.agent`
+    /// （按安装）——同一台电脑跑几份 agent 时，会话索引本就近安装各一份，AGENTS.md
+    /// 却共享一份，两层口径不一致。
+    #[test]
+    fn global_dir_is_per_install_not_per_user() {
+        assert_eq!(global_dir(), crate::config::app_root().join(".agent"));
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        if !home.is_empty() {
+            assert_eq!(legacy_global_dir(), std::path::Path::new(&home).join(".agent"));
+        }
+        assert_ne!(global_dir(), legacy_global_dir(), "新根不能再落在用户目录下");
+    }
+
+    #[test]
+    fn migrate_legacy_global_copies_only_what_is_missing() {
+        let tag = uuid::Uuid::new_v4().simple();
+        let old = std::env::temp_dir().join(format!("agent-mig-old-{tag}"));
+        let new = std::env::temp_dir().join(format!("agent-mig-new-{tag}"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("AGENTS.md"), "用户亲手写的约定").unwrap();
+        std::fs::write(old.join("index.json"), r#"{"projects":[]}"#).unwrap();
+        std::fs::create_dir_all(old.join("skills")).unwrap();
+        std::fs::write(old.join("skills").join("keep.txt"), "别碰我").unwrap();
+
+        let moved = migrate_legacy_global_at(&new, &old);
+        assert_eq!(moved, vec!["AGENTS.md", "index.json"], "只搬两个记忆文件");
+        assert_eq!(std::fs::read_to_string(new.join("AGENTS.md")).unwrap(), "用户亲手写的约定");
+        assert_eq!(std::fs::read_to_string(new.join("index.json")).unwrap(), r#"{"projects":[]}"#);
+        assert!(!new.join("skills").exists(), "记忆文件之外的一概不碰");
+
+        // 幂等 + 绝不覆盖：新根已有 = 这份安装自己的记忆
+        std::fs::write(new.join("AGENTS.md"), "这份安装自己的").unwrap();
+        assert!(migrate_legacy_global_at(&new, &old).is_empty(), "新根已有就不搬");
+        assert_eq!(std::fs::read_to_string(new.join("AGENTS.md")).unwrap(), "这份安装自己的");
+
+        // 旧根永不删
+        assert!(old.join("AGENTS.md").exists() && old.join("index.json").exists());
+        // 同根 = 空操作（防自拷贝）
+        assert!(migrate_legacy_global_at(&old, &old).is_empty());
+
+        std::fs::remove_dir_all(&old).ok();
+        std::fs::remove_dir_all(&new).ok();
     }
 
     #[test]

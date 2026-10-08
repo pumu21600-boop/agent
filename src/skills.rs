@@ -1,5 +1,5 @@
 //! 传统 Skill（SKILL.md）机制：目录约定 + frontmatter 解析 + 索引注入 + 读写。
-//! 目录：`<workspace>/skills/`（项目级）与 `~/.agent/skills/`（全局），每个技能一个文件夹，内含 SKILL.md。
+//! 目录：`<workspace>/skills/`（项目级）与 `<app_root>/skills/`（全局），每个技能一个文件夹，内含 SKILL.md。
 //! SKILL.md 支持 `---` 围栏 frontmatter，字段 name / description；缺省 name 用文件夹名。
 //! 注入策略：system 提示只注入「名字 + 一句话描述」的索引，模型按需用 read_skill 工具拉全文。
 //! 加固：①符号链接三级拒绝（技能目录 / SKILL.md / references 内文件）——
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 pub struct Skill {
     pub name: String,
     pub description: String,
-    /// "project"（工作区 skills/）| "global"（~/.agent/skills/）| "plugin"（插件自带）
+    /// "project"（工作区 skills/）| "global"（应用根 skills/）| "plugin"（插件自带）
     pub source: String,
     pub dir: String,
     pub content: String,
@@ -334,9 +334,10 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     if stale != dir && stale.is_dir() {
         migrate_skill_dir(&stale, &dir);
     }
-    // 旧「全局」根（~/.agent/skills）遗留同名副本也并进来（换根后别留双份，
-    // 资产同样要保住）
-    let legacy = crate::memory::global_dir().join("skills").join(name);
+    // 旧「全局」根（`~/.agent/skills`，搬根前的位置）遗留同名副本也并进来（换根后别留双份，
+    // 资产同样要保住）。这里必须认旧根：记忆层全局根 2026-10-09 搬到 app_root/.agent 后，
+    // 跟着 global_dir() 走就再也找不到真遗留副本了。
+    let legacy = crate::memory::legacy_global_dir().join("skills").join(name);
     if legacy != dir && legacy.is_dir() {
         migrate_skill_dir(&legacy, &dir);
     }
@@ -606,7 +607,7 @@ mod tests {
     #[test]
     fn refs_listing_and_read_ref() {
         let name = "zz-test-skill-ref";
-        // 2026-10-02：save 默认落全局根（~/.agent/skills）——references 也建在返回的真实目录里
+        // 2026-10-02：save 默认落全局根（应用根 skills/）——references 也建在返回的真实目录里
         let dir = save(name, "带参考资料的技能", "步骤一").expect("save 失败");
         let dir = std::path::PathBuf::from(dir);
         fs::create_dir_all(dir.join("references")).unwrap();
