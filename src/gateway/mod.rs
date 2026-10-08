@@ -815,6 +815,10 @@ impl Gateway {
         let mut buf: Vec<u8> = Vec::new();
         let mut done = false;
         let mut agg = StreamAgg::new();
+        // 解析失败的分片数：整条流结束时若什么都没攒到（无正文/思考/工具调用），
+        // 说明关键分片（典型是携带 tool_calls 的那个）被吞了——必须报错而不是
+        // 当「模型给了空回答」静默结束（2026-10-08 修）。
+        let mut parse_failures = 0usize;
         // Anthropic 协议（P23）：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
         let mut translator = anthropic::SseTranslator::default();
         let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
@@ -849,6 +853,7 @@ impl Gateway {
                             EventType::Error,
                             json!({ "message": format!("解析 SSE 分片失败: {e}"), "raw": data }),
                         );
+                        parse_failures += 1;
                         continue;
                     }
                 };
@@ -888,6 +893,27 @@ impl Gateway {
         }
         agg.finish();
         let turn = agg.turn;
+        // 2026-10-08 修：有分片解析失败、且整条流什么都没攒到（无正文/思考/工具调用）时，
+        // 关键分片（典型是携带 tool_calls 的那个）被吞了——报错让用户看见，而不是
+        // 当「模型给了空回答」静默结束。有部分可用内容时不影响（坏行丢弃即可）。
+        if parse_failures > 0
+            && turn.tool_calls.is_empty()
+            && turn.content.trim().is_empty()
+            && turn.reasoning.trim().is_empty()
+        {
+            record_usage(
+                ctx,
+                base_url,
+                provider_id.as_deref(),
+                model,
+                started.elapsed().as_millis() as u64,
+                UsageOutcome::err("error", format!("{parse_failures} 个 SSE 分片解析失败且无可用内容")),
+            );
+            anyhow::bail!(
+                "渠道返回了无法解析的数据（{parse_failures} 个分片解析失败，且未收到任何正文/工具调用）：\
+                 可能是中转代理在 data: 行前后注入了文本，或流被截断。请重试或更换渠道。"
+            );
+        }
         // P21 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
         record_usage(
             ctx,

@@ -999,6 +999,11 @@ pub async fn run_task(
         on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
     }
 
+    // 撞步数上限也是任务结束：补「结束快照」提交 + 改动统计条（2026-10-08 修——
+    // 其余四个出口都拍了只这条漏：前端拿不到 Checkpoint 事件 = 没有改动统计/撤销入口；
+    // 影子仓库没提交末段新建文件 = 撤销后这些文件静默留在磁盘上）。事件流水补 task.finish。
+    emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
+    mem.record("task.finish", json!({ "steps": cfg.max_steps, "reason": "step_limit", "max_steps": cfg.max_steps }));
     observability::event(EventType::Error, json!({ "message": format!("已达步数上限 {}，强制终止", cfg.max_steps) }));
     on_event(AgentEvent::StepLimit(cfg.max_steps));
     Ok(LoopOutcome::Done)

@@ -243,10 +243,25 @@ impl StreamAgg {
     }
 }
 
+/// tool_call index 的 sane 上限：并行调用再多也到不了这个量级。越界或负值都是协议
+/// 违反——照旧合并会把 Vec 撑爆（`as usize` 把 -1 变成 ~1.8e19，`while calls.len()
+/// <= index` 无限 push 到 OOM；index: 999999999 同理）。2026-10-08 修。
+const MAX_TOOL_CALL_INDEX: i64 = 128;
+
 /// 按 index 合并流式 tool_calls 分片（OpenAI 兼容增量格式）。
 pub(crate) fn accumulate_tool_calls(arr: &[Value], calls: &mut Vec<ToolCall>) {
     for entry in arr {
-        let index = entry.get("index").and_then(Value::as_i64).unwrap_or(0) as usize;
+        let index = match entry.get("index").and_then(Value::as_i64) {
+            None => 0, // 缺 index 按 0 合并（原行为）
+            Some(i) if (0..=MAX_TOOL_CALL_INDEX).contains(&i) => i as usize,
+            Some(i) => {
+                observability::event(
+                    EventType::Error,
+                    json!({ "message": format!("tool_calls 分片 index 越界（{i}），忽略该分片"), "raw": entry }),
+                );
+                continue;
+            }
+        };
         while calls.len() <= index {
             calls.push(ToolCall { id: String::new(), name: String::new(), arguments: String::new() });
         }
@@ -304,4 +319,43 @@ pub(crate) fn extract_reasoning(delta: &Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_logger() {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir = std::env::temp_dir().join("agent-test-logs");
+            let _ = crate::observability::init(&dir, "openai.jsonl", format!("openai-{}", uuid::Uuid::new_v4()));
+        });
+    }
+
+    /// 2026-10-08 修：负 index（`as usize` → ~1.8e19）与超大 index 会把合并 Vec
+    /// 无限撑大直到 OOM；越界分片应被忽略，且不影响正常分片合并。
+    #[test]
+    fn tool_call_index_out_of_range_is_ignored() {
+        init_logger();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        accumulate_tool_calls(
+            &[
+                json!({"index": 0, "id": "a", "function": {"name": "read_file", "arguments": "{}"}}),
+                json!({"index": -1, "id": "bad"}),
+                json!({"index": 999999999, "id": "bad2"}),
+                json!({"index": 1, "id": "b", "function": {"name": "shell", "arguments": "{\"c\":1}"}}),
+            ],
+            &mut calls,
+        );
+        assert_eq!(calls.len(), 2, "越界分片不得占位: {calls:?}");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[1].arguments, "{\"c\":1}");
+        // 缺 index 仍按 0 合并（原行为不变）
+        let mut c2: Vec<ToolCall> = Vec::new();
+        accumulate_tool_calls(&[json!({"id": "x", "function": {"name": "git"}})], &mut c2);
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].id, "x");
+    }
 }
