@@ -141,6 +141,7 @@ impl agent::ApprovalGate for ChatGate {
             }
         }))));
         let pending = self.pending.clone();
+        let meta = self.meta.clone();
         let tx = self.tx.clone();
         let cancel = self.cancel.clone();
         let steer = self.steer.clone();
@@ -170,6 +171,12 @@ impl agent::ApprovalGate for ChatGate {
                 _ = tx.closed() => false,
             };
             pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            // 2026-10-08 修：meta 原来只有 decide_approval（用户真的做决定）才清——
+            // 超时、取消、引导让位、客户端断开四条退出路径都只清 pending，每次都在
+            // approval_meta 留一条永久条目。这里无论走哪条退出路径都清。
+            if let Ok(mut m) = meta.lock() {
+                m.remove(&id);
+            }
             observability::event(
                 EventType::State,
                 json!({ "kind": "approval.decided", "id": id, "approved": decision }),

@@ -440,11 +440,22 @@ pub fn delete(name: &str) -> Result<(), String> {
         fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
         return Ok(());
     }
+    // 兜底（老技能 frontmatter name 与文件夹名不一致时的兼容路径）：按文件夹名找，
+    // 但必须校验该目录的**有效名**（frontmatter name 优先，空则回退文件夹名）就是
+    // name——否则删的是另一个技能（实测场景：全局 docx 的 frontmatter 写成
+    // docx-old，list 里没有 docx，兜底按文件夹名会把项目级真实 docx 删掉）。
+    // roots() 只含项目/全局两个根，插件技能不在其中，天然碰不到。
     for (root, _) in roots() {
         let dir = root.join(name);
-        if dir.is_dir() && !is_symlink(&dir) {
-            fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
-            return Ok(());
+        if !dir.is_dir() || is_symlink(&dir) {
+            continue;
+        }
+        match load_skill(&dir, "project") {
+            Some(s) if s.name == name => {
+                fs::remove_dir_all(&dir).map_err(|e| format!("删除失败: {e}"))?;
+                return Ok(());
+            }
+            _ => continue, // 有效名对不上：这是别的技能，不删
         }
     }
     Err(format!("未找到技能「{name}」"))
@@ -548,6 +559,47 @@ mod tests {
         assert!(valid_name("a\\b").is_err());
         assert!(valid_name("ok-name_1").is_ok());
         assert!(valid_name("部署流程").is_ok(), "中文技能名应允许");
+    }
+
+    /// 2026-10-08 修：delete 的文件夹名兜底必须校验有效名——全局技能 frontmatter
+    /// 写错名时，按文件夹名兜底曾把项目级同名技能删掉（用户什么都没做，技能没了）。
+    #[test]
+    fn delete_fallback_refuses_to_delete_a_different_skill() {
+        let proj = crate::tools::workspace_root().join("skills");
+        std::fs::create_dir_all(proj.join("zz-real-docx")).unwrap();
+        std::fs::write(
+            proj.join("zz-real-docx/SKILL.md"),
+            "---\nname: zz-real-docx\ndescription: 项目级真技能\n---\n正文",
+        )
+        .unwrap();
+        // 全局位放一个 frontmatter 名写错的技能（有效名 zz-typo，文件夹 zz-real-docx
+        // 在项目位已被占——这里直接用另一个文件夹名制造「按文件夹名兜底会误命中」）
+        let global = global_skills_root();
+        std::fs::create_dir_all(global.join("zz-typo-folder")).unwrap();
+        std::fs::write(
+            global.join("zz-typo-folder/SKILL.md"),
+            "---\nname: zz-typo-name\ndescription: frontmatter 名写错\n---\n正文",
+        )
+        .unwrap();
+
+        // 按有效名删：走主路径，删的是全局那个（项目级同名才优先，这里不同名）
+        assert!(delete("zz-typo-name").is_ok(), "有效名删除应成功");
+        assert!(!global.join("zz-typo-folder").exists(), "有效名对应的目录应被删");
+        assert!(proj.join("zz-real-docx").exists(), "项目级真技能不许被牵连");
+
+        // 按文件夹名删一个有效名不同的技能：必须拒绝（这是别的技能）
+        std::fs::create_dir_all(global.join("zz-typo-folder")).unwrap();
+        std::fs::write(
+            global.join("zz-typo-folder/SKILL.md"),
+            "---\nname: zz-typo-name\ndescription: frontmatter 名写错\n---\n正文",
+        )
+        .unwrap();
+        assert!(delete("zz-typo-folder").is_err(), "文件夹名与有效名不一致时必须拒删");
+        assert!(global.join("zz-typo-folder").exists(), "拒删后目录必须还在");
+        assert!(proj.join("zz-real-docx").exists(), "项目级真技能依旧不许被牵连");
+
+        let _ = std::fs::remove_dir_all(proj.join("zz-real-docx"));
+        let _ = std::fs::remove_dir_all(global.join("zz-typo-folder"));
     }
 
     /// P25：references 渐进披露——list 报篇数、read_ref 按名读单篇、穿越名被拒。

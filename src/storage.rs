@@ -93,7 +93,11 @@ pub fn plugin_read_at(root: &Path, name: &str, key: &str) -> Result<Option<Value
     let path = plugin_dir(root, name).join(format!("{key}.json"));
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => return Ok(None),
+        // 2026-10-08 修：一切读错误都当「键不存在」——文件被 AV/备份短暂锁住
+        // （Windows sharing violation）时插件读到 None，误判无数据并随即
+        // plugin_write 覆盖，旧数据被静默冲掉。NotFound 才是真的不存在。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读插件数据失败（{name}/{key}，可能被其它程序占用）: {e}")),
     };
     serde_json::from_str(&text).map(Some).map_err(|e| format!("插件数据损坏（{name}/{key}）: {e}"))
 }

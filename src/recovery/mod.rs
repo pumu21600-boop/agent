@@ -7,7 +7,8 @@
 //!   防 IO 爆炸；失败只记日志，绝不阻断工具执行。
 //! - restore：影子仓库 `reset --hard` 回指定检查点（含删除其后新建的已跟踪文件）；
 //!   shell 副作用不可回滚，靠沙箱兜底。
-//! - HANDOFF：交接文档落 `<workspace>/HANDOFF.md`，头部强制项目名/remote/commit/时间戳。
+//!
+//! HANDOFF 交接文档已于 2026-10-01 按用户要求移除，跨任务续命靠会话落盘 + 滚动摘要。
 //!
 //! 所有 git 调用都是阻塞的，调用方（核心循环/server）包 spawn_blocking。
 
@@ -618,6 +619,27 @@ pub struct ChangedFile {
     pub dels: u64,
 }
 
+/// numstat 对重命名输出的路径 → 真正的新路径。两种形态：
+/// `dir/{old => new}/rest`（共同目录，git 最常用）与裸 `old => new`。
+/// 原样保留会让产物面板出现 "old => new" 这种点不开的假路径（2026-10-08 修）。
+fn numstat_path(p: &str) -> String {
+    let Some(i) = p.find(" => ") else { return p.to_string() };
+    let left = &p[..i];
+    let right = &p[i + 4..];
+    if let Some(lb) = left.rfind('{') {
+        let inner_left = &left[lb + 1..];
+        let dir_prefix = inner_left.rfind('/').map(|k| &inner_left[..=k]).unwrap_or("");
+        let outer_prefix = &left[..lb];
+        let (new_tail, suffix) = match right.find('}') {
+            Some(rb) => (&right[..rb], &right[rb + 1..]),
+            None => (right, ""),
+        };
+        format!("{outer_prefix}{dir_prefix}{new_tail}{suffix}")
+    } else {
+        right.to_string()
+    }
+}
+
 /// 工作树相对基线 commit 的改动文件清单（`diff --numstat` + `--name-status` 合并）。
 /// **追加未跟踪文件**（`ls-files --others`）：任务里新建的文件不入 git diff
 /// （基线检查点之后 add 过才可见），产物面板「本任务还没有产物」的第二个实锤根因——
@@ -651,7 +673,17 @@ pub fn changed_files(
     for line in status.lines() {
         let mut it = line.splitn(2, '\t');
         if let (Some(s), Some(p)) = (it.next(), it.next()) {
-            status_of.insert(p.to_string(), s.chars().next().unwrap_or('M'));
+            let code = s.chars().next().unwrap_or('M');
+            // 2026-10-08 修：R/C 行有两个路径（`R100\told\tnew`），splitn(2) 把
+            // "old\tnew" 整个当键——与 numstat 侧重命名行的新路径永远对不上，
+            // 产物面板于是出现一条 path="old => new" 的假路径、status 退化成 'M'。
+            // 取最后一个 tab 后的新路径，与 numstat_path 的口径一致。
+            let path = if matches!(code, 'R' | 'C') {
+                p.rsplit('\t').next().unwrap_or(p).to_string()
+            } else {
+                p.to_string()
+            };
+            status_of.insert(path, code);
         }
     }
     let mut out: Vec<ChangedFile> = Vec::new();
@@ -660,9 +692,10 @@ pub fn changed_files(
         let a = it.next().unwrap_or("0");
         let d = it.next().unwrap_or("0");
         if let Some(p) = it.next() {
+            let path = numstat_path(p);
             out.push(ChangedFile {
-                path: p.to_string(),
-                status: status_of.get(p).copied().unwrap_or('M'),
+                status: status_of.get(&path).copied().unwrap_or('M'),
+                path,
                 adds: a.parse().unwrap_or(0),
                 dels: d.parse().unwrap_or(0),
             });

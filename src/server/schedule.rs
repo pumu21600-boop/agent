@@ -97,6 +97,10 @@ pub(super) async fn save_schedule(
         req.created_ts = chrono::Local::now().timestamp();
     }
     {
+        // 2026-10-08 修：settings 写互斥——schedules 也住 settings.json，只持
+        // settings RwLock 挡不住持 settings_write 的写者（工具/其它 handler），
+        // 并发时后写者拿陈旧基线整份覆盘。锁序：settings_write → settings RwLock。
+        let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
         if is_new {
             s.schedules.push(req.clone());
@@ -146,6 +150,8 @@ pub(super) async fn delete_schedule(
     if id.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
     }
+    // 2026-10-08 修：settings 写互斥（同 save_schedule；锁序：settings_write → settings RwLock）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
     let before = s.schedules.len();
     s.schedules.retain(|t| t.id != id);

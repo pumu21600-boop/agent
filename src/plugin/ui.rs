@@ -477,6 +477,19 @@ fn skill_roots_in(disabled: &[String], ws: &Path, app: &Path) -> Vec<(PathBuf, S
 /// 「已停用」和「内容指纹对不上」两道旧记忆拦住，界面像见了鬼。
 /// HTTP 端点（POST /api/plugins/remove）与 plugin 工具（action=remove）共用这一份，
 /// 不分叉第二套逻辑。Err 带 HTTP 状态码，工具侧只取消息。
+/// 解析删除目标（2026-10-08 修）：目录形态 → 插件目录本身；裸 .wasm/.wat 旧形态
+/// （清单 dir 指向 plugins/ 根）→ 那个文件。返回 None = 两边都不存在。
+/// 单独抽出为纯函数（root 由调用方从 plugins_dir 取）：这条逻辑曾把 plugins/ 根
+/// 当删除目标，必须能脱离全局状态单测。
+fn remove_target(name: &str, scanned_dir: &str, plugins_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(scanned_dir);
+    if dir.is_dir() && dir.file_name().and_then(|s| s.to_str()) == Some(name) {
+        return Some(dir);
+    }
+    let root = plugins_root?;
+    ["wat", "wasm"].iter().map(|ext| root.join(format!("{name}.{ext}"))).find(|f| f.is_file())
+}
+
 pub fn remove(name: &str) -> Result<String, (axum::http::StatusCode, String)> {
     let bad = |m: String| (axum::http::StatusCode::BAD_REQUEST, m);
     let name = name.trim();
@@ -496,12 +509,18 @@ pub fn remove(name: &str) -> Result<String, (axum::http::StatusCode, String)> {
             format!("「{}」是内置插件，不能删：内置能力随包分发，删了更新又会回来；想停用把开关关掉即可", e.title),
         ));
     }
-    let dir = std::path::PathBuf::from(&e.dir);
-    if !dir.is_dir() {
+    // 删除目标自己解析，不信清单里的 dir：wasm::scan_plugins 对裸 .wasm/.wat 旧形态
+    // 填的 dir 是 plugins/ **根目录**，remove_dir_all 它会把九个内置插件一起删掉
+    // （2026-10-08 修）。目录形态的 dir file_name 必等于插件名；否则按裸文件删文件。
+    let Some(target) = remove_target(name, &e.dir, crate::plugin::wasm::plugins_dir().as_deref()) else {
         return Err(bad("插件目录不存在（可能已被手工删掉）".into()));
+    };
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target).map_err(|err| bad(format!("删除目录失败: {err}")))?;
+    } else {
+        std::fs::remove_file(&target).map_err(|err| bad(format!("删除文件失败: {err}")))?;
     }
-    let shown = dir.display().to_string();
-    std::fs::remove_dir_all(&dir).map_err(|err| bad(format!("删除目录失败: {err}")))?;
+    let shown = target.display().to_string();
     // 停用名单 / 信任表残留：清得到才落盘（没有残留就不动 settings.json）。
     // 共享句柄缺失（只跑内核的单测）时跳过清理——目录已删，核心动作已完成。
     if let Some(handle) = crate::config::settings::shared_settings() {
@@ -888,6 +907,41 @@ mod tests {
         let (code, msg) = remove("../evil").unwrap_err();
         assert_eq!(code, axum::http::StatusCode::BAD_REQUEST, "{msg}");
         assert!(msg.contains("插件名非法"), "{msg}");
+    }
+
+    /// 2026-10-08 修：裸 .wasm/.wat 旧形态的清单 dir 是 plugins/ 根目录，
+    /// 删除目标必须解析成文件本身——曾有人照 dir 删，九个内置插件一起没了。
+    #[test]
+    fn remove_target_resolves_bare_file_not_plugins_root() {
+        let root = std::env::temp_dir().join(format!("agent-rm-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("plugins")).unwrap();
+        // 模拟九个内置插件目录 + 一个裸文件插件
+        for builtin in ["board", "browser", "css-ui"] {
+            std::fs::create_dir_all(root.join("plugins").join(builtin)).unwrap();
+            std::fs::write(root.join("plugins").join(builtin).join("manifest.json"), "{}").unwrap();
+        }
+        std::fs::write(root.join("plugins").join("calc.wat"), "(module)").unwrap();
+        let plugins_root = root.join("plugins");
+
+        // 裸文件：扫描清单给的 dir 是 plugins/ 根 → 目标必须是 calc.wat 文件
+        let t = remove_target("calc", &plugins_root.display().to_string(), Some(&plugins_root))
+            .expect("应解析到裸文件");
+        assert!(t.is_file(), "目标必须是文件: {}", t.display());
+        assert_eq!(t.file_name().and_then(|s| s.to_str()), Some("calc.wat"));
+        assert_ne!(t, plugins_root, "绝不许把 plugins/ 根当删除目标");
+
+        // 目录形态：dir 的 file_name 等于插件名 → 目标就是该目录
+        let d = plugins_root.join("board");
+        let t2 = remove_target("board", &d.display().to_string(), Some(&plugins_root)).expect("应解析到目录");
+        assert_eq!(t2, d);
+
+        // 都不存在 → None（调用方报「已被手工删掉」）
+        assert!(remove_target("ghost", &plugins_root.display().to_string(), Some(&plugins_root)).is_none());
+        // root 都没登记（只跑内核的单测）→ None，不 panic
+        assert!(remove_target("calc", &plugins_root.display().to_string(), None).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 测试用的最小 UiExt（只填索引要用的字段，其余取默认）。

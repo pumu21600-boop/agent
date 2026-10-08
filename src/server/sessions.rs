@@ -283,6 +283,12 @@ pub(super) async fn clear_session(State(state): State<AppState>, axum::extract::
             if let Ok(mut m) = state.approved_scopes.lock() {
                 m.remove(id);
             }
+            // 2026-10-08 修：档位表也只插不删——每个历史会话永久留一条，
+            // 长期运行无上限增长。删会话时一并收掉（session 字段不校验存在性，
+            // 直接 curl 循环打 /api/approval-mode 也能灌，这里至少让正常路径闭合）。
+            if let Ok(mut m) = state.session_approval.write() {
+                m.remove(id);
+            }
             observability::event(EventType::State, json!({ "kind": "session.cleared", "session": id }));
             (StatusCode::OK, Json(json!({ "ok": true })))
         }

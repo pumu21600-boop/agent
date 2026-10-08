@@ -244,6 +244,12 @@ impl SessionManager {
         let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        // 文件存在但读不出（损坏/被占用）≠ 新会话：get() 的 None 分不清这两种，
+        // 早先按新会话整份覆写 → 置顶/归档/标题/创建时间/用量快照被静默抹掉。
+        // 2026-10-08 修：存在却读不出时拒绝覆写（保住盘上现场，下次 save 再试），
+        // 只有「文件确实不在」才走新会话分支。
+        let path = self.path(id);
+        let existed = path.exists();
         // 用量快照随文件保留：save 由消息侧高频调用，不能把 update_usage 写的快照抹掉
         let (title, created_at, old_summary, workspace, pinned, archived, old_usage) = match self.get(id) {
             Some(old) => (
@@ -255,7 +261,7 @@ impl SessionManager {
                 old.archived,
                 old.usage,
             ),
-            None => (
+            None if !existed => (
                 first_user_title(messages),
                 now.clone(),
                 None,
@@ -264,6 +270,12 @@ impl SessionManager {
                 false,
                 None,
             ),
+            None => {
+                anyhow::bail!(
+                    "会话文件存在但读不出（损坏或被占用），拒绝覆写以防丢元数据: {}",
+                    path.display()
+                );
+            }
         };
         let file = SessionFile {
             id: id.to_string(),
@@ -712,6 +724,51 @@ mod tests {
         // 不存在的会话
         assert!(m.set_flags("ghost", Some(true), None).is_err());
         assert!(m.fork("ghost").is_err());
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_unreadable_file() {
+        // 2026-10-08：文件存在但读不出（损坏/被占）时 save 必须拒绝覆写——
+        // 早先按「新会话」整份重写，置顶/归档/标题/创建时间/用量快照被静默抹掉。
+        let _ = crate::observability::init(
+            &std::env::temp_dir().join("agent-test-logs"),
+            "sessions.jsonl",
+            format!("session-test-{}", uuid::Uuid::new_v4()),
+        );
+        let (_d, m) = mgr("clobber");
+        let a = m.new_id();
+        m.save(&a, &[json!({"role":"user","content":"原始会话"})], None).unwrap();
+        m.set_flags(&a, Some(true), Some(true)).unwrap();
+        m.rename(&a, "重要标题").unwrap();
+
+        // 损坏盘上文件（合法 id、合法路径，内容不是 JSON）
+        let path = _d.path().join("sessions").join(format!("{a}.json"));
+        std::fs::write(&path, "{ 这不是合法 JSON").unwrap();
+
+        // save 必须报错且不碰盘上现场
+        let err = m.save(&a, &[json!({"role":"user","content":"新一轮"})], None).unwrap_err();
+        assert!(err.to_string().contains("拒绝覆写"), "错误要说人话: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ 这不是合法 JSON", "损坏现场必须原样保留");
+        // 恢复成合法内容后 save 照常工作（不是永久卡死）
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": a,
+                "title": "重要标题",
+                "created_at": "2026-10-08T00:00:00.000Z",
+                "updated_at": "2026-10-08T00:00:00.000Z",
+                "messages": [{"role":"user","content":"原始会话"}],
+                "workspace": "C:\\ws",
+                "pinned": true,
+                "archived": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        m.save(&a, &[json!({"role":"user","content":"原始会话"})], None).unwrap();
+        let f = m.get(&a).unwrap();
+        assert!(f.pinned && f.archived, "元数据必须还在");
+        assert_eq!(f.title, "重要标题");
     }
 
     #[test]

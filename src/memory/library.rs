@@ -86,11 +86,30 @@ pub fn save(log_dir: &Path, lib: &Library) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(lib)?)?;
-    std::fs::rename(&tmp, &path)?;
+    // 2026-10-08：tmp 名带 pid + 自增序号——固定 `library.json.tmp` 时两个并发
+    // 写者以各自偏移写同一文件，短的那份写完后长的那份尾部残留，rename 出去的是
+    // 混合字节的坏 JSON，load() 的 unwrap_or_default() 再把全库静默重置。
+    // （串行化在 sync 侧用 WRITE_LOCK 保证；这里是纵深，防别的路径也来写。）
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
+    let write = || -> anyhow::Result<()> {
+        std::fs::write(&tmp, serde_json::to_string(lib)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&tmp); // 别把残缺 tmp 留在盘上
+        return Err(e);
+    }
     Ok(())
 }
+
+/// memory 库写互斥（tokio 异步锁）：sync 的「读-算-写」整条链路串行化。设置工具
+/// 强制重建、星云面板刷新、定时「记忆提醒」同步可能并发——都以陈旧基线整份覆写，
+/// 先同步算好的向量/已删会话状态会被后写者抹掉。std 锁不能跨 await（handler 的
+/// future 必须 Send），故用 tokio 锁把临界区包到 embedder 调用之后。
+static WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // —— 会话 → 检索正文 ——
 
@@ -356,6 +375,22 @@ fn lexical_score(qt: &[String], doc_toks: &[String], title: &str, idf: &HashMap<
     (got / total).min(1.0)
 }
 
+/// dl（小写化正文）的字符下标 → d（原文）的字符下标。小写化只膨胀不删字符
+/// （'İ' → "i̇" 两个字符），逐字符展开计数对齐；对不上返回 None（退回首段）。
+fn dl_index_to_d(d: &str, dl: &str, dl_idx: usize) -> Option<usize> {
+    let mut di = 0usize;
+    let mut li = 0usize;
+    for dc in d.chars() {
+        if li >= dl_idx {
+            return Some(di);
+        }
+        li += dc.to_lowercase().count();
+        di += 1;
+    }
+    let _ = dl;
+    if li >= dl_idx { Some(di) } else { None }
+}
+
 /// digest 内查询词附近的窗口（找不到时退回首段）。
 fn best_window(digest: &str, q: &str) -> String {
     let d: Vec<char> = digest.chars().collect();
@@ -365,13 +400,15 @@ fn best_window(digest: &str, q: &str) -> String {
     let ql = q.trim().to_lowercase();
     let dl = digest.to_lowercase();
     let byte_pos = if ql.chars().count() >= 2 { dl.find(&ql) } else { None };
-    let start = match byte_pos {
-        Some(b) => {
-            let idx = dl[..b].chars().count();
-            idx.saturating_sub(30)
-        }
+    // 2026-10-08 修：窗口起点曾直接按 dl 的字符下标算——小写化膨胀字符
+    // （'İ' → "i̇"）让 dl 字符数多于 d，end < start 时 `d[start..end]` 直接
+    // panic（slice index starts at 370 but ends at 206）。先映射回原文下标，
+    // 再钳进合法区间；映射失败退回首段，位置本就只是「大致窗口」。
+    let want = match byte_pos {
+        Some(b) => dl_index_to_d(digest, &dl, dl[..b].chars().count()).unwrap_or(0).saturating_sub(30),
         None => 0,
     };
+    let start = want.min(d.len().saturating_sub(1));
     let end = (start + SNIPPET_MAX).min(d.len());
     let mut s: String = d[start..end].iter().collect();
     if start > 0 {
@@ -528,6 +565,9 @@ pub async fn sync(
     embedder: Option<Embedder<'_>>,
     force: bool,
 ) -> SyncReport {
+    // 整条链路串行化（含 embedder 的 await）：两个 sync 并发时后写者会拿陈旧基线
+    // 整份覆写，先同步算好的向量/已删会话状态被静默抹掉。
+    let _g = WRITE_LOCK.lock().await;
     let label = embedder.as_ref().map(|e| e.model.clone()).unwrap_or_else(|| LOCAL_MODEL.to_string());
     let mut lib = load(log_dir);
     if lib.model != label || force {
@@ -670,6 +710,63 @@ mod tests {
         assert!(s.contains("登录改 JWT"), "摘要优先作短句: {s}");
         assert_eq!(project_name("C:\\ws\\demo"), "demo");
         assert_eq!(project_name(""), "未分组");
+    }
+
+    #[test]
+    fn best_window_survives_lowercase_expanding_chars() {
+        // 2026-10-08：'İ' 小写化成两个字符，dl 字符数多于 d——窗口起点按 dl 算会
+        // 越界，end < start 时 d[start..end] panic。30+ 个 İ 后接查询词即复现。
+        let mut digest = "İ".repeat(40);
+        digest.push_str("登录接口 JWT 校验失败，需要修复");
+        let s = best_window(&digest, "JWT");
+        assert!(s.contains("JWT") || s.contains("登录"), "窗口应覆盖命中处: {s}");
+        // 查询词在很后面（起点被钳回首部）也不能 panic
+        let s2 = best_window(&digest, "修复");
+        assert!(!s2.is_empty());
+        // 空 digest / 短查询照旧
+        assert!(best_window("", "任意").is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_serializes_under_write_lock() {        // 2026-10-08：sync 的「读-算-写」必须整条串行化——设置工具强制重建与星云
+        // 面板刷新并发时，后写者拿陈旧基线整份覆写，先同步算好的向量被抹掉。
+        // 占住写锁 → 并发的 sync 必须阻塞（而不是各写各的）。
+        let dir = tmp("memlock");
+        let sessions = SessionManager::new(&dir);
+        let a = sessions.new_id();
+        sessions.save(&a, &[json!({"role":"user","content":"把登录接口改成 JWT"})], None).unwrap();
+
+        let _held = WRITE_LOCK.lock().await; // 测试占住锁
+        let d2 = dir.clone();
+        let handle = tokio::spawn(async move { sync_local(&SessionManager::new(&d2), &d2, false).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!handle.is_finished(), "写锁被占时 sync 必须等待，不得并行读写");
+        drop(_held);
+        let rep = handle.await.unwrap();
+        assert_eq!(rep.total, 1, "锁释放后 sync 必须正常跑完");
+        assert_eq!(load(&dir).entries.len(), 1);
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_residue() {
+        // 固定 tmp 名是并发写交叉出坏 JSON 的根因；改为 pid+序号后必须不留残骸
+        let dir = tmp("memtmp");
+        let lib = Library::default();
+        save(&dir, &lib).unwrap();
+        let mem = dir.join("memory");
+        let leftovers: Vec<_> = std::fs::read_dir(&mem)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "save 后不得留 tmp 残骸: {leftovers:?}");
+        assert!(mem.join("library.json").exists());
+        // 连续保存（序号递增）也不会互相覆盖
+        for _ in 0..3 {
+            save(&dir, &lib).unwrap();
+        }
+        assert_eq!(load(&dir).version, LIB_VERSION);
     }
 
     #[tokio::test]

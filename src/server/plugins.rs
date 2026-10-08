@@ -352,7 +352,9 @@ pub(super) async fn toggle_plugin(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 name" })));
     }
     let enabled = req.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
+    // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     s.disabled_plugins.retain(|d| d != &name);
     if !enabled {
         s.disabled_plugins.push(name.clone());
@@ -448,6 +450,8 @@ pub(super) async fn promote_draft(
             // 自动 pin：从落盘的 manifest 路径推导插件目录与 digest
             let pins = crate::plugin::trust::pin_from_manifest_paths(&paths);
             if !pins.is_empty() {
+                // 2026-10-08 修：settings 写互斥（pin 表读-改-写整条链路持锁）
+                let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
                 let mut s = state
                     .settings
                     .read()
@@ -492,6 +496,8 @@ pub(super) async fn trust_plugin(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 plugins:<name>）" })));
     }
     let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
+    // 2026-10-08 修：settings 写互斥（pin 表读-改-写整条链路持锁，防与其它写面互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     match action.as_str() {
         "pin" => {
@@ -597,8 +603,10 @@ pub(super) struct PluginDataQuery {
 pub(super) async fn read_plugin_data(Query(q): Query<PluginDataQuery>) -> Response {
     match crate::storage::plugin_read(&q.name, &q.key) {
         Ok(Some(v)) => (StatusCode::OK, Json(json!({ "ok": true, "value": v }))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "键不存在").into_response(),
-        Err(e) => (StatusCode::FORBIDDEN, e).into_response(),
+        // 2026-10-08 修：404 原是纯文本「键不存在」——该端点其余分支与全部其它 API
+        // 错误都是 JSON，插件前端对 404 直接 resp.json() 会抛异常而不是走到空值分支。
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "ok": false, "error": "键不存在" }))).into_response(),
+        Err(e) => (StatusCode::FORBIDDEN, Json(json!({ "error": e }))).into_response(),
     }
 }
 

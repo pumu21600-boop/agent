@@ -357,7 +357,11 @@ pub(super) async fn manage_configs(
     State(state): State<AppState>,
     Json(req): Json<ConfigRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
+    // 2026-10-08 修：settings 写互斥——本 handler 也是「clone→改→save→换内存」的
+    // 读-改-写，漏锁就会与 settings 工具/其它 handler 并发互覆盖（表现为
+    // 「刚改的设置又变回去」，重启后确认丢失）。锁序：settings_write → settings RwLock。
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let err =
         |m: &str| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
     match req.action.as_str() {

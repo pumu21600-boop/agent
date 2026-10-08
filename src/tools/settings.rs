@@ -467,7 +467,8 @@ async fn memory_op(v: &Value) -> Result<String, String> {
         "reindex" => {
             let state = crate::server::shared_state().ok_or("记忆库子系统尚未初始化")?;
             let lib = crate::server::memory::build_library(&state, true).await;
-            let count = lib.get("points").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
+            // 键名与 build_library 的产出对齐（items；曾误读 points，永远报 0 个光点）
+            let count = lib.get("items").and_then(|p| p.as_array()).map(|a| a.len()).unwrap_or(0);
             Ok(format!("记忆库索引已强制重建（{count} 个会话光点）"))
         }
         other => Err(format!("未知 op: {other:?}（reindex）")),

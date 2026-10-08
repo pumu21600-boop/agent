@@ -55,6 +55,9 @@ pub(super) async fn post_skills(
                 return Err(err("缺少技能名".into()));
             }
             let now = {
+                // 2026-10-08 修：settings 写互斥（disabled_skills 读-改-写持锁，
+                // 锁序：settings_write → settings RwLock）
+                let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
                 let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner());
                 s.disabled_skills.retain(|n| n != &name);
                 if !enabled {
@@ -183,15 +186,26 @@ pub(super) async fn get_trace(
 /// 阻塞在 spawn_blocking 里做；kill-tree / 内存上限探针较慢，只在 cargo test 跑。
 pub(super) async fn sandbox_selftest(State(state): State<AppState>) -> Json<Value> {
     let cfg = (*state.sandbox_cfg).clone();
-    let results = tokio::task::spawn_blocking(move || crate::sandbox::probes::run_fast_suite(&cfg))
-        .await
-        .unwrap_or_default();
+    // 2026-10-08 修：JoinError（探针任务 panic）时 unwrap_or_default 给出空 Vec，
+    // 而 `iter().all()` 空真算出 ok=true——界面显示「自检通过」而一个探针都没跑。
+    // 探针必须诚实：跑不起来就是失败，原因照实带回。
+    let results = match tokio::task::spawn_blocking(move || crate::sandbox::probes::run_fast_suite(&cfg)).await {
+        Ok(r) => r,
+        Err(e) => {
+            observability::event(EventType::Error, json!({ "kind": "sandbox.selftest_panicked", "error": e.to_string() }));
+            return Json(json!({
+                "ok": false,
+                "error": format!("自检任务崩溃（探针 panic）: {e}"),
+                "results": []
+            }));
+        }
+    };
     observability::event(
         EventType::State,
-        json!({ "kind": "sandbox.selftest", "ok": results.iter().all(|r| r.ok) }),
+        json!({ "kind": "sandbox.selftest", "ok": results.iter().all(|r| r.ok), "count": results.len() }),
     );
     Json(json!({
-        "ok": results.iter().all(|r| r.ok),
+        "ok": !results.is_empty() && results.iter().all(|r| r.ok),
         "results": results
             .iter()
             .map(|r| json!({ "name": r.name, "ok": r.ok, "detail": r.detail }))
