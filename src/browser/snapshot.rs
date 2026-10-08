@@ -256,9 +256,14 @@ pub(crate) async fn take_snapshot(
     max_elements: Option<usize>,
     include_hidden: bool,
 ) -> Result<String, String> {
+    // 2026-10-08 修：max_elements 由模型直传、原先无 clamp——传 1e8 时 JS 仍遍历
+    // 全量 NodeList 且每元素 getClientRects/selOf（渲染器卡死），returnByValue 的
+    // 超大结果 JSON 还会整块进 Rust 堆（10s CDP 预算只限时间不限大小）。封顶 2000：
+    // 交互元素到这个量级早已不可读，工具文本本就会截断。
+    const MAX_ELEMENTS_CAP: usize = 2_000;
     let expr = format!(
         "{SNAPSHOT_JS}({}, {})",
-        max_elements.unwrap_or(0),
+        max_elements.unwrap_or(0).min(MAX_ELEMENTS_CAP),
         include_hidden
     );
     let value = tab

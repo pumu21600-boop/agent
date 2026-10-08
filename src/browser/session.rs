@@ -211,7 +211,12 @@ pub(crate) async fn shell_create_target(session: &BrowserSession) -> Result<(Str
     if !shell::available() {
         return Err("桌面壳控制通道未连接（壳没跑或已断开）".into());
     }
-    let label = format!("wv-{}", session.tabs.lock().unwrap_or_else(|e| e.into_inner()).len() + 1);
+    // label 单调递增不复用（2026-10-08 修）：wv-{len+1} 在关一个再建时复用同名，
+    // 壳侧异步销毁窗口里两个 webview 同名，close/visible/rect 作用对象歧义。
+    let label = format!(
+        "wv-{}",
+        session.shell_label_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     // 初始矩形：有面板同步过的矩形就用；没有（面板收起过/从未同步）建到**屏幕外**——
     // 壳的 add_child 是先可见再按 visible=false 隐藏，建在 (0,0) 或失效矩形上会闪一个
     // 莫名窗口（用户实测实锤）；屏幕外建、保持隐藏，等真正的 rect+visible 指令再归位。
@@ -538,6 +543,7 @@ pub(crate) async fn launch() -> Result<Arc<BrowserSession>, String> {
                     last_frame_poll_ms: AtomicU64::new(0),
                     agent_touched_ms: AtomicU64::new(0),
                     agent_tab_id: std::sync::Mutex::new(None),
+                    shell_label_seq: std::sync::atomic::AtomicU64::new(1),
                 });
                 ensure_reaper();
                 return Ok(session);
@@ -581,6 +587,7 @@ pub(crate) async fn shell_launch() -> Result<Arc<BrowserSession>, String> {
         last_frame_poll_ms: AtomicU64::new(0),
         agent_touched_ms: AtomicU64::new(0),
         agent_tab_id: std::sync::Mutex::new(None),
+                    shell_label_seq: std::sync::atomic::AtomicU64::new(1),
     });
     // 壳不重启而服务重启过时，上一个会话的 webview 还活着——先清干净再建，
     // 免得残留 target 干扰发现、白白常驻
@@ -852,8 +859,13 @@ pub(crate) fn spawn_tab_events(tab: Arc<WebTab>) {
             if tab.retired.load(Ordering::Relaxed) {
                 break;
             }
-            match rx.recv().await {
-                Ok((method, params)) => match method.as_str() {
+            // 2026-10-08 修：retired 原先只在循环顶检查，而 recv() 会永久 park——
+            // 关标签页后事件任务 + 整个 WebTab（含最新帧、ref_selectors）一起泄漏，
+            // 只有恰好再来一个 CDP 事件才退出（广播发送端被本任务自己持有的
+            // Arc<WebTab> 保活，通道永不关闭）。改为带超时的 recv（broadcast 的
+            // recv 是 cancel-safe）：超时即回循环顶复查 retired，最坏 500ms 后退出。
+            match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok((method, params))) => match method.as_str() {
                     "Page.screencastFrame" => {
                         if tab.screencast_on.load(Ordering::Relaxed)
                             && let Some(data) = params.get("data").and_then(Value::as_str)
@@ -894,8 +906,10 @@ pub(crate) fn spawn_tab_events(tab: Arc<WebTab>) {
                     _ => {}
                 },
                 // 帧消费慢导致丢中间帧：最新帧胜出，可接受；dialog 低频不受影响
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => break,
+                // 超时（无事件到达）：回循环顶复查 retired，关掉的标签页有界退出
+                Err(_) => continue,
             }
         }
     });

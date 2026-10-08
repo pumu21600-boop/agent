@@ -192,6 +192,15 @@ impl WebTab {
             self.ref_selectors.lock().await.insert(reference.to_string(), selector.to_string());
         }
     }
+    /// 导航后重置快照状态（2026-10-08 修）：diff 基线与 ref→selector 映射都是
+    /// **按页面内容**编号的——整文档替换后 JS 的 seq 从 0 重编号，新页第一个交互
+    /// 元素又拿到 e1。不清的话：① 旧 ref 在新页命中另一个元素（click/fill 打错
+    /// 目标）；② diff 把旧基线元素误报「~变化」而非「+新增」；③ 失效 ref 的
+    /// selector 兜底会在新页 querySelector 命中错误元素。
+    pub(crate) async fn reset_snapshot_state(&self) {
+        self.last_outline.lock().await.clear();
+        self.ref_selectors.lock().await.clear();
+    }
 }
 
 impl WebTab {
@@ -263,6 +272,10 @@ pub(crate) struct BrowserSession {
     /// 与 visible_tab（面板自己的视图）分开：agent 切页不再抢用户的视图，但界面要
     /// 能看见 agent 在哪儿干活。
     agent_tab_id: std::sync::Mutex<Option<String>>,
+    /// shell 模式 webview label 的单调计数器（2026-10-08 修）：原先是
+    /// `wv-{tabs.len()+1}`——关掉一个再建就复用同名 label，而壳侧关闭是异步的
+    /// （无 ack），短暂窗口里两个 webview 同名，close/visible/rect 作用对象歧义。
+    shell_label_seq: AtomicU64,
 }
 
 impl BrowserSession {

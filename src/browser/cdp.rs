@@ -6,12 +6,14 @@
 //!
 //! 架构：单 actor 任务独占 WS 流（select 命令通道 + WS 消息），请求按 id 配对经
 //! oneshot 回传；事件等待器与命令走同一条 FIFO 通道，「先注册等待器再发命令」
-//! 在 actor 处理顺序上天然成立，无竞态。调用超时在客户端侧计时，超时后等待器
-//! 残留由 actor 在事件到达时「发入已关闭通道」自然丢弃。
+//! 在 actor 处理顺序上天然成立，无竞态。等待器带 token，调用失败/事件超时走
+//! `UnwaitEvent` 摘除（2026-10-08 修：残留的陈旧 waiter 会在事件到达时被优先
+//! 匹配、喂进已 drop 的 oneshot 把事件吞掉，后续同事件的等待全部干等满预算）。
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -21,9 +23,14 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// 事件广播容量：screencast 帧消费慢时丢弃中间帧（最新帧胜出），不阻塞 actor。
 const EVENT_CHANNEL_CAP: usize = 256;
 
+/// 事件等待器 token（进程级自增；只需在单个 actor 的 waiters 里唯一）。
+static WAIT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 enum ToActor {
     Call { method: String, params: Value, reply: oneshot::Sender<Result<Value, String>> },
-    WaitEvent { method: String, reply: oneshot::Sender<Result<Value, String>> },
+    WaitEvent { token: u64, method: String, reply: oneshot::Sender<Result<Value, String>> },
+    /// 摘除等待器（调用失败/事件超时后用；保序：注册 → 命令 → 摘除）
+    UnwaitEvent { token: u64 },
 }
 
 /// 页面级 CDP 会话句柄。
@@ -55,19 +62,20 @@ impl Cdp {
             let mut next_id: u64 = 1;
             let mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<Value, String>>> =
                 std::collections::HashMap::new();
-            // 事件等待器：注册顺序即触发顺序（同页面同方法极少并发等待）
-            let mut waiters: Vec<(String, oneshot::Sender<Result<Value, String>>)> = Vec::new();
+            // 事件等待器：注册顺序即触发顺序（同页面同方法极少并发等待）。
+            // token 用于精确摘除（UnwaitEvent），避免误摘别人的等待器。
+            let mut waiters: Vec<(u64, String, oneshot::Sender<Result<Value, String>>)> = Vec::new();
 
             let die = |pending: &mut std::collections::HashMap<
                 u64,
                 oneshot::Sender<Result<Value, String>>,
             >,
-                      waiters: &mut Vec<(String, oneshot::Sender<Result<Value, String>>)>| {
+                      waiters: &mut Vec<(u64, String, oneshot::Sender<Result<Value, String>>)>| {
                 alive_in_actor.store(false, std::sync::atomic::Ordering::Relaxed);
                 for (_, slot) in pending.drain() {
                     let _ = slot.send(Err("CDP 连接已断开（浏览器退出或标签页崩溃）".to_string()));
                 }
-                for (_, slot) in waiters.drain(..) {
+                for (_, _, slot) in waiters.drain(..) {
                     let _ = slot.send(Err("CDP 连接已断开".to_string()));
                 }
             };
@@ -88,8 +96,11 @@ impl Cdp {
                                 }
                                 pending.insert(id, reply);
                             }
-                            ToActor::WaitEvent { method, reply } => {
-                                waiters.push((method, reply));
+                            ToActor::WaitEvent { token, method, reply } => {
+                                waiters.push((token, method, reply));
+                            }
+                            ToActor::UnwaitEvent { token } => {
+                                waiters.retain(|(t, _, _)| *t != token);
                             }
                         }
                     }
@@ -121,9 +132,11 @@ impl Cdp {
                                 method.to_string(),
                                 v.get("params").cloned().unwrap_or(Value::Null),
                             ));
-                            if let Some(pos) = waiters.iter().position(|(m, _)| method == m || method.starts_with(m.as_str()))
+                            if let Some(pos) = waiters
+                                .iter()
+                                .position(|(_, m, _)| method == m || method.starts_with(m.as_str()))
                             {
-                                let (_, slot) = waiters.remove(pos);
+                                let (_, _, slot) = waiters.remove(pos);
                                 let _ = slot.send(Ok(v.get("params").cloned().unwrap_or(Value::Null)));
                             }
                         }
@@ -177,13 +190,23 @@ impl Cdp {
         event: &str,
         budget: std::time::Duration,
     ) -> Result<Value, String> {
+        let token = WAIT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<Result<Value, String>>();
         self.tx
-            .send(ToActor::WaitEvent { method: event.into(), reply: tx })
+            .send(ToActor::WaitEvent { token, method: event.into(), reply: tx })
             .map_err(|_| "CDP actor 已退出".to_string())?;
-        self.call_budgeted(method, params, budget).await?;
+        // 2026-10-08 修：命令失败/超时必须摘掉等待器。旧版直接 `?` 返回，陈旧 waiter
+        // 留在 actor 里——迟到的事件被它优先匹配、喂进已 drop 的 oneshot（事件被吞），
+        // 后续同事件的等待只能干等满预算：navigate 20s 超时后立刻重试，第二次也必超时。
+        if let Err(e) = self.call_budgeted(method, params, budget).await {
+            let _ = self.tx.send(ToActor::UnwaitEvent { token });
+            return Err(e);
+        }
         match tokio::time::timeout(budget + std::time::Duration::from_secs(2), rx).await {
-            Err(_) => Err(format!("等待事件超时: {event}")),
+            Err(_) => {
+                let _ = self.tx.send(ToActor::UnwaitEvent { token });
+                Err(format!("等待事件超时: {event}"))
+            }
             Ok(Err(_)) => Err("CDP actor 已退出".to_string()),
             Ok(Ok(res)) => res,
         }

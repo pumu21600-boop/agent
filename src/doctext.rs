@@ -34,6 +34,13 @@ pub fn extract(path: &Path) -> anyhow::Result<String> {
 
 /// pptx 结构化（预览面板分页渲染用）：[{n, text}]，n=幻灯片页码。
 pub fn pptx_slides_json(path: &Path) -> anyhow::Result<String> {
+    // 2026-10-08 修：与 doc 预览端点对齐的大小上限——原先 std::fs::read 无上限，
+    // 一个数 GB 的 .pptx（或任意大文件改名 .pptx）直接把进程撑爆。
+    const MAX_BYTES: u64 = 50 * 1024 * 1024;
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_BYTES {
+        anyhow::bail!("文件过大（{} 字节，上限 50MB）", meta.len());
+    }
     let bytes = std::fs::read(path)?;
     let mut names = zip_list(&bytes)?
         .into_iter()
@@ -160,6 +167,11 @@ fn zip_entries(bytes: &[u8]) -> anyhow::Result<Vec<(String, u16, usize, usize)>>
         let elen = u16le(bytes, off + 30) as usize;
         let clen = u16le(bytes, off + 32) as usize;
         let lfh = u32le(bytes, off + 42) as usize;
+        // 2026-10-08 修：nlen/elen/clen 各最大 65535，原先只校验了 46 字节固定头，
+        // 声明巨大 nlen 的畸形条目直接切出界 panic（预览端点 500）。名字段也必须在界内。
+        if off + 46 + nlen > bytes.len() {
+            anyhow::bail!("zip 中央目录损坏（条目名长度越界）");
+        }
         let name = String::from_utf8_lossy(&bytes[off + 46..off + 46 + nlen]).into_owned();
         // 本地文件头的名字/扩展字段长度可能与中央目录不同，按本地头自己的字段算
         if lfh + 30 <= bytes.len() && u32le(bytes, lfh) == 0x0403_4b50 {
@@ -188,8 +200,16 @@ fn zip_read(bytes: &[u8], want: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let data = match method {
             0 => raw.to_vec(),
             8 => {
+                // 2026-10-08 修：read_to_end 无输出上限——deflate 极限压缩比约 1032:1，
+                // 入口侧 50MB 的恶意/畸形条目能解出数十 GB 直接把进程撑爆。预览本就
+                // 截断，32MB 解压数据对任何文档都富富余；超了按炸弹拒。
+                const MAX_UNZIP: u64 = 32 * 1024 * 1024;
                 let mut out = Vec::new();
-                flate2::read::DeflateDecoder::new(raw).read_to_end(&mut out)?;
+                std::io::Read::take(flate2::read::DeflateDecoder::new(raw), MAX_UNZIP + 1)
+                    .read_to_end(&mut out)?;
+                if out.len() as u64 > MAX_UNZIP {
+                    anyhow::bail!("zip 条目解压后超过 32MB 上限（疑似压缩比炸弹）: {name}");
+                }
                 out
             }
             m => anyhow::bail!("不支持的压缩方法 {m}: {name}"),
@@ -208,8 +228,28 @@ fn xml_to_text(xml: &[u8]) -> String {
     let mut rest = s.as_ref();
     while let Some(lt) = rest.find('<') {
         out.push_str(&decode_entities(&rest[..lt]));
-        let Some(gt) = rest[lt..].find('>') else { break };
-        let tag = &rest[lt + 1..lt + gt];
+        let after = &rest[lt..];
+        // CDATA / 注释里的 `>` 不是标签结束（2026-10-08 修）：`<![CDATA[a > b]]>`
+        // 原先被切成「a 」当正文、「 b]]>」当标签，注释内容也会漏进预览。
+        if let Some(inner) = after.strip_prefix("<![CDATA[") {
+            match inner.find("]]>") {
+                Some(end) => {
+                    out.push_str(&inner[..end]); // CDATA 是纯字面文本，不解实体
+                    rest = &inner[end + 3..];
+                }
+                None => break,
+            }
+            continue;
+        }
+        if let Some(inner) = after.strip_prefix("<!--") {
+            match inner.find("-->") {
+                Some(end) => rest = &inner[end + 3..],
+                None => break,
+            }
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let tag = &after[1..gt];
         let t = tag.trim();
         if t.starts_with("/w:p") || t.starts_with("/a:p") || t.starts_with("/text:p") || t.starts_with("/text:h") {
             out.push('\n');
@@ -218,7 +258,7 @@ fn xml_to_text(xml: &[u8]) -> String {
         } else if t.starts_with("w:br") || t.starts_with("a:br") {
             out.push('\n');
         }
-        rest = &rest[lt + gt + 1..];
+        rest = &after[gt + 1..];
     }
     // 段落间的连续空行压成单个换行，别给预览灌十行空白
     let mut compact = String::with_capacity(out.len());
@@ -389,4 +429,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
+
+
+    /// 2026-10-08 修：中央目录条目声明巨大 nlen 时，名字切片直接切出界 panic
+    /// （预览端点 500）。畸形 zip 必须返回 Err。
+    #[test]
+    fn crafted_zip_huge_nlen_does_not_panic() {
+        let mut zip = make_zip_m(0, &[("word/document.xml", b"<w:p><w:t>x</w:t></w:p>")]);
+        // 中央目录第一条目的 nlen 字段（off+28）：找到 CD 签名后改写成 65535
+        let cd = zip
+            .windows(4)
+            .position(|w| w == 0x0201_4b50u32.to_le_bytes())
+            .expect("应有中央目录签名");
+        zip[cd + 28..cd + 30].copy_from_slice(&65535u16.to_le_bytes());
+        let r = zip_entries(&zip);
+        assert!(r.is_err(), "巨大 nlen 必须报错而非 panic: {:?}", r.as_ref().map(|v| v.len()));
+    }
+
+    /// 2026-10-08 修：read_to_end 无输出上限，压缩比炸弹把进程撑爆。
+    /// 33MB 全零 defate 后只有几十 KB，必须被 32MB 上限拒下。
+    #[test]
+    fn zip_bomb_is_rejected() {
+        use std::io::Write as _;
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0u8; 33 * 1024 * 1024];
+        enc.write_all(&zeros).unwrap();
+        let packed = enc.finish().unwrap();
+        assert!(packed.len() < 1024 * 1024, "零串应压得很小: {}", packed.len());
+        let zip = make_zip_m(8, &[("word/document.xml", &packed)]);
+        let r = zip_read(&zip, "word/document.xml");
+        let e = r.expect_err("炸弹必须被拒").to_string();
+        assert!(e.contains("32MB"), "应提到上限: {e}");
+    }
+
+    /// 2026-10-08 修：CDATA / 注释里的 `>` 不是标签结束——`<![CDATA[a > b]]>`
+    /// 原先把 CDATA 内容切碎，注释也会漏进预览。
+    #[test]
+    fn cdata_and_comment_are_not_split_on_gt() {
+        let xml = r#"<w:p><w:t><![CDATA[a > b & <c>]]></w:t></w:p><!-- 注释里有 > 字符 --><w:p><w:t>尾</w:t></w:p>"#;
+        let t = xml_to_text(xml.as_bytes());
+        assert!(t.contains("a > b & <c>"), "CDATA 内容应完整保留: {t:?}");
+        assert!(!t.contains("注释"), "注释内容不应泄漏: {t:?}");
+        assert!(t.contains("尾"), "注释后的正文应保留: {t:?}");
+    }
+
 }
+

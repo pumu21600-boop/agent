@@ -69,6 +69,7 @@ pub(crate) async fn navigate_tab(tab: &WebTab, url: &str) -> Result<Option<&'sta
     match nav {
         Ok(_) => {
             tab.cdp.invalidate_worlds(); // 导航销毁了旧的隔离世界 context
+            tab.reset_snapshot_state().await; // ref/diff 基线按页编号，换页即废（2026-10-08 修）
             Ok(None)
         }
         Err(e) if e.contains("等待事件超时") => Ok(Some("（页面加载未在预算内完成，以下为当前状态）\n")),
