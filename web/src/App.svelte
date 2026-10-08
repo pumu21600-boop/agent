@@ -4,9 +4,9 @@
   import Galaxy from './Galaxy.svelte';
   // docx 排版预览（2026-10-02 用户实锤「要能看排版，完全体」）：mammoth 把 docx
   // 容器转成 HTML 再沙箱 iframe 渲染（表格/列表/图片/标题层级全保留）
-  import mammoth from 'mammoth/mammoth.browser.js';
-  // xlsx 表格渲染（SheetJS 前端库，走 raw 字节解析）
-  import * as XLSX from 'xlsx/dist/xlsx.full.min.js';
+  // docx/xlsx 预览的大依赖（mammoth 304KB / SheetJS 688KB）2026-10-08 起改**动态
+  // 导入**：静态 import 时它们进首包，每次开应用都要多下 1MB，而大多数会话压根
+  // 不打开文档预览。调用点都在 async 函数里，await import 零行为变化。
   import ImagePreview from './lib/ImagePreview.svelte';
   // 助手消息 markdown 渲染（2026-10-04 用户拍板「星号太多」：escape-first 安全渲染）
   import { md } from './lib/md.js';
@@ -1957,6 +1957,7 @@
         if (!r.ok) throw new Error(`读取失败: HTTP ${r.status}`);
         return r.arrayBuffer();
       });
+      const mammoth = (await import('mammoth/mammoth.browser.js')).default;
       const res = await mammoth.convertToHtml(
         { arrayBuffer: buf },
         {
@@ -1979,6 +1980,7 @@
         if (!r.ok) throw new Error(`读取失败: HTTP ${r.status}`);
         return r.arrayBuffer();
       });
+      const XLSX = await import('xlsx/dist/xlsx.full.min.js');
       const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
       const sheets = wb.SheetNames.map((name) => {
         const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: false, blankrows: true, defval: '' });

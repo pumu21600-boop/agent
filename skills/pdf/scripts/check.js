@@ -87,8 +87,10 @@ async function renderSmoke(file, kindName, expectedUnits) {
   } catch (e) {
     results.push({ name: 'render', ok: false, detail: `soffice 转换失败: ${e.message}` });
   } finally {
-    for (const f of fs.readdirSync(tmp)) fs.unlinkSync(path.join(tmp, f));
-    fs.rmdirSync(tmp);
+    // 2026-10-08 修：rmSync 递归一把收——unlinkSync 遇子目录抛 EISDIR，
+    // 异常从 finally 逃逸把整个验收以退出码 2 结束（前面的结构断言全 PASS 也白搭），
+    // rmdirSync 同样非递归。清理代码不该污染验收结论。
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
@@ -173,7 +175,10 @@ async function main() {
     if (opts.pages) ck(`页数=${opts.pages}`, doc.getPageCount() === opts.pages, `got ${doc.getPageCount()}`);
     const pdfParse = need('pdf-parse');
     if (pdfParse && (opts.expect.length || opts.not.length)) {
-      const parsed = await pdfParse(bytes, { max: 50 });
+      // 2026-10-08 修：max:50 只解前 50 页——文本在第 50 页之后的文档，
+      // --expect 断言会误报（文档明明对）。断言要覆盖整本，去掉页数上限
+      // （pdf-parse 对超大文档只是慢一点，验收是一次性的）。
+      const parsed = await pdfParse(bytes);
       for (const t of opts.expect) ck(`应含「${t}」`, parsed.text.includes(t));
       for (const t of opts.not) ck(`应不含「${t}」`, !parsed.text.includes(t));
     }

@@ -160,6 +160,20 @@ function channelModels(host) {
 }
 
 function drawRows() {
+  // 2026-10-08 修：整体替换 innerHTML 会把用户正在敲、还没 blur 的输入静默重置
+  // （onchange 只在 blur 后触发；改汇率/切换货币分段都会走到这里重绘）。重绘前
+  // 记下焦点元素的身份（第几行第几格 + 标签名）与当前 DOM 值，重绘后还回去。
+  const act = document.activeElement;
+  const tr = act && act.closest ? act.closest('#rows tr') : null;
+  const keep = tr
+    ? {
+        row: Array.prototype.indexOf.call(tr.parentNode.children, tr),
+        col: Array.prototype.indexOf.call(tr.children, act.closest('td')),
+        tag: act.tagName,
+        value: act.value,
+        caret: act.selectionStart,
+      }
+    : null;
   const opts = (sel) =>
     channels.map((c) => `<option value="${c.host}" ${c.host === sel ? 'selected' : ''}>${c.name} · ${c.host}</option>`).join('');
   // 模型格：选中渠道后带出该渠道配置的模型做下拉建议（datalist，仍可手填 * 或别的 id）
@@ -184,6 +198,19 @@ function drawRows() {
     .join('');
   // select 的 value 在 innerHTML 里不生效（option 无 value 时用文本），这里补一次
   document.querySelectorAll('#rows select').forEach((sel, i) => { sel.value = rows[i].provider || ''; });
+  // 焦点与未提交输入还回去（2026-10-08 修）
+  if (keep && keep.col >= 0) {
+    const tr2 = $('rows').children[keep.row];
+    const td = tr2 && tr2.children[keep.col];
+    const el = td && td.querySelector(keep.tag === 'SELECT' ? 'select' : 'input');
+    if (el) {
+      el.value = keep.value;
+      try {
+        el.focus();
+        if (keep.caret != null && el.setSelectionRange) el.setSelectionRange(keep.caret, keep.caret);
+      } catch (e) {}
+    }
+  }
 }
 
 function addRow() { rows.push({ provider: '', model: '', prompt: 0, cached: 0, completion: 0 }); drawRows(); }

@@ -87,8 +87,10 @@ async function renderSmoke(file, kindName, expectedUnits) {
   } catch (e) {
     results.push({ name: 'render', ok: false, detail: `soffice 转换失败: ${e.message}` });
   } finally {
-    for (const f of fs.readdirSync(tmp)) fs.unlinkSync(path.join(tmp, f));
-    fs.rmdirSync(tmp);
+    // 2026-10-08 修：rmSync 递归一把收——unlinkSync 遇子目录抛 EISDIR，
+    // 异常从 finally 逃逸把整个验收以退出码 2 结束（前面的结构断言全 PASS 也白搭），
+    // rmdirSync 同样非递归。清理代码不该污染验收结论。
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 

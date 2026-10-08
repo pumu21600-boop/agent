@@ -59,6 +59,15 @@ function req(method, params) {
     const id = 'r' + ++seq;
     pending.set(id, { res, rej });
     parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+    // 2026-10-08 修：宿主不响应（agent:response 丢失/被早退）时 Promise 永久
+    // pending——面板卡在「读取中…」且无重试无提示，pending 条目也永不清理。
+    // 补 8s 超时（与 board/trace 同一范式）。
+    setTimeout(() => {
+      if (pending.has(id)) {
+        pending.delete(id);
+        rej(new Error('宿主未响应（超时）'));
+      }
+    }, 8000);
   });
 }
 parent.postMessage({ type: 'agent:hello' }, '*');

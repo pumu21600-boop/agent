@@ -197,7 +197,11 @@ fn ensure_service() -> Option<u32> {
     {
         use std::os::windows::process::CommandExt;
         match Command::new(&exe)
-            .current_dir(exe.parent().map(|p| p.parent().unwrap_or(p)).unwrap_or(Path::new(".")))
+            // 2026-10-08 修：cwd 固定到 exe 所在目录（target/release），与服务自身
+            // spawn_detached 的 current_dir(exe.parent()) 一致——原来多跳一级到
+            // target/，两个拉起面的工作目录语义分叉（app_root 按 exe 路径兜住了主要
+            // 资源，但任何显式读 cwd 的路径会拿错地方）。
+            .current_dir(exe.parent().unwrap_or(Path::new(".")))
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .spawn()
         {

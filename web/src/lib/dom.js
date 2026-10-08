@@ -1,10 +1,68 @@
 // DOM/CSS 纯助手(P19 范式 App.svelte 拆分):无组件状态依赖,App 与各视图组件共用。
 // 给每条顶层规则的选择器加 #app 前缀：压过 Svelte scoped 样式（.composer.s-xxx 两级类名）；
 // @media/@keyframes 等整块原样保留
+// 2026-10-08 修两处 CSS 语法盲区：① 选择器按逗号切分时不识别引号/[]/()——
+// [data-x="a,b"]、:is(.a, .b) 会被切碎成语法错误规则，整条注入静默失效；
+// ② 找声明块收尾的 '}' 不跳过字符串与注释——content: "}" 会提前截断，
+// 后续全部错位。两个 helper 都按字符扫描处理。
 export function escalateCss(css) {
   let out = '';
   let i = 0;
   const n = css.length;
+  // 顶层逗号切分：引号 / [] / () 内部的逗号不是选择器分隔符
+  const splitSelector = (sel) => {
+    const parts = [];
+    let cur = '';
+    let quote = '';
+    let bracket = 0;
+    let paren = 0;
+    for (const ch of sel) {
+      if (quote) {
+        cur += ch;
+        if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        cur += ch;
+        continue;
+      }
+      if (ch === '[') bracket++;
+      else if (ch === ']') bracket = Math.max(0, bracket - 1);
+      else if (ch === '(') paren++;
+      else if (ch === ')') paren = Math.max(0, paren - 1);
+      if (ch === ',' && bracket === 0 && paren === 0) {
+        parts.push(cur);
+        cur = '';
+        continue;
+      }
+      cur += ch;
+    }
+    parts.push(cur);
+    return parts;
+  };
+  // 声明块收尾：跳过字符串与 /* */ 注释，声明值里的 } 不是块结束
+  const findBlockEnd = (from) => {
+    let quote = '';
+    for (let j = from; j < n; j++) {
+      const ch = css[j];
+      if (quote) {
+        if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === '/' && css[j + 1] === '*') {
+        const e = css.indexOf('*/', j + 2);
+        j = e === -1 ? n : e + 1;
+        continue;
+      }
+      if (ch === '}') return j;
+    }
+    return -1;
+  };
   while (i < n) {
     const brace = css.indexOf('{', i);
     if (brace === -1) {
@@ -23,8 +81,7 @@ export function escalateCss(css) {
       out += css.slice(i, j);
       i = j;
     } else {
-      const prefixed = selector
-        .split(',')
+      const prefixed = splitSelector(selector)
         .map((s) => {
           const t = s.trim();
           return t ? `#app ${t}` : t;
@@ -32,7 +89,7 @@ export function escalateCss(css) {
         .join(', ');
       out += `${prefixed}{`;
       // 跳过这条规则的声明块，直到它的关闭 '}'（声明不嵌套）
-      const close = css.indexOf('}', brace + 1);
+      const close = findBlockEnd(brace + 1);
       const end = close === -1 ? n : close + 1;
       out += css.slice(brace + 1, end);
       i = end;
