@@ -105,6 +105,10 @@ pub struct UiExt {
     /// 声明后插件的启用开关就是这个功能的总开关（host 侧 toggle_plugin 同步写
     /// settings.features），一个能力只留一个开关，不搞「插件停用 + 功能关闭」双闸
     pub feature: String,
+    /// 2026-10-08：manifest `popup: true`——从设置→插件点「打开」时开**居中小窗口**
+    /// （模态）而不是右侧大面板。表单型插件（如插件制作器）用它：用户要的是弹窗，
+    /// 不是侧栏。缺省 false = 老行为（aside 大面板）。
+    pub popup: bool,
 }
 
 /// 扫描全部插件（内置 + 当前工作区 + 内存 draft；工作区同名覆盖内置，顺序稳定）。
@@ -162,6 +166,7 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
             // draft 是模型自产隔离区：豁免验签
             settings_entry: String::new(),
             feature: String::new(),
+            popup: false,
         });
     }
     out
@@ -231,6 +236,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         skills: Vec::new(),
         settings_entry: String::new(),
         feature: String::new(),
+        popup: false,
     };
     if !safe_segment(name) {
         e.error = Some("目录名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into());
@@ -291,6 +297,8 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             return e;
         }
     }
+    // 2026-10-08：popup 型插件——设置→插件「打开」开居中小窗口（模态）而非右侧大面板
+    e.popup = v.get("popup").and_then(Value::as_bool).unwrap_or(false);
     // 界面插槽与写操作权限（只认白名单里的插槽名与动作名）
     if let Some(ui) = v.get("ui").and_then(Value::as_array) {
         e.ui = ui
@@ -870,6 +878,7 @@ mod tests {
             skills: skills.into_iter().map(str::to_string).collect(),
             settings_entry: String::new(),
             feature: String::new(),
+            popup: false,
         }
     }
 

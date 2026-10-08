@@ -3876,6 +3876,10 @@
   let extOpen = false;
   let extCurrent = null; // 当前打开的扩展（{ name, title, ... }）
   let extFrame = null; // 面板里那个 iframe 元素（当前打开的扩展）
+  // 2026-10-08：弹窗型插件（manifest popup:true）——设置→插件「打开」开居中小窗口，
+  // 不开右侧大面板。用户拍板的交互：点打开 → 弹小窗 → 确定 → 落进新对话。
+  let extPopup = null;
+  let extPopupFrame = null;
   let extMsg = '';
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
@@ -4287,6 +4291,8 @@
           resetComposerHeight();
           composerInputEl?.focus();
         }
+        // 弹窗型插件（插件制作器）：事已成，小窗让位——用户直接落进新对话看预填
+        if (extPopup) extPopup = null;
         reply(true, { id: currentSessionId, workspace });
       },
     },
@@ -4672,6 +4678,14 @@
   let extPendingMsgs = [];
 
   function openExt(e, slotEvent) {
+    // 弹窗型插件（manifest popup:true）：开居中小窗口，不开侧面板；设置弹窗同时让位，
+    // 小窗确定后用户直接落进新对话（不再被设置弹窗压着）
+    if (e.popup && e.entry) {
+      extPopup = e;
+      extMsg = '';
+      settingsOpen = false;
+      return;
+    }
     // 面板此刻是不是已经开着同一个扩展（决定插槽事件直接投还是排队等面板 iframe load）
     const wasOpenSame = extOpen && extCurrent && extCurrent.name === e.name;
     extCurrent = e;
@@ -4696,6 +4710,8 @@
     // 独立插件面板那个 iframe 绑的是 extFrame，这里补登记：否则 postToName 找不到它，
     // init / 插槽事件都投不进去（后台 iframe 此时已经卸载）
     if (extFrame && extCurrent && extCurrent.name === name) extFrameEls[name] = extFrame;
+    // 弹窗型插件那个 iframe 绑的是 extPopupFrame，同样要登记（后台 iframe 此时已卸载）
+    if (extPopupFrame && extPopup && extPopup.name === name) extFrameEls[name] = extPopupFrame;
     const ext = extList.find((e) => e.name === name);
     postToName(name, { type: 'agent:init', payload: extInitPayload(ext) });
     extPendingMsgs = extPendingMsgs.filter((p) => {
@@ -6306,9 +6322,29 @@
     </aside>
   {/if}
 
+  {#if extPopup}
+    <div class="modal-backdrop" on:click={() => (extPopup = null)}>
+      <div class="ext-popup" on:click|stopPropagation>
+        <div class="modal-head">
+          <b>{extPopup.title}</b>
+          <span class="flex-sp"></span>
+          <button class="btn ghost" on:click={() => (extPopup = null)}>关闭</button>
+        </div>
+        <iframe
+          class="ext-popup-frame"
+          bind:this={extPopupFrame}
+          title={extPopup.title}
+          sandbox="allow-scripts"
+          src={`/plugins/${encodeURIComponent(extPopup.name)}/${extPopup.entry || 'index.html'}`}
+          on:load={() => onExtFrameLoad(extPopup.name)}
+        ></iframe>
+      </div>
+    </div>
+  {/if}
+
   <!-- 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
   {#each enabledExts.filter((e) => e.entry && !(e.ui || []).some((u) => u.slot === 'dock')) as e (e.name)}
-    {#if !(extOpen && extCurrent && extCurrent.name === e.name)}
+    {#if !(extOpen && extCurrent && extCurrent.name === e.name) && !(extPopup && extPopup.name === e.name)}
       <iframe
         class="ext-hidden"
         title={`插件后台：${e.title}`}

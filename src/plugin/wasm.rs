@@ -599,6 +599,7 @@ pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
                 skills: Vec::new(), // 工具插件不声明技能（技能走 ui::skill_roots 扫描目录形态）
                 settings_entry: String::new(), // 工具插件没有设置页
                 feature: String::new(), // 工具插件不绑功能开关（面板插件才绑）
+                popup: false, // 工具插件没有面板页
             }
         })
         .collect()
