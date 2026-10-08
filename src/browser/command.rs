@@ -44,13 +44,18 @@ pub(crate) async fn page_state(tab: &WebTab) -> Result<PageState, BrowserError> 
     Ok(st)
 }
 
+/// Agent 工具侧 URL 准入（2026-10-08 收紧）：只放行 http(s) 与 about:blank。
+/// file:// 一度放行——navigate 判只读 Safe，read-only 档也零审批，模型
+/// `navigate file:///C:/Users/.../.ssh/id_rsa` 再 snapshot 即拿到文件正文，
+/// 等于绕过 read_file 的工作区禁锢读任意本地文件。用户想开本地文件（如 agent
+/// 生成的 HTML 报告）走「网页」面板地址栏——check_panel_url 仍放行 file://。
 pub(crate) fn check_url(url: &str) -> Result<(), BrowserError> {
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") || url == "about:blank" {
+    if url.starts_with("http://") || url.starts_with("https://") || url == "about:blank" {
         Ok(())
     } else {
         Err(BrowserError::new(
             ErrorCode::NavigationBlocked,
-            "地址必须以 http:// / https:// / file:// 开头（或 about:blank）",
+            "地址必须以 http:// 或 https:// 开头（或 about:blank）；本地文件请用户在「网页」面板的地址栏打开",
         ))
     }
 }

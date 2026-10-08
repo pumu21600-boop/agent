@@ -116,6 +116,28 @@ pub(super) async fn post_mcp(
     (StatusCode::OK, get_mcp_inner(&state))
 }
 
+/// env/headers 脱敏（2026-10-08 修）：这两个映射里是第三方服务的密钥/token，
+/// 明文回显等于把它们递给任何能调本机端口的调用方——与 settings 对 api_key
+/// 只给尾 4 位（key_hint）的纪律不一致，也违反 McpServerCfg.headers 字段
+/// 自述的「值绝不进日志」。前端编辑走 McpTab 自己的表单 textarea，不消费这里
+/// 的值；留键名 + 尾 2 位只够确认「存没存」。
+fn mask_secret_map(m: &std::collections::BTreeMap<String, String>) -> Value {
+    m.iter()
+        .map(|(k, v)| {
+            let n = v.chars().count();
+            let hint = if n > 4 {
+                let tail: String = v.chars().skip(n - 2).collect();
+                format!("••••{tail}")
+            } else if n > 0 {
+                "••••".to_string()
+            } else {
+                String::new()
+            };
+            json!({ "key": k, "hint": hint })
+        })
+        .collect()
+}
+
 fn get_mcp_inner(state: &AppState) -> Json<Value> {
     let wasm_list: Vec<Value> = crate::plugin::wasm::status()
         .into_iter()
@@ -145,7 +167,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             let (res, prompts) = catalogs.get(&c.name).cloned().unwrap_or_default();
             json!({
                 "name": c.name, "transport": c.transport, "command": c.command, "args": c.args,
-                "env": c.env, "url": c.url, "headers": c.headers,
+                "env": mask_secret_map(&c.env), "url": c.url, "headers": mask_secret_map(&c.headers),
                 "enabled": c.enabled,
                 "online": online,
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
@@ -741,5 +763,32 @@ mod tests {
         emit_plugin_settings_changed("");
         let ev2 = plain.try_recv().expect("普通插件开关也要推 settings_changed");
         assert_eq!(ev2["keys"].as_array().map(|a| a.len()).unwrap_or(0), 1, "无联动时 keys 只有 disabled_plugins: {ev2}");
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    /// 2026-10-08 修：env/headers 明文回显把第三方密钥递给任何本机调用方。
+    /// 脱敏后只剩键名 + 尾 2 位（短值全遮），键名保留供确认「存没存」。
+    #[test]
+    fn mcp_secret_maps_are_masked() {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("API_KEY".to_string(), "sk-super-secret-token-1234".to_string());
+        m.insert("SHORT".to_string(), "ab".to_string());
+        m.insert("EMPTY".to_string(), String::new());
+        let v = mask_secret_map(&m);
+        let arr = v.as_array().unwrap();
+        let find = |k: &str| arr.iter().find(|e| e["key"] == k).unwrap().clone();
+        let api = find("API_KEY");
+        let hint = api["hint"].as_str().unwrap();
+        assert!(hint.starts_with("••••") && hint.ends_with("34"), "只留尾 2 位: {hint}");
+        assert!(!hint.contains("secret"), "正文不得泄露: {hint}");
+        assert_eq!(find("SHORT")["hint"].as_str().unwrap(), "••••", "短值全遮");
+        assert_eq!(find("EMPTY")["hint"].as_str().unwrap(), "", "空值留空");
+        // 空映射 → 空数组（不是 null）
+        let empty = mask_secret_map(&std::collections::BTreeMap::new());
+        assert_eq!(empty.as_array().unwrap().len(), 0);
     }
 }

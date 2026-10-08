@@ -751,3 +751,20 @@ mod tests {
         crate::plugin::ui::set_disabled(&restore);
     }
 }
+
+/// 2026-10-08 修：agent 工具侧不再放行 file://——navigate 判只读 Safe，
+/// read-only 档也零审批，`file:///C:/.../id_rsa` + snapshot 即绕过 read_file
+/// 的工作区禁锢读任意本地文件。面板地址栏（用户自主）仍放行。
+#[test]
+fn agent_side_navigate_blocks_file_url_but_panel_allows() {
+    assert!(check_url("https://example.com/").is_ok());
+    assert!(check_url("http://example.com/").is_ok());
+    assert!(check_url("about:blank").is_ok());
+    let e = check_url("file:///C:/Users/test/.ssh/id_rsa").unwrap_err();
+    assert_eq!(e.code, ErrorCode::NavigationBlocked, "{e:?}");
+    assert!(e.message.contains("面板"), "错误要指路：{e}", e = e.message);
+    // 面板侧：用户手输本地文件放行
+    assert!(check_panel_url("file:///C:/report.html").is_ok());
+    assert!(check_panel_url("https://example.com/").is_ok());
+    assert!(check_panel_url("javascript:alert(1)").is_err());
+}

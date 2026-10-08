@@ -4,7 +4,12 @@ use super::*;
 pub const VIEWPORT_W: i64 = 1280;
 pub const VIEWPORT_H: i64 = 900;
 
+/// 面板地址栏准入：用户自主输入，file:// 放行（开自己的本地文件/agent 生成的
+/// HTML 报告是正当场景）；其余规则与 agent 工具侧一致（http(s)/about:blank）。
 pub(crate) fn check_panel_url(url: &str) -> Result<(), BrowserError> {
+    if url.starts_with("file://") {
+        return Ok(());
+    }
     check_url(url)
 }
 

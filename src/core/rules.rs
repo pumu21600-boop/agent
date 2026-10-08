@@ -769,19 +769,34 @@ fn risk_simple_command(cmd: &str, ws: &Path) -> (RiskLevel, String) {
     // 的程序名都不是 del，DANGEROUS_PROGRAMS 全部失效后落 Normal（auto 档静默）。
     // 这里对非安全程序的命令串做高危名 token 扫描（词级、剥括号引号），
     // 任何位置出现高危程序即 Dangerous；安全程序（echo/findstr 等打印/搜索
-    // "del" 字样）跳过避免误伤。残余盲区：`%var%` 间接展开、`d^el` 转义——
-    // cmd 语义无法完全模拟，宁可后续再收。
+    // "del" 字样）跳过避免误伤。
+    // 2026-10-08 收两头残余盲区：① `d^el`/`de^l` 这类 ^ 转义——cmd 解析时 ^ 被
+    // 吃掉，执行的就是 del，token 原样不命中，剥掉所有 ^ 再比一次；② cmd 延迟
+    // 展开（/V:ON 或 setlocal enabledelayedexpansion）下 `!x!!y!` 运行时才展开，
+    // 静态文本里没有任何高危 token 却真实执行 del——开了延迟展开且带 !标识符!
+    // 形态即判高危。仍剩的盲区：`%var%` 间接展开（var 值来自文件/环境时不可知），
+    // 注释挂账。
     if !SAFE_PROGRAMS.contains(&prog.as_str()) {
         for tok in trimmed.split(['(', ')', '"', '\'', ' ', '\t', ',', '=']) {
             let t = tok
                 .trim_matches(['&', '|', ';', '^'])
                 .to_lowercase();
-            if DANGEROUS_PROGRAMS.contains(&t.as_str()) {
+            // ^ 是 cmd 转义符：`d^el` 执行时就是 del
+            let unescaped = t.replace('^', "");
+            if DANGEROUS_PROGRAMS.contains(&t.as_str())
+                || DANGEROUS_PROGRAMS.contains(&unescaped.as_str())
+            {
                 return (
                     RiskLevel::Dangerous,
-                    format!("复合命令中出现高危程序 {t}（包装/嵌套形态也拦）"),
+                    format!("复合命令中出现高危程序 {}（包装/嵌套/转义形态也拦）", if t.is_empty() { unescaped } else { t }),
                 );
             }
+        }
+        if has_delayed_expansion(trimmed) {
+            return (
+                RiskLevel::Dangerous,
+                "命令开了 cmd 延迟展开（/V:ON 或 setlocal enabledelayedexpansion，!var! 运行时才展开），实际执行的程序不可静态判定".into(),
+            );
         }
     }
 
@@ -810,6 +825,25 @@ fn program_name(cmd: &str) -> String {
         }
     }
     lower
+}
+
+/// cmd 延迟展开启用判定（2026-10-08 修）：`/V:ON` 开关或
+/// `setlocal enabledelayedexpansion` 开启后，`!var!` 在命令行解析结束后才展开——
+/// `set x=de& set y=l& !x!!y! /f 目标` 静态文本里没有任何高危 token，
+/// 执行的却是 del。单独出现（不开延迟展开时 ! 是普通字符）不误伤。
+fn has_delayed_expansion(cmd: &str) -> bool {
+    let lower = cmd.to_lowercase();
+    if !lower.contains("/v:on") && !lower.contains("enabledelayedexpansion") {
+        return false;
+    }
+    // !标识符! 形态（`!x!!y!` 连续展开也算：前一个 ! 后紧跟字母即启动匹配）
+    let b = lower.as_bytes();
+    (0..b.len()).any(|i| {
+        b[i] == b'!'
+            && i + 1 < b.len()
+            && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+            && lower[i + 1..].contains('!')
+    })
 }
 
 /// 按命令分隔符拆分（`&&` `||` `&` `;` `|` 换行），双引号内的分隔符不拆。
@@ -1125,6 +1159,32 @@ mod tests {
         assert_eq!(evaluate_risk("shell", &json!({"command": "findstr del notes.txt"}), &ws()).0, RiskLevel::Safe);
         assert_eq!(evaluate_risk("shell", &json!({"command": "dir del*"}), &ws()).0, RiskLevel::Safe);
         assert_eq!(evaluate_risk("shell", &json!({"command": "echo it's ok"}), &ws()).0, RiskLevel::Safe);
+    }
+
+    /// 2026-10-08 修：注释里挂账的两处残余盲区实测可利用，收口。
+    /// ① `^` 转义：cmd 解析时吃掉 ^，`d^el /f x` 执行的就是 del；
+    /// ② 延迟展开：`cmd /V:ON /C "set x=de& set y=l& !x!!y! /f 目标"` 静态
+    /// 文本里没有任何高危 token，真实执行 del——auto 档原先静默放行。
+    #[test]
+    fn test_shell_caret_and_delayed_expansion_not_bypassed() {
+        for cmd in [
+            "d^el /f main.rs",
+            "de^l /f main.rs",
+            "cmd /c d^el /f main.rs",
+            "cmd /V:ON /C \"set x=de& set y=l& !x!!y! /f C:\\target.txt\"",
+            "cmd /v:on /c \"set a=ta&set b=skkill& !a!sb^! /f x\"",
+            "cmd /c \"setlocal enabledelayedexpansion & set p=del& !p! /f x\"",
+        ] {
+            let r = evaluate_risk("shell", &json!({ "command": cmd }), &ws());
+            assert_eq!(r.0, RiskLevel::Dangerous, "转义/延迟展开删除应判高危: {cmd}: {}", r.1);
+        }
+        // 误伤护栏：没开延迟展开时 ! 是普通字符；安全程序打印 ^ / ! 不拦。
+        // 注：`echo hello^|world` 的 | 被 split_commands 当管道拆成两条
+        // （echo Safe + world Normal），结论 Normal——判级从紧但不误升危。
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo hello^|world"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("shell", &json!({"command": "echo !important! done"}), &ws()).0, RiskLevel::Safe);
+        // 开了延迟展开但没有 !标识符! 形态（纯 /V:ON 无害用法）不拦
+        assert_eq!(evaluate_risk("shell", &json!({"command": "cmd /V:ON /C echo hi"}), &ws()).0, RiskLevel::Normal);
     }
 
     // —— 2026-10-04 审计修复：解释器不再无条件 Safe ——
