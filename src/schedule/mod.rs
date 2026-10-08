@@ -383,6 +383,17 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
     }
     let state = state.clone();
     tokio::spawn(async move {
+        // 2026-10-08 修：运行标记改 Drop 守卫摘。旧代码移除语句在 await 之后——
+        // run_headless_inner panic 时 tokio 吞掉 panic、future 不恢复执行，标记
+        // 永远留在 running_slot 里，tick_all 每跳 continue，该任务从此不再触发
+        //（只能重启进程恢复）。
+        struct RunningGuard(String);
+        impl Drop for RunningGuard {
+            fn drop(&mut self) {
+                running_slot().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+            }
+        }
+        let _running_guard = RunningGuard(task.id.clone());
         // P22-D：记忆提醒类型——到点先同步记忆库（本地索引，零网络）并生成回顾指令；
         // 窗口内没有可回顾的对话就跳过本轮（标记已处理，不每跳重复到点、不白烧模型调用）
         let message = if task.kind() == "memory" {
@@ -483,10 +494,7 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
                 "kind": "schedule.done", "task": task.id, "name": task.name, "trigger": trigger,
             }),
         );
-        running_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&task.id);
+        // 运行标记由 _running_guard 的 Drop 摘（含 panic 路径）
     });
 }
 

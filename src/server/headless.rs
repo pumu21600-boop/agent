@@ -499,9 +499,16 @@ pub(crate) async fn run_headless_inner(
             }
             followups += 1;
             if followups > 3 {
+                // 2026-10-08 修：超上限时把取走的消息**还回队列**（先 drain 后判上限，
+                // 旧代码在这里直接 break，第 4 个非空批次被取出即弃——用户发了却
+                // 静默消失，只有一条内部事件，与「不丢消息」的注释正相反）。
+                // 口径同聊天路径抢不到占位时 push 回去：留给下一轮/下一次唤醒跑。
+                for text in extra {
+                    steer_queue.push(&sid, text, false);
+                }
                 observability::event(
                     EventType::State,
-                    json!({ "kind": "headless.leftover", "session": sid, "count": extra.len() }),
+                    json!({ "kind": "headless.leftover", "session": sid, "count": steer_queue.pending(&sid), "note": "续跑轮数用尽，消息还回队列等下一轮" }),
                 );
                 break;
             }

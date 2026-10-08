@@ -674,7 +674,7 @@ pub async fn run_task(
             emit_checkpoint_bar(baseline, gate.session_id(), &on_event).await;
             observability::event(
                 EventType::State,
-                json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count() }),
+                json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count(), "session": gate.session_id() }),
             );
             // P7 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));

@@ -67,7 +67,10 @@ fn value_tokens(v: &Value) -> u64 {
     match v {
         Value::String(s) => estimate_tokens(s),
         Value::Array(a) => a.iter().map(value_tokens).sum(),
-        Value::Object(o) => o.values().map(value_tokens).sum(),
+        // 2026-10-08 修：键名也要计——tool_calls 的 {"id"/"type"/"function"/"name"}
+        // 这些结构键原先全漏，一次 write_file 调用少算 15-20 tokens，随步数线性
+        // 累积，把裁剪时机系统性推晚（模块注释自己实锤过同类偏差：估算 1866 vs 实际 4750）。
+        Value::Object(o) => o.iter().map(|(k, v)| estimate_tokens(k) + value_tokens(v)).sum(),
         Value::Null => 0,
         other => estimate_tokens(&other.to_string()),
     }
@@ -234,11 +237,16 @@ pub fn compact_messages(
         groups.push((start, out.len()));
 
         // 保护：最后一组；含最近 N 个工具结果起始位置的组（该组及之后全保）
-        let protected_start = tool_idx
-            .len()
-            .checked_sub(cfg.recent_tool_results_kept)
-            .and_then(|k| tool_idx.get(k))
-            .copied();
+        // 2026-10-08 修：工具结果总数 ≤ 保留数时 checked_sub 下溢成 None，而
+        // is_none_or(None) 返回 true——「最近 N 个永不裁」反转为「全组可裁」，
+        // 最新的工具结果被整组折叠（且不像归档那样留占位符，模型侧无声丢失）。
+        // 总数不超保留数时第一个工具结果就是保护起点；一个工具结果都没有时
+        // 才是真正的「无保护」（None）。
+        let protected_start = if tool_idx.len() <= cfg.recent_tool_results_kept {
+            tool_idx.first().copied()
+        } else {
+            tool_idx.get(tool_idx.len() - cfg.recent_tool_results_kept).copied()
+        };
         let foldable: Vec<(usize, usize)> = groups
             .iter()
             .take(groups.len().saturating_sub(1)) // 最后一组不折
@@ -517,5 +525,72 @@ mod tests {
                 assert!(prev.get("tool_calls").is_some(), "折叠破坏了 tool_calls/tool 配对");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod protected_start_tests {
+    use super::*;
+
+    fn user_msg(s: &str) -> Value {
+        json!({ "role": "user", "content": s })
+    }
+    fn tool_msg(s: &str) -> Value {
+        json!({ "role": "tool", "tool_call_id": "t", "name": "shell", "content": s })
+    }
+    fn asst_msg() -> Value {
+        json!({ "role": "assistant", "content": "好的" })
+    }
+
+    /// 2026-10-08 修：工具结果总数 ≤ 保留数时，旧代码的 checked_sub 下溢成 None，
+    /// is_none_or(None)=true 把「最近 N 个永不裁」反转为「全组可裁」——最新工具
+    /// 结果被整组折叠（无占位符，模型侧无声丢失）。
+    #[test]
+    fn few_tool_results_are_never_folded() {
+        let long_result = "r".repeat(5000);
+        let mut messages = vec![json!({ "role": "system", "content": "sys" }), user_msg("开始")];
+        for _ in 0..3 {
+            messages.push(asst_msg());
+            messages.push(tool_msg(&long_result));
+        }
+        messages.push(user_msg("最后问题"));
+        // 保留数 6 ≥ 实际 3 个结果 + 预算极小（本来会触发折叠）
+        let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 6 };
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
+        let tools: Vec<&Value> = out
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        assert_eq!(tools.len(), 3, "3 个工具结果一个都不许被折叠掉: {stats:?}");
+        for t in &tools {
+            let c = t.get("content").and_then(Value::as_str).unwrap_or("");
+            assert_eq!(c.len(), 5000, "最新工具结果必须完整保留（不归档不折叠）");
+        }
+        // 折叠没发生（没有可折的组：含工具结果的组全在保护区内）
+        assert_eq!(stats.folded_messages, 0, "没有组该被折叠: {stats:?}");
+        // 超过预算是预期（保护优先于预算），但消息一条不少
+        assert!(stats.tokens_after > cfg.budget_tokens);
+        assert_eq!(out.len(), messages.len(), "消息一条不动");
+    }
+
+    /// 对照：结果数 > 保留数时，旧行为不变——更早的轮可折，最近 N 个结果所在的组受保护。
+    #[test]
+    fn many_tool_results_keep_recent_rounds() {
+        let long_result = "r".repeat(6000);
+        let mut messages = vec![json!({ "role": "system", "content": "sys" })];
+        for i in 0..8 {
+            messages.push(user_msg(&format!("问题{i}")));
+            messages.push(asst_msg());
+            messages.push(tool_msg(&long_result));
+        }
+        messages.push(user_msg("最后问题"));
+        let cfg = CompactConfig { budget_tokens: 2000, recent_tool_results_kept: 2 };
+        let (out, stats) = compact_messages(&messages, &cfg, 0, false);
+        assert!(stats.folded_messages > 0, "旧轮该折");
+        let tools: Vec<&Value> = out
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        assert_eq!(tools.len(), 2, "最近 2 个工具结果必须留在上下文里");
     }
 }

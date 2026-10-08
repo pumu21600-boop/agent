@@ -134,7 +134,12 @@ impl Memory {
             return;
         }
         let text = serde_json::to_string_pretty(&idx).unwrap_or_default();
-        if let Err(e) = std::fs::write(self.index_path(), text) {
+        // 2026-10-08 修：原子写。裸 fs::write 是「截断→写」，进程在写盘期间被杀
+        // （断电/强杀）会留下空/半截文件；而 load_index 对解析失败
+        // unwrap_or_default() 返回空表，下一次 register_index 就把只有当前项目的
+        // 空表写回——此前登记的全部项目静默抹掉。同文件的 save_agents 早就用
+        // fsx::write_atomic_str，这里补上。
+        if let Err(e) = crate::fsx::write_atomic_str(&self.index_path(), &text) {
             crate::observability::debug(&format!("[memory] 写 index.json 失败: {e}"));
         }
     }
@@ -248,7 +253,17 @@ impl Memory {
     }
 }
 
-/// 敏感打码（单遍扫描，替换后不回扫）：sk- 开头的 key、Bearer 令牌、api_key 字段值。
+/// 敏感打码（单遍扫描，替换后不回扫）：sk- 开头的 key、Bearer 令牌、密钥字段值。
+/// 2026-10-08 修：键名族改大小写不敏感并扩面——原先是 api_key/apikey/API_KEY
+/// 三个字面量精确匹配，api-key/Api-Key/apiKey/Authorization/password/secret/
+/// access_key/常见 token 写法全漏，裸令牌原样落进记忆日志（与模块头「默认
+/// 脱敏」的宣称不符）。sk- 的键字符集补 '.'（含点的 key 原先只掩一半）。
+const SECRET_KEYS: &[&str] = &[
+    "api_key", "apikey", "api-key", "authorization", "password", "passwd", "secret",
+    "access_key", "private_key", "auth_token", "access_token", "refresh_token",
+    "id_token", "client_secret",
+];
+
 pub fn sanitize(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -257,12 +272,26 @@ pub fn sanitize(text: &str) -> String {
         let p: Vec<char> = pat.chars().collect();
         i + p.len() <= n && chars[i..i + p.len()] == p[..]
     };
+    // 大小写不敏感的前缀匹配（键名族用）
+    let starts_ci = |i: usize, pat: &str| -> bool {
+        let p: Vec<char> = pat.chars().collect();
+        i + p.len() <= n
+            && chars[i..i + p.len()]
+                .iter()
+                .zip(p.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+    };
     let mut i = 0usize;
     while i < n {
         // sk-xxxx（≥4 个 key 字符才算，避免误伤普通词）
         if starts(i, "sk-") {
             let mut j = i + 3;
-            while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '-' || chars[j] == '_') {
+            while j < n
+                && (chars[j].is_ascii_alphanumeric()
+                    || chars[j] == '-'
+                    || chars[j] == '_'
+                    || chars[j] == '.')
+            {
                 j += 1;
             }
             if j - (i + 3) >= 4 {
@@ -281,11 +310,11 @@ pub fn sanitize(text: &str) -> String {
             i = j;
             continue;
         }
-        // api_key / apikey / API_KEY 字段：名字与分隔符照抄，值打码
+        // 密钥字段：名字与分隔符照抄，值打码（键名族大小写不敏感）
         let mut handled = false;
-        for pat in ["api_key", "apikey", "API_KEY"] {
-            if starts(i, pat) {
-                out.push_str(pat);
+        for pat in SECRET_KEYS {
+            if starts_ci(i, pat) {
+                out.push_str(&chars[i..i + pat.chars().count()].iter().collect::<String>());
                 let mut j = i + pat.chars().count();
                 while j < n && (chars[j] == ':' || chars[j] == '=' || chars[j] == '"' || chars[j].is_whitespace()) {
                     out.push(chars[j]);
@@ -336,6 +365,29 @@ mod tests {
         // 幂等：再扫一遍不炸不改
         let again = sanitize(&out);
         assert_eq!(again, out);
+    }
+
+    /// 2026-10-08 修：键名族扩面 + 大小写不敏感。原先是三个字面量精确匹配，
+    /// api-key / Api-Key / apiKey / Authorization / password / secret / token
+    /// 等常见写法全漏，裸令牌原样落进记忆日志。
+    #[test]
+    fn sanitize_covers_key_name_variants() {
+        for s in [
+            r#"{"api-key":"abc123XYZ"}"#,
+            r#"{"Api-Key":"abc123XYZ"}"#,
+            r#"{"apiKey":"abc123XYZ"}"#,
+            r#"{"Authorization":"abc123XYZ"}"#,
+            r#"password = "hunter2hunter2""#,
+            r#"{"client_secret": "abc123XYZ"}"#,
+            "access_token: abc123XYZ",
+        ] {
+            let out = sanitize(s);
+            assert!(!out.contains("abc123XYZ") && !out.contains("hunter2hunter2"), "密钥必须打码: {s} → {out}");
+            assert!(out.contains("***"), "应有打码标记: {s} → {out}");
+        }
+        // 普通 prose 不误伤（没有密钥字段名/令牌形态的词照旧）
+        let plain = sanitize("token 数量是 42，今天没配密码");
+        assert!(plain.contains("42"), "普通内容不该被打码: {plain}");
     }
 
     #[test]

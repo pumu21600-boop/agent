@@ -43,11 +43,20 @@ impl CancelFlag {
     }
 
     /// 异步等到取消置位（已置位则立即返回）。供 select! 中断阻塞中的工具执行。
+    ///
+    /// 2026-10-08 修丢唤醒竞态：`notified()` 在**首次被 poll 时**才注册等待者，而
+    /// `notify_waiters()` 不存许可——若另一线程在 `is_set()` 返回 false 之后、future
+    /// 首次 poll 之前置位，这次唤醒永久丢失（flag 已置位但 `cancelled()` 继续睡：
+    /// 审批干等满 120s、阻塞中的工具跑完才响应停止）。标准修法是先 `enable()` 把
+    /// 等待者注册好，再复查 flag。
     pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable(); // 预注册：这之后的 notify_waiters 必定叫得到我
         if self.is_set() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

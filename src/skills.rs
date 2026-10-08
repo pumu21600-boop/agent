@@ -323,20 +323,50 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     // 用户 2026-10-02（第四轮实锤）：技能落**agent 应用目录** skills/（app_root，
     // 与 plugins/prompts 同级；「不是整个电脑的」）。项目级旧副本写完全局后顺手搬走
     // ——否则 list() 的项目级覆盖规则会让它继续顶着全局版，chip 还显示项目级。
+    // 2026-10-08 修：搬是**整体并入**（连 references/scripts 资产一起），不是
+    // remove_dir_all 一把删——旧代码编辑一个项目级技能的描述就会静默毁掉它的
+    // 参考资料与脚本资产（delete() 对符号链接目录都有防护，这条删除路径原先没有）。
     let dir = global_skills_root().join(name);
     fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
     crate::fsx::write_atomic_str(&dir.join("SKILL.md"), &full).map_err(|e| format!("写入失败: {e}"))?;
-    let stale = crate::tools::workspace_root().join("skills").join(name);
     // 守卫：工作区根与应用根同目录时（开发形态跑在工作区上）stale==dir，别把刚写的删了
+    let stale = crate::tools::workspace_root().join("skills").join(name);
     if stale != dir && stale.is_dir() {
-        let _ = fs::remove_dir_all(&stale);
+        migrate_skill_dir(&stale, &dir);
     }
-    // 旧「全局」根（~/.agent/skills）遗留同名副本也清掉（换根后别留双份）
+    // 旧「全局」根（~/.agent/skills）遗留同名副本也并进来（换根后别留双份，
+    // 资产同样要保住）
     let legacy = crate::memory::global_dir().join("skills").join(name);
     if legacy != dir && legacy.is_dir() {
-        let _ = fs::remove_dir_all(&legacy);
+        migrate_skill_dir(&legacy, &dir);
     }
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// 把旧技能目录内容整体并入目标目录：SKILL.md 以目标里的新版为准（不覆盖），
+/// references/scripts/其余文件全部搬过去（子目录递归）。跨卷 rename 失败退复制+删源。
+fn migrate_skill_dir(from: &std::path::Path, to: &std::path::Path) {
+    let Ok(rd) = fs::read_dir(from) else { return };
+    for e in rd.flatten() {
+        let src = e.path();
+        let file_name = e.file_name();
+        let dst = to.join(&file_name);
+        if file_name == "SKILL.md" {
+            // 新的全局版刚写好，旧副本不覆盖它
+            let _ = fs::remove_file(&src);
+            continue;
+        }
+        if src.is_dir() {
+            let _ = fs::create_dir_all(&dst);
+            migrate_skill_dir(&src, &dst);
+        } else if fs::rename(&src, &dst).is_err() {
+            // 跨卷/目标被占：复制后删源（copy 覆盖已存在的目标）
+            if fs::copy(&src, &dst).is_ok() {
+                let _ = fs::remove_file(&src);
+            }
+        }
+    }
+    let _ = fs::remove_dir(from); // 内容搬空后收掉空壳
 }
 
 /// 内容自带 frontmatter 时，把其中的 description 行同步为传入值（缺行则补在 name 行后）。

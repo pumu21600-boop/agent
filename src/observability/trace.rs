@@ -110,14 +110,16 @@ where
                 && payload.get("step").and_then(Value::as_u64) == Some(0)
                 && cur.is_none();
             // 任务收尾（旧日志兜底用）：loop.finish / cancel 后关闭任务，
-            // 让下一个 step0 tool_call 正确开新任务
-            let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel");
-            // 降级任务的收尾：真机日志里 loop.finish 压根不存在（实测 0 条），只靠
-            // session.saved。它每轮至少两条（任务起点一次、回复落地一次），所以
-            // 「本任务已经干过活（有 tool_result）之后来的那条」才是这一轮的结束——
-            // 起点那条在 tool_call 之前，不会误闭合。
-            let is_partial_end = kind == "session.saved"
-                && cur.as_ref().is_some_and(|t| t.lost_start && t.events.iter().any(|e| e.etype == "tool_result"));
+            // 让下一个 step0 tool_call 正确开新任务。
+            // 2026-10-08 修：多会话并发时（单进程共用一份 agent.jsonl）B 的
+            // loop.finish/cancel 会把 A 尚未收尾的开放任务当场闭合，A 后续的 tool
+            // 事件只能按「孤儿活动」开降级碎片、或被 allowed 过滤整条丢掉。收尾事件
+            // 带 session 时按归属核对（两边都有 session 且不一致 → 不是我的收尾）；
+            // 缺字段（旧日志）保持宽容，照旧闭合。
+            let end_session = payload.get("session").and_then(Value::as_str).unwrap_or("");
+            let end_mine = end_session.is_empty()
+                || cur.as_ref().is_none_or(|t| t.session.is_empty() || t.session == end_session);
+            let is_task_end = etype == "state" && (kind == "loop.finish" || kind == "cancel") && end_mine;
             // 任务归属（时间线按工作区过滤用）：task.start 新带的 session 优先，
             // 旧日志回落任务内第一条 session.saved 的 session（实测 46 个任务里 45 个可归属）
             let ev_session = payload
@@ -126,6 +128,15 @@ where
                 .filter(|_| is_task_start || kind == "session.saved")
                 .unwrap_or("")
                 .to_string();
+            // 降级任务的收尾：真机日志里 loop.finish 压根不存在（实测 0 条），只靠
+            // session.saved。它每轮至少两条（任务起点一次、回复落地一次），所以
+            // 「本任务已经干过活（有 tool_result）之后来的那条」才是这一轮的结束——
+            // 起点那条在 tool_call 之前，不会误闭合。同样按 session 归属核对：
+            // 多会话并发时 B 的 session.saved 不该闭合 A 的降级任务。
+            let is_partial_end = kind == "session.saved"
+                && cur.as_ref().is_some_and(|t| t.lost_start && t.events.iter().any(|e| e.etype == "tool_result"))
+                && (ev_session.is_empty()
+                    || cur.as_ref().is_none_or(|t| t.session.is_empty() || t.session == ev_session));
             // 边界 3（轮转兜底）：当前没有任务，却出现了**只有任务里才会有**的活动事件。
             // task.start 被日志轮转吃掉（keep_archives=3、单归档 ~100MB）是真机常态：
             // 长任务的起点落在更早的归档里被删，后续 tool_call 还留在仅存的几份中。
