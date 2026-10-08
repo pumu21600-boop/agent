@@ -409,6 +409,29 @@ mod tests {
         assert!(c2.contains("close_browser 重开浏览器实例再试一次"), "{c2}");
     }
 
+    /// HTTP 错误页（4xx/5xx）与网络不通必须分开说：API 端点被浏览器 GET 打出 404 是常态，
+    /// 旧文案一律「站点连不上」还附代理诊断，把用户往「坏了」上误导（2026-10-08 实锤：
+    /// 面板手动开 api.stepfun.com/step_plan/ 得 404，被当成网络故障）。
+    #[test]
+    fn http_error_page_is_not_a_network_failure() {
+        // 状态码提取：中英混排正文里只认 "HTTP ERROR NNN"
+        assert_eq!(
+            parse_http_error_code("找不到以下 Web 地址的网页：https://api.stepfun.com/step_plan/ HTTP ERROR 404"),
+            Some(404)
+        );
+        assert_eq!(parse_http_error_code("HTTP ERROR 502"), Some(502));
+        assert_eq!(parse_http_error_code("chrome-error://chromewebdata/"), None);
+        assert_eq!(parse_http_error_code("HTTP ERROR abc"), None);
+        assert_eq!(parse_http_error_code("HTTP ERROR 999"), None, "超范围状态码不采信");
+        // 文案：站点可达、点名状态码、仍禁止重试，且不得残留网络/代理诊断
+        let t = http_error_text(404);
+        assert!(t.contains("站点可达"), "{t}");
+        assert!(t.contains("HTTP 404"), "{t}");
+        assert!(t.contains("不要再重试导航"), "{t}");
+        assert!(!t.contains("站点连不上"), "不得把 404 说成连不上：{t}");
+        assert!(!t.contains("代理"), "站点可达时不该附代理诊断：{t}");
+    }
+
     /// 进程内 CDP mock：按方法回固定响应（evaluate_ok=false 时 Runtime.evaluate 回
     /// CDP 错误，触发客户端清缓存重试 + 回退导航历史——覆盖两条取源路径）。
     async fn spawn_mock_cdp(evaluate_ok: bool) -> String {

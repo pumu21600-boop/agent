@@ -831,14 +831,62 @@ pub(crate) fn timeout_error_text(e: &str, diag: &ProxyDiagnosis) -> String {
     )
 }
 
-/// 落点检查：导航结束后页面停在 chrome-error = 站点连不上（连接超时/被拒/被墙）。
-/// 返回给模型的人话（别再重试 + 代理诊断）；不在错误页返回 None。
+/// 落点检查：导航结束后页面停在 chrome-error = 访问失败。
+/// 先分「HTTP 错误页（站点可达，4xx/5xx）」与「网络不通（超时/被拒/被墙）」两种再给人话
+/// （别再重试 + 对应诊断）；不在错误页返回 None。
 pub(crate) async fn chrome_error_note(tab: &WebTab) -> Option<String> {
     let url = current_page_url(tab).await?;
     if !url.starts_with("chrome-error://") {
         return None;
     }
-    Some(chrome_error_message(&url))
+    Some(chrome_error_detail(tab).await)
+}
+
+/// chrome-error 落地后的完整人话：HTTP 错误页走「站点可达」口径，其余才是网络不通。
+/// 求值读不到状态码（弹窗/页面楔死）时按网络不通处理，与旧行为一致。
+async fn chrome_error_detail(tab: &WebTab) -> String {
+    if let Some(code) = http_error_code(tab).await {
+        return http_error_text(code);
+    }
+    chrome_error_message("chrome-error://chromewebdata/")
+}
+
+/// 读错误页正文里的 HTTP 状态码（Chromium 的 4xx/5xx 错误页正文含 "HTTP ERROR 404"，
+/// 中文本地化也只翻前半句）。读不到/不是 HTTP 错误返回 None——按网络不通处理。
+async fn http_error_code(tab: &WebTab) -> Option<u16> {
+    let v = tab
+        .cdp
+        .evaluate_in_isolated_world(
+            ISOLATED_WORLD,
+            "document.body ? (document.body.innerText || '') : ''",
+        )
+        .await
+        .ok()?;
+    parse_http_error_code(v.as_str()?)
+}
+
+/// 纯函数：从错误页正文提取三位状态码（可单测）。
+pub(crate) fn parse_http_error_code(text: &str) -> Option<u16> {
+    const MARK: &str = "HTTP ERROR ";
+    let idx = text.find(MARK)?;
+    let digits: String = text[idx + MARK.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .parse()
+        .ok()
+        .filter(|code| (100..=599).contains(code))
+}
+
+/// HTTP 错误页的人话：站点可达，别再往「网络不通/代理」上诊断，也别重试——
+/// 把真实状态码告诉用户，让用户决定换地址还是换方式。
+pub(crate) fn http_error_text(code: u16) -> String {
+    format!(
+        "访问失败：站点可达，但该地址返回了 HTTP {code} 错误页——页面不存在或不允许直接打开。\
+         常见情形：API 端点只认 POST，用浏览器直接 GET 就会 404，这不是故障。\
+         不要再重试导航；把真实状态码 {code} 告诉用户，按用户意图换地址或换方式（如 web_fetch）。"
+    )
 }
 
 /// 失败路径专用：CDP 超时那一刻 Chromium 往往还在连接（错误页要再等约 10s 才落地），
@@ -849,7 +897,7 @@ pub(crate) async fn chrome_error_note_wait(tab: &WebTab, max_ms: u64) -> Option<
         if let Some(url) = current_page_url(tab).await
             && url.starts_with("chrome-error://")
         {
-            return Some(chrome_error_message(&url));
+            return Some(chrome_error_detail(tab).await);
         }
         if std::time::Instant::now() >= deadline {
             return None;
