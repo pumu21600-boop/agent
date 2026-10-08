@@ -284,6 +284,9 @@ impl MediaAttachment {
         else if n.ends_with(".png") { "image/png".into() }
         else if n.ends_with(".jpg") || n.ends_with(".jpeg") { "image/jpeg".into() }
         else if n.ends_with(".webp") { "image/webp".into() }
+        else if n.ends_with(".gif") { "image/gif".into() }
+        else if n.ends_with(".bmp") { "image/bmp".into() }
+        else if n.ends_with(".svg") { "image/svg+xml".into() }
         else { "application/octet-stream".into() }
     }
 }
