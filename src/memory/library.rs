@@ -335,6 +335,13 @@ pub struct Hit {
     pub lexical: f32,
     /// 命中上下文（digest 里 query 附近的窗口）
     pub snippet: String,
+    // —— 身份字段：光点过滤只要 id，agent 检索要能说清「哪条对话、什么时候、哪个工作区」——
+    pub title: String,
+    pub workspace: String,
+    pub project: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub count: usize,
 }
 
 /// 语料级 idf（df = 含该词元的文档数）。
@@ -447,6 +454,29 @@ pub fn similar(lib: &Library, id: &str, top_k: usize, min_score: f32) -> Vec<Hit
     hits
 }
 
+/// 最近会话（无查询时浏览「以前的记忆」用）：按 updated_at 倒序取前 limit 条。
+/// score 恒为 0——这里没有相关性可言，别让调用方把 0 读成「不匹配」。
+pub fn recent(lib: &Library, limit: usize) -> Vec<Hit> {
+    let mut es: Vec<&Entry> = lib.entries.iter().collect();
+    es.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    es.into_iter()
+        .take(limit.max(1))
+        .map(|e| Hit {
+            id: e.id.clone(),
+            score: 0.0,
+            vector: 0.0,
+            lexical: 0.0,
+            snippet: e.snippet.clone(),
+            title: e.title.clone(),
+            workspace: e.workspace.clone(),
+            project: e.project.clone(),
+            created_at: e.created_at.clone(),
+            updated_at: e.updated_at.clone(),
+            count: e.count,
+        })
+        .collect()
+}
+
 /// 排序内核：`vector_weight` = 向量分权重（0=纯词法；本地哈希向量对短查询无意义）。
 fn rank(lib: &Library, qvec: &[f32], query: &str, top_k: usize, min_score: f32, vector_weight: f32) -> Vec<Hit> {
     let qt = tokens(query);
@@ -485,6 +515,12 @@ fn rank(lib: &Library, qvec: &[f32], query: &str, top_k: usize, min_score: f32, 
                 vector: vec,
                 lexical: lex,
                 snippet: best_window(&e.digest, query),
+                title: e.title.clone(),
+                workspace: e.workspace.clone(),
+                project: e.project.clone(),
+                created_at: e.created_at.clone(),
+                updated_at: e.updated_at.clone(),
+                count: e.count,
             });
         }
     }
@@ -841,6 +877,26 @@ mod tests {
         assert!(!sim.is_empty(), "应能找到相似会话");
         assert_eq!(sim[0].id, d, "最相似的应是同主题会话: {:?}", sim.iter().map(|h| (&h.id, h.score)).collect::<Vec<_>>());
         assert!((sim[0].score - 1.0).abs() < 1e-3, "最高分归一化到 1");
+
+        // 命中带身份字段：agent 侧要能说清「哪条对话、什么时候、哪个工作区」，
+        // 只有 id 和片段是不够的（曾因此只能回 session id，用户问是哪条就卡住）
+        let hits = search(&lib, &local_vec("JWT 登录"), "JWT 登录", 5, 0.1);
+        let top = &hits[0];
+        assert!(!top.title.is_empty() && !top.workspace.is_empty(), "身份字段必须带全: {top:?}");
+        let ws_tail = std::path::Path::new(&top.workspace)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        assert_eq!(top.project, ws_tail, "project 取工作区目录名");
+        assert!(top.count >= 1, "轮数来自消息条数");
+
+        // recent：按 updated_at 倒序，score 恒 0（没有相关性，别让调用方误读）
+        let rec = recent(&lib, 2);
+        assert_eq!(rec.len(), 2);
+        assert!(rec.iter().all(|h| h.score == 0.0), "recent 不产分数: {:?}", rec.iter().map(|h| h.score).collect::<Vec<_>>());
+        assert!(rec[0].updated_at >= rec[1].updated_at, "应按时间倒序");
+        assert_eq!(rec[0].id, d, "最后动过的会话排最前");
+        assert!(rec.iter().all(|h| !h.title.is_empty()), "recent 也要带身份字段");
 
         std::fs::remove_dir_all(&dir).ok();
     }

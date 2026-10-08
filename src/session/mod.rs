@@ -175,6 +175,62 @@ fn fmt_ts(iso: &str) -> String {
         .unwrap_or_else(|_| iso.to_string())
 }
 
+/// 会话正文抽取（面板转写端点与 memory 工具读原文同一条路，常量不各抄一份）：
+/// 只取 user/assistant 的文本，单条封顶 `max_msg` 字符；总量超 `max_total` 预算时
+/// 从**最早**的消息开始丢（保尾部——最近的往来信息量最大）。
+/// 返回 (保留的消息, 是否真的因预算丢过内容)。
+///
+/// `omitted` 只认预算截断：会话里的 tool 消息与空消息本就不进转写，拿
+/// 「保留数 < 总会话数」判定会让一条没丢内容的会话也报「只保留了最近部分」
+/// （前端 @引用 与 memory 工具的提示都信它，等于对用户说假话）。
+pub fn transcript(f: &SessionFile, max_total: usize, max_msg: usize) -> (Vec<(String, String)>, bool) {
+    let mut msgs: Vec<(String, String)> = Vec::new();
+    for m in &f.messages {
+        let Some(role) = m.get("role").and_then(Value::as_str) else { continue };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let text = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| {
+                    if p.get("type").and_then(Value::as_str) == Some("text") {
+                        p.get("text").and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut text = text.to_string();
+        if text.chars().count() > max_msg {
+            text = format!("{}…", text.chars().take(max_msg).collect::<String>());
+        }
+        msgs.push((role.to_string(), text));
+    }
+    let mut used = 0usize;
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut truncated = false;
+    for (role, text) in msgs.into_iter().rev() {
+        let cost = text.chars().count() + 8;
+        if used + cost > max_total {
+            truncated = true;
+            break;
+        }
+        used += cost;
+        kept.push((role, text));
+    }
+    kept.reverse();
+    (kept, truncated)
+}
+
 impl SessionManager {
     /// dir 为日志目录，会话文件落 `<dir>/sessions/`。
     pub fn new(log_dir: &Path) -> Self {
@@ -907,5 +963,37 @@ mod concurrency_tests {
         assert_eq!(f.messages[1]["content"], "a79", "应留下最后一轮 save 的内容");
         // 最后一轮 set_flags 是 n=79（奇数 → false）
         assert!(!f.pinned, "pinned 应是最后一轮 set_flags 写的值");
+    }
+
+    /// omitted 只认预算截断：tool 消息与空消息本就不进转写，不能因此报「已省略」。
+    /// 旧实现拿「保留数 < 总会话数」判定，前端 @引用 与 memory 工具都会对用户说
+    /// 「只保留了最近部分」——一条啥都没丢的会话被说成截断过。
+    #[test]
+    fn transcript_omitted_only_when_budget_truncates() {
+        let f = SessionFile {
+            id: "t1".into(),
+            title: "带工具调用的会话".into(),
+            created_at: "2026-10-01T00:00:00Z".into(),
+            updated_at: "2026-10-01T00:00:00Z".into(),
+            messages: vec![
+                json!({"role":"user","content":"帮我查一下"}),
+                json!({"role":"assistant","content":"","tool_calls":[{"id":"c1"}]}),
+                json!({"role":"tool","content":"工具返回一大段……"}),
+                json!({"role":"assistant","content":"查完了"}),
+            ],
+            summary: None,
+            workspace: String::new(),
+            pinned: false,
+            archived: false,
+            usage: None,
+        };
+        // 4 条消息里只有 2 条进转写，但一条都没丢 → 不该报 omitted
+        let (kept, omitted) = transcript(&f, 16_000, 2_500);
+        assert_eq!(kept.len(), 2, "只取 user/assistant 的非空正文");
+        assert!(!omitted, "没丢内容却报了省略: kept={:?}", kept);
+        // 预算极小 → 真的丢 → 报 omitted
+        let (kept2, omitted2) = transcript(&f, 12, 2_500);
+        assert!(omitted2, "预算装不下必须报省略");
+        assert!(kept2.len() < kept.len() || kept2.iter().map(|(_, t)| t.len()).sum::<usize>() <= 12);
     }
 }

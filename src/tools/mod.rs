@@ -16,6 +16,7 @@ use crate::config::SandboxConfig;
 
 mod fs;
 mod git;
+mod memory;
 mod plugin;
 mod search;
 mod session;
@@ -356,6 +357,22 @@ fn builtin_tools() -> Vec<ToolSpec> {
             }),
             danger_level: 0,
         },
+        ToolSpec {
+            name: "memory",
+            description: "记忆库检索正门：查以前聊过什么、做过什么、说过什么。用户说「你记得吗」「上次」「之前是不是」「检索一下记忆」「看看你记得什么」，或任务需要历史上下文（上次的方案/结论/约定/踩过的坑）时先用它，别去翻 logs/ 目录、别解析 library.json、别读应用源码考古。action=search 配 query（关键词或自然语言；语义+关键词混合，跨全部工作区）：按相关度返回会话标题/工作区/时间/轮数/命中片段/id。action=recent 配 limit（默认 10）与可选 workspace（按项目名或路径片段过滤）：按时间倒序列最近会话。action=similar 配 id：找与某条会话相近的其它会话。action=read 配 id：读某条会话的对话原文（要真答「上次聊到哪」就用它）。全都只读；「记忆库」插件关着会被拒并指路 设置→插件。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["search", "recent", "similar", "read"], "description": "search 配 query；recent 可配 limit/workspace；similar/read 配 id" },
+                    "query": { "type": "string", "description": "search：关键词或自然语言描述（如「插件删除」「上次定的接口风格」）" },
+                    "workspace": { "type": "string", "description": "可选：只搜某个项目（项目名或工作区路径片段，大小写不敏感）" },
+                    "limit": { "type": "integer", "description": "recent：返回条数（默认 10，上限 50）" },
+                    "id": { "type": "string", "description": "similar/read：会话 id（从 search/recent 结果里拿，别自己编）" }
+                },
+                "required": ["action"]
+            }),
+            danger_level: 0,
+        },
     ]
 }
 
@@ -435,6 +452,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "skill" => skill::run(args).await,
         // 2026-10-03：会话管理（new/open/rename/fork/delete/pin/archive，事件驱动前端）
         "session" => session::run(args).await,
+        // 2026-10-08：记忆库检索（search/recent/similar/read，全部只读）
+        "memory" => memory::run(args).await,
         other => Err(format!("未知工具: {other}")),
     }
 }

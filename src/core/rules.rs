@@ -66,6 +66,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "session",
     // 2026-10-04 放开权限轮：第三方插件信任（先审后装；分级见 evaluate_risk 的 plugin 臂）
     "plugin",
+    // 2026-10-08 记忆库检索（search/recent/similar/read 全只读；分级见 evaluate_risk 的 memory 臂）
+    "memory",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -283,6 +285,16 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             "install" => (RiskLevel::Normal, "安装插件（落位即加载）".into()),
             "remove" => (RiskLevel::Dangerous, "删除插件（连目录带文件，不可恢复）".into()),
             _ => (RiskLevel::Dangerous, "plugin 工具缺少合法 action（install/remove）".into()),
+        },
+
+        // 2026-10-08 记忆库检索：search/recent/similar/read 全是只读（索引同步与
+        // 向量计算在数据面做，不动任何用户文件），恒定 Safe。缺 action/未知 action
+        // 按高危兜底，与 skill/session 同一套路。
+        "memory" => match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
+            "search" | "recent" | "similar" | "read" => {
+                (RiskLevel::Safe, "检索历史记忆（只读）".into())
+            }
+            _ => (RiskLevel::Dangerous, "memory 工具缺少合法 action（search/recent/similar/read）".into()),
         },
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）

@@ -36,58 +36,13 @@ pub(super) async fn session_transcript(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
-    const MAX_TOTAL: usize = 16_000;
-    const MAX_MSG: usize = 2_500;
     let Some(id) = q.get("id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
     };
     let Some(f) = state.session.get(&id) else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "会话不存在" })));
     };
-    let mut msgs: Vec<(String, String)> = Vec::new();
-    for m in &f.messages {
-        let Some(role) = m.get("role").and_then(Value::as_str) else { continue };
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let text = match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| {
-                    if p.get("type").and_then(Value::as_str) == Some("text") {
-                        p.get("text").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => continue,
-        };
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        let mut text = text.to_string();
-        if text.chars().count() > MAX_MSG {
-            text = format!("{}…", text.chars().take(MAX_MSG).collect::<String>());
-        }
-        msgs.push((role.to_string(), text));
-    }
-    // 预算：从尾部往前收，装不下的早期消息丢弃
-    let mut used = 0usize;
-    let mut kept: Vec<(String, String)> = Vec::new();
-    for (role, text) in msgs.into_iter().rev() {
-        let cost = text.chars().count() + 8;
-        if used + cost > MAX_TOTAL {
-            break;
-        }
-        used += cost;
-        kept.push((role, text));
-    }
-    kept.reverse();
-    let omitted = kept.len() < f.messages.len();
+    let (kept, omitted) = crate::session::transcript(&f, 16_000, 2_500);
     (
         StatusCode::OK,
         Json(json!({

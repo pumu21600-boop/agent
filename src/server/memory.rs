@@ -153,6 +153,88 @@ pub(crate) async fn build_library(state: &AppState, force: bool) -> Value {
     })
 }
 
+/// 有界增量同步（面板 GET /library 与 memory 工具同一条路）：指纹未变的条目不重算、
+/// 不调嵌入渠道，新条目最多补 MAX_EMBED_PER_SYNC 条向量，其余留给下次。
+/// `force` = 忽略指纹全量重算（reindex 用）。
+pub(crate) async fn sync_index(state: &AppState, force: bool) -> crate::memory::library::SyncReport {
+    use crate::memory::library as lb;
+    let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let embedder = resolve_embedder(state, &settings);
+    lb::sync(&state.session, &state.log_dir, embedder, force).await
+}
+
+/// memory 工具的检索数据面：先有界同步（索引不新鲜就搜不到最近几条会话），再混合检索。
+/// `notice` 说明本次为何降级（嵌入渠道不可用 → 纯关键词），工具层原样转述给模型。
+pub(crate) async fn search_hits(
+    state: &AppState,
+    query: &str,
+    top_k: usize,
+) -> (Vec<crate::memory::library::Hit>, Value) {
+    use crate::memory::library as lb;
+    let _ = sync_index(state, false).await;
+    let lib = lb::load(&state.log_dir);
+    let top_k = top_k.clamp(1, 50);
+    let min_score = 0.18;
+    // 查询向量必须与索引同口径：本地索引直接本地算；外部索引调嵌入席位，
+    // 失败/未配置则退化为纯词法（qvec 为空，search 内部自动降级）。
+    let mut notice: Option<String> = None;
+    let qvec = if lib.model.is_empty() || lib.model == lb::LOCAL_MODEL {
+        lb::local_vec(query)
+    } else {
+        let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+        match resolve_embedder(state, &settings) {
+            Some(emb) => match emb
+                .gw
+                .embed(&emb.base_url, &emb.model, &emb.api_key, &[query.to_string()])
+                .await
+            {
+                Ok(vs) if !vs.is_empty() => lb::norm_vec(&vs[0]),
+                Ok(_) => {
+                    notice = Some("嵌入渠道未返回向量，本次只用关键词匹配".into());
+                    Vec::new()
+                }
+                Err(e) => {
+                    notice = Some(format!("嵌入渠道不可用（{e}），本次只用关键词匹配"));
+                    Vec::new()
+                }
+            },
+            None => {
+                notice = Some("嵌入席位未配置或 key 缺失，本次只用关键词匹配".into());
+                Vec::new()
+            }
+        }
+    };
+    let hits = lb::search(&lib, &qvec, query, top_k, min_score);
+    let mode = if qvec.is_empty() {
+        "lexical"
+    } else if lib.model == lb::LOCAL_MODEL {
+        "local"
+    } else {
+        "external"
+    };
+    let meta = json!({
+        "total": lib.entries.len(),
+        "mode": mode,
+        "model": lib.model,
+        "notice": notice,
+    });
+    (hits, meta)
+}
+
+/// 「相似会话」：以某条会话自己的向量当查询（不调外部渠道）。
+pub(crate) fn similar_hits(state: &AppState, id: &str, top_k: usize) -> Vec<crate::memory::library::Hit> {
+    use crate::memory::library as lb;
+    let lib = lb::load(&state.log_dir);
+    lb::similar(&lib, id, top_k.clamp(1, 50), 0.3)
+}
+
+/// 最近会话（无查询时浏览用）。
+pub(crate) fn recent_hits(state: &AppState, limit: usize) -> Vec<crate::memory::library::Hit> {
+    use crate::memory::library as lb;
+    let lib = lb::load(&state.log_dir);
+    lb::recent(&lib, limit.clamp(1, 50))
+}
+
 /// GET /api/memory/library —— 记忆库光点数据（每次调用做一次有界增量同步）。
 pub(super) async fn get_memory_library(State(state): State<AppState>) -> Json<Value> {
     Json(build_library(&state, false).await)
