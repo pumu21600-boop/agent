@@ -520,6 +520,27 @@ mod tests {
         assert!(read(name).is_err(), "删除后不应再读到");
     }
 
+    /// 2026-10-08 修：save() 迁移项目级旧副本时保住 references/scripts 资产，
+    /// 且 SKILL.md 以全局新版为准（旧代码 remove_dir_all 一把删，资产静默毁掉）。
+    #[test]
+    fn migrate_skill_dir_keeps_assets_and_prefers_new_skill_md() {
+        let from = std::env::temp_dir().join(format!("agent-skill-from-{}", std::process::id()));
+        let to = std::env::temp_dir().join(format!("agent-skill-to-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+        std::fs::create_dir_all(from.join("references")).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join("SKILL.md"), "旧版").unwrap();
+        std::fs::write(from.join("references/guide.md"), "指南").unwrap();
+        std::fs::write(to.join("SKILL.md"), "新版").unwrap();
+        migrate_skill_dir(&from, &to);
+        assert_eq!(std::fs::read_to_string(to.join("SKILL.md")).unwrap(), "新版", "新 SKILL.md 不被旧版覆盖");
+        assert_eq!(std::fs::read_to_string(to.join("references/guide.md")).unwrap(), "指南", "资产必须搬过去");
+        assert!(!from.exists(), "源目录搬空后应清掉空壳");
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&to);
+    }
+
     #[test]
     fn invalid_name_rejected() {
         assert!(valid_name("../evil").is_err());
