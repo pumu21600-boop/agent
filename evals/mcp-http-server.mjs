@@ -14,9 +14,28 @@ import http from 'node:http';
 
 const argv = process.argv.slice(2);
 const useSse = argv.includes('--sse');
-const portArg = argv.indexOf('--port');
-const PORT = portArg >= 0 ? Number(argv[portArg + 1]) : 9401;
+// 2026-10-08 修：--port 取值零校验——漏取值/非数字会 listen 在 NaN 上（日志还照印
+// listening on :NaN），等号写法 --port=9402 也不被识别（indexOf 匹配不到）静默回落 9401。
+function parsePort() {
+  const eq = argv.find((a) => a.startsWith('--port='));
+  if (eq) return Number(eq.slice('--port='.length));
+  const i = argv.indexOf('--port');
+  if (i < 0) return 9401;
+  if (i + 1 >= argv.length) {
+    console.error('[mini-mcp] --port 漏了取值（示例：--port 9402）');
+    process.exit(2);
+  }
+  const n = Number(argv[i + 1]);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    console.error(`[mini-mcp] --port 取值非法: ${argv[i + 1]}（要 1-65535 的整数）`);
+    process.exit(2);
+  }
+  return n;
+}
+const PORT = parsePort();
 const SESSION_ID = 'mini-http-' + Math.random().toString(36).slice(2, 8);
+// 请求体上限（本地冒烟 server 也不做无界累加——一个 POST 把内存吃满太容易）
+const MAX_BODY = 1024 * 1024;
 
 const TOOLS = [
   {
@@ -95,9 +114,32 @@ const server = http.createServer((req, res) => {
     res.end('use POST /mcp');
     return;
   }
+  // 2026-10-08 修：请求体无上限 + 传输中途出错无错误臂——前者能把内存累满，
+  // 后者让请求永远悬挂（无响应也无日志，只能看着客户端干等）。
   let body = '';
-  req.on('data', (c) => (body += c));
+  let tooBig = false;
+  req.on('error', (e) => {
+    console.error(`[mini-mcp] 请求流传输出错: ${e.message}`);
+    try {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: -32700, message: 'request stream error' } }));
+    } catch {
+      /* 响应可能已开始写，忽略 */
+    }
+  });
+  req.on('data', (c) => {
+    body += c;
+    if (body.length > MAX_BODY) {
+      tooBig = true;
+      req.destroy();
+    }
+  });
   req.on('end', () => {
+    if (tooBig) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: -32600, message: `body too large (>${MAX_BODY})` } }));
+      return;
+    }
     let msg;
     try {
       msg = JSON.parse(body);

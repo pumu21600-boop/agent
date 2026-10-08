@@ -13,8 +13,11 @@
 
 mod eval_core;
 
-use eval_core::{load_tasks, run_assertion, snapshot, drive_chat, drive_turn, TaskReport};
+use eval_core::{load_tasks, run_assertion, snapshot, drive_chat, drive_turn, sanitize_setup_rel, TaskReport};
 use std::path::PathBuf;
+
+/// setup_files 相对路径消毒在 eval_core（sanitize_setup_rel）——与断言引擎同侧，
+/// 单测直接覆盖。
 
 #[tokio::main]
 async fn main() {
@@ -70,21 +73,39 @@ async fn main() {
         println!("[eval] ▶ 任务 {}（{} 条断言）", task.name, task.assertions.len());
 
         // 1) 独立临时工作区 + setup_files
+        // 2026-10-08：路径带 pid——同毫秒并发（CI 重跑/两个终端）会互删工作区，
+        // 两边结果都不可信（eval_core 的测试代码早就带了 process::id() 防竞态）。
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let ws: PathBuf = std::env::temp_dir().join(format!("agent_eval_ws_{}_{}", task.name, stamp));
+        let ws: PathBuf = std::env::temp_dir()
+            .join(format!("agent_eval_ws_{}_{}_{}", task.name, stamp, std::process::id()));
         if let Err(e) = std::fs::create_dir_all(&ws) {
             reports.push(TaskReport {
-                name: task.name.clone(), passed: 0, failed: task.assertions.len(),
+                name: task.name.clone(), passed: 0, failed: 0,
                 duration_ms: t0.elapsed().as_millis() as u64,
                 drive_error: Some(format!("建临时工作区失败: {e}")),
             });
             continue;
         }
+        let mut skip_ws = false;
         for (rel, content) in &task.setup_files {
-            let full = ws.join(rel);
+            // 2026-10-08：setup 路径消毒——PathBuf::join 遇绝对路径会整体替换基路径，
+            // 任务 JSON 里一个笔误（"C:\temp\x" / "../.."）就把种子文件写到临时工作区
+            // 之外的真实位置，且不报错，随后断言对临时目录判一串假红。
+            let full = match sanitize_setup_rel(rel) {
+                Some(p) => p,
+                None => {
+                    reports.push(TaskReport {
+                        name: task.name.clone(), passed: 0, failed: 0,
+                        duration_ms: t0.elapsed().as_millis() as u64,
+                        drive_error: Some(format!("setup_files 路径非法（拒绝写出工作区）: {rel}")),
+                    });
+                    skip_ws = true;
+                    break;
+                }
+            };
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -92,21 +113,42 @@ async fn main() {
                 eprintln!("[eval] 写 setup 文件 {rel} 失败: {e}");
             }
         }
+        if skip_ws {
+            let _ = std::fs::remove_dir_all(&ws);
+            continue;
+        }
         let files_before = snapshot(&ws);
 
         // 2) 切换服务工作区
+        // 2026-10-08 修：只判传输错误不够——HTTP 400/500（目录在服务端不可见、
+        // settings 保存失败）时也曾继续跑，把 agent 驱动到服务端当前工作区（用户
+        // 真实项目）里去建文件，断言仍对着临时工作区判：既污染真实项目又全盘假红。
         let switch = client
             .post(format!("{base}/api/workspace"))
             .json(&serde_json::json!({ "path": ws.to_string_lossy() }))
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await;
+        let switch = match switch {
+            Err(e) => Err(format!("切换工作区失败: {e}")),
+            Ok(r) if !r.status().is_success() => {
+                let code = r.status();
+                let body = r.text().await.unwrap_or_default();
+                Err(format!("切换工作区失败: HTTP {code} {body}"))
+            }
+            Ok(r) => match r.json::<serde_json::Value>().await {
+                Ok(v) if v.get("ok").and_then(|k| k.as_bool()) == Some(true) => Ok(()),
+                Ok(v) => Err(format!("切换工作区失败: 服务端未确认 {v}")),
+                Err(e) => Err(format!("切换工作区失败: 响应解析失败 {e}")),
+            },
+        };
         if let Err(e) = switch {
             reports.push(TaskReport {
-                name: task.name.clone(), passed: 0, failed: task.assertions.len(),
+                name: task.name.clone(), passed: 0, failed: 0,
                 duration_ms: t0.elapsed().as_millis() as u64,
-                drive_error: Some(format!("切换工作区失败: {e}")),
+                drive_error: Some(e),
             });
+            let _ = std::fs::remove_dir_all(&ws);
             continue;
         }
 
@@ -140,7 +182,12 @@ async fn main() {
                     a.sse_events.extend(b.sse_events);
                     a.done = b.done;
                     a.timed_out = first_timed_out || b.timed_out;
-                    a.error = b.error;
+                    // 2026-10-08 修：第二轮正常结束时曾无条件覆盖 error——第一轮
+                    // 中途服务端下发的错误（渠道 401 等）被完全掩盖，断言全过就报 PASS。
+                    // 任一轮有错就留住先出现的那个。
+                    if a.error.is_none() {
+                        a.error = b.error;
+                    }
                     Ok(a)
                 }
                 (Ok(a), Err(e)) => Err(anyhow::anyhow!("第二轮失败: {e:#}（第一轮 {a:?}）")),
@@ -180,23 +227,42 @@ async fn main() {
             drive_error,
         });
 
-        // 5) 清理临时工作区（--keep 保留诊断）
+        // 5) 清理临时工作区（--keep 保留诊断）+ 删掉评测会话
+        // 2026-10-08：会话文件此前永不删——每轮 eval 在每个任务建一个
+        // eval-<task>-<ms> 会话，落 <log_dir>/sessions/ 并出现在前端会话列表里，
+        // 反复跑就是无限泄漏。收尾删掉（删不掉只提示，不谎报）。
         if keep {
             println!("[eval]   保留工作区: {}", ws.display());
         } else {
             let _ = std::fs::remove_dir_all(&ws);
         }
+        match client
+            .delete(format!("{base}/api/session?id={session_id}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => eprintln!("[eval]   ! 删除评测会话 {session_id} 失败: HTTP {}", r.status()),
+            Err(e) => eprintln!("[eval]   ! 删除评测会话 {session_id} 失败: {e}"),
+        }
     }
 
-    // 6) 恢复原工作区
+    // 6) 恢复原工作区（如实报告：失败就明说，别让服务留在已删的临时目录上）
     if let Some(orig) = &original_ws {
-        let _ = client
+        match client
             .post(format!("{base}/api/workspace"))
             .json(&serde_json::json!({ "path": orig }))
             .timeout(std::time::Duration::from_secs(10))
             .send()
-            .await;
-        println!("[eval] 已恢复原工作区 {orig}");
+            .await
+        {
+            Ok(r) if r.status().is_success() => println!("[eval] 已恢复原工作区 {orig}"),
+            Ok(r) => eprintln!("[eval] ! 恢复原工作区 {orig} 失败: HTTP {}（请手动切回）", r.status()),
+            Err(e) => eprintln!("[eval] ! 恢复原工作区 {orig} 失败: {e}（请手动切回）"),
+        }
+    } else {
+        eprintln!("[eval] ! 启动时没取到原工作区，无法自动恢复（如切换过请手动切回）");
     }
 
     // 7) 报告

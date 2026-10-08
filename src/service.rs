@@ -321,7 +321,7 @@ fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
         Err(e) => {
             eprintln!("[agent] {e}");
             eprintln!(
-                "usage: agent.exe run <消息> [--session <id>] [--model <m>] [--mode read-only|sandbox|auto|full-access] [--timeout <秒>] [--approve] [--json]"
+                "usage: agent.exe run <消息> [--session <id>] [--model <m>] [--mode read-only|auto|full-access] [--timeout <秒>] [--approve] [--json]"
             );
             std::process::exit(2);
         }

@@ -97,6 +97,23 @@ pub fn load_tasks(dir: &Path) -> anyhow::Result<Vec<EvalTask>> {
     for p in entries {
         let raw = fs::read_to_string(&p).with_context(|| format!("读 {}", p.display()))?;
         let task: EvalTask = serde_json::from_str(&raw).with_context(|| format!("解析 {}", p.display()))?;
+        // 2026-10-08 修：字段语义校验——档位写错（如笔误成 "readonly"）服务端会静默
+        // 按 auto 跑，本该拦的写入成功，负向断言失败且没人知道是档位写错；
+        // timeout_secs=0 时 serde 的 default 不生效（仅缺键才兜底），任务立刻
+        // 「整体超时」。错在这里爆出来，别让它变成一轮看不懂的假红。
+        if !matches!(task.approval_mode.as_str(), "read-only" | "auto" | "full-access") {
+            anyhow::bail!(
+                "{}: approval_mode {:?} 不是合法档位（read-only / auto / full-access；旧值 sandbox 等已并入 read-only）",
+                p.display(),
+                task.approval_mode
+            );
+        }
+        if task.timeout_secs == 0 {
+            anyhow::bail!("{}: timeout_secs 不能为 0（缺键走默认 {}s）", p.display(), default_timeout());
+        }
+        if task.name.trim().is_empty() {
+            anyhow::bail!("{}: name 不能为空", p.display());
+        }
         out.push(task);
     }
     Ok(out)
@@ -104,18 +121,65 @@ pub fn load_tasks(dir: &Path) -> anyhow::Result<Vec<EvalTask>> {
 
 // —— 文件系统辅助 ——
 
+/// setup_files 相对路径消毒：拒绝绝对路径、盘符、UNC 与任何 `..` 段——
+/// `PathBuf::join` 遇绝对路径会整体替换基路径，种子文件会落到临时工作区之外的
+/// 真实位置（2026-10-08 修）。返回 None = 非法。
+pub fn sanitize_setup_rel(rel: &str) -> Option<PathBuf> {
+    if rel.trim().is_empty() {
+        return None;
+    }
+    let p = Path::new(rel);
+    if p.is_absolute() || rel.contains(':') || rel.starts_with(r"\\") || rel.starts_with('/') {
+        return None;
+    }
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => return None, // ParentDir / RootDir / Prefix 一律拒
+        }
+    }
+    Some(PathBuf::from(rel))
+}
+
+/// 递归枚举 root 下全部文件（相对路径、正斜杠、排序）。
 /// 递归枚举 root 下全部文件（相对路径、正斜杠、排序）。
 pub fn list_files(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     walk(root, root, &mut out);
     out
 }
+
+/// 2026-10-08 修：加深深度上限与目录型符号链接跳过——任务真机会让 agent 建
+/// junction/reparse 环（mklink /J loop .），无限递归直接把评测进程拖死；
+/// 无读权限的目录也不再静默返回（曾让该目录下新增的文件对 no_new_files 隐形=假绿）。
 fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    walk_at(root, dir, out, 0);
+}
+fn walk_at(root: &Path, dir: &Path, out: &mut BTreeSet<String>, depth: usize) {
+    const MAX_DEPTH: usize = 12;
+    if depth > MAX_DEPTH {
+        eprintln!("[eval]   ! 目录层级超过 {MAX_DEPTH} 层，停止下钻（防链接环）: {}", dir.display());
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        if depth == 0 {
+            eprintln!("[eval]   ! 读不了目录（权限？）: {}", dir.display());
+        }
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
+        // 链接不跟进（Windows junction 的 is_dir() 为 true、is_symlink() 为 false，
+        // 但 file_type() 对 reparse point 报 symlink——两种判据都上）
+        let ft = match e.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
-            walk(root, &p, out);
+            walk_at(root, &p, out, depth + 1);
         } else if let Ok(rel) = p.strip_prefix(root) {
             out.insert(rel.to_string_lossy().replace('\\', "/"));
         }
@@ -145,9 +209,14 @@ pub fn run_assertion(
             let now = list_files(ws_dir);
             now.iter().all(|f| before.contains_key(f) || is_runtime_file(f))
         }
+        // 2026-10-08 修：files_unchanged 曾对整个 is_runtime_file 族豁免——种子文件
+        // （setup_files 提供的 AGENTS.md）被模型改写也判「未改动」，假绿。快照在任务
+        // 跑之前取，before 里的文件全是任务种子，任何变化都算任务的改动。
+        // 唯一例外是 .gitignore：服务会在粘贴媒体时自动追加 `.attachments/` 一行
+        // （turn.rs attachments_gitignore，只追加不重写），那是服务侧改动不是任务的。
         "files_unchanged" => before.iter().all(|(f, h)| {
-            if is_runtime_file(f) {
-                return true; // 服务自己维护的文件（.agent/ 等）不算任务改动
+            if f.eq_ignore_ascii_case(".gitignore") {
+                return true; // 服务自行维护的追加行，不算任务改动
             }
             match fs::read(ws_dir.join(f)) {
                 Ok(bytes) => hash_bytes(&bytes) == *h,
@@ -211,6 +280,14 @@ pub struct DriveResult {
     pub text: String,
     /// 自动批准的审批次数（评测跑真模型用：审批门另有单测与真机矩阵覆盖）
     pub auto_approved: usize,
+    /// 2026-10-08：流是否在读方正常关闭前结束（EOF/连接重置）。done 没收到的
+    /// 情况下这就是「驱动被掐断」——曾与正常完成无法区分，断流前已落地的文件
+    /// 会让任务假绿。
+    pub stream_ended: bool,
+    /// 解析失败/格式不符的 SSE 帧数（诊断用：合法 SSE 也允许 `data:{json}` 无空格形式）
+    pub bad_frames: usize,
+    /// 传输层错误原文（流中途断掉时带上，收尾升级成驱动错误用）
+    pub transport_error: Option<String>,
 }
 
 /// 对服务发一轮 /api/chat 并收流至 done/error/超时（任务定义驱动）。
@@ -274,7 +351,17 @@ pub async fn drive_turn(
         };
         let bytes = match chunk {
             Some(Ok(b)) => b,
-            Some(Err(_)) | None => break, // 连接结束/中断
+            // 2026-10-08：传输错误不再连消息一起丢掉——连同原因记下来，收尾时
+            // 若没收到 done 就升级成驱动错误（原来是静默 break，假绿路径）。
+            Some(Err(e)) => {
+                out.stream_ended = true;
+                out.transport_error = Some(format!("{e}"));
+                break;
+            }
+            None => {
+                out.stream_ended = true;
+                break;
+            }
         };
         buf.extend_from_slice(&bytes);
         // 同 gateway（N1）：字节缓冲、按事件界（\n\n）切再解码——逐分片 lossy
@@ -283,8 +370,17 @@ pub async fn drive_turn(
             let raw: Vec<u8> = buf.drain(..pos + 2).collect();
             let event = String::from_utf8_lossy(&raw[..pos]);
             for line in event.split('\n') {
-                let Some(data) = line.strip_prefix("data: ") else { continue };
-                let Ok(ev) = serde_json::from_str::<Value>(data) else { continue };
+                // 合法 SSE 的 data 行两种形态都认：`data: {json}` 与 `data:{json}`
+                let Some(data) = line.strip_prefix("data:").map(|s| s.strip_prefix(' ').unwrap_or(s)) else {
+                    continue;
+                };
+                let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                    // 2026-10-08：坏帧不再零日志跳过——被丢的若是 done/error 帧，
+                    // 评测要么干等到超时要么假绿，日志里必须留得下线索
+                    out.bad_frames += 1;
+                    eprintln!("[eval]   ! SSE 帧解析失败（{} 字节）: {}", data.len(), &data[..data.len().min(120)]);
+                    continue;
+                };
                 if let Some(obj) = ev.as_object()
                     && let Some(key) = obj.keys().next() {
                         out.sse_events.insert(key.clone());
@@ -326,6 +422,15 @@ pub async fn drive_turn(
         if out.done || out.error.is_some() {
             break;
         }
+    }
+    // 2026-10-08 修：流被掐断（EOF/连接重置）而没收到 done，曾与「正常完成」
+    // 无法区分——文件在断流前已落地的任务照样计分，假绿。done 没到就升级成
+    // 驱动错误，断流原因（有的话）一并带回。
+    if out.stream_ended && !out.done && out.error.is_none() {
+        out.error = Some(match &out.transport_error {
+            Some(e) => format!("SSE 流在收到 done 前中断: {e}"),
+            None => "SSE 流在收到 done 前结束（连接被关闭）".into(),
+        });
     }
     Ok(out)
 }
@@ -445,9 +550,72 @@ mod tests {
         assert!(run_assertion(&a("no_new_files", "", "", ""), &ws, &before, &BTreeSet::new()).0);
     }
 
+    /// 2026-10-08：种子 AGENTS.md 被模型改写必须算「改动」——曾对整个运行时文件族
+    /// 豁免，任务自带 AGENTS.md 时断言形同虚设（假绿）。.gitignore 仍豁免（服务会
+    /// 自行追加 .attachments/ 行）。
     #[test]
-    fn load_tasks_sorted_and_typed() {
-        let (_g, dir) = ws_with("load", &[]);
+    fn files_unchanged_catches_seeded_agents_md() {
+        let (_g, ws) = ws_with("seeded_agents", &[("AGENTS.md", "项目设定原文"), ("a.txt", "1")]);
+        let before = snapshot(&ws);
+        assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+        // 模型改写种子 AGENTS.md → 必须失败
+        std::fs::write(ws.join("AGENTS.md"), "被模型改写了").unwrap();
+        assert!(!run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+        // 服务自行追加 .gitignore 行 → 仍放行（服务侧维护，不是任务改动）
+        std::fs::write(ws.join("AGENTS.md"), "项目设定原文").unwrap();
+        std::fs::write(ws.join(".gitignore"), ".attachments/\n").unwrap();
+        assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
+    }
+
+    /// 2026-10-08：setup 路径消毒——绝对路径/..段/盘符/UNC 一律拒，
+    /// 普通相对路径放行（join 遇绝对路径会整体替换基路径，种子文件会写出工作区）。
+    #[test]
+    fn sanitize_setup_rel_rejects_escapes() {
+        assert_eq!(sanitize_setup_rel("notes.txt").as_deref(), Some(Path::new("notes.txt")));
+        assert_eq!(sanitize_setup_rel("docs/a.md").as_deref(), Some(Path::new("docs/a.md")));
+        assert_eq!(sanitize_setup_rel("./x.txt").as_deref(), Some(Path::new("./x.txt")));
+        for bad in [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32\\x",
+            "C:\\temp\\x.txt",
+            "\\\\server\\share\\x",
+            "/abs/path",
+            "",
+            "   ",
+            "a/../../b",
+        ] {
+            assert!(sanitize_setup_rel(bad).is_none(), "{bad} 必须被拒");
+        }
+    }
+
+    /// 2026-10-08：任务字段语义校验——档位笔误/超时 0 在加载期就爆，
+    /// 别变成一轮「不知道为什么全红」的评测。
+    #[test]
+    fn load_tasks_rejects_bad_fields() {
+        let (_g, dir) = ws_with("badfields", &[]);
+        let write = |name: &str, body: serde_json::Value| {
+            std::fs::write(dir.join(name), body.to_string()).unwrap();
+        };
+        write("ok.json", serde_json::json!({"name": "t", "prompt": "p"}));
+        assert!(load_tasks(&dir).is_ok(), "合法任务应能加载");
+
+        std::fs::remove_file(dir.join("ok.json")).unwrap();
+        write("bad_mode.json", serde_json::json!({"name": "t", "prompt": "p", "approval_mode": "readonly"}));
+        let e = load_tasks(&dir).unwrap_err().to_string();
+        assert!(e.contains("approval_mode"), "错误要点名档位: {e}");
+
+        std::fs::remove_file(dir.join("bad_mode.json")).unwrap();
+        write("zero.json", serde_json::json!({"name": "t", "prompt": "p", "timeout_secs": 0}));
+        let e = load_tasks(&dir).unwrap_err().to_string();
+        assert!(e.contains("timeout_secs"), "错误要点名超时: {e}");
+
+        std::fs::remove_file(dir.join("zero.json")).unwrap();
+        write("noname.json", serde_json::json!({"name": "  ", "prompt": "p"}));
+        assert!(load_tasks(&dir).is_err(), "空 name 必须拒");
+    }
+
+    #[test]
+    fn load_tasks_sorted_and_typed() {        let (_g, dir) = ws_with("load", &[]);
         std::fs::write(
             dir.join("b_second.json"),
             serde_json::json!({
