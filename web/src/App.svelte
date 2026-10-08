@@ -362,7 +362,16 @@
     let rzT = null;
     const onRz = () => { clearTimeout(rzT); rzT = setTimeout(refreshWinMax, 300); };
     window.addEventListener('resize', onRz);
-    return () => { clearInterval(t); clearTimeout(rzT); window.removeEventListener('resize', onRz); };
+    // 2026-10-08 修：三个根级监听器原无配对清理——生产态 App 只挂一次无感，
+    // dev 的 HMR 每次热替换都销毁重建，message 监听累积会让插件桥的每次
+    // agent:request 被新旧实例各处理一次（reply 发两遍）。
+    return () => {
+      clearInterval(t);
+      clearTimeout(rzT);
+      window.removeEventListener('resize', onRz);
+      window.removeEventListener('agentwinready', adoptWinApi);
+      window.removeEventListener('message', onExtMessage);
+    };
   });
 
   onMount(async () => {
@@ -377,7 +386,10 @@
     loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
     loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
     // 点工具栏菜单外部 → 全部收起（问题1）
+    // 2026-10-08 修：配对清理（HMR 下不累积重复处理器）。注意不能放在 async onMount
+    // 的返回值里——Svelte 只认函数，async 的 Promise 不当清理用。
     document.addEventListener('click', closeMenusOnOutside);
+    onDestroy(() => document.removeEventListener('click', closeMenusOnOutside));
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
     stampMicroUids();
     // 面板上次就是开着且停在「网页」时，补一次浏览器状态加载：openRightPanel 只在用户
@@ -587,16 +599,31 @@
     applyState(s);
   }
 
+  // 正在编辑的字段不的服务端同步覆盖（2026-10-08 修）：settings_changed（外部改
+  // settings.json/agent 自改）、SSE 重连、自身保存响应回来，三条路都会调 applyState，
+  // 原来无条件整体重置——用户正在敲的 Base URL/配置名/参数被静默拽回旧值，未保存的
+  // 字符全丢。范式同 loadWebState 守 addressBar：焦点在哪个输入框，那个字段就跳过。
+  // （只守直接输入的文本框；Select 只有显式点选才变，变了就立即自动保存，无中间态。）
+  function editingField(name) {
+    try {
+      return document.activeElement && document.activeElement.dataset
+        ? document.activeElement.dataset.field === name
+        : false;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function applyState(s) {
-    providerId = s.provider_id || 'deepseek';
-    baseUrl = s.base_url || '';
+    if (!editingField('baseUrl')) baseUrl = s.base_url || '';
     model = s.model || '';
-    configName = s.name || '';
+    if (!editingField('configName')) configName = s.name || '';
+    if (!editingField('ctxLen')) ctxLen = s.context_length || 0;
+    if (!editingField('maxOut')) maxOut = s.max_output_tokens || 0;
+    if (!editingField('temperature')) temperature = s.temperature ?? null;
+    if (!editingField('topP')) topP = s.top_p ?? null;
+    providerId = s.provider_id || 'deepseek';
     savedModels = s.models || [];
-    ctxLen = s.context_length || 0;
-    maxOut = s.max_output_tokens || 0;
-    temperature = s.temperature ?? null;
-    topP = s.top_p ?? null;
     thinking = s.thinking || '';
     thinkingStyle = s.thinking_style || 'auto';
     capabilities = s.capabilities || { tools: true, vision: false, video: false, audio: false };
@@ -2992,6 +3019,10 @@
   // 把「排队中」气泡对成真消息 + 补上错过的一切。不重发任何东西（消息已在服务端队列里）。
   function reconcileServerQueued(skey) {
     if (reconcileTimers[skey]) return;
+    // 连续失败计数：服务没起/断网时 fetch 抛错走 catch，原来无限重试到页面关闭
+    // （每 2s 一次永久空转）。攒够次数就自清定时器，把对账留给用户重连后的正常流程
+    // （2026-10-08 修）。
+    let misses = 0;
     reconcileTimers[skey] = setInterval(async () => {
       try {
         if (streams[skey]) return; // 本页又起了流：对账交给正常流程
@@ -3014,7 +3045,12 @@
           loadSessions();
         }
       } catch (e) {
-        // 网络抖动：下一跳再试
+        // 网络抖动：下一跳再试；但服务长时间不可达时不能无限转——攒够次数收工
+        misses += 1;
+        if (misses >= 30) {
+          clearInterval(reconcileTimers[skey]);
+          delete reconcileTimers[skey];
+        }
       }
     }, 2000);
   }
@@ -3415,6 +3451,11 @@
   function manageVisibleIds() {
     return sidebarView === 'list' ? flatSessions.map((s) => s.id) : displayRows.filter((r) => r.type === 'conv').map((r) => r.s.id);
   }
+  // Svelte4 坑（同 commitSelN）：模板里调 manageVisibleIds().length 不建立函数体内
+  // 变量的依赖——后台任务跑完/搜索过滤/批量操作后 loadSessions 重拉，分母冻在旧值，
+  // 「已选 4 / 12」而列表只有 4 条。计数必须 $: 派生（2026-10-08 修）。
+  $: manageTotal =
+    sidebarView === 'list' ? flatSessions.length : displayRows.filter((r) => r.type === 'conv').length;
 
   async function batchSet(archived) {
     if (!checkedIds.length) return;
@@ -4138,7 +4179,14 @@
     // ——后台刷新不许抢夺当前打开的会话。
     sessions_changed: {
       kind: 'sessions_changed', title: '（内部）会话清单刷新', risk: 'safe', internal: true,
-      run() { loadSessions(); },
+      async run() {
+        await loadSessions();
+        // 2026-10-08 修：多窗口改名后本窗口顶栏标题停在旧值——displayTitle 优先取
+        // currentTitle（本地快照），只刷列表不刷它。列表标题本就是权威值（含首条
+        // 消息兜底），从新列表里取当前会话的标题对齐（本窗口自己改名走本地更新）。
+        const cur = sessions.find((x) => x.id === currentSessionId);
+        if (cur && cur.title && cur.title !== currentTitle) currentTitle = cur.title;
+      },
     },
 
     // —— 插件桥方法（扩展 iframe postMessage；阶段4 并表）——
@@ -5040,7 +5088,7 @@
 
       {#if manageMode}
         <div class="manage-bar">
-          <span class="m-count">已选 {checkedIds.length} / {manageVisibleIds().length}</span>
+          <span class="m-count">已选 {checkedIds.length} / {manageTotal}</span>
           <button class="m-btn" on:click={() => (checkedIds = manageVisibleIds())}>全选</button>
           <button class="m-btn" disabled={!checkedIds.length} on:click={() => batchSet(true)}>归档</button>
           <button class="m-btn" disabled={!checkedIds.length} on:click={() => batchSet(false)}>取消归档</button>
@@ -6526,6 +6574,7 @@
       <div class="field">
         <label>配置名称</label>
         <input
+          data-field="configName"
           bind:value={configName}
           placeholder="给这套配置起个名，如：商汤主力 / tokeness 免费"
           on:input={() => autoSave({ name: configName })}
@@ -6554,6 +6603,7 @@
       <div class="field">
         <label>Base URL</label>
         <input
+          data-field="baseUrl"
           bind:value={baseUrl}
           placeholder="留空用预设默认"
           on:input={() => autoSave({ base_url: baseUrl })}
@@ -6606,6 +6656,7 @@
             class="num-input"
             type="number"
             min="0"
+            data-field="ctxLen"
             bind:value={ctxLen}
             title="上下文长度：决定圆环预算与历史裁剪时机"
             on:change={() => autoSave({ context_length: Number(ctxLen) || 0 }, 0)}
@@ -6614,6 +6665,7 @@
             class="num-input"
             type="number"
             min="0"
+            data-field="maxOut"
             bind:value={maxOut}
             title="最大输出长度：随请求作为 max_tokens 发给渠道。思考开启时自动加思考余量（配置值+max(配置值,8192)）——上游把思考和正文算进同一个额度，不加余量正文会被思考挤断；端点拒收会自动回退原值"
             on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
@@ -6628,6 +6680,7 @@
             class="num-input"
             type="number" step="0.1" min="0" max="2"
             placeholder="温度"
+            data-field="temperature"
             bind:value={temperature}
             title="temperature：越低越稳定，0=确定性输出"
             on:change={() => autoSave({ temperature: temperature === null || temperature === '' ? -1 : Number(temperature) }, 0)}
@@ -6636,6 +6689,7 @@
             class="num-input"
             type="number" step="0.05" min="0" max="1"
             placeholder="top_p"
+            data-field="topP"
             bind:value={topP}
             title="top_p：核采样截断"
             on:change={() => autoSave({ top_p: topP === null || topP === '' ? -1 : Number(topP) }, 0)}

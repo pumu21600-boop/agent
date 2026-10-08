@@ -1,7 +1,7 @@
 <script>
   import Select from '../Select.svelte';
   import ScheduleCronPicker from '../ScheduleCronPicker.svelte';
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onDestroy } from 'svelte';
 
   // 「去查看」：交给宿主 App 打开对应会话（组件内拿不到会话切换逻辑）
   const dispatch = createEventDispatcher();
@@ -49,6 +49,13 @@
   // cron 人话预览（输入即查，250ms 防抖；解析失败由界面提示）
   let schedCronText = '';
   let schedCronTimer = null;
+  let schedReloadTimer = null;
+  // 2026-10-08 修：编辑中/点了「立即运行」后立刻关设置弹窗，组件已销毁但两个
+  // 定时器到点仍会对已销毁实例发 fetch 并写状态（Svelte4 不报错，纯浪费）。
+  onDestroy(() => {
+    clearTimeout(schedCronTimer);
+    clearTimeout(schedReloadTimer);
+  });
   let schedCronPending = false;
   // 三档（2026-10-05 用户实锤纠正：sandbox 档 10-03 就取消了，这里一直挂着四档旧表；
   // 与输入框上方的全局档位菜单同一套口径，跟随全局语义）
@@ -257,7 +264,8 @@
     try {
       const r = await fetch(`/api/schedules/run?id=${encodeURIComponent(id)}`, { method: 'POST' }).then((r) => r.json());
       schedMsg = r.ok ? '已触发，跑完会出现在下面的完成记录里' : `触发失败: ${r.error}`;
-      setTimeout(loadSchedules, 1500);
+      clearTimeout(schedReloadTimer);
+      schedReloadTimer = setTimeout(loadSchedules, 1500);
     } catch (e) {
       schedMsg = `触发失败: ${e.message || e}`;
     } finally {

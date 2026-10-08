@@ -133,6 +133,9 @@
     document.removeEventListener('mousedown', onDocDown, true);
     window.removeEventListener('resize', closeOnViewportChange);
     window.removeEventListener('scroll', closeOnViewportChange, true);
+    // 2026-10-08 修：micro-preview 漏卸——每次挂载/销毁泄漏一个监听器 + 整个组件闭包
+    // （设置弹窗里 ~10 个 Select，反复开合设置就累积一批，微调面板每次拖动都在跑）
+    window.removeEventListener('micro-preview', onMicroPreview);
   });
 </script>
 

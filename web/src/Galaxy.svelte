@@ -17,6 +17,8 @@
   let renderer = null;
   let fallback2d = false;
   let renderError = '';
+  // 2026-10-08 修：组件销毁标记（renderer.dispose 不置空 renderer，靠它守野操作）
+  let destroyed = false;
 
   let loading = true;
   let errMsg = '';
@@ -310,12 +312,14 @@
         method: force ? 'POST' : 'GET',
       });
       const d = await r.json();
+      if (destroyed) return; // 面板已关：续体不再碰渲染器（dispose 后的野操作）
       items = d.items || [];
       stats = d.stats || null;
       notice = d.notice || '';
       rebuildScene();
       applyBrightness();
       await tick();
+      if (destroyed) return;
       resize();
       if (!searched) {
         resetView();
@@ -346,6 +350,7 @@
         body: JSON.stringify({ query: q, top_k: 60 }),
       });
       const d = await r.json();
+      if (destroyed) return; // 面板已关：续体不再碰渲染器（同 load 的守卫）
       results = d.results || [];
       searchNotice = d.notice || '';
       matchIds = new Set(results.map((x) => x.id));
@@ -720,10 +725,17 @@
       window.removeEventListener('resize', onResize);
       cancelAnimationFrame(raf);
       if (renderer) renderer.dispose();
+      // 2026-10-08 修：dispose 后必须置 destroyed——load() 的 await 续体（面板开着时
+      // /api/memory/library 在途）回来后仍会对已 dispose 的渲染器 bufferData/resize
+      // （WebGL 错误默认静默的野操作）。守卫见 load()/rebuildScene 入口。
+      destroyed = true;
     };
   });
 
-  onDestroy(() => cancelAnimationFrame(raf));
+  onDestroy(() => {
+    destroyed = true;
+    cancelAnimationFrame(raf);
+  });
 </script>
 
 <svelte:window on:keydown={onKey} />
