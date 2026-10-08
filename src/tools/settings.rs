@@ -296,6 +296,12 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             let patch: SettingsPatch = parse_patch(&raw)?;
             let handle =
                 settings::shared_settings().ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
+            // 2026-10-08 修：与 HTTP 端点同一把写锁——agent 经工具改设置与用户经
+            // 界面改设置并发时，两条读-改-写链路互不踩（后写者整份覆盖先写者的坑）。
+            let write_lock = crate::server::shared_state()
+                .map(|s| s.settings_write.clone())
+                .ok_or_else(|| "设置子系统尚未初始化".to_string())?;
+            let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
             let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
             let changed = apply_patch(&mut s, &patch)?;
             s.save().map_err(|e| format!("保存 settings.json 失败: {e}"))?;

@@ -200,7 +200,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         enum_values: &[],
         default: None,
         risk: "normal",
-        desc: "整表替换（先 get 拿现状）。2026-10-04 起装了就能用、无首装确认",
+        desc: "整表替换（先 get 拿现状；按 name 合并：已存在的服务不带的字段保留旧值）。第三方服务的密钥也在 env 里——2026-10-04 用户拍板放开，改动后用 action=mcp op=refresh 重连",
     },
     SchemaEntry {
         path: "disabled_plugins",
@@ -219,15 +219,6 @@ pub const SCHEMA: &[SchemaEntry] = &[
         default: None,
         risk: "normal",
         desc: "技能名整表替换（对不上报错并列可用名）",
-    },
-    SchemaEntry {
-        path: "mcp_servers",
-        label: "MCP 服务配置",
-        ty: "object",
-        enum_values: &[],
-        default: None,
-        risk: "normal",
-        desc: "MCP 服务整表（name/command/args/env/url 等，按 name 合并：已存在的服务不带的字段保留旧值）。第三方服务的密钥也在 env 里——2026-10-04 用户拍板放开，改动后用 action=mcp op=refresh 重连",
     },
     SchemaEntry {
         path: "schedules",

@@ -145,6 +145,23 @@ async fn main() -> anyhow::Result<()> {
                 tools::set_workspace_root(&path);
                 path
             } else {
+                // 2026-10-08 修：目录不在（移动盘/卸载/误删）时原来静默降级到 app_root
+                // ——fs/shell 工具会静静落到 exe 同级目录（可能往安装目录里写文件），
+                // 界面还显示原工作区路径，用户毫无感知。HTTP 端点同场景是硬报错，
+                // 两边口径不一致。降级可以（否则起不来），但必须留痕 + 界面说人话。
+                observability::event(
+                    observability::EventType::State,
+                    serde_json::json!({
+                        "kind": "workspace.fallback",
+                        "missing": p,
+                        "fallback": manifest.display().to_string(),
+                        "note": "settings 里的工作区目录不存在，本次降级到应用根目录",
+                    }),
+                );
+                eprintln!(
+                    "[workspace] settings 里的工作区不存在（{p}），本次降级到应用根目录：{}",
+                    manifest.display()
+                );
                 manifest.clone()
             }
         }
@@ -166,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
             config::settings::install_shared_settings(shared.clone());
             shared
         },
+        // 2026-10-08：settings 写互斥（读-改-写整条链路持锁，见字段注释）
+        settings_write: Arc::new(std::sync::Mutex::new(())),
         agent_cfg: Arc::new(config.agent),
         sandbox_cfg: Arc::new(config.sandbox),
         context_cfg: Arc::new(config.context),

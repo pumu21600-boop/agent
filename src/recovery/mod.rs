@@ -104,6 +104,10 @@ fn git(bin: &Path, gitdir: Option<&Path>, ws: &Path, args: &[&str]) -> anyhow::R
     let mut cmd = Command::new(bin);
     // 后台无窗口运行时，控制台子进程会闪黑框：一律不创建新控制台窗口
     cmd.creation_flags(0x0800_0000);
+    // 2026-10-08 修：CJK 路径默认被 quotepath 转义（中文.txt → \346\226\207.txt），
+    // 解析 diff/status 输出时按转义串拼路径必然找不到文件（本机 ~/.gitconfig 恰好
+    // 设了 core.quotepath=false 会掩盖，换机器/换用户即复现）。所有 git 调用统一关掉。
+    cmd.arg("-c").arg("core.quotepath=false");
     match gitdir {
         Some(g) => {
             cmd.arg("--git-dir").arg(g);
@@ -223,11 +227,20 @@ fn walk_files(ws: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// 影子仓库操作串行锁（进程级，2026-10-08 修）：影子仓库单个 index 没有任何跨任务
+/// 互斥——两个会话同时拍检查点时，B 的 `git add` 可能落在 A 的 add 与 commit 之间，
+/// A 的提交吞掉 B 的文件且只带 A 的 Agent-Session trailer，B 随后 `diff --cached`
+/// 干净 → 返 None（B 丢检查点，改动条/撤销的会话归属失真）；另一种交错是 B 的 add
+/// 撞 index.lock 直接失败。restore 同样碰这个 index，一并排大队。
+/// 频率低（任务起点/结束/高危工具前各一次），全局锁的代价可忽略。
+static SHADOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 拍检查点：add + 有变更才 commit。返回 None 表示没有需要落的变化。
 /// 任何失败都由调用方决定降级（核心循环只记日志不阻断）。
 /// `session_id` 写进提交正文的 trailer，供改动条/撤销按会话对齐。
 /// 跟踪范围：git 工作区沿用真仓库 ls-files；非 git 工作区整目录扫（见 tracked_files）。
 pub fn checkpoint(ws: &Path, reason: &str, session_id: &str) -> anyhow::Result<Option<Checkpoint>> {
+    let _serial = SHADOW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let bin = git_bin()?;
     let gitdir = ensure_shadow(&bin, ws)?;
 
@@ -445,6 +458,9 @@ pub fn restore(ws: &Path, id: &str) -> anyhow::Result<()> {
     if !id.chars().all(|c| c.is_ascii_hexdigit()) || !(7..=40).contains(&id.len()) {
         bail!("非法检查点 id: {id}");
     }
+    // 与 checkpoint 同一把串行锁：restore 改工作树 + 动影子 index，不能与在拍的
+    // 检查点交错（2026-10-08 修）
+    let _serial = SHADOW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let bin = git_bin()?;
     let gitdir = shadow_gitdir(ws);
     if !gitdir.exists() {
@@ -454,13 +470,26 @@ pub fn restore(ws: &Path, id: &str) -> anyhow::Result<()> {
     let out = git_ok(&bin, Some(&gitdir), ws, &["diff", "--name-status", id, "HEAD"])?;
     let mut touched = 0usize;
     for line in out.lines() {
-        let mut it = line.splitn(2, '\t');
+        // 2026-10-08 修两处：① rename 检测默认开着，输出 `R100\told\tnew` 三字段——
+        // 原来 splitn(2) 把 "old\tnew" 当一个 path，checkout 必失败，且循环前面的行
+        // 已改完，工作区停在半回滚态；② CJK 路径默认被 quotepath 转义
+        // （\346\226\207.txt），ws.join 找不到文件——与 status() 一样带
+        // core.quotepath=false（本机 gitconfig 恰好设了会掩盖，换机器即复现）。
+        let mut it = line.split('\t');
         let status = it.next().unwrap_or("").to_string();
-        let path = match it.next() {
-            Some(p) => p.trim().to_string(),
-            None => continue,
-        };
         let status0 = status.chars().next().unwrap_or('M');
+        // R/C（rename/copy）有两个路径：恢复到旧路径意味着删新的、还原旧的
+        let (path, renamed_from) = if matches!(status0, 'R' | 'C') {
+            match (it.next(), it.next()) {
+                (Some(from), Some(to)) => (to.trim().to_string(), Some(from.trim().to_string())),
+                _ => continue,
+            }
+        } else {
+            match it.next() {
+                Some(p) => (p.trim().to_string(), None),
+                None => continue,
+            }
+        };
         if status0 == 'A' {
             // 影子仓库在检查点后新增的文件：直接从工作区删掉
             let full = ws.join(&path);
@@ -469,6 +498,10 @@ pub fn restore(ws: &Path, id: &str) -> anyhow::Result<()> {
         } else {
             // M / D：把该文件恢复回检查点时的内容
             git_ok(&bin, Some(&gitdir), ws, &["checkout", id, "--", &path])?;
+            // rename 的旧路径也要还原（新路径上面的 A 分支已删）
+            if let Some(from) = renamed_from {
+                git_ok(&bin, Some(&gitdir), ws, &["checkout", id, "--", &from])?;
+            }
         }
         touched += 1;
     }
@@ -531,8 +564,15 @@ pub fn diff_text(
     }
     let out = git_ok(&bin, gitdir.as_deref(), ws, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
     const MAX: usize = 512 * 1024;
+    // 2026-10-08 修：按字节下标切 String，第 524288 字节落在多字节字符中间即
+    // 「byte index is not a char boundary」panic（CJK diff 里约 2/3 的边界字节是
+    // 续字节）→ spawn_blocking 任务 panic、端点 500。按字符边界回退。
     if out.len() > MAX {
-        Ok(format!("{}…（diff 超过 512KB 已截断）", &out[..MAX]))
+        let mut end = MAX;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(format!("{}…（diff 超过 512KB 已截断）", &out[..end]))
     } else {
         Ok(out)
     }

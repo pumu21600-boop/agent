@@ -190,6 +190,10 @@ pub(super) async fn put_settings(
     State(state): State<AppState>,
     Json(req): Json<SettingsUpdate>,
 ) -> (StatusCode, Json<Value>) {
+    // 2026-10-08 修：读-改-写整条链路持写锁——原先 clone 与换内存之间不持锁，
+    // 两个并发写者各拿旧基线，后写者整份覆盖先写者（用户改设置的同时 agent 用
+    // settings 工具改设置即中，前者的键在内存与磁盘上一致地丢）。
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     let (url_changed, pid, eff_model) = apply_settings_update(&mut s, &req);
 
@@ -256,6 +260,7 @@ pub(crate) fn sync_runtime(s: &Settings) {
 pub(crate) fn start_external_reload(state: &AppState) {
     use std::time::{Duration, SystemTime};
     let settings = state.settings.clone();
+    let settings_write = state.settings_write.clone();
     let path = Settings::path_pub();
     std::thread::spawn(move || {
         let mut last_sig: Option<(SystemTime, u64)> = None;
@@ -282,6 +287,19 @@ pub(crate) fn start_external_reload(state: &AppState) {
                 observability::debug("[settings] 外部改动解析失败，保持内存现状（等下一次轮询）");
                 continue;
             };
+            // 2026-10-08 修：读文件与换内存之间可能被自家端点/工具的写入插足
+            // （读的是旧内容、解析完别人已写新的）——拿写锁后再核一次文件签名，
+            // 变了就本轮作废（下一轮 500ms 后重读），否则旧快照会整份盖回内存，
+            // 把在途写入的改动打回旧值（窗口内再来一次写即永久丢失）。持锁换内存
+            // 也保证不会与写入方的「换内存」交错。
+            let _w = settings_write.lock().unwrap_or_else(|e| e.into_inner());
+            let still_same_file = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok().map(|mt| (mt, m.len())))
+                .is_some_and(|s2| Some(s2) == last_sig);
+            if !still_same_file {
+                continue; // 文件又变了：本轮快照已过期，下一轮重读
+            }
             let cur = settings.read().unwrap_or_else(|e| e.into_inner()).clone();
             let same = serde_json::to_string(&cur).ok().as_deref() == serde_json::to_string(&fresh).ok().as_deref();
             if same {

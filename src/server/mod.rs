@@ -86,6 +86,11 @@ pub struct AppState {
     /// 运行中追加消息队列（025）：同会话已在跑时，新消息进这里并入当前一轮
     pub steer: Arc<crate::core::steer::SteerQueue>,
     pub settings: Arc<std::sync::RwLock<Settings>>,
+    /// settings 写互斥（2026-10-08 修）：所有写入面都是「read clone → 改 → save →
+    /// 换内存」，读-改-写之间不持写锁——两个并发写者各拿旧基线，后写者整份覆盖
+    /// 先写者，前者的键在内存与磁盘上一致地丢（用户改 MCP 的同时 agent 改设置即中）。
+    /// 整条链路持这把锁串行化；外部文件监听线程换内存时也持它（见 start_external_reload）。
+    pub settings_write: std::sync::Arc<std::sync::Mutex<()>>,
     pub agent_cfg: Arc<AgentConfig>,
     pub sandbox_cfg: Arc<crate::config::SandboxConfig>,
     pub context_cfg: Arc<crate::config::ContextConfig>,

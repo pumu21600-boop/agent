@@ -106,6 +106,8 @@ pub(super) async fn put_usage_prices(
     let rate = req.get("usd_cny_rate").and_then(Value::as_f64).unwrap_or(7.2);
     let rate = if rate > 0.0 { rate } else { 7.2 };
 
+    // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     s.cost.prices = prices.clone();
     s.cost.currency = currency;

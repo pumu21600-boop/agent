@@ -30,9 +30,33 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    // 2026-10-08 修：rename 只保证目录项的原子切换，不保证数据块已落盘——硬杀/掉电
+    // 时可能出现「rename 已生效、内容没写下去」的半截文件（模块头把「断电」列为已
+    // 防护场景，实际差这一步）。fsync 临时文件把数据推下去再 rename。
+    if let Err(e) = fsync_file(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// fsync 一个文件（数据落盘）。失败不致命（某些文件系统/网络盘不支持），
+/// 由调用方决定是否清理临时文件——这里返回 Err 让 write_atomic 按失败路径收口。
+fn fsync_file(path: &Path) -> std::io::Result<()> {
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.sync_all()?;
+    drop(f);
+    // 目录项也要落盘，否则极端情况下 rename 本身可能丢（网络文件系统上常常失败，
+    // 不阻断主流程）
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && let Ok(d) = std::fs::OpenOptions::new().read(true).open(dir)
+    {
+        let _ = d.sync_all();
     }
     Ok(())
 }

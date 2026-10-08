@@ -505,6 +505,10 @@ pub fn remove(name: &str) -> Result<String, (axum::http::StatusCode, String)> {
     // 停用名单 / 信任表残留：清得到才落盘（没有残留就不动 settings.json）。
     // 共享句柄缺失（只跑内核的单测）时跳过清理——目录已删，核心动作已完成。
     if let Some(handle) = crate::config::settings::shared_settings() {
+        // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）。
+        // 拿不到 AppState（只跑内核的单测）时不阻塞——那种场景本就单线程。
+        let write_lock = crate::server::shared_state().map(|s| s.settings_write.clone());
+        let _w = write_lock.as_ref().map(|l| l.lock().unwrap_or_else(|e| e.into_inner()));
         let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
         let mut cleaned: Vec<&str> = Vec::new();
         if s.disabled_plugins.iter().any(|d| d == name) {

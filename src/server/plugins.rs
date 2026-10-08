@@ -22,78 +22,84 @@ pub(super) async fn post_mcp(
     State(state): State<AppState>,
     Json(req): Json<McpActionRequest>,
 ) -> (StatusCode, Json<Value>) {
-    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
     let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
-    match req.action.as_str() {
-        "save" => {
-            let Some(srv) = req.server.clone() else {
-                return err("缺少 server 配置".into());
-            };
-            let cfg: crate::config::settings::McpServerCfg = match serde_json::from_value(srv) {
-                Ok(c) => c,
-                Err(e) => return err(format!("server 配置不合法: {e}")),
-            };
-            // transport 合法性 + 必需字段 + 名称规则：与 settings 工具的整表替换
-            // 共用同一份校验（mcp::validate_server_cfg）
-            if let Err(e) = crate::mcp::validate_server_cfg(&cfg) {
-                return err(e);
+    // 2026-10-08 修：settings 写互斥——读-改-写整条链路持锁，防并发写者互覆盖。
+    // 临界区只包同步段（clone→改→save→换内存→同步）；refresh 的 spawn_blocking
+    // await 在锁外（std 守卫跨 await 会让 handler 的 future 非 Send，axum 不收）。
+    {
+        let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
+        match req.action.as_str() {
+            "save" => {
+                let Some(srv) = req.server.clone() else {
+                    return err("缺少 server 配置".into());
+                };
+                let cfg: crate::config::settings::McpServerCfg = match serde_json::from_value(srv) {
+                    Ok(c) => c,
+                    Err(e) => return err(format!("server 配置不合法: {e}")),
+                };
+                // transport 合法性 + 必需字段 + 名称规则：与 settings 工具的整表替换
+                // 共用同一份校验（mcp::validate_server_cfg）
+                if let Err(e) = crate::mcp::validate_server_cfg(&cfg) {
+                    return err(e);
+                }
+                s.mcp_servers.retain(|c| c.name != cfg.name);
+                s.mcp_servers.push(cfg);
             }
-            s.mcp_servers.retain(|c| c.name != cfg.name);
-            s.mcp_servers.push(cfg);
-        }
-        "remove" => {
-            let Some(name) = &req.name else { return err("缺少 name".into()) };
-            s.mcp_servers.retain(|c| &c.name != name);
-        }
-        "toggle" => {
-            let Some(name) = &req.name else { return err("缺少 name".into()) };
-            let Some(c) = s.mcp_servers.iter_mut().find(|c| &c.name == name) else {
-                return err(format!("未知 server: {name}"));
-            };
-            c.enabled = !c.enabled;
-        }
-        "refresh" => {
-            let Some(name) = &req.name else { return err("缺少 name".into()) };
-            if !s.mcp_servers.iter().any(|c| &c.name == name) {
-                return err(format!("未知 server: {name}"));
+            "remove" => {
+                let Some(name) = &req.name else { return err("缺少 name".into()) };
+                s.mcp_servers.retain(|c| &c.name != name);
             }
-            // 只重连+重新发现；配置不动（ensure_online 用管理器内已同步的 cfg）
-        }
-        // P24 OAuth：发起授权（后台线程跑 discovery→授权→换 token，立即返回快照）
-        "oauth_authorize" => {
-            let Some(name) = &req.name else { return err("缺少 name".into()) };
-            let Some(c) = s.mcp_servers.iter().find(|c| &c.name == name) else {
-                return err(format!("未知 server: {name}"));
-            };
-            match crate::mcp::oauth::start_authorize(name, c) {
-                Ok(snap) => return (StatusCode::OK, Json(json!({ "ok": true, "tx": snap }))),
-                Err(e) => return err(e),
+            "toggle" => {
+                let Some(name) = &req.name else { return err("缺少 name".into()) };
+                let Some(c) = s.mcp_servers.iter_mut().find(|c| &c.name == name) else {
+                    return err(format!("未知 server: {name}"));
+                };
+                c.enabled = !c.enabled;
             }
-        }
-        // P24 OAuth：撤销授权（删 token + 强制下线；下次调用回「未授权」人话）
-        "oauth_revoke" => {
-            let Some(name) = &req.name else { return err("缺少 name".into()) };
-            if !s.mcp_servers.iter().any(|c| &c.name == name) {
-                return err(format!("未知 server: {name}"));
+            "refresh" => {
+                let Some(name) = &req.name else { return err("缺少 name".into()) };
+                if !s.mcp_servers.iter().any(|c| &c.name == name) {
+                    return err(format!("未知 server: {name}"));
+                }
+                // 只重连+重新发现；配置不动（ensure_online 用管理器内已同步的 cfg）
             }
-            crate::mcp::oauth::revoke(name);
-            crate::mcp::force_offline(name);
-            observability::event(
-                observability::EventType::State,
-                json!({ "kind": "mcp.oauth.revoked", "server": name }),
-            );
+            // P24 OAuth：发起授权（后台线程跑 discovery→授权→换 token，立即返回快照）
+            "oauth_authorize" => {
+                let Some(name) = &req.name else { return err("缺少 name".into()) };
+                let Some(c) = s.mcp_servers.iter().find(|c| &c.name == name) else {
+                    return err(format!("未知 server: {name}"));
+                };
+                match crate::mcp::oauth::start_authorize(name, c) {
+                    Ok(snap) => return (StatusCode::OK, Json(json!({ "ok": true, "tx": snap }))),
+                    Err(e) => return err(e),
+                }
+            }
+            // P24 OAuth：撤销授权（删 token + 强制下线；下次调用回「未授权」人话）
+            "oauth_revoke" => {
+                let Some(name) = &req.name else { return err("缺少 name".into()) };
+                if !s.mcp_servers.iter().any(|c| &c.name == name) {
+                    return err(format!("未知 server: {name}"));
+                }
+                crate::mcp::oauth::revoke(name);
+                crate::mcp::force_offline(name);
+                observability::event(
+                    observability::EventType::State,
+                    json!({ "kind": "mcp.oauth.revoked", "server": name }),
+                );
+            }
+            other => return err(format!("未知操作: {other}")),
         }
-        other => return err(format!("未知操作: {other}")),
-    }
 
-    if let Err(e) = s.save() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+        if let Err(e) = s.save() {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+        }
+        *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
+        // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+        crate::plugin::wasm::set_disabled(&s.disabled_plugins);
+        crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：插件技能根同步停用
+        crate::mcp::sync_configs(&s.mcp_servers);
     }
-    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
-    crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：插件技能根同步停用
-    crate::mcp::sync_configs(&s.mcp_servers);
 
     // refresh：同步后拉起并重新发现工具（阻塞 IO 丢 blocking 池）
     crate::plugin::wasm::rescan(); // 017：顺带重扫 WASM 插件

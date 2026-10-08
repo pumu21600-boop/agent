@@ -368,6 +368,8 @@ pub(crate) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Resu
     *state.memory.write().unwrap_or_else(|e| e.into_inner()) = new_mem;
     // 持久化 + 最近列表（去重、新→旧、最多 8）
     let cur = canon.display().to_string();
+    // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     s.workspace = Some(cur.clone());
     s.recent_workspaces.retain(|w| *w != cur);
@@ -459,6 +461,8 @@ pub(super) async fn remove_workspace(
     if path.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "路径为空" })));
     }
+    // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     s.recent_workspaces.retain(|w| w != path);
     if let Err(e) = s.save() {
@@ -489,6 +493,8 @@ pub(crate) fn alias_into(s: &mut Settings, path: &str, name: &str) -> String {
 
 /// 设置/清除工作区别名（侧边栏「重命名项目」与 agent 的 settings 工具 action=alias 共用）。
 pub(crate) fn set_workspace_alias(state: &AppState, path: &str, name: &str) -> Result<(), String> {
+    // 2026-10-08 修：settings 写互斥（读-改-写整条链路持锁，防并发写者互覆盖）
+    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = state.settings.write().unwrap_or_else(|e| e.into_inner()).clone();
     let key = alias_into(&mut s, path, name);
     let name = name.trim().to_string();

@@ -67,6 +67,28 @@ impl ChildJob {
             }
         }
     }
+
+    /// 按 pid 收编（给拿不到进程句柄的调用方用：tokio::process::Child 不暴露
+    /// raw handle）。OpenProcess 出来的临时句柄用完即关，Job 里留的是引用。
+    pub(crate) fn assign_pid(&self, pid: u32) {
+        unsafe {
+            let h = windows_sys::Win32::System::Threading::OpenProcess(
+                windows_sys::Win32::System::Threading::PROCESS_SET_QUOTA
+                    | windows_sys::Win32::System::Threading::PROCESS_TERMINATE,
+                0,
+                pid,
+            );
+            if h == 0 {
+                crate::observability::debug(&format!(
+                    "[jobguard] OpenProcess({pid}) 失败: {}（该子进程将无生命周期保险丝）",
+                    GetLastError()
+                ));
+                return;
+            }
+            self.assign(h);
+            CloseHandle(h);
+        }
+    }
 }
 
 impl Drop for ChildJob {

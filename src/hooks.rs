@@ -156,6 +156,16 @@ async fn run_hook_cmd(cmd: &str, event_json: &str, timeout_ms: u64) -> Result<Op
         .kill_on_drop(true); // 超时后 future 被 drop → 子进程被杀，不留孤儿
 
     let mut child = command.spawn().map_err(|e| format!("拉起钩子命令失败: {e}"))?;
+    // 生命周期保险丝（2026-10-08 修）：kill_on_drop 只杀直子进程（cmd.exe），钩子
+    // 派生的孙进程（start /b、node 再 spawn）在超时后照样活着占资源/端口——模块头
+    // 宣称的「不留孤儿」原先并不成立。挂 Job Object 整树击杀（与 browser/mcp 同一套
+    // 保险丝），job 守到本函数返回（含超时路径的 drop）。
+    let job = crate::jobguard::ChildJob::new();
+    if let Some(j) = job.as_ref()
+        && let Some(pid) = child.id()
+    {
+        j.assign_pid(pid);
+    }
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(event_json.as_bytes()).await;
         let _ = si.shutdown().await; // 关 stdin：让命令的 EOF 语义成立

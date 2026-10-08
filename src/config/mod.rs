@@ -515,6 +515,66 @@ fn coerce_to_existing(
                 },
                 (serde_json::Value::Number(n), true, _, _, _) => Ok(serde_json::json!(n.to_string())),
                 (serde_json::Value::Bool(b), true, _, _, _) => Ok(serde_json::json!(b.to_string())),
+                // 2026-10-08 修：下面几类原先落 `_ => Ok(clone)` 原样落盘——
+                // ① 浮点写整数键：TOML 写成 `max_steps = 100.0`，serde 的 u32 字段
+                //    遇 visit_f64 直接 invalid type → config::load 失败 → **服务重启
+                //    起不来**，且写时零告警（str→int 有专门防护并注释「真机实锤」，
+                //    浮点/布尔/数组是同款漏洞的漏网口子）
+                // ② 布尔写数值键：同理炸启动
+                // ③ 数组元素类型不校验：一维数组里塞错类型元素，同样起不来
+                (serde_json::Value::Number(n), _, true, _, _) => {
+                    // 整数键：整数原样；浮点必须是无小数部分的（100.0 → 100），否则拒
+                    n.as_i64()
+                        .map(serde_json::Value::from)
+                        .or_else(|| {
+                            n.as_f64()
+                                .filter(|f| f.fract() == 0.0)
+                                .map(|f| serde_json::json!(f as i64))
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "config.toml 的 {key} 是整数，不能写成 {n}（小数部分会被丢掉，且会让重启失败）"
+                            )
+                        })
+                }
+                (serde_json::Value::Number(_), _, _, true, _) => Ok(value.clone()), // 整数写浮点键：serde 的 f64 收 visit_i64，安全
+                (serde_json::Value::Bool(_), _, true, _, _) | (serde_json::Value::Bool(_), _, _, true, _) => {
+                    bad()
+                }
+                (serde_json::Value::Array(new), _, _, _, _) => {
+                    // 一维数组：元素类型逐個对（str→str/num→num/bool→bool）
+                    let Some(old) = v.as_array() else { return Ok(value.clone()) };
+                    // toml_edit::Value 与 serde_json::Value 的判定 API 名字不同，分别取
+                    let toml_kind = |x: &toml_edit::Value| {
+                        if x.is_str() {
+                            "s"
+                        } else if x.is_bool() {
+                            "b"
+                        } else if x.is_integer() || x.is_float() {
+                            "n"
+                        } else {
+                            "?"
+                        }
+                    };
+                    let json_kind = |x: &serde_json::Value| {
+                        if x.is_string() {
+                            "s"
+                        } else if x.is_boolean() {
+                            "b"
+                        } else if x.is_number() {
+                            "n"
+                        } else {
+                            "?"
+                        }
+                    };
+                    let old_kind = old.iter().next().map(toml_kind).unwrap_or("?");
+                    if new.iter().any(|x| json_kind(x) != old_kind) {
+                        return Err(format!(
+                            "config.toml 的 {key} 是{old_kind}数组，不能写成 {value}（元素类型对不上会让重启失败）"
+                        ));
+                    }
+                    Ok(value.clone())
+                }
                 _ => Ok(value.clone()),
             };
         }
@@ -572,6 +632,40 @@ mod set_config_tests {
         set_config_key_at(&p, "agent.brand_new", &serde_json::json!("text")).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("brand_new = \"text\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-08 修：浮点/布尔/数组元素类型原先落 `_ => Ok(clone)` 原样落盘——
+    /// `max_steps = 100.0` 让 serde 的 u32 字段解析失败，**服务重启起不来**，
+    /// 且写时零告警（str→int 有防护，这几个是同款漏洞的漏网口子）。
+    #[test]
+    fn set_config_rejects_type_mismatches_that_break_next_boot() {
+        let dir = std::env::temp_dir().join(format!("agent_cfg_coerce2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[agent]\nmax_steps = 0\n").unwrap();
+        // 浮点写整数键：无小数部分的收成整数（100.0 → 100）
+        set_config_key_at(&p, "agent.max_steps", &serde_json::json!(100.0)).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("max_steps = 100"), "无小数浮点应收成整数: {text}");
+        // 带小数的浮点 → 拒写（写下去重启必炸）
+        let err = set_config_key_at(&p, "agent.max_steps", &serde_json::json!(100.5)).unwrap_err();
+        assert!(err.contains("整数"), "应说明键是整数: {err}");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("max_steps = 100"), "拒写后保持原值: {text}");
+        // 布尔写整数键 → 拒
+        let err = set_config_key_at(&p, "agent.max_steps", &serde_json::json!(true)).unwrap_err();
+        assert!(err.contains("对不上"), "{err}");
+        // 数组元素类型不符 → 拒
+        std::fs::write(&p, "[gateway]\nfallback_configs = [\"a\", \"b\"]\n").unwrap();
+        let err = set_config_key_at(&p, "gateway.fallback_configs", &serde_json::json!([1, 2])).unwrap_err();
+        assert!(err.contains("数组"), "应点名数组元素类型: {err}");
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("fallback_configs = [\"a\", \"b\"]"), "拒写后保持原值: {text}");
+        // 同类型数组照旧放行
+        set_config_key_at(&p, "gateway.fallback_configs", &serde_json::json!(["x"])).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("fallback_configs = [\"x\"]"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
