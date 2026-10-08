@@ -310,26 +310,33 @@ pub fn sanitize(text: &str) -> String {
             i = j;
             continue;
         }
-        // 密钥字段：名字与分隔符照抄，值打码（键名族大小写不敏感）
+        // 密钥字段：名字与分隔符照抄，值打码（键名族大小写不敏感 + 词边界——
+        // 不查边界会把 "passwords are rotated" 里的 "are" 也掩掉）
         let mut handled = false;
-        for pat in SECRET_KEYS {
-            if starts_ci(i, pat) {
-                out.push_str(&chars[i..i + pat.chars().count()].iter().collect::<String>());
-                let mut j = i + pat.chars().count();
-                while j < n && (chars[j] == ':' || chars[j] == '=' || chars[j] == '"' || chars[j].is_whitespace()) {
-                    out.push(chars[j]);
-                    j += 1;
+        let at_word_start = i == 0 || {
+            let prev = chars[i - 1];
+            !(prev.is_ascii_alphanumeric() || prev == '_' || prev == '-')
+        };
+        if at_word_start {
+            for pat in SECRET_KEYS {
+                if starts_ci(i, pat) {
+                    out.push_str(&chars[i..i + pat.chars().count()].iter().collect::<String>());
+                    let mut j = i + pat.chars().count();
+                    while j < n && (chars[j] == ':' || chars[j] == '=' || chars[j] == '"' || chars[j].is_whitespace()) {
+                        out.push(chars[j]);
+                        j += 1;
+                    }
+                    let mut k = j;
+                    while k < n && chars[k] != '"' && chars[k] != ',' && chars[k] != '}' && !chars[k].is_whitespace() {
+                        k += 1;
+                    }
+                    if k > j {
+                        out.push_str("***");
+                    }
+                    i = k;
+                    handled = true;
+                    break;
                 }
-                let mut k = j;
-                while k < n && chars[k] != '"' && chars[k] != ',' && chars[k] != '}' && !chars[k].is_whitespace() {
-                    k += 1;
-                }
-                if k > j {
-                    out.push_str("***");
-                }
-                i = k;
-                handled = true;
-                break;
             }
         }
         if handled {

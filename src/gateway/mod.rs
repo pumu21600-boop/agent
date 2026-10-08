@@ -396,8 +396,14 @@ impl Gateway {
                     return Ok(r);
                 }
                 Err(e) if e.is_connect() || e.is_timeout() || e.is_request() => {
-                    // 网络类失败：热重建客户端再试一次（成败都收口，不回到循环头）
-                    let fresh = self.rebuild_client();
+                    // 网络类失败：热重建客户端再试一次（成败都收口，不回到循环头）。
+                    // 环回渠道不走代理，重建只对默认客户端有意义——重试若换回默认
+                    // 客户端会把本地端点又拽进代理（502），这里保持用环回客户端。
+                    let fresh = if is_loopback_base_url(base_url) {
+                        self.loopback_client.clone()
+                    } else {
+                        self.rebuild_client()
+                    };
                     match build(fresh).send().await {
                         Ok(r) => return Ok(r),
                         Err(e) => return Err(anyhow!(e.to_string())),
