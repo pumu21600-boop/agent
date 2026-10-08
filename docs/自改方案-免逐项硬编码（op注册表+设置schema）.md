@@ -163,7 +163,7 @@ SSE 事件链 与 插件 `postMessage` 桥 共用同一张 `ops` 表与同一个
 - **破坏类操作继续走具名路径**：例如删除会话（`delete_session`）当前**刻意没有**塞进通用 `fire_event` 白名单，
   就是为了让 `rules` 能**按参数**判级、并在工具层完成确认。通用化后，这类操作应在 op 元数据里标 `risk: destructive`
   并保留「按参数判级 + 必问」的语义，而不是简单并进一条宽松的通用通道。
-- **范围外保留范围外**：`api_key` / 价格表 / 信任插件 仍不进模型可改范围；`config.toml` 改文件仍需重启且同样必问。
+- **范围外保留范围外**：`api_key` / 价格表 仍不进模型可改范围；`config.toml` 改文件仍需重启且同样必问。（2026-10-08 注：随验签机制移除，「信任插件」一项已无对应字段，自然作废。）
 - **审批档位本身（2026-10-08 校正）**：档位已并三档（read-only / auto / full-access，
   sandbox 档 2026-10-03 取消、旧值自动迁移 read-only）；agent 经 `set_config` 改
   `config.toml` 的 `default_approval` 有通道但**必经用户确认**（rules.rs 判 Dangerous），

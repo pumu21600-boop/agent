@@ -276,19 +276,13 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             _ => (RiskLevel::Dangerous, "session 工具缺少合法 method".into()),
         },
 
-        // 2026-10-04 放开权限轮：第三方插件信任交给 agent——先审后装（blocker 自动
-        // 停下带回报告），审查没过要强装（force）必须用户亲自批准（弹卡=选择权）。
-        // 卸载可逆走 Normal；审查本身只读。2026-10-06 加 remove：删文件不可逆 →
-        // Dangerous 必问（与界面删除按钮走同一道 ConfirmModal 纪律）。
+        // 2026-10-04 放开权限轮：第三方插件安装交给 agent（落位即加载；2026-10-08
+        // 审核关与 pin 验签按用户拍板移除）。安装改插件面走 Normal；2026-10-06 加
+        // remove：删文件不可逆 → Dangerous 必问（与界面删除按钮走同一道 ConfirmModal 纪律）。
         "plugin" => match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
-            "review" => (RiskLevel::Normal, "审查插件（只读，不改信任状态）".into()),
-            "install" if args.get("force").and_then(|v| v.as_bool()).unwrap_or(false) => {
-                (RiskLevel::Dangerous, "强制安装未通过审查的第三方插件（blocker 在身，等用户拍板）".into())
-            }
-            "install" => (RiskLevel::Normal, "安装插件（先审后装：blocker 会自动停下并带回报告）".into()),
-            "unpin" => (RiskLevel::Normal, "取消插件信任（可逆，停用即可恢复）".into()),
+            "install" => (RiskLevel::Normal, "安装插件（落位即加载）".into()),
             "remove" => (RiskLevel::Dangerous, "删除插件（连目录带文件，不可恢复）".into()),
-            _ => (RiskLevel::Dangerous, "plugin 工具缺少合法 action（install/review/unpin/remove）".into()),
+            _ => (RiskLevel::Dangerous, "plugin 工具缺少合法 action（install/remove）".into()),
         },
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
@@ -1334,18 +1328,12 @@ mod tests {
         assert_eq!(evaluate_risk("settings", &json!({"action": "set"}), &ws()).0, RiskLevel::Dangerous);
     }
 
-    // —— 2026-10-04 放开权限轮：plugin 工具判级（先审后装，force 必问）——
+    // —— 2026-10-04 放开权限轮：plugin 工具判级（install 常规 / remove 必问）——
     #[test]
     fn test_plugin_tool_grading() {
-        // 常规安装 Normal（blocker 由工具层自动停下带回报告）
+        // 常规安装 Normal（落位即加载，无前置门）
         let (r, why) = evaluate_risk("plugin", &json!({"action": "install", "name": "calc", "manifest": {}, "files": {"index.html": "<p>x</p>"}}), &ws());
-        assert_eq!(r, RiskLevel::Normal, "先审后装应判常规: {why}");
-        // 强装未过审插件 = 用户亲自拍板，任何档位必问
-        let (r, why) = evaluate_risk("plugin", &json!({"action": "install", "name": "calc", "manifest": {}, "files": {"index.html": "<p>x</p>"}, "force": true}), &ws());
-        assert_eq!(r, RiskLevel::Dangerous, "force 强装必问: {why}");
-        // review 只读、unpin 可逆
-        assert_eq!(evaluate_risk("plugin", &json!({"action": "review", "key": "plugins:calc"}), &ws()).0, RiskLevel::Normal);
-        assert_eq!(evaluate_risk("plugin", &json!({"action": "unpin", "key": "plugins:calc"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(r, RiskLevel::Normal, "安装应判常规: {why}");
         // 2026-10-06 remove：删文件不可逆 → 必问（与界面 ConfirmModal 同纪律）
         let (r, why) = evaluate_risk("plugin", &json!({"action": "remove", "name": "calc"}), &ws());
         assert_eq!(r, RiskLevel::Dangerous, "删插件不可逆必问: {why}");

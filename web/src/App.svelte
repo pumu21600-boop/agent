@@ -17,7 +17,6 @@
   import MemoryTab from './lib/MemoryTab.svelte';
   import SkillsTab from './lib/SkillsTab.svelte';
   import McpTab from './lib/McpTab.svelte';
-  import ReviewModal from './lib/ReviewModal.svelte';
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
   import { parseCssColor, rgbToHex, rgbAlpha, hexWithAlpha, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
@@ -362,6 +361,12 @@
     let rzT = null;
     const onRz = () => { clearTimeout(rzT); rzT = setTimeout(refreshWinMax, 300); };
     window.addEventListener('resize', onRz);
+    // 点工具栏菜单外部 → 全部收起（问题1）。监听与清理都必须在**同步** onMount 里：
+    // async onMount 的 await 续体跑在 mount 完成之后，那里调 onDestroy 会抛
+    // 「Function called outside component initialization」（2026-10-08 修过一版但放错了
+    // 位置——放在 async 续体里照抛，且抛出会打断后面的启动续体）。清理函数随同步
+    // onMount 的返回值注册，HMR 下不累积。
+    document.addEventListener('click', closeMenusOnOutside);
     // 2026-10-08 修：三个根级监听器原无配对清理——生产态 App 只挂一次无感，
     // dev 的 HMR 每次热替换都销毁重建，message 监听累积会让插件桥的每次
     // agent:request 被新旧实例各处理一次（reply 发两遍）。
@@ -371,6 +376,7 @@
       window.removeEventListener('resize', onRz);
       window.removeEventListener('agentwinready', adoptWinApi);
       window.removeEventListener('message', onExtMessage);
+      document.removeEventListener('click', closeMenusOnOutside);
     };
   });
 
@@ -385,11 +391,6 @@
     refreshGit(); // 顶条显示当前分支/未提交数（非仓库时自动隐藏）
     loadVersion(); // 021：侧栏「关于」行（版本 + 运行根）
     loadExt(); // 021：组件总线扩展清单（有扩展时侧栏才出入口）
-    // 点工具栏菜单外部 → 全部收起（问题1）
-    // 2026-10-08 修：配对清理（HMR 下不累积重复处理器）。注意不能放在 async onMount
-    // 的返回值里——Svelte 只认函数，async 的 Promise 不当清理用。
-    document.addEventListener('click', closeMenusOnOutside);
-    onDestroy(() => document.removeEventListener('click', closeMenusOnOutside));
     // 单元素微调标记首屏补盖（会话恢复后元素才就位，故在加载完再盖一次）
     stampMicroUids();
     // 面板上次就是开着且停在「网页」时，补一次浏览器状态加载：openRightPanel 只在用户
@@ -3926,7 +3927,6 @@
       const r = await fetch('/api/plugins', { cache: 'no-store' }).then((r) => r.json());
       extList = r.plugins || [];
       extInfo = { app_dir: r.app_dir || '', workspace_dir: r.workspace_dir || '' };
-      autoReviewThirdParty();
     } catch (e) {
       extList = [];
       extMsg = `读取插件失败: ${e.message || e}`;
@@ -4260,6 +4260,34 @@
         const text = String(params.text || '');
         input = input ? `${input}\n${text}` : text;
         reply(true, { ok: true });
+      },
+    },
+    // 插件制作器：在指定工作区新建对话并把提示词预填进输入框（不代发——用户自己审自己回车）。
+    // 机制全是现成管道的拼装：切工作区走 applyWorkspace（与「在项目内新建会话」同路，
+    // 没切成就停下，否则会话会落到别的项目里），建会话走 startNewSession，预填就是
+    // 给 bind:value={input} 赋值。有会话在跑时拒绝：切项目会断流，那轮就白跑了。
+    'session.create': {
+      bridge: true, perm: 'session.create', title: '在指定工作区新建对话并预填输入框',
+      async run({ reply, params }) {
+        if (Object.keys(streams).length > 0) {
+          return reply(false, '有会话正在运行，等它跑完再试');
+        }
+        const ws = String(params.workspace || '').trim();
+        if (ws && normPath(ws).toLowerCase() !== normPath(workspace).toLowerCase()) {
+          await applyWorkspace(ws);
+          // 没真正切过去（目录不存在/失败）就别新建，否则会话会落到别的项目里
+          if (normPath(workspace).toLowerCase() !== normPath(ws).toLowerCase()) {
+            return reply(false, `没能切换到工作区：${ws}`);
+          }
+        }
+        await startNewSession();
+        const text = String(params.text || '');
+        if (text) {
+          input = text;
+          resetComposerHeight();
+          composerInputEl?.focus();
+        }
+        reply(true, { id: currentSessionId, workspace });
       },
     },
     'notify': {
@@ -4810,96 +4838,6 @@
       cancelCreateExt();
     } catch (err) {
       extMsg = `新建插件失败: ${err.message || err}`;
-    }
-  }
-
-  // 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
-  // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查，blocker 后端直接拒；审核报告按插件名缓存
-  let extReviews = {}; // name -> report（{verdict, findings, files_scanned, bytes_scanned}）
-  let reviewModal = null; // 打开中的审查报告：{ ext, report }（用户要「可视化界面，还要简洁」）
-  let reviewBusy = false;
-  // 拉一份报告并缓存；open=true 时同步弹开报告弹窗（按钮/自动预审共用）
-  async function fetchReview(e) {
-    const r = await fetch('/api/plugins/review', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: e.trust_key }),
-    }).then((r) => r.json());
-    if (r.error) {
-      extMsg = `审核失败: ${r.error}`;
-      return null;
-    }
-    extReviews = { ...extReviews, [e.name]: r.report };
-    return r.report;
-  }
-  async function reviewExt(e, open = true) {
-    if (!e.trust_key) {
-      extMsg = `「${e.title || e.name}」没有验签键（内置/draft 不审）`;
-      return;
-    }
-    try {
-      const report = await fetchReview(e);
-      if (!report) return;
-      // 弹窗前从最新清单里取一份（trust 改的是 extList，缓存的那份 trusted 态可能过期）
-      const fresh = extList.find((x) => x.name === e.name) || e;
-      if (open) {
-        reviewModal = { ext: fresh, report };
-      } else {
-        const n = report.findings.length;
-        extMsg =
-          report.verdict === 'blocked'
-            ? `「${fresh.title || fresh.name}」审核未通过（${n} 条问题）`
-            : `「${fresh.title || fresh.name}」审核通过${n ? `（${n} 条警告）` : ''}`;
-      }
-    } catch (err) {
-      extMsg = `审核失败: ${err.message || err}`;
-    }
-  }
-  // 行内状态 chip：未审过 →「未审核」（点了就审）；审过 → 结论 chip（点了看报告）
-  function reviewChip(e) {
-    const rv = extReviews[e.name];
-    if (!rv) return { text: '未审核', cls: 'warn', tip: '点一下跑静态审查（清单/外联/动态执行/体积）' };
-    if (rv.verdict === 'blocked') return { text: `审核未通过 ${rv.findings.length}`, cls: 'warn', tip: '有阻断项：点开看报告' };
-    return { text: rv.findings.length ? `审核通过 · ${rv.findings.length} 警告` : '审核通过', cls: '', tip: '点开看审查报告' };
-  }
-  // 自动预审：清单到手后，把还没验签的第三方插件都静默审一遍——审查状态进得来就看见，
-  // 不用逐个点「审核」（本地静态扫描，无外呼）。失败不打扰，留「未审核」chip 让人手动点。
-  async function autoReviewThirdParty() {
-    const pending = extList.filter((e) => e.origin === 'user' && !e.trusted && e.trust_key && !extReviews[e.name]);
-    for (const e of pending) {
-      try {
-        await reviewExt(e, false);
-      } catch {
-        /* 单个失败不打断其余 */
-      }
-    }
-  }
-  async function trustExt(e, action) {
-    const key = e.trust_key;
-    if (!key) return;
-    const verb = action === 'pin' ? '信任' : '取消信任';
-    if (action === 'pin' && !(await confirmAsk(`信任插件「${e.title || e.name}」？\n\n会先做静态审核（manifest 合规/外联白名单/动态执行/体积），通过后才记录内容指纹；文件被改动后会再次要求重新审核并信任。`))) return;
-    try {
-      const r = await fetch('/api/plugins/trust', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, action }),
-      }).then((r) => r.json());
-      if (r.error) {
-        extMsg = `${verb}失败: ${r.error}`;
-        // 审核被拒：直接把完整报告弹开（人话索引留在 extMsg，逐条理由看弹窗）
-        if (Array.isArray(r.review_blocked) && r.report) {
-          extReviews = { ...extReviews, [e.name]: r.report };
-          reviewModal = { ext: e, report: r.report };
-        }
-      }
-      else {
-        extMsg = action === 'pin' ? `已信任「${e.title || e.name}」（内容指纹已固定）` : `已取消信任「${e.title || e.name}」`;
-        if (action === 'pin') reviewModal = null;
-      }
-      if (r.plugins) extList = r.plugins;
-    } catch (err) {
-      extMsg = `${verb}失败: ${err.message || err}`;
     }
   }
 
@@ -6846,7 +6784,6 @@
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} confirm={confirmAsk} on:reload={loadSkills} />
       <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.server)} on:reload={loadMcp} />
       {#if settingsTab === 'ext'}
-        <div class="param-hint">来源为 user 的第三方插件要先点「信任」才会加载</div>
         {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
 
         <!-- 用户 2026-10-05：「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
@@ -6884,7 +6821,6 @@
             </div>
             {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
             {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
-            {#if e.origin === 'user' && !e.trusted}<span class="plug-chip warn" title="第三方来源：未记录内容指纹，暂不加载">未验签</span>{/if}
             {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
             {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
             <span class="flex-sp"></span>
@@ -6892,13 +6828,6 @@
               <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
               <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
             {:else}
-              {#if e.origin === 'user'}
-                {#if e.trusted}
-                  <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
-                {:else}
-                  <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
-                {/if}
-              {/if}
               {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
               {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
               {#if e.origin === 'user'}
@@ -6923,10 +6852,6 @@
               </div>
               {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
               {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
-              {#if e.origin === 'user' && !e.trusted}
-                <button class="plug-chip warn btnish" title={reviewChip(e).tip} on:click={() => (extReviews[e.name] ? (reviewModal = { ext: e, report: extReviews[e.name] }) : reviewExt(e))}>{reviewChip(e).text}</button>
-              {/if}
-              {#if e.origin === 'user' && e.trusted}<span class="plug-chip" title="已记录内容指纹：文件被改动后会要求重新审核">已验签</span>{/if}
               {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
               {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
               <span class="flex-sp"></span>
@@ -6934,14 +6859,6 @@
                 <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
                 <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
               {:else}
-                {#if e.origin === 'user'}
-                  {#if e.trusted}
-                    <button class="btn ghost" on:click={() => trustExt(e, 'unpin')} title="取消后该插件立即停止加载">取消信任</button>
-                  {:else}
-                    <button class="btn ghost" on:click={() => reviewExt(e)} title="静态审查：manifest 合规/外联白名单/动态执行/体积">审核</button>
-                    <button class="btn primary" on:click={() => trustExt(e, 'pin')}>信任</button>
-                  {/if}
-                {/if}
                 {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
                 {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
                 {#if e.origin === 'user'}
@@ -7071,30 +6988,6 @@
     const resolve = confirmModal && confirmModal.resolve;
     confirmModal = null;
     if (resolve) resolve(e.detail);
-  }}
-/>
-
-<!-- 插件审查报告（准入审核关的可视化界面）：只审不信的预审、信任被拒的逐条理由都弹它 -->
-<ReviewModal
-  ext={reviewModal?.ext ?? null}
-  report={reviewModal?.report ?? null}
-  busy={reviewBusy}
-  on:close={() => (reviewModal = null)}
-  on:review={async () => {
-    if (!reviewModal || reviewBusy) return;
-    reviewBusy = true;
-    try {
-      const r = await fetchReview(reviewModal.ext);
-      if (r) reviewModal = { ext: extList.find((x) => x.name === reviewModal.ext.name) || reviewModal.ext, report: r };
-    } finally {
-      reviewBusy = false;
-    }
-  }}
-  on:trust={async () => {
-    if (!reviewModal) return;
-    const target = reviewModal.ext;
-    reviewModal = null;
-    await trustExt(target, 'pin');
   }}
 />
 

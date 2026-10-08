@@ -83,7 +83,6 @@ async fn main() -> anyhow::Result<()> {
     crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); //  027：停用名单贯通工具插件
     crate::plugin::ui::set_disabled(&user_settings.disabled_plugins); // 生态轮：同名单贯通插件技能根
     crate::skills::set_disabled(&user_settings.disabled_skills); // 2026-10-02：技能启停名单贯通（index_prompt/composer 过滤）
-    crate::plugin::trust::install(&user_settings.trusted_plugins); // 红线3：第三方插件验签（pin digest）
     crate::hooks::install(config.hooks.clone()); //  027：钩子四挂点（config.toml [hooks]）
     // 成本台账：价格表来自 settings.json（由「用量价格」插件的价格设置页维护），
     // 初始化台账时扫一遍装入累计花费（费用已冻结在记录里，直接求和），最后装花费硬闸。

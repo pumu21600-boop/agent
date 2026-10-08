@@ -95,10 +95,6 @@ pub struct PluginEntry {
     pub description: String,
     pub version: String,
     pub api_version: u32,
-    /// 红线3：内容指纹（user 来源才算；内置/draft 为空串）
-    pub digest: String,
-    /// 红线3：是否可信任（未 pin / 内容已变的 user 插件 = false，工具不下发）
-    pub trusted: bool,
     /// draft 插件的内存字节（磁盘插件为 None；call_tool 优先用）
     pub inline: Option<Vec<u8>>,
 }
@@ -115,8 +111,6 @@ impl PluginEntry {
             description: String::new(),
             version: String::new(),
             api_version: contract::API_VERSION,
-            digest: String::new(),
-            trusted: true,
             inline: None,
         }
     }
@@ -218,27 +212,6 @@ pub fn scan_and_load(dir: &Path) -> usize {
     n
 }
 
-/// 红线3：user 来源插件的验签门（内置/模型自产豁免）。
-/// 通过/豁免 → Ok(digest)；拒载 → Err(人话理由 + 审计)。
-fn trust_gate(stem: &str, origin: &str, path: &Path, is_dir: bool) -> Result<String, String> {
-    if origin != contract::ORIGIN_USER {
-        return Ok(String::new());
-    }
-    let key = crate::plugin::trust::key_of("plugins", stem);
-    let digest = if is_dir {
-        crate::plugin::trust::digest_dir(path)?
-    } else {
-        crate::plugin::trust::digest_file(path)?
-    };
-    let st = crate::plugin::trust::state(&key, origin, &digest);
-    if st.trusted() {
-        Ok(digest)
-    } else {
-        crate::plugin::trust::audit_blocked(&key, &st, "wasm.scan");
-        Err(crate::plugin::trust::reject_reason(&st))
-    }
-}
-
 /// 目录形态插件：manifest（契约校验 + 元数据）+ 目录内**恰好一个** .wasm/.wat 工具文件。
 fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     let mut entry = PluginEntry::new(name, dir.to_path_buf(), Vec::new(), None);
@@ -272,16 +245,6 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     }
     if let Some(v) = mf.get("version").and_then(Value::as_str) {
         entry.version = v.to_string();
-    }
-    // 红线3：第三方工具插件先 pin 后代跑（未 pin / 内容已变 → 拒载，工具不下发）
-    match trust_gate(name, &entry.origin, dir, true) {
-        Ok(d) => entry.digest = d,
-        Err(reason) => {
-            entry.load_error = Some(reason);
-            entry.trusted = false;
-            entry.tools = Vec::new();
-            return entry;
-        }
     }
     // 目录内只允许一个工具文件（多个 = 不知道加载哪个，显式报错不静默）
     let mut bins: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -321,23 +284,10 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     }
 }
 
-/// 加载单个插件：先过验签门，再编译 + 实例化 + describe。
+/// 加载单个插件：编译 + 实例化 + describe。
 fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
-    // 旧形态裸文件默认 origin=user：同样要先 pin 后代跑
-    let digest = match trust_gate(stem, contract::ORIGIN_USER, file, false) {
-        Ok(d) => d,
-        Err(reason) => {
-            let mut e = PluginEntry::new(stem, file.to_path_buf(), Vec::new(), Some(reason));
-            e.trusted = false;
-            return e;
-        }
-    };
     match std::fs::read(file).map_err(|e| format!("读插件失败: {e}")).and_then(|b| compile_tools(&b)) {
-        Ok(tools) => {
-            let mut e = PluginEntry::new(stem, file.to_path_buf(), tools, None);
-            e.digest = digest;
-            e
-        }
+        Ok(tools) => PluginEntry::new(stem, file.to_path_buf(), tools, None),
         Err(e) => PluginEntry::new(stem, file.to_path_buf(), Vec::new(), Some(e)),
     }
 }
@@ -649,13 +599,6 @@ pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
                 skills: Vec::new(), // 工具插件不声明技能（技能走 ui::skill_roots 扫描目录形态）
                 settings_entry: String::new(), // 工具插件没有设置页
                 feature: String::new(), // 工具插件不绑功能开关（面板插件才绑）
-                trust_key: if inline {
-                    String::new()
-                } else {
-                    crate::plugin::trust::key_of("plugins", &e.stem)
-                },
-                digest: e.digest.clone(),
-                trusted: e.trusted,
             }
         })
         .collect()
@@ -668,22 +611,6 @@ mod tests {
     /// 沾注册表的测试全部串行（全局静态会被 scan_and_load 整表替换）。
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// 把 plugins 目录里的全部条目（裸文件 + 目录形态）pin 上（与 promote 自动 pin 同路），
-    /// 让验签门放行——测的是别的行为时不至于被红线挡住。
-    fn pin_plugins_dir(dir: &Path) {
-        let mut pins = std::collections::BTreeMap::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
-                if let Ok(d) = crate::plugin::trust::digest_of_path(&p) {
-                    pins.insert(crate::plugin::trust::key_of("plugins", stem), d);
-                }
-            }
-        }
-        crate::plugin::trust::install(&pins);
     }
 
     /// 测试插件：describe 声明 echo 工具；run 把 payload（第 3/4 个参数指到的那段）
@@ -726,13 +653,10 @@ mod tests {
     #[test]
     fn wat_plugin_end_to_end_round_trips_payload() {
         let _g = lock();
-        let _t = crate::plugin::trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("agent-wasm-abi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
-        // 裸文件默认 user 来源 → 先 pin 后代跑（验签红线）
-        pin_plugins_dir(&dir);
 
         let n = scan_and_load(&dir);
         assert_eq!(n, 1, "应扫描到 1 个插件");
@@ -759,7 +683,6 @@ mod tests {
     #[test]
     fn contract_dir_form_disabled_filter_and_inline() {
         let _g = lock();
-        let _t = crate::plugin::trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("agent-wasm-contract-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -784,8 +707,6 @@ mod tests {
         std::fs::create_dir_all(&future).unwrap();
         std::fs::write(future.join("manifest.json"), r#"{"apiVersion":2}"#).unwrap();
         std::fs::write(future.join("f.wat"), ECHO_WAT).unwrap();
-        // 目录形态未声明 source → 默认 user（自装位）→ 先 pin 后代跑
-        pin_plugins_dir(&dir);
 
         let n = scan_and_load(&dir);
         assert_eq!(n, 3, "目录形态 + 两个坏目录都应进注册表（坏的带 load_error）");
@@ -825,46 +746,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 红线3：第三方工具插件「先 pin 后代跑」全矩阵——
-    /// 未 pin 拒载（工具不下发）→ pin 后放行 → 内容被改再次拒载（digest 不符）。
-    #[test]
-    fn untrusted_dir_plugin_is_blocked_until_pinned() {
-        let _g = lock();
-        let _t = crate::plugin::trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::plugin::trust::install(&std::collections::BTreeMap::new());
-        let dir = std::env::temp_dir().join(format!("agent-wasm-trust-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let sub = dir.join("third");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("manifest.json"), r#"{"apiVersion":1,"title":"第三方","source":"user"}"#).unwrap();
-        std::fs::write(sub.join("t.wat"), ECHO_WAT).unwrap();
-
-        // 1) 未 pin → 拒载，且不带任何工具（不进工具表）
-        let e = load_dir_plugin("third", &sub);
-        assert!(!e.trusted);
-        assert!(e.load_error.as_deref().unwrap_or("").contains("信任"), "{:?}", e.load_error);
-        assert!(e.tools.is_empty(), "拒载的插件不该带工具");
-
-        // 2) pin 当前 digest → 放行
-        let digest = crate::plugin::trust::digest_dir(&sub).unwrap();
-        let mut pins = std::collections::BTreeMap::new();
-        pins.insert(crate::plugin::trust::key_of("plugins", "third"), digest);
-        crate::plugin::trust::install(&pins);
-        let e = load_dir_plugin("third", &sub);
-        assert!(e.load_error.is_none(), "pin 后应放行: {:?}", e.load_error);
-        assert_eq!(e.tools.len(), 1);
-
-        // 3) 内容被改（合法 wat 注释，字节已变）→ digest 不符 → 再次拒载
-        std::fs::write(sub.join("t.wat"), format!("{ECHO_WAT}\n;; touched")).unwrap();
-        let e = load_dir_plugin("third", &sub);
-        assert!(!e.trusted);
-        assert!(e.load_error.as_deref().unwrap_or("").contains("内容已变"), "{:?}", e.load_error);
-
-        crate::plugin::trust::install(&std::collections::BTreeMap::new()); // 清场
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-
     /// 2026-10-08 修：StoreLimits 内存闸。插件 grow 超过 64MB 时按 spec 返回 -1
     /// （不 trap 不崩——实测；燃料/epoch 在本平台会炸进程，见常量区注释故不设）。
     /// 直接走 with_instance 验证限额接线，不经插件注册表。
@@ -900,12 +781,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_calls_all_complete_without_deadlock() {
         let _g = lock();
-        let _t = crate::plugin::trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("agent-wasm-conc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
-        pin_plugins_dir(&dir);
         assert_eq!(scan_and_load(&dir), 1);
         let mut handles = Vec::new();
         for _ in 0..WASM_MAX_CONCURRENT * 3 {

@@ -207,10 +207,6 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         // 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
         .route("/api/plugins/draft", post(submit_draft).delete(discard_draft))
         .route("/api/plugins/promote", post(promote_draft))
-        // 红线3：第三方插件验签（pin/unpin 内容指纹）
-        .route("/api/plugins/trust", post(trust_plugin))
-        // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查；本端点只审不信，供界面预审
-        .route("/api/plugins/review", post(review_plugin))
         // 成本台账：按供应商/模型的 token、次数、费用报表 + 价格表与重算
         .route("/api/usage", get(get_usage))
         .route("/api/usage/prices", get(get_usage_prices).put(put_usage_prices))

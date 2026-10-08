@@ -206,8 +206,8 @@ pub(super) async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-/// 新建插件的起始 index.html：自包含、无外联、无动态执行——静态审核（review）干净
-/// 通过；深浅色主题变量对齐其它内置面板。
+/// 新建插件的起始 index.html：自包含、无外联、无动态执行——干净起步；
+/// 深浅色主题变量对齐其它内置面板。
 const STARTER_INDEX_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -244,9 +244,8 @@ const STARTER_INDEX_HTML: &str = r#"<!doctype html>
 "#;
 
 /// POST /api/plugins/create —— 用户 2026-10-05：插件页「新建插件」脚手架。在工作区
-/// plugins/<name>/ 下生成 manifest.json + 起始 index.html。**创建不等于放行**：新插件
-/// 与手工放置的插件走同一条信任/审核链路，仍要用户点「信任」才加载（模型自产的 draft
-/// 隔离区不适用于用户主动创建——来源是 user、权限该自己声明）。
+/// plugins/<name>/ 下生成 manifest.json + 起始 index.html。创建即落位即加载（来源
+/// user、权限自己声明；模型自产的 draft 隔离区不适用于用户主动创建的场景）。
 pub(super) async fn create_plugin(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -438,8 +437,6 @@ pub(super) async fn submit_draft(
 }
 
 /// POST /api/plugins/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
-/// 红线3：转正是用户显式动作 = 信任决定，落盘后**自动 pin** 内容指纹（不 pin 就会被
-/// 自己的验签门拦下，转正等于白做）。
 pub(super) async fn promote_draft(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -447,26 +444,6 @@ pub(super) async fn promote_draft(
     let name = req.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
     match crate::plugin::draft::promote(&name) {
         Ok(paths) => {
-            // 自动 pin：从落盘的 manifest 路径推导插件目录与 digest
-            let pins = crate::plugin::trust::pin_from_manifest_paths(&paths);
-            if !pins.is_empty() {
-                // 2026-10-08 修：settings 写互斥（pin 表读-改-写整条链路持锁）
-                let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
-                let mut s = state
-                    .settings
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                for (k, d) in &pins {
-                    s.trusted_plugins.insert(k.clone(), d.clone());
-                    crate::plugin::trust::audit_pinned(k, d, "promote");
-                }
-                if let Err(e) = s.save() {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
-                }
-                crate::plugin::trust::install(&s.trusted_plugins);
-                *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-            }
             let disabled = state
                 .settings
                 .read()
@@ -474,97 +451,8 @@ pub(super) async fn promote_draft(
                 .disabled_plugins
                 .clone();
             let list = crate::plugin::ui::scan_all(&disabled);
-            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "pinned": pins.len(), "plugins": list })))
+            (StatusCode::OK, Json(json!({ "ok": true, "written": paths, "plugins": list })))
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
-    }
-}
-
-/// POST /api/plugins/trust {key, action} —— 第三方插件验签的 pin / unpin（红线3）。
-/// key 形如 `plugins:<name>`；pin 时按当前位置重算 digest。
-///
-/// **准入审核（用户 2026-10-02 拍板）**：pin 是加载的前置条件，所以 pin 前必须先过
-/// 静态审核——有 blocker 直接拒 pin（审核不过 → 装不进来 → 跑不起来）。pin 表记的是
-/// 内容指纹，天然把「放行」绑定到「审过的这一份」：内容一变 → 验签打回 → 重新走审核。
-pub(super) async fn trust_plugin(
-    State(state): State<AppState>,
-    Json(req): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    let key = req.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let action = req.get("action").and_then(Value::as_str).unwrap_or("pin").trim().to_string();
-    if key.is_empty() || !key.contains(':') {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 plugins:<name>）" })));
-    }
-    let err = |m: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": m })));
-    // 2026-10-08 修：settings 写互斥（pin 表读-改-写整条链路持锁，防与其它写面互覆盖）
-    let _w = state.settings_write.lock().unwrap_or_else(|e| e.into_inner());
-    let mut s = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
-    match action.as_str() {
-        "pin" => {
-            let Some(path) = crate::plugin::trust::resolve(&key) else {
-                return err(format!("找不到插件 {key}（目录不存在或名字非法）"));
-            };
-            if !path.is_dir() {
-                return err(format!("{key} 不是目录形态（裸文件旧形态不支持审核，请改用插件目录）"));
-            }
-            // 准入审核：blocker 一律拒 pin；warn 放行但随响应带回亮旗
-            let report = match crate::plugin::review::review_key(&key) {
-                Ok(r) => r,
-                Err(e) => return err(e),
-            };
-            if report.verdict == crate::plugin::review::Verdict::Blocked {
-                let reasons = crate::plugin::review::block_reasons(&report);
-                observability::event(
-                    EventType::State,
-                    json!({ "kind": "plugin.review_blocked", "key": key, "reasons": reasons }),
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": "审核未通过，不能信任：",
-                        "review_blocked": reasons,
-                        "report": report,
-                    })),
-                );
-            }
-            observability::event(
-                EventType::State,
-                json!({ "kind": "plugin.review_passed", "key": key, "warns": report.findings.len() }),
-            );
-            let digest = report.digest.unwrap_or_default();
-            s.trusted_plugins.insert(key.clone(), digest.clone());
-            crate::plugin::trust::audit_pinned(&key, &digest, "user");
-        }
-        "unpin" => {
-            s.trusted_plugins.remove(&key);
-            observability::event(
-                EventType::State,
-                json!({ "kind": "plugin.trust_unpinned", "key": key, "by": "user" }),
-            );
-        }
-        other => return err(format!("未知操作: {other}（pin | unpin）")),
-    }
-    if let Err(e) = s.save() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
-    }
-    crate::plugin::trust::install(&s.trusted_plugins);
-    *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // pin/unpin 会改变工具插件的可加载性 → 重扫注册表，清单与工具表同步
-    crate::plugin::wasm::rescan();
-    let disabled = s.disabled_plugins.clone();
-    let list = crate::plugin::ui::scan_all(&disabled);
-    (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
-}
-
-/// POST /api/plugins/review {key} —— 只审不信（界面「审核」按钮用）：跑静态审查，
-/// 返回完整报告（结论 + 逐条发现）。不落任何状态——放行只在 pin 时发生一次。
-pub(super) async fn review_plugin(Json(req): Json<Value>) -> (StatusCode, Json<Value>) {
-    let key = req.get("key").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    if key.is_empty() || !key.contains(':') {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 key（形如 plugins:<name>）" })));
-    }
-    match crate::plugin::review::review_key(&key) {
-        Ok(report) => (StatusCode::OK, Json(json!({ "ok": true, "report": report }))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
     }
 }
@@ -644,7 +532,7 @@ pub(super) async fn plugin_asset(
     serve_plugin(&state, &name, &path)
 }
 
-/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用、未通过验签的也 404。
+/// 分发扩展资产：越界/缺失一律 404（不区分，避免探测目录结构）；停用的也 404。
 fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
     let disabled = state
         .settings
@@ -655,15 +543,14 @@ fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
     if disabled.iter().any(|d| d == name) {
         return (StatusCode::NOT_FOUND, "插件已停用").into_response();
     }
-    // 红线3：第三方验签门与清单拒载同一把尺子——未 pin / 内容已变的插件不服务任何资产
-    // （否则「清单里显示未受信任、面板 iframe 却能打开」自相矛盾）
+    // 清单拒载（manifest 坏了/入口缺失）与停用同一把尺子：不服务任何资产
     let list = crate::plugin::ui::scan(&disabled);
     if let Some(e) = list.iter().find(|e| e.name == name)
-        && (!e.ok || !e.trusted)
+        && !e.ok
     {
         return (
             StatusCode::NOT_FOUND,
-            format!("插件未通过来源验签：{}", e.error.clone().unwrap_or_else(|| "未受信任".into())),
+            format!("插件未加载：{}", e.error.clone().unwrap_or_else(|| "清单不可用".into())),
         )
             .into_response();
     }
@@ -700,34 +587,6 @@ fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 新建插件的脚手架必须干净过静态审核（review 判 Pass）——否则建出来的插件
-    /// 点「信任」会被后端拦下，「新建插件」入口就成了死路。改起始页模板先跑这个测试。
-    #[test]
-    fn scaffold_passes_static_review() {
-        let d = std::env::temp_dir().join(format!("agent-plugin-scaffold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        // 与 create_plugin 落盘的 manifest 同字段（描述留空也走这条）
-        let manifest = json!({
-            "apiVersion": 1,
-            "source": "user",
-            "title": "demo",
-            "description": "",
-            "version": "0.1.0",
-            "entry": "index.html",
-        });
-        crate::fsx::write_atomic_str(
-            &d.join("manifest.json"),
-            &serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        crate::fsx::write_atomic_str(&d.join("index.html"), STARTER_INDEX_HTML).unwrap();
-        let report = crate::plugin::review::review_dir(&d);
-        let _ = std::fs::remove_dir_all(&d);
-        assert_eq!(report.verdict, crate::plugin::review::Verdict::Pass);
-        assert!(report.findings.is_empty(), "脚手架不该亮任何旗: {:?}", report.findings);
-    }
 
     /// 插件开关必须推 settings_changed，且联动命中功能键时把它带在 keys 里。
     ///

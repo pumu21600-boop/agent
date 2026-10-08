@@ -26,6 +26,8 @@
 6. MCP 已分家为顶层 `src/mcp/`（mod.rs + oauth.rs），调用点全部 `crate::mcp`，与 plugin 的唯一过境点是 `ToolBrief`
 7. 三套生命周期（内置 / 用户验签 / 模型草稿）保留——属安全设计，合理
 
+> **2026-10-08 更新（插件制作器轮）**：本节第 3/4/7 条描述的 trust 端点、信任键迁移与「用户验签」生命周期已随审核/pin 机制一并移除（用户拍板，详见 ROADMAP 10-08 行与 docs/plugin-contract-v1.md 第八节）；现行路由为 `/api/plugins`（create/remove/toggle/draft/promote），`trusted_plugins` 设置字段已删（旧键由 serde 忽略未知字段自然兼容）。
+
 有意保留（已记入施工单 031 第四节，**不要再报为问题**）：
 - 前端内部变量仍为 ext 词汇（extCurrent / extOpen / rpTab 值 `ext:xxx`）——含 localStorage 持久键，改名会破坏用户已存状态
 - `ui.rs` 类型名 `UiExt`——纯内部类型名，无序列化影响

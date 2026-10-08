@@ -33,7 +33,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::plugin::{contract, ToolBrief};
-use crate::plugin::trust;
 
 /// 插件目录名（应用根与工作区同名；「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "plugins";
@@ -106,12 +105,6 @@ pub struct UiExt {
     /// 声明后插件的启用开关就是这个功能的总开关（host 侧 toggle_plugin 同步写
     /// settings.features），一个能力只留一个开关，不搞「插件停用 + 功能关闭」双闸
     pub feature: String,
-    /// 红线3：验签键（`plugins:<name>`；draft 为空串）
-    pub trust_key: String,
-    /// 红线3：内容指纹（user 来源才算；内置/draft 为空串）
-    pub digest: String,
-    /// 红线3：是否可信任（内置/已 pin/模型自产 = true；未 pin 或内容已变 = false）
-    pub trusted: bool,
 }
 
 /// 扫描全部插件（内置 + 当前工作区 + 内存 draft；工作区同名覆盖内置，顺序稳定）。
@@ -169,9 +162,6 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
             // draft 是模型自产隔离区：豁免验签
             settings_entry: String::new(),
             feature: String::new(),
-            trust_key: String::new(),
-            digest: String::new(),
-            trusted: true,
         });
     }
     out
@@ -241,9 +231,6 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
         skills: Vec::new(),
         settings_entry: String::new(),
         feature: String::new(),
-        trust_key: String::new(),
-        digest: String::new(),
-        trusted: true,
     };
     if !safe_segment(name) {
         e.error = Some("目录名非法（仅字母数字与 - _ . ，且不能是 . 或 ..）".into());
@@ -319,7 +306,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             .filter(|p| {
                 matches!(
                     *p,
-                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard" | "settings.feature" | "action.run"
+                    "composer.insert" | "workspace.write" | "bus.publish" | "notify" | "storage" | "usage.prices" | "clipboard" | "settings.feature" | "action.run" | "session.create"
                 )
             })
             .map(str::to_string)
@@ -331,29 +318,6 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
     if let Some(sd) = v.get("skills").and_then(Value::as_str) {
         match skills_dir_of(dir, sd) {
             Ok(p) => e.skills = list_skill_names(&p),
-            Err(err) => {
-                e.ok = false;
-                e.error = Some(err);
-                return e;
-            }
-        }
-    }
-    // 红线3：第三方插件（origin=user）先 pin 后代跑——算内容指纹、对 pin 表，
-    // 未 pin / 内容已变 → 拒载（ok=false + 人话理由 + 审计），元数据照常带回供界面提示
-    e.trust_key = trust::key_of(DIR, name);
-    if e.origin == contract::ORIGIN_USER {
-        match trust::digest_dir(dir) {
-            Ok(d) => {
-                let st = trust::state(&e.trust_key, &e.origin, &d);
-                e.digest = d;
-                e.trusted = st.trusted();
-                if !st.trusted() {
-                    trust::audit_blocked(&e.trust_key, &st, "ui.scan");
-                    e.ok = false;
-                    e.error = Some(trust::reject_reason(&st));
-                    return e;
-                }
-            }
             Err(err) => {
                 e.ok = false;
                 e.error = Some(err);
@@ -430,7 +394,7 @@ pub fn skill_roots() -> Vec<(PathBuf, String)> {
 fn skill_roots_in(disabled: &[String], ws: &Path, app: &Path) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for (base, location) in [(ws, "workspace"), (app, "app")] {
+    for base in [ws, app] {
         let Ok(rd) = std::fs::read_dir(base) else { continue };
         let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         dirs.sort();
@@ -453,17 +417,6 @@ fn skill_roots_in(disabled: &[String], ws: &Path, app: &Path) -> Vec<(PathBuf, S
                 Ok(p) => p,
                 Err(_) => continue, // 清单问题在插件页有显式报错；这里只当「不贡献技能」
             };
-            let origin = contract::origin_of(&v, location);
-            if origin == contract::ORIGIN_USER {
-                // 技能正文会进系统提示（比跑代码更敏感），第三方插件同样要先 pin
-                let key = trust::key_of(DIR, &name);
-                let Ok(digest) = trust::digest_dir(&dir) else { continue };
-                let st = trust::state(&key, &origin, &digest);
-                if !st.trusted() {
-                    trust::audit_blocked(&key, &st, "skills.roots");
-                    continue;
-                }
-            }
             out.push((skills_dir, name));
         }
     }
@@ -534,15 +487,10 @@ pub fn remove(name: &str) -> Result<String, (axum::http::StatusCode, String)> {
             s.disabled_plugins.retain(|d| d != name);
             cleaned.push("停用名单");
         }
-        let key = trust::key_of(DIR, name);
-        if s.trusted_plugins.remove(&key).is_some() {
-            cleaned.push("信任记录");
-        }
         if !cleaned.is_empty() {
             s.save().map_err(|err| bad(format!("保存 settings.json 失败: {err}")))?;
             crate::plugin::wasm::set_disabled(&s.disabled_plugins);
             set_disabled(&s.disabled_plugins);
-            crate::plugin::trust::install(&s.trusted_plugins);
             *handle.write().unwrap_or_else(|e| e.into_inner()) = s;
         }
     }
@@ -686,18 +634,8 @@ mod tests {
         d
     }
 
-    /// 给测试里的 user 来源插件 pin 指纹（与 promote 自动 pin 同路），
-    /// 否则验签门会按设计拒载。用完由调用方 install 空表清场。
-    fn pin_dir(name: &str, dir: &Path) {
-        let digest = trust::digest_dir(dir).unwrap();
-        let mut pins = std::collections::BTreeMap::new();
-        pins.insert(trust::key_of(DIR, name), digest);
-        trust::install(&pins);
-    }
-
     #[test]
     fn manifest_loaded_and_entry_checked() {
-        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmpdir("manifest");
         let d = root.join("panel");
         std::fs::create_dir_all(&d).unwrap();
@@ -711,22 +649,7 @@ mod tests {
         assert_eq!(e.title, "记忆看板");
         assert_eq!(e.version, "1.2.3");
         assert_eq!(e.source, "workspace");
-        // workspace 来源 = user → 未 pin 显式拒载（元数据照常带回，界面能提示）
-        assert!(!e.ok, "未 pin 的第三方插件不加载");
-        assert!(!e.trusted);
-        assert!(e.error.as_deref().unwrap_or("").contains("信任"), "{:?}", e.error);
-        // pin 后放行
-        pin_dir("panel", &d);
-        let e = load_one(&d, "panel", "workspace", &[]);
-        assert!(e.ok, "pin 后应加载: {:?}", e.error);
-        assert!(e.trusted);
-        assert!(!e.digest.is_empty(), "user 来源应带内容指纹");
-        // 内容被改 → digest 不符 → 拒载 + 提示重新信任（红线：改动可检出）
-        std::fs::write(d.join("index.html"), "<html>改</html>").unwrap();
-        let tampered = load_one(&d, "panel", "workspace", &[]);
-        assert!(!tampered.ok);
-        assert!(tampered.error.as_deref().unwrap_or("").contains("内容已变"), "{:?}", tampered.error);
-        trust::install(&std::collections::BTreeMap::new()); // 清场
+        assert!(e.ok, "{:?}", e.error);
 
         // 入口不存在 → 不 ok 且带原因（不静默）
         std::fs::write(d.join("manifest.json"), r#"{"entry":"missing.html"}"#).unwrap();
@@ -738,7 +661,6 @@ mod tests {
 
     #[test]
     fn workspace_ext_shadows_builtin_with_flag_and_test_two_roots() {
-        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let app = tmpdir("shadow-app");
         let ws = tmpdir("shadow-ws");
         for (root, title) in [(&app, "内置看板"), (&ws, "工作区看板")] {
@@ -764,10 +686,7 @@ mod tests {
         let solo = out.iter().find(|e| e.name == "solo").unwrap();
         assert!(!solo.shadowed, "工作区独有（无同名内置）不该标覆盖");
         assert!(!out.iter().any(|e| e.title == "内置看板"), "被覆盖的内置项应被顶掉");
-        // 内置位（app）不验签；工作区位（user）未 pin → 显式不 ok（红线3）
         assert!(out.iter().find(|e| e.name == "board").unwrap().origin == contract::ORIGIN_USER);
-        assert!(!out.iter().find(|e| e.name == "board").unwrap().ok, "未 pin 的第三方插件不加载");
-        trust::install(&std::collections::BTreeMap::new()); // 清场
         let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -840,11 +759,9 @@ mod tests {
         assert!(!safe_segment(""));
     }
 
-    /// 生态轮：技能根扫描——只收声明 skills 的合法插件；工作区覆盖内置；停用不贡献；
-    /// 第三方（user 来源）未 pin 不贡献、pin 后贡献。
+    /// 生态轮：技能根扫描——只收声明 skills 的合法插件；工作区覆盖内置；停用不贡献。
     #[test]
-    fn skill_roots_scan_override_disable_and_trust() {
-        let _g = trust::TRUST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn skill_roots_scan_override_and_disable() {
         let app = tmpdir("roots-app");
         let ws = tmpdir("roots-ws");
         let mk = |root: &Path, name: &str, manifest: &str| {
@@ -855,39 +772,25 @@ mod tests {
             d
         };
         let _builtin = mk(&app, "docplug", r#"{"apiVersion":1,"skills":"skills"}"#);
-        // 工作区同名插件（user 来源，未 pin）→ 整体遮蔽内置（与 UI 扫描 retain 同语义）：
-        // 遮蔽者自己又没过信任门 → 两边都不贡献，不让内置版从背后漏出来
+        // 工作区同名插件 → 整体遮蔽内置（与 UI 扫描 retain 同语义）
         mk(&ws, "docplug", r#"{"apiVersion":1,"skills":"skills"}"#);
-        // 工作区独有插件：停用名单里的 + 未 pin 的各一个
+        // 工作区独有插件：停用名单里的一个
         mk(&ws, "offplug", r#"{"apiVersion":1,"skills":"skills"}"#);
-        mk(&ws, "evilplug", r#"{"apiVersion":1,"skills":"skills"}"#);
+        mk(&ws, "soloplug", r#"{"apiVersion":1,"skills":"skills"}"#);
         // 不声明 skills 的插件不进技能根
         let plain = app.join("plainplug");
         std::fs::create_dir_all(&plain).unwrap();
         std::fs::write(plain.join("manifest.json"), r#"{"apiVersion":1}"#).unwrap();
 
         let roots = skill_roots_in(&["offplug".to_string()], &ws, &app);
-        assert!(
-            roots.is_empty(),
-            "未过信任门的工作区插件不贡献，被遮蔽的内置也不漏: {roots:?}"
-        );
-
-        // pin 工作区两份 → 覆盖生效 + evilplug 贡献
-        let mut pins = std::collections::BTreeMap::new();
-        for n in ["docplug", "evilplug"] {
-            pins.insert(trust::key_of(DIR, n), trust::digest_dir(&ws.join(n)).unwrap());
-        }
-        trust::install(&pins);
-        let roots = skill_roots_in(&["offplug".to_string()], &ws, &app);
         let mut names: Vec<_> = roots.iter().map(|(_, n)| n.as_str()).collect();
         names.sort();
-        assert_eq!(names, vec!["docplug", "evilplug"], "pin 后工作区覆盖内置 + 未停用者贡献");
+        assert_eq!(names, vec!["docplug", "soloplug"], "工作区覆盖内置 + 未停用者贡献");
         let ws_docplug = roots.iter().find(|(_, n)| n == "docplug").unwrap();
-        assert!(ws_docplug.0.starts_with(&ws), "pin 后用的是工作区那份的技能目录");
+        assert!(ws_docplug.0.starts_with(&ws), "覆盖后用工作区那份的技能目录");
         assert!(roots.iter().all(|(p, _)| p.ends_with("skills")));
         // 停用的始终不贡献
         assert!(!roots.iter().any(|(_, n)| n == "offplug"));
-        trust::install(&std::collections::BTreeMap::new()); // 清场
         let _ = std::fs::remove_dir_all(&app);
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -967,9 +870,6 @@ mod tests {
             skills: skills.into_iter().map(str::to_string).collect(),
             settings_entry: String::new(),
             feature: String::new(),
-            trust_key: String::new(),
-            digest: String::new(),
-            trusted: true,
         }
     }
 

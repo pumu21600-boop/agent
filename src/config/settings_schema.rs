@@ -17,7 +17,7 @@
 //! 不存在「静默不生效」的灰区。审批档位也不在本表（config.toml 的 default_approval
 //! 是它的持久形态，set_config 改它一律弹卡）。其余全部可改：渠道指向（原先的
 //! red_line 四件套）降为 normal，MCP 配置（mcp_servers）入表；config.toml 其余键走
-//! settings 工具 action=set_config；第三方插件信任走 plugin 工具（先审后装）。
+//! settings 工具 action=set_config；第三方插件安装走 plugin 工具（install）。
 
 use serde_json::{Value, json};
 
@@ -405,7 +405,7 @@ pub fn manifest_json() -> Value {
             "risk": e.risk,
             "desc": e.desc,
         })).collect::<Vec<Value>>(),
-        "out_of_scope": "api_key/clear_key（key 永不经模型之手，换 key 请到设置页）/workspace（自己挪自己的笼子）不可经本工具修改。审批档位不在本表：config.toml 的 default_approval 是它的持久形态，set_config 改它一律弹卡。config.toml 其余键走 action=set_config（改完需重启生效）。第三方插件的信任走 plugin 工具（先审查后装，审查不过要强装需用户批准）",
+        "out_of_scope": "api_key/clear_key（key 永不经模型之手，换 key 请到设置页）/workspace（自己挪自己的笼子）不可经本工具修改。审批档位不在本表：config.toml 的 default_approval 是它的持久形态，set_config 改它一律弹卡。config.toml 其余键走 action=set_config（改完需重启生效）。插件的安装/删除走 plugin 工具（install/remove）",
     })
 }
 

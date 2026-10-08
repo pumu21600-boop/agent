@@ -40,14 +40,14 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | 字段 | 必填 | 语义 |
 | --- | --- | --- |
 | apiVersion | 否 | 缺失按 v1 读入（老目录自动迁移）；写了但不等于 1 → **拒载并提示升级**，不做 shim |
-| source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；**未声明按位置默认：只有应用根 `plugins/` 默认 built_in，其余位置（工作区 plugins、自装位）一律默认 user**（：不声明不能成为绕过第三方验签的后门；2026-10-08 补洞：豁免级来源只在位置配得上时被接受——`built_in` 仅 app 位、`model_generated` 仅 draft 隔离区，其余位置自称一律按 user 验签）|
+| source | 否 | 来源三值：`built_in`（随包）/ `user`（用户安装）/ `model_generated`（模型自产，走 draft）；**未声明按位置默认：只有应用根 `plugins/` 默认 built_in，其余位置（工作区 plugins、自装位）一律默认 user**（2026-10-08 补洞：豁免级来源只在位置配得上时被接受——`built_in` 仅 app 位、`model_generated` 仅 draft 隔离区）。来源现在决定三件事：删除保护（内置拒删）、draft 隔离区归属、界面来源标注 |
 | title / description / version | 否 | 展示元数据；目录形态工具插件未写时用目录名 |
 | entry | 否 | 面板入口页（相对插件目录，默认 index.html）；纯工具插件不写。dock/toolbar 面板插件的 entry 不再在设置→插件卡上给「打开」按钮（面板归侧边栏，用户 2026-10-03 拍板） |
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
 | settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它。dock 面板插件不给「设置」按钮——设置从侧边栏面板内进（如用量的价格表在面板里有入口） |
 | ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量价格」插件） |
-| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）；**未声明的一律拒绝** |
-| skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件或未过信任门的 user 插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
+| permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）/ `session.create`（在指定工作区新建对话并预填输入框，插件制作器用）/ `settings.feature` / `action.run`；**未声明的一律拒绝** |
+| skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
 
 **契约纪律**：解析器忽略未知字段（只增不删 = 天然向后兼容）；apiVersion 不匹配即拒载 +
 UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件兼容。
@@ -173,6 +173,7 @@ timeout_ms = 5000
 | trace 时间线 | 纯面板（entry + 只读桥）| 现有字段**够用**；拆 App.svelte 时把 trace 面板拆成独立组件顺势插件化 |
 | web_search | 纯工具 | 现有字段**够用**：以目录形态落 plugins/（或内置注册表直挂）即可，无需新契约字段 |
 | 用量台账（插件化）| dock 面板 + 插件自带设置页 | **要加两口**：`ui` 插槽新值 `dock`（右侧面板页签）+ manifest `settings_entry`（插件设置页，宿主在插件卡上渲染「设置」按钮；2026-10-03 起 dock 插件不再给「设置」按钮，价格表从侧边栏用量面板进）；数据走新增桥 `usage.session` / `usage.prices`（写要 `usage.prices` 权限）。内核（台账/计价/硬闸）不插件化 |
+| 插件制作器（plugin-maker） | 纯面板（表单，不开 dock 槽，从设置→插件「打开」）| 2026-10-08：**表单即窗口**——插件 UI 没有宿主模态原语，需求输入 + 工作区选择 + 确定，全部在面板页里画；确定后走新桥 `session.create`（须声明 `session.create` 权限）：宿主切工作区（没切成就不建会话）→ 建对话 → 给输入框预填「用户需求 + 插件契约规范 + 安装验证引导」，**不代发**。提示词模板内联在面板页（`plugins/plugin-maker/index.html`），改模板不用重编译宿主；工作区下拉直接用只读桥 `workspace.info`（回 `{current, recent}`） |
 
 试点的意义：自己吃自己的狗粮——内置功能装得进插件壳，契约就够结实；装不进就说明契约
 有缺陷，开源前赶紧改。**执法者（审批门 / 存储 / 并发控制）永不插件化**（裁判不下场）。
@@ -185,25 +186,25 @@ timeout_ms = 5000
 > 之前的 postMessage 会被宿主按「未知来源」丢弃。因此**初始拉数据必须等宿主推来的
 > `agent:init` 再发起**（见 plugins/trace/index.html），脚本一加载就调用只读桥会一直超时。
 
-## 八、第三方来源验签（红线二，施工单 030）
+## 八、准入机制的现状（2026-10-08：审核与验签移除，生态起来再重建）
 
-**诉求**：第三方插件要能验明来源再跑。真实密码学签名体系（CA / 私钥分发 / 吊销列表）
-工程面超出一个阶段的容量，且 manifest 里自称的签名字串在无密钥前提下不构成任何保证
-（复制一份就能伪造）——故采用 **pin digest 模型**（SSH 主机密钥同款思路，零密钥分发）：
+2026-10-02 曾按应用商店模型加过两道门：**静态审核**（`plugin/review.rs`：manifest 合规 /
+外联白名单 / 动态执行 / 体积，blocker 拒载）与 **pin 验签**（`plugin/trust.rs`：内容指纹
+绑定，改动即停载）。2026-10-08 用户拍板**两道都移除**（理由：插件制作器把「提示词写规范」
+的路走通后，生成插件的规范性由提示词保证；沙箱隔离——面板 iframe 不透明源 + WASM 零宿主
+函数——保证单个插件崩了不拖垮整体；两道门在生态还没起来时只是安装摩擦）。
 
-- **内容指纹**：canonical digest = sha256(排序后的 `相对路径\n` + sha256(文件内容) + `\n` 序列)；
-  目录形态与裸文件形态各一把尺子（`digest_dir` / `digest_file`），域前缀换算法必须换（历史 pin 全失效重 pin）。
-- **规则**：`source` 为 `user` 的插件（工作区 plugins、应用根 plugins 自装位、plugins/ 目录与裸文件）
-  **必须先被 pin 才能加载**——未 pin → 清单里显式「未受信任」+ 拒载（工具不进注册表、面板不服务资产）；
-  内容被改 → 指纹不符 → 拒载 + 「内容已变，需重新信任」。
-- **pin 表**：settings.json `trusted_plugins{ "plugins:<name>": digest }`（后唯一 kind；
-  旧 `ui-ext:<name>` 键读入即迁）；
-  设置 → 插件 →「信任 / 取消信任」（`POST /api/plugins/trust`）即写即生效并重扫注册表。
-- **豁免两类**：`built_in`（随包内置，位置即信任）、`model_generated`（draft 隔离区：
-  内存态 + 权限清空）；**draft「转正」自动 pin**（转正是用户显式动作 = 信任决定，
-  见 `draft::promote` 落盘后由 `trust::pin_from_manifest_paths` 回填）。
-- **审计**：`plugin.trust_pinned` / `plugin.trust_blocked` / `plugin.trust_unpinned` 只增。
-- 不做的事：不做签名 CA、不校验 manifest 自称的 `signature` 字段、不联网验签。
+**当前状态**：
+
+- 落盘即加载：写进 `plugins/`（应用根或工作区）的目录形态插件直接进清单，没有 pin /
+  审核前置门；`/api/plugins/trust`、`/api/plugins/review` 端点与 plugin 工具的
+  `review`/`unpin` action 一并移除，plugin 工具只剩 `install`（draft 提交 → 转正落位）
+  与 `remove`（删 user 来源，内置拒删）。
+- 仍然有效的边界：manifest 契约校验（apiVersion / entry 存在性 / 路径不出目录 /
+  权限白名单）、停用语义（拒新调用 + 等完）、draft 隔离区（权限清空 + 内存态 + 重启即失）、
+  `source` 三值语义（删除保护 / draft 归属 / 来源标注）。
+- 重建时的入口点：git 历史里 `src/plugin/review.rs` 与 `src/plugin/trust.rs` 的删除提交
+  （2026-10-08 轮）保留了完整实现与测试，照搬回去再按新形态接线即可。
 
 ## 九、术语对照（退役表）
 
@@ -213,6 +214,7 @@ timeout_ms = 5000
 | WASM 插件 | 工具插件 / 插件工具（WASM 引擎） |
 | 界面型 / 能力型 | （废除，不再分型） |
 
-兼容说明（2026-10-08 校正）：端点已改名 `/api/plugins`（promote/draft/trust 同）、
+兼容说明（2026-10-08 校正）：端点已改名 `/api/plugins`（promote/draft 同）、
 静态分发 `/plugins/*`、设置字段 `disabled_plugins`——旧名字（`/api/ext`、`/ui-ext/`、
-`disabled_extensions`、`ui-ext:` pin 键）只作**读入迁移源**，不再作为现行接口保留。
+`disabled_extensions`、`ui-ext:` pin 键、`trusted_plugins` 设置字段）只作**读入迁移源**
+或由 serde 忽略未知字段自然兼容，不再作为现行接口保留。

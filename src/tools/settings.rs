@@ -9,8 +9,8 @@
 //!   判 Dangerous，且经 `rules::red_line_hold` 在**任何审批档位**（含完全访问）强制弹卡。
 //!
 //! 刻意不在范围内（防自提权/防 key 入日志）：api_key 与 clear_key（key 永不经模型之手，
-//! 换 key 请用户在设置页操作）、workspace（自己挪自己的笼子）、cost（价格表 = 钱）、
-//! trusted_plugins（准入审核归用户）。config.toml 的字段（花费上限/审批默认档/钩子等）
+//! 换 key 请用户在设置页操作）、workspace（自己挪自己的笼子）、cost（价格表 = 钱）。
+//! config.toml 的字段（花费上限/审批默认档/钩子等）
 //! 不在本工具内——想改走文件编辑（属红线，写前必问）且需重启生效。
 
 use serde::Deserialize;
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn empty_and_unknown_patches_rejected() {
         let mut s = test_settings();
-        // 范围外键（cost/工作区/trusted_plugins 等）在解析层就被拒
+        // 范围外键（cost/工作区等）在解析层就被拒
         assert!(
             serde_json::from_value::<SettingsPatch>(json!({"cost": {"currency": "CNY"}})).is_err(),
             "未知/范围外键必须在解析层报错，不得静默忽略"

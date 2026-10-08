@@ -376,13 +376,6 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
 
-    /// 红线3（第三方插件验签）：已 pin 的内容指纹表。
-    /// 键 = `plugins:<name>`（目录合并后唯一 kind；旧 `ui-ext:<name>` 键读入时自动迁移），
-    /// 值 = canonical digest（sha256）。
-    /// user 来源插件必须在这里有且 digest 一致才会加载；draft 转正时自动写入。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub trusted_plugins: BTreeMap<String, String>,
-
     /// 成本台账：展示币种 / 汇率 / 模型价格表（美元 / 1M tokens 规范存储）
     #[serde(default)]
     pub cost: CostSettings,
@@ -922,8 +915,6 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
     s.migrate_provider_keys_to_urls();
     // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
     s.migrate_url_keys_to_configs();
-    // 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
-    migrate_legacy_trust_keys(&mut s.trusted_plugins);
     // 确保存在有效激活配置
     s.ensure_active_config();
     Ok(s)
@@ -956,23 +947,6 @@ fn migrate_legacy_field_names(v: &mut serde_json::Value) {
             obj.insert(new.to_string(), val);
         }
     }
-}
-
-/// 目录合并迁移：信任表旧键 `ui-ext:<name>` → `plugins:<name>`（合并后唯一 kind）。
-/// 目标键已存在则保留新键、丢旧键；抽成纯函数让 load 与单测共用同一把尺子。
-fn migrate_legacy_trust_keys(map: &mut BTreeMap<String, String>) {
-    if !map.keys().any(|k| k.starts_with("ui-ext:")) {
-        return;
-    }
-    let legacy: Vec<(String, String)> = map
-        .iter()
-        .filter(|(k, _)| k.starts_with("ui-ext:"))
-        .map(|(k, v)| (k.trim_start_matches("ui-ext:").to_string(), v.clone()))
-        .collect();
-    for (name, digest) in legacy {
-        map.entry(format!("plugins:{name}")).or_insert(digest);
-    }
-    map.retain(|k, _| !k.starts_with("ui-ext:"));
 }
 
 #[cfg(test)]

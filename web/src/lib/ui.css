@@ -30,7 +30,7 @@
   /* 2026-10-08 补：orange/purple/pink/gray 四组原先只在 light 定义，深色（默认态）
      下 var() 无值 → 声明 invalid at computed-value time：color 退化继承值、
      background 退化 transparent、border-color 退化 currentColor——所有「警告」橙色态
-     （未验签徽章/审查报告/cron 提示）在深色下掉成灰色透明底，切到浅色才正常。 */
+     （cron 提示等）在深色下掉成灰色透明底，切到浅色才正常。 */
   --tint-orange-bg: #3d2a12;
   --tint-orange-fg: #f0a35e;
   --tint-purple-bg: #2c2244;
@@ -324,24 +324,12 @@ select option:checked {
   border-color: currentColor;
   border-style: solid;
 }
-/* chip 当按钮用（审查状态行内点开）：按钮默认样式清掉，其余沿用 plug-chip */
-button.plug-chip {
-  background: none;
-  cursor: pointer;
-  font-family: inherit;
-  text-align: center;
-}
-button.plug-chip:hover {
-  border-color: var(--g6);
-  color: var(--g7);
-}
 .plug-sub {
   font-size: 12px;
   color: var(--tint-orange-fg);
   margin: -2px 4px 8px 46px;
   word-break: break-all;
 }
-/* 审核未通过的那几条（blocker）：红字，和普通提示区分开 */
 .plug-sub.block {
   color: var(--tint-red-fg);
   font-weight: 600;

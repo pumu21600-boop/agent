@@ -1,0 +1,9 @@
+{
+  "apiVersion": 1,
+  "source": "built_in",
+  "title": "插件制作器",
+  "description": "说清你想做的插件，自动在选定工作区新建对话并带上规范提示词",
+  "version": "0.1.0",
+  "entry": "index.html",
+  "permissions": ["session.create"]
+}

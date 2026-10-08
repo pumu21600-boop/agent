@@ -1,43 +1,39 @@
-//! 插件信任工具（2026-10-04 放开权限轮）：第三方插件的「装 / 审 / 卸」正门。
+//! 插件安装工具（2026-10-04 放开权限轮）：模型自产插件进 draft 隔离区并一键转正。
 //!
-//! 流程（用户拍板）：先审查后安装——审查有 blocker 自动停下、带回完整报告，agent 把
-//! 问题列给用户问是否继续；用户点头后带 force=true 重装（force 判 Dangerous 必弹卡，
-//! 审批卡就是用户的选择权）。全程复用宿主现成管道（draft 提交 → promote 落位 →
-//! review 静态审查 → pin 信任），与 HTTP 端点 /api/plugins/* 同一批内核函数，
-//! 不分叉第二套逻辑——审查规则（外联/密钥/动态执行 blocker）见 plugin/review.rs。
+//! 流程：draft 提交（名字/文件数/单文件大小/契约校验齐全，权限一律清空）→ promote
+//! 落位到 `plugins/<name>/` 即加载。全程复用宿主现成管道，与 HTTP 端点
+//! `/api/plugins/*` 同一批内核函数，不分叉第二套逻辑。draft 隔离区本身即边界：
+//! 权限清空 + WASM 纯计算沙箱（零宿主函数）+ 面板 iframe 不透明源。
+//!
+//! 2026-10-08：准入审核（静态审查）与 pin 验签按用户拍板移除——生态起来后再重建。
+//! 安装路径回到「写文件 → 转正落位 → 即时生效」，没有前置门。
 
 use serde_json::{json, Value};
 
-use crate::plugin::{draft, review, trust};
+use crate::plugin::draft;
 
 /// 工具入口。`args` 是模型给的参数 JSON 串。
 pub(crate) async fn run(args: &str) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
     match action {
-        // install 受闸（装插件=改插件面，自改纪律管着）；review 只读不受闸
+        // install 受闸（装插件=改插件面，自改纪律管着）
         "install" => {
             super::selfmod_gate()?;
             install(&v).await
-        }
-        "review" => review_one(&v),
-        "unpin" => {
-            super::selfmod_gate()?;
-            unpin(&v).await
         }
         // 删除同样受闸（删插件=改插件面，且不可恢复）；内核与 HTTP 端点同一份
         "remove" => {
             super::selfmod_gate()?;
             remove_one(&v).await
         }
-        _ => Err("未知 action（install/review/unpin/remove）".into()),
+        _ => Err("未知 action（install/remove）".into()),
     }
 }
 
-/// action=install：{ name, manifest, files, force? }。
-/// draft 提交（名字/文件数/单文件大小/契约校验齐全）→ promote 落位 → 静态审查：
-/// 通过 → pin 信任并即时生效；blocker 且未 force → **不信任**（插件落位但休眠不加载），
-/// 返回完整报告让 agent 转述给用户；force=true（判级层已弹卡）→ 记 user_override 强装。
+/// action=install：{ name, manifest, files }。
+/// draft 提交（规范化：权限清空）→ promote 落位 → 即时生效；落位后推
+/// settings_changed 让界面清单刷新（后台实体要即时进界面）。
 async fn install(v: &Value) -> Result<String, String> {
     let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
     if name.is_empty() {
@@ -54,64 +50,14 @@ async fn install(v: &Value) -> Result<String, String> {
         }
     }
     draft::submit(name, &manifest, &files)?;
-    draft::promote(name)?;
-
-    let key = format!("plugins:{name}");
-    let report = review::review_key(&key)?;
-    let blocked = report.verdict == review::Verdict::Blocked;
-    let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
-
-    if blocked && !force {
-        let reasons = review::block_reasons(&report);
-        trust::audit_pinned(&key, "", "review_blocked");
-        return Ok(json!({
-            "installed": false,
-            "blocked": reasons,
-            "report": report,
-            "hint": "插件文件已就位但未信任（不会加载执行）。把 blocked 里的逐条问题讲给用户听，用户同意继续就带 force=true 重试（会弹审批卡让用户亲自确认）",
-        })
-        .to_string());
-    }
-
-    pin(&key, report.digest.clone().unwrap_or_default(), if force { "agent_user_override" } else { "agent" })?;
-    let reason = json!({ "installed": true, "key": key, "forced": blocked && force, "report": report });
-    Ok(reason.to_string())
-}
-
-/// action=review：{ key }（形如 plugins:xxx）。只审不信，返回完整报告。
-fn review_one(v: &Value) -> Result<String, String> {
-    let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if key.is_empty() || !key.contains(':') {
-        return Err("review 需要 key（形如 plugins:名字）".into());
-    }
-    let report = review::review_key(key)?;
-    Ok(json!({ "key": key, "verdict": format!("{:?}", report.verdict), "report": report }).to_string())
-}
-
-/// action=unpin：{ key }。撤回信任（插件停载但不删文件，可逆）。
-async fn unpin(v: &Value) -> Result<String, String> {
-    let key = v.get("key").and_then(|x| x.as_str()).unwrap_or("").trim();
-    if key.is_empty() || !key.contains(':') {
-        return Err("unpin 需要 key（形如 plugins:名字）".into());
-    }
-    let handle = crate::config::settings::shared_settings()
-        .ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
-    let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
-    let removed = s.trusted_plugins.remove(key).is_some();
-    if !removed {
-        return Err(format!("{key} 本来就不在信任表里"));
-    }
-    s.save().map_err(|e| format!("保存 settings.json 失败: {e}"))?;
-    *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    trust::install(&s.trusted_plugins);
-    crate::plugin::wasm::rescan();
-    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["trusted_plugins"] }));
-    Ok(format!("已取消信任 {key}（插件停载，文件保留，可重新 install 恢复）"))
+    let written = draft::promote(name)?;
+    // 落位即加载：推事件让前端重拉插件清单（与 toggle 端点同一条总线）
+    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["disabled_plugins"] }));
+    Ok(json!({ "installed": true, "name": name, "written": written }).to_string())
 }
 
 /// action=remove：{ name }。删除 user 来源插件（删目录，不可恢复）。内置拒删并说人话
-/// （内核与 HTTP 端点同一份：plugin::ui::remove）。unpin 是「停载不删文件」的可逆路，
-/// remove 是连文件一起删的不可逆路——用户说「删掉/卸掉」且指向具体插件时才用它。
+/// （内核与 HTTP 端点同一份：plugin::ui::remove）。
 async fn remove_one(v: &Value) -> Result<String, String> {
     let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim();
     if name.is_empty() {
@@ -122,19 +68,4 @@ async fn remove_one(v: &Value) -> Result<String, String> {
     crate::plugin::wasm::rescan();
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["disabled_plugins"] }));
     Ok(json!({ "removed": name, "dir": dir }).to_string())
-}
-
-/// pin 落信任表并即时生效（与 HTTP trust_plugin 的 pin 分支同语义）。
-fn pin(key: &str, digest: String, by: &str) -> Result<(), String> {
-    let handle = crate::config::settings::shared_settings()
-        .ok_or_else(|| "设置子系统尚未初始化（共享句柄缺失）".to_string())?;
-    let mut s = handle.read().unwrap_or_else(|e| e.into_inner()).clone();
-    s.trusted_plugins.insert(key.to_string(), digest.clone());
-    s.save().map_err(|e| format!("保存 settings.json 失败: {e}"))?;
-    *handle.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    trust::install(&s.trusted_plugins);
-    crate::plugin::wasm::rescan();
-    trust::audit_pinned(key, &digest, by);
-    crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["trusted_plugins"] }));
-    Ok(())
 }

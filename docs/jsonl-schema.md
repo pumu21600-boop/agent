@@ -164,9 +164,6 @@
 | `usage.ledger_init_failed` | 台账目录初始化失败（启动时） | `dir`、`error` |
 | `cost.cap_blocked` | 全局花费上限硬闸拦下一次模型请求 | `session`、`purpose`、`model`、`spend_usd`、`cap_usd` |
 | `cost.downgraded` | 任务超 token 预算，剩余步骤改走降级渠道 | `step`、`from`、`to` |
-| `plugin.trust_pinned` | 插件内容指纹被 pin（用户点信任 / draft 转正自动） | `key`、`digest`、`by` |
-| `plugin.trust_blocked` | 第三方插件未 pin 或内容已变 → 拒载 | `key`、`state`、`via` |
-| `plugin.trust_unpinned` | 取消信任（插件立即停止加载） | `key`、`by` |
 | `usage.prices_saved` | 价格表/币种已保存（「用量价格」插件设置页） | `rows`、`currency` |
 | `usage.ledger_recomputed` | 用当前价格重算全部历史账 | `records`、`spend_usd`、`unpriced` |
 

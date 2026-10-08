@@ -13,8 +13,8 @@ Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。版本号以 `Cargo
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）。
 - **记忆**：双层存储（全局 `~/.agent` + 项目 `.agent/memory`）+ events.log 事件流水（默认脱敏）+ AGENTS.md 双层注入 + 滚动摘要；系统约定（`prompts/system.md`）每轮任务实时读盘。记忆库星云：会话压成检索正文，语义向量 + 词法混合排序，前端体积渲染。
 - **Skills**：`skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
-- **插件（契约 v1）**：一个目录 + 一份 manifest.json = 一个插件，清单只声明「有什么」（面板/工具/权限），不分类型；对外只留四个词：**Skill / MCP / 插件 / 沙箱**。面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 draft 隔离区（内存、权限清空、一键转正）；`user` 来源插件须点「信任」pin 内容指纹后才加载。契约全文见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)。
-- **用量与成本**：每次模型调用在网关单点记账（token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位 + 记账时算定冻结的费用），落 `logs/usage/ledger.jsonl`；「用量价格」插件在右侧面板显示**当前对话**的用量与费用，价格按「渠道 host + 模型 id」每百万 token 单价手填；红线 = 全局花费上限硬闸（`[cost] spend_cap_usd`）+ 第三方插件验签。
+- **插件（契约 v1）**：一个目录 + 一份 manifest.json = 一个插件，清单只声明「有什么」（面板/工具/权限），不分类型；对外只留四个词：**Skill / MCP / 插件 / 沙箱**。面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 draft 隔离区（内存、权限清空、一键转正）；「插件制作器」内置插件把「说清需求 → 选定工作区 → 新对话自动带上规范提示词」跑成一键流程。契约全文见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)。
+- **用量与成本**：每次模型调用在网关单点记账（token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位 + 记账时算定冻结的费用），落 `logs/usage/ledger.jsonl`；「用量价格」插件在右侧面板显示**当前对话**的用量与费用，价格按「渠道 host + 模型 id」每百万 token 单价手填；红线 = 全局花费上限硬闸（`[cost] spend_cap_usd`）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；能力标记（工具/视觉/视频/音频）手动勾选优先于按名推导；思考档位按厂商规范适配。
 - **观测与工程**：JSONL 六类事件 + 轮转、trace 时间线面板、eval 黑盒评测（12 个任务）；CI 跑 clippy + 全量测试 + 前端构建；写盘全部原子写。
 - **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / 网页——内置浏览器，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含插件贡献的 dock 页签；设置面板八分区（外观 / 模型配置 / 功能桥接 / 记忆 / 技能 / MCP / 插件 / 定时）。
@@ -47,7 +47,7 @@ agent/
 │   ├── gateway/    #   模型网关：providers 数据加载、端点/思考形态探测、降级链
 │   ├── browser/    #   浏览器内核：CDP 客户端 + 标签页会话管理 + DOM 快照/diff
 │   ├── sandbox/    #   执行沙箱：SandboxTier trait + 探针与档位探测链
-│   ├── plugin/     #   插件核心：契约 v1 + draft 隔离区 + pin 验签 + 面板扫描 + WASM 桥
+│   ├── plugin/     #   插件核心：契约 v1 + draft 隔离区 + 面板扫描 + WASM 桥
 │   ├── mcp/        #   MCP 独立层：stdio / Streamable HTTP / SSE 三 transport + OAuth
 │   ├── usage/      #   用量台账：记账（费用冻结）+ 价格匹配 + 报表 + 花费硬闸
 │   ├── session/ memory/ tools/ recovery/ schedule/ context/ config/ observability/
@@ -98,9 +98,9 @@ agent/
 - **来源与版本**：`source` 三值 built_in / user / model_generated；`apiVersion` 不匹配 → 拒载并提示升级（无 shim）；未知字段一律忽略。
 - **draft 隔离区**（模型自产）：只在内存（重启即失）、权限一律清空；「转正」（落盘、来源改 user）或「丢弃」。
 - **dock 页签与设置页**：manifest 声明 `ui:[{slot:"dock"}]` 的启用插件在右侧面板多一个页签（停用即消失）；`settings_entry` 让插件卡片多一个「设置」按钮。
-- **插件自带技能**：manifest `skills: "skills"` → 技能进系统提示索引；停用或未验签的第三方插件不贡献技能。
-- **第三方验签**：`user` 来源插件（自装/工作区/plugins 目录与裸文件）**必须先被信任才加载**——「信任」把内容指纹（canonical sha256）记进 `settings.json`，每次加载重算比对，对不上立即停用；draft「转正」自动 pin。
-- 参考实现：`plugins/board/`（项目文件）。清单写坏不会静默：标红给原因，「打开」禁用。
+- **插件自带技能**：manifest `skills: "skills"` → 技能进系统提示索引；停用的插件不贡献技能。
+- **准入机制**：2026-10-08 起静态审核与 pin 验签按用户拍板移除（生态起来再重建，git 历史留有完整实现）——写进 `plugins/` 即加载；仍在的边界是 manifest 契约校验、停用语义与 draft 隔离区。
+- 参考实现：`plugins/board/`（项目文件）、`plugins/plugin-maker/`（表单 + session.create 桥）。清单写坏不会静默：标红给原因，「打开」禁用。
 
 # 用量台账与成本红线
 
@@ -150,7 +150,7 @@ cargo run                                # 终端 2：127.0.0.1:5173
 - **桌面壳**：已启用 = 内置浏览器宿主（child webview + 控制通道 9225 + CDP 9223），用户日常使用中。留口：`desktop/` 仍是开发布局（服务 exe 路径按 desktop/ 上两级解析），打包分发时改同级目录探测；壳启动后窗口会自行 resize 一次（机制待查）。
 - **MCP**：tools + resources + prompts（三 transport）；**OAuth 授权流程已做**（授权码 / client_credentials，DPAPI 逐条加密存 `mcp_tokens.json`）。
 - **工具插件（WASM）**：ABI v1，**零 host function** 纯计算沙箱——碰不到文件/网络/UI。
-- **第三方验签**：v1 = 内容指纹 pin（非密码学签名体系：无 CA/私钥分发，manifest 自称的签名字串不采信）；信任是一次性的，指纹变了要重新点。
+- **插件准入**：审核与验签已移除（2026-10-08 用户拍板），当前靠沙箱隔离 + manifest 契约 + 权限白名单兜底；重建入口见 docs/plugin-contract-v1.md 第八节。
 - **用量台账**：价格表靠手填（不抓取、不同步、不多币种）；未命中价格计入「未计价」不计费；花费上限是全累计口径，调到 0 即关闭。
 - **钩子**：四挂点（before_tool 仅否决权 / after_tool / session_end / budget_exceeded），超时与失败一律放行。
 - **eval**：12 个任务；2026-09-23 已在真实渠道（StepFun `step-5-preview`，隔离临时实例）跑过 **53/53 断言全过**；复跑流程与两个本机坑见 ROADMAP「eval 真模型验证」行。

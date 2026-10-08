@@ -108,18 +108,15 @@
 
     #[test]
     fn backward_compat_plugins_rename_migration() {
-        // 目录合并迁移：旧字段 disabled_extensions → disabled_plugins（serde alias），
-        // 旧信任键 ui-ext:<name> → plugins:<name>（load 迁移）；落盘只写新名。
+        // 目录合并迁移：旧字段 disabled_extensions → disabled_plugins（serde alias）；
+        // 落盘只写新名。（2026-10-08：信任表 trusted_plugins 随验签机制移除，旧键
+        // trusted_plugins/ui-ext:* 由 serde 忽略未知字段自然兼容，不再迁移。）
         let legacy = r#"{
             "disabled_extensions": ["usage"],
-            "trusted_plugins": { "ui-ext:board": "digest-a", "plugins:calc": "digest-b" }
+            "trusted_plugins": { "ui-ext:board": "digest-a" }
         }"#;
-        let mut s: Settings = parse_settings(legacy).expect("旧字段名 alias 必须可反序列化");
+        let s: Settings = parse_settings(legacy).expect("旧字段名 alias 必须可反序列化");
         assert_eq!(s.disabled_plugins, vec!["usage".to_string()], "alias 读入旧字段");
-        migrate_legacy_trust_keys(&mut s.trusted_plugins);
-        assert!(!s.trusted_plugins.contains_key("ui-ext:board"), "旧键必须删除");
-        assert_eq!(s.trusted_plugins.get("plugins:board").map(String::as_str), Some("digest-a"), "旧键迁移到新键");
-        assert_eq!(s.trusted_plugins.get("plugins:calc").map(String::as_str), Some("digest-b"), "已有新键不被迁移覆盖");
         let text = serde_json::to_string(&s).unwrap();
         assert!(text.contains("\"disabled_plugins\""), "落盘写新字段名");
         assert!(!text.contains("disabled_extensions"), "旧字段名不再写出");
@@ -202,7 +199,8 @@
     /// （2026-10-05 真机实锤：agent 直接改 settings.json，界面不刷新）。
     #[test]
     fn settings_from_text_matches_load_migration_semantics() {
-        // 老版形态：无 configs 数组，全靠顶层字段 + 旧字段名 + 旧信任键
+        // 老版形态：无 configs 数组，全靠顶层字段 + 旧字段名（2026-10-08：旧信任键
+        // trusted_plugins/ui-ext:* 已随验签移除，serde 忽略未知字段自然兼容）
         let legacy = r#"{
             "active_profile_id": "p1",
             "profiles": [{"id":"p1","name":"老配置","provider_id":"deepseek","base_url":"https://api.deepseek.com","model":"deepseek-chat"}],
@@ -214,11 +212,6 @@
         assert_eq!(s.configs[0].name, "老配置");
         assert_eq!(s.active_config_id.as_deref(), Some("p1"), "旧 active_profile_id 应迁成激活项");
         assert_eq!(s.disabled_plugins, vec!["usage".to_string()], "旧 disabled_extensions 应迁名");
-        assert!(
-            s.trusted_plugins.contains_key("plugins:demo"),
-            "旧 ui-ext: 信任键应迁成 plugins:，实际 {:?}",
-            s.trusted_plugins
-        );
     }
 
     /// 空/坏 JSON 一律解析失败——外部监听据此「保持内存现状」，绝不拿半截文件覆盖

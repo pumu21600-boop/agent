@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>插件制作器</title>
+<style>
+  :root { scrollbar-color: var(--line2, #3a3e49) transparent; color-scheme: dark; }
+  body {
+    --bg: #17171a; --fg: #e8e8ea; --dim: #9a9aa2; --line: #2c2c31;
+    --hover: #26262b; --btn-line: #3a3a41; --err: #e5534b; --ok: #4bb543;
+    color-scheme: dark;
+  }
+  body.light {
+    scrollbar-color: var(--line2, #b3bac4) transparent;
+    --bg: #ffffff; --fg: #1a1a1c; --dim: #6b6b74; --line: #e4e4e8;
+    --hover: #f2f2f5; --btn-line: #d4d4da; --err: #cf222e; --ok: #1a7f37;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px 16px 20px;
+    font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
+  .dim { color: var(--dim); font-size: 12px; margin: 0 0 10px; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
+  textarea, select {
+    width: 100%; font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
+  }
+  textarea { min-height: 110px; resize: vertical; }
+  textarea:focus, select:focus { outline: none; border-color: var(--fg); }
+  .row { display: flex; gap: 8px; margin-top: 14px; }
+  button {
+    font: inherit; padding: 6px 16px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--btn-line); background: transparent; color: var(--fg);
+  }
+  button:hover { background: var(--hover); }
+  button.primary { border-color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  button:disabled:hover { background: transparent; }
+  .msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+</style>
+</head>
+<body>
+  <h3>插件制作器</h3>
+  <p class="dim">说清你想做的插件。确定后在选定工作区新建对话，输入框自动带上规范提示词——你审一遍，自己回车发。</p>
+  <label for="req">插件制作要求</label>
+  <textarea id="req" placeholder="例如：一个待办面板，列出工作区 TODO.md 里没做完的项，前面带复选框，能勾掉并写回文件…"></textarea>
+  <label for="ws">工作区</label>
+  <select id="ws"><option>读取中…</option></select>
+  <div class="row">
+    <button id="go" class="primary" disabled>确定</button>
+    <button id="clear">清空</button>
+  </div>
+  <div id="msg" class="msg"></div>
+
+<script>
+// —— 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对 ——
+let seq = 0;
+const pending = new Map();
+let booted = false;
+
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    // 主题跟着宿主走（宿主切主题会重发 init）；但 boot 只跑一次
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) {
+      booted = true;
+      boot();
+    }
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id);
+    if (!r) return;
+    pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq;
+    pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function boot() {
+  $('go').onclick = go;
+  $('clear').onclick = () => {
+    $('req').value = '';
+    refresh();
+    $('req').focus();
+  };
+  $('req').oninput = refresh;
+  // 工作区列表：当前置顶 + 最近（去重）。workspace.info 是只读桥，不占权限
+  let current = '';
+  let recent = [];
+  try {
+    const info = await req('workspace.info', {});
+    current = info.current || '';
+    recent = info.recent || [];
+  } catch (e) {
+    showMsg('读不到工作区列表：' + (e.message || e), 'err');
+  }
+  const seen = new Set();
+  const list = [];
+  for (const w of [current, ...recent]) {
+    const k = w.toLowerCase();
+    if (w && !seen.has(k)) {
+      seen.add(k);
+      list.push(w);
+    }
+  }
+  if (!list.length) list.push('');
+  $('ws').innerHTML = list
+    .map((w, i) => `<option value="${esc(w)}">${i === 0 ? '（当前）' : ''}${esc(w.split(/[\\/]/).filter(Boolean).pop() || w)}</option>`)
+    .join('');
+  refresh();
+}
+
+function refresh() {
+  $('go').disabled = !$('req').value.trim();
+}
+
+function showMsg(text, cls) {
+  const m = $('msg');
+  m.textContent = text;
+  m.className = 'msg' + (cls ? ' ' + cls : '');
+}
+
+async function go() {
+  const requirements = $('req').value.trim();
+  if (!requirements) return;
+  const ws = $('ws').value;
+  $('go').disabled = true;
+  showMsg('正在新建对话…', '');
+  try {
+    // 切工作区 + 建会话 + 预填输入框，一次桥调用搞定（不代发，用户自己回车）
+    await req('session.create', { workspace: ws, text: buildPrompt(requirements, ws) });
+    showMsg(`已在「${ws}」新建对话并预填提示词。去输入框审一遍，回车发送。`, 'ok');
+    $('req').value = '';
+  } catch (e) {
+    showMsg('新建对话失败：' + (e.message || e), 'err');
+  }
+  refresh();
+}
+
+// 插入输入框的提示词 = 用户原话需求 + agent-copy 插件规范 + 安装验证引导。
+// 规范全部内联（新对话开在用户选的工作区，够不着应用目录里的参考实现）；
+// 改这段不用重编译宿主，刷新页面即生效。
+function buildPrompt(requirements, ws) {
+  return `你是 agent-copy 的插件工程师。请按下面的规范，为我制作一个插件。
+
+【我的需求】
+${requirements}
+
+【落点】
+- 工作区：${ws}
+- 插件目录：${ws}/plugins/<name>/（<name> 用小写连字符风格，仅字母数字与 - _ .；已存在就换个名字）
+
+【硬性规范（agent-copy 插件契约 v1）】
+1. 一个插件 = 一个目录 + 一份 manifest.json（不是 .zcode-plugin/plugin.json），放在上面的落点。
+2. manifest.json 字段：
+   - apiVersion: 1（必须）；source: "user"；version: "0.1.0"
+   - title / description：中文标题 + 一句话描述
+   - entry: "index.html"：面板入口页（纯工具插件不写这个字段）
+   - permissions: 只用白名单内的：composer.insert / workspace.write / bus.publish / notify / storage / usage.prices / clipboard / settings.feature / action.run / session.create
+   - 可选：ui: [{"slot":"dock","id":"<name>","title":"<标题>"}]（面板从 设置→插件 页点「打开」进入）；skills: "skills"（插件自带技能，每个子目录一份 SKILL.md）；tool_file: "x.wat"（WASM 工具文件，目录内只允许一个）
+3. 面板页跑在不透明 iframe 里，与宿主唯一通道是 postMessage 桥：
+   - 插件发 {type:'agent:hello'}，宿主回 {type:'agent:init', payload:{...}}
+   - 插件发 {type:'agent:request', id, method, params}，宿主回 {type:'agent:response', id, ok, result}，按 id 配对
+   - 只读方法：app.info / workspace.info / workspace.files / workspace.file / workspace.dir / git.status / session.info / memory.search / memory.library / features.get
+   - 写方法须在 manifest 声明权限：composer.insert / notify / bus.publish / workspace.write（弹确认）/ clipboard.write / storage.read|write|delete
+   - 不许直连 /api/*；主题跟随宿主：body.light class + CSS 变量；boot 逻辑只跑一次
+4. 工具插件（可选）：目录内一个 .wat 文件 + manifest tool_file，导出 describe/alloc/run，零宿主函数。
+
+【最小可用示例】
+manifest.json：
+{
+  "apiVersion": 1,
+  "source": "user",
+  "title": "我的插件",
+  "description": "一句话说明这个插件做什么",
+  "version": "0.1.0",
+  "entry": "index.html"
+}
+
+index.html：
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>我的插件</title>
+<style>
+  :root { color-scheme: dark; }
+  body { --bg:#17171a; --fg:#e8e8ea; --dim:#9a9aa2; --line:#2c2c31; margin:0; padding:16px;
+         font:13px/1.7 "Segoe UI","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  body.light { --bg:#ffffff; --fg:#1a1a1c; --dim:#6b6b74; --line:#e4e4e8; color-scheme:light; }
+</style>
+</head>
+<body>
+  <h3>我的插件</h3>
+  <div id="out">加载中…</div>
+<script>
+let seq = 0; const pending = new Map(); let booted = false;
+window.addEventListener('message', (ev) => {
+  const d = ev.data || {};
+  if (d.type === 'agent:init') {
+    document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
+    if (!booted) { booted = true; boot(); }
+  }
+  if (d.type === 'agent:response') {
+    const r = pending.get(d.id); if (!r) return; pending.delete(d.id);
+    d.ok ? r.res(d.result) : r.rej(new Error(String(d.result || '请求失败')));
+  }
+});
+function req(method, params) {
+  return new Promise((res, rej) => {
+    const id = 'r' + ++seq; pending.set(id, { res, rej });
+    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+  });
+}
+parent.postMessage({ type: 'agent:hello' }, '*');
+async function boot() {
+  const info = await req('workspace.info', {});
+  document.getElementById('out').textContent = '当前工作区：' + (info.current || '未知');
+}
+<\/script>
+</body>
+</html>
+
+【安装与验证（必做）】
+1. 文件直接写进上面的插件目录即自动加载，没有额外激活步骤。（不需要任何权限的纯面板/纯工具插件，也可以改用 plugin 工具 action=install——但那样权限会被清空且落到应用目录、全局可用；凡是要用权限的插件，一律走直接写文件这条路。）
+2. 自检：manifest.json 是合法 JSON；entry 指向的文件真实存在；所有路径不出插件目录；权限都在白名单内。
+3. 让用户在 设置→插件 页找到该插件，点「打开」试用。
+
+【汇报要求】
+- 做完如实汇报：插件目录、manifest 要点、自检结果、一个试用提示词和预期效果。
+- 没验证的就说没验证，别把「写完了」说成「装好了」。`;
+}
+</script>
+</body>
+</html>

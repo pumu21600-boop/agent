@@ -41,11 +41,10 @@ pub fn check_api_version(manifest: &Value) -> Result<u32, String> {
 }
 
 /// 解析清单声明的来源；未声明/不合法时按所在位置取默认。
-/// **红线3 收口（2026-10-08 补洞）**：声明只能「降级」不能「升级」——
-/// `built_in` 只在随包内置位（`app`）被接受，`model_generated` 只在草稿隔离区
-/// （`draft`）被接受，其余位置（工作区 plugins、自装目录）一律 `user` 要先 pin。
-/// 否则在工作区 plugins 里放一份自声明 `source:"model_generated"` 的 manifest
-/// 就能跳过验签——「不声明」的后门换成「声明」的后门，红线 3 形同虚设。
+/// 声明只能「降级」不能「升级」：`built_in` 只在随包内置位（`app`）被接受，
+/// `model_generated` 只在草稿隔离区（`draft`）被接受，其余位置（工作区 plugins、
+/// 自装目录）一律 `user`。来源仍决定三件事：删除保护（内置拒删）、draft 隔离区
+/// 归属、界面上的来源标注。
 /// （`model_generated` 的 manifest 只存在于内存草稿区，从不落盘；落盘的转正
 /// 插件在 draft.rs:180 被强制改写成 `user`，所以此约束不影响正常流转。）
 pub fn origin_of(manifest: &Value, location: &str) -> String {
@@ -81,12 +80,12 @@ mod tests {
         // 未声明：按位置取默认
         assert_eq!(origin_of(&json!({}), "app"), ORIGIN_BUILT_IN);
         assert_eq!(origin_of(&json!({}), "workspace"), ORIGIN_USER);
-        // 自称 user 永远允许（更严不更宽）：内置位自称 user → 也要 pin
+        // 自称 user 永远允许（更严，不更宽）
         assert_eq!(origin_of(&json!({"source": "user"}), "app"), ORIGIN_USER);
-        // 2026-10-08 收口：豁免级来源只在位置配得上时被接受
+        // 豁免级来源只在位置配得上时被接受
         assert_eq!(origin_of(&json!({"source": "built_in"}), "app"), ORIGIN_BUILT_IN);
         assert_eq!(origin_of(&json!({"source": "model_generated"}), "draft"), ORIGIN_MODEL);
-        // 非法值 / 越位声明 → 位置默认（workspace 一律 user，不许自称豁免）
+        // 非法值 / 越位声明 → 位置默认（workspace 一律 user）
         assert_eq!(origin_of(&json!({"source": "mcp"}), "app"), ORIGIN_BUILT_IN);
         assert_eq!(origin_of(&json!({"source": "built_in"}), "workspace"), ORIGIN_USER);
         assert_eq!(origin_of(&json!({"source": "model_generated"}), "workspace"), ORIGIN_USER);
@@ -94,12 +93,12 @@ mod tests {
     }
 
     #[test]
-    fn origin_self_declaration_cannot_bypass_pin() {
-        // 红线3 回归：工作区 plugins 里自声明豁免来源 → 必须落到 user（要 pin）
+    fn origin_self_declaration_stays_user() {
+        // 工作区 plugins 里自声明豁免来源 → 必须落到 user（删除保护/来源标注按 user 走）
         for src in ["built_in", "model_generated"] {
             let mf = json!({"apiVersion": 1, "source": src});
             for loc in ["workspace", "plugins"] {
-                assert_eq!(origin_of(&mf, loc), ORIGIN_USER, "{src} @ {loc} 不能免验签");
+                assert_eq!(origin_of(&mf, loc), ORIGIN_USER, "{src} @ {loc} 不能自称豁免");
             }
         }
     }

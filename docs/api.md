@@ -51,8 +51,8 @@ DNS rebinding，这层校验补的就是它。不带 `Origin` 的命令行客户
 | GET / POST | `/api/mcp` | MCP server（stdio / http / sse 三 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
 | GET | `/api/plugins` | 插件统一清单（面板 + 工具 + draft，一份列表）|
-| POST | `/api/plugins/create` | 新建插件脚手架（工作区 plugins/，不等于放行）|
-| POST | `/api/plugins/remove` | 删除插件（只删 user 来源，内置拒删；清停用名单/信任表残留）|
+| POST | `/api/plugins/create` | 新建插件脚手架（工作区 plugins/，落盘即加载）|
+| POST | `/api/plugins/remove` | 删除插件（只删 user 来源，内置拒删；清停用名单残留）|
 | POST | `/api/plugins/toggle` | 启用/停用插件（停用 = 拒新调用 + 等完）|
 | POST | `/api/plugins/draft` / DELETE | 模型自产插件提交 draft 隔离区 / 丢弃 |
 | POST | `/api/plugins/promote` | draft 一键转正（落盘持久化、来源改 user）|

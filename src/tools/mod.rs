@@ -328,16 +328,14 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "plugin",
-            description: "第三方插件安装与信任（2026-10-04 放开权限轮；自改纪律：install/unpin 要求「中枢」插件开着，review 只读不受闸）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）装第三方插件：宿主先落位再跑静态审查（外联/密钥/动态执行等红线项为 blocker）——审查通过自动信任并即时生效，用户可在界面看到；有 blocker 会停下不信任（插件休眠不加载），返回完整报告：把 blocked 里的问题逐条讲给用户听，用户同意继续就带 force=true 重试（会弹审批卡让用户亲自拍板，别替用户做这个决定）。action=review 配 key（形如 plugins:名字）只审不信返回完整报告——装之前想先看审查结论就用它。action=unpin 配 key 撤回信任（插件停载、文件保留，可逆）。action=remove 配 name 删除插件（连目录带文件一起删，不可恢复，判 Dangerous 必弹审批卡；只删 user 来源，内置拒删并说人话——想停用内置插件就引导用户关它的开关，别删）。删除前把插件名念给用户确认，别把 unpin（停载可逆）和 remove（删文件不可逆）混为一谈。审查由宿主统一执行，不要用 shell 自己审也不要绕过这个工具。",
+            description: "模型自产插件安装与删除（自改纪律：install/remove 要求「中枢」插件开着）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）：落位到插件目录即加载生效。action=remove 配 name 删除插件（连目录带文件一起删，不可恢复，判 Dangerous 必弹审批卡；只删 user 来源，内置拒删并说人话——想停用内置插件就引导用户关它的开关，别删）。删除前把插件名念给用户确认。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["install", "review", "unpin"], "description": "install 配 name/manifest/files（force 可选）；review/unpin 配 key" },
-                    "name": { "type": "string", "description": "install：插件名（仅字母数字与 - _ .）" },
+                    "action": { "type": "string", "enum": ["install", "remove"], "description": "install 配 name/manifest/files；remove 配 name" },
+                    "name": { "type": "string", "description": "install/remove：插件名（仅字母数字与 - _ .）" },
                     "manifest": { "type": "object", "description": "install：manifest.json 内容（apiVersion=1 + title + ui/tools 声明）" },
-                    "files": { "type": "object", "description": "install：{相对路径: 文本内容}，如 {\"index.html\": \"<html>…\"}" },
-                    "force": { "type": "boolean", "description": "install：审查有 blocker 时经用户明确同意后强装（任何档位弹卡）" },
-                    "key": { "type": "string", "description": "review/unpin：插件键（形如 plugins:名字）" }
+                    "files": { "type": "object", "description": "install：{相对路径: 文本内容}，如 {\"index.html\": \"<html>…\"}" }
                 },
                 "required": ["action"]
             }),
