@@ -19,17 +19,18 @@
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 14px 16px 20px;
+    margin: 0; padding: 0;
     font: 13px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
     background: var(--bg); color: var(--fg);
   }
+  #wrap { padding: 14px 16px 6px; }
   h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
   label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
   textarea, select {
     width: 100%; font: inherit; color: var(--fg); background: var(--bg);
     border: 1px solid var(--btn-line); border-radius: 6px; padding: 6px 8px;
   }
-  textarea { min-height: 110px; resize: vertical; }
+  textarea { min-height: 110px; }
   textarea:focus, select:focus { outline: none; border-color: var(--fg); }
   .row { display: flex; gap: 8px; margin-top: 14px; }
   button {
@@ -40,12 +41,18 @@
   button.primary { border-color: var(--fg); }
   button:disabled { opacity: .5; cursor: default; }
   button:disabled:hover { background: transparent; }
+  /* 空消息条不占位（否则弹窗下边缘和按钮之间白多一条 margin） */
+  #msg:empty { display: none; }
   .msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
   .msg.err { color: var(--err); }
   .msg.ok { color: var(--ok); }
 </style>
 </head>
 <body>
+  <!-- 包裹层：高度只由内容决定（不受 iframe 视口钳制）——弹窗贴合就量它。
+       直接量 documentElement.scrollHeight 有个坑：它不低于当前视口，框一旦被撑大
+       就再也报不小，清空后收不回来（实测实锤） -->
+  <main id="wrap">
   <h3>插件制作器</h3>
   <label for="req">插件制作要求</label>
   <textarea id="req"></textarea>
@@ -56,6 +63,7 @@
     <button id="clear">清空</button>
   </div>
   <div id="msg" class="msg"></div>
+  </main>
 
 <script>
 // —— 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对 ——
@@ -99,9 +107,13 @@ async function boot() {
   $('clear').onclick = () => {
     $('req').value = '';
     refresh();
+    growReq();
     $('req').focus();
   };
-  $('req').oninput = refresh;
+  $('req').oninput = () => {
+    refresh();
+    growReq();
+  };
   // 工作区列表：当前置顶 + 最近（去重）。workspace.info 是只读桥，不占权限
   let current = '';
   let recent = [];
@@ -126,6 +138,23 @@ async function boot() {
     .map((w, i) => `<option value="${esc(w)}">${i === 0 ? '（当前）' : ''}${esc(w.split(/[\\/]/).filter(Boolean).pop() || w)}</option>`)
     .join('');
   refresh();
+  fit();
+}
+
+// 需求框随输入长高（封顶 200，超出内部滚），长高后同步弹窗高度
+function growReq() {
+  const ta = $('req');
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+  fit();
+}
+
+// 内容高度上报（宿主 agent:resize 协议）：弹窗下边缘贴着内容，不在按钮下方留空白。
+// 量 #wrap（内容驱动、不受视口钳制）——量 documentElement.scrollHeight 会导致框只能
+// 长大不能缩小（scrollHeight 不低于当前视口高度）。
+function fit() {
+  const h = Math.ceil(document.getElementById('wrap').getBoundingClientRect().height);
+  parent.postMessage({ type: 'agent:resize', height: h }, '*');
 }
 
 function refresh() {
@@ -136,6 +165,7 @@ function showMsg(text, cls) {
   const m = $('msg');
   m.textContent = text;
   m.className = 'msg' + (cls ? ' ' + cls : '');
+  fit(); // 消息条出现/消失会改变内容高度，弹窗跟着贴
 }
 
 async function go() {

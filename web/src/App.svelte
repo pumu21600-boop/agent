@@ -3880,6 +3880,8 @@
   // 不开右侧大面板。用户拍板的交互：点打开 → 弹小窗 → 确定 → 落进新对话。
   let extPopup = null;
   let extPopupFrame = null;
+  // 插件页 post 过来的内容高度（0 = 用 CSS 默认）：弹窗贴着内容长，不在下面留空白
+  let extPopupFrameH = 0;
   let extMsg = '';
   let extSeq = 0;
   const extPending = new Map(); // 请求 id → 发起方（这次是父侧主动调用扩展，留口）
@@ -4942,6 +4944,14 @@
     const d = ev.data || {};
     if (d.type === 'agent:hello') {
       postToName(from, { type: 'agent:init', payload: extInitPayload(ext) });
+      return;
+    }
+    // 弹窗型插件的内容高度上报（通用协议，不占权限）：插件页把自身高度 post 过来，
+    // 宿主让弹窗下边缘贴着内容——固定高度会在内容下方留一条空白（用户实锤：
+    // 「下边缘为什么不直接到确定取消刚好下面」）。夹在 [260, 视口-140] 防爆框。
+    if (d.type === 'agent:resize' && extPopup && ev.source === extPopupFrame?.contentWindow) {
+      const h = Number(d.height) || 0;
+      if (h > 0) extPopupFrameH = Math.max(200, Math.min(h, window.innerHeight - 140));
       return;
     }
     if (d.type !== 'agent:request') return;
@@ -6338,6 +6348,7 @@
           bind:this={extPopupFrame}
           title={extPopup.title}
           sandbox="allow-scripts"
+          style={extPopupFrameH ? `height:${extPopupFrameH}px` : ''}
           src={`/plugins/${encodeURIComponent(extPopup.name)}/${extPopup.entry || 'index.html'}`}
           on:load={() => onExtFrameLoad(extPopup.name)}
         ></iframe>

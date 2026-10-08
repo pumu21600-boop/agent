@@ -46,7 +46,7 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
 | settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它。dock 面板插件不给「设置」按钮——设置从侧边栏面板内进（如用量的价格表在面板里有入口） |
 | ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量价格」插件） |
-| popup | 否 | `true` = 设置→插件卡片点「打开」时开**居中小窗口**（模态）而非右侧大面板；表单型插件用它（用户 2026-10-08 拍板：要弹窗不要侧栏）。缺省 false = 老行为 |
+| popup | 否 | `true` = 设置→插件卡片点「打开」时开**居中小窗口**（模态）而非右侧大面板；表单型插件用它（用户 2026-10-08 拍板：要弹窗不要侧栏）。缺省 false = 老行为。小窗口高度**贴内容**：插件页把自身高度 post 给宿主（`parent.postMessage({type:'agent:resize', height})`，不占权限），宿主夹在 [200, 视口-140] 内设置 iframe 行内高度。注意两个坑：① 要量**内容驱动的包裹元素**（如 `<main id=wrap>`），不能量 `documentElement.scrollHeight`——它不低于当前视口高度，框一旦撑大就再也报不小（清空收不回）；② 宿主侧 iframe 样式须 `flex:none` 且不留大 min-height，否则行内高度被压住 |
 | permissions | 否 | 能力白名单：`composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）/ `session.create`（在指定工作区新建对话并预填输入框，插件制作器用）/ `settings.feature` / `action.run`；**未声明的一律拒绝** |
 | skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
 

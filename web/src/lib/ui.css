@@ -184,22 +184,28 @@ body {
   display: flex;
   gap: 6px;
 }
-/* 弹窗型插件（manifest popup:true）：居中小窗口，别的不动 */
+/* 弹窗型插件（manifest popup:true）：居中小窗口，高度跟着插件页上报的内容走
+   （agent:resize 协议）——下边缘贴内容，不在确定按钮下方留空白 */
 .ext-popup {
   box-sizing: border-box;
   background: var(--g2);
   border: 1px solid var(--g3);
   border-radius: 10px;
   width: min(560px, calc(100vw - 48px));
-  height: min(60vh, 460px);
+  height: auto;
+  max-height: calc(100vh - 48px);
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding: 12px;
+  padding: 12px 12px 8px;
   gap: 10px;
   box-shadow: 0 12px 48px rgb(0 0 0 / 45%);
 }
+/* 注意 flex:none——flex:1 的 basis 是 0，auto 高度容器会把 iframe 塌到 min-height，
+   行内高度（插件页上报的内容高度）就不起作用了，内容会被裁。
+   min-height 也不能留大的：它压过行内 height，小内容插件会被撑高。 */
 .ext-popup-frame {
-  flex: 1;
+  flex: none;
   width: 100%;
   border: none;
   border-radius: 8px;
