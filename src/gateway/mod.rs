@@ -55,6 +55,12 @@ pub struct Gateway {
     /// 之后 Clash 开/关/换节点不会自动跟进。网络层失败时 rebuild_client()
     /// 重新读系统代理，服务不用重启就能自愈。
     client: RwLock<reqwest::Client>,
+    /// 环回渠道专用客户端（no_proxy）：本地模型服务（ollama/lmstudio/mnn/
+    /// llamacpp 预设全是 127.0.0.1/localhost 端点）经代理必坏——代理连自己的
+    /// localhost 回 502，用户却看到「渠道返回 502」。reqwest 默认不排除环回
+    /// （注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现），2026-10-08
+    /// 补上：base_url 是环回主机时 send() 换这个客户端。
+    loopback_client: reqwest::Client,
     /// 本地限流（P8）：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
     throttle: Option<Throttle>,
     /// P23 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
@@ -199,6 +205,43 @@ fn build_client() -> reqwest::Client {
         })
 }
 
+/// 环回专用客户端：显式清掉所有代理并关掉系统代理自动探测——本地模型端点
+/// （127.0.0.1/localhost/::1）的请求永不经代理。
+fn build_loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// base_url 是否指向环回主机（本地模型服务）：是则 send() 换 loopback_client。
+/// 本地端点经代理必坏（代理连自己的 localhost，回 502），而 reqwest 默认不排除
+/// 环回——注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现，2026-10-08 补。
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let after_scheme = base_url
+        .trim()
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or_else(|| base_url.trim());
+    let host = after_scheme.split('/').next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host); // 剥 user:pass@
+    // [::1]:8080 先去括号；其余按第一个 : 剥端口（IPv6 无括号形态不常见，不特殊处理）
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    let host = host.trim().to_lowercase();
+    if host == "localhost" || host == "::1" {
+        return true;
+    }
+    // 127.0.0.0/8：四段全数字且首段是 127
+    let mut it = host.split('.');
+    it.next() == Some("127") && it.clone().count() == 3 && it.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// 聚合后的模型回复（P2 核心循环用）：正文 / 思考 / 工具调用。
 #[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
@@ -243,7 +286,12 @@ pub enum ChatOutcome {
 
 impl Gateway {
     pub fn new() -> Self {
-        Self { client: RwLock::new(build_client()), throttle: None, thinking_degraded: RwLock::new(std::collections::HashSet::new()) }
+        Self {
+            client: RwLock::new(build_client()),
+            loopback_client: build_loopback_client(),
+            throttle: None,
+            thinking_degraded: RwLock::new(std::collections::HashSet::new()),
+        }
     }
 
     /// 该渠道（base_url|model）是否已被登记为「端点拒收思考参数」。
@@ -308,14 +356,24 @@ impl Gateway {
     /// 1) 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
     /// 2) 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
     ///    仍 429 才把错误抛给上层。用户不该看见瞬时限流。
+    /// `base_url` 决定用哪个客户端：环回主机（本地模型服务）永不走代理。
     async fn send(
         &self,
+        base_url: &str,
         build: impl Fn(reqwest::Client) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
         self.gate().await;
         let mut attempt_429 = 0u32;
+        // 环回渠道（本地模型端点）：代理必坏，用 no_proxy 客户端
+        let pick = |g: &Gateway| {
+            if is_loopback_base_url(base_url) {
+                g.loopback_client.clone()
+            } else {
+                g.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client)
+            }
+        };
         loop {
-            let client = self.client.read().ok().map(|c| c.clone()).unwrap_or_else(build_client);
+            let client = pick(self);
             match build(client).send().await {
                 Ok(r) => {
                     if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt_429 < 3 {
@@ -402,7 +460,7 @@ impl Gateway {
         observability::debug(&format!("[gateway] GET {url}"));
 
         let response = self
-            .send(|c| Self::auth(c.get(&url), api_key, protocol))
+            .send(base_url, |c| Self::auth(c.get(&url), api_key, protocol))
             .await
             .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
 
@@ -480,7 +538,7 @@ impl Gateway {
             return Err(anyhow!(msg));
         }
         let mut response = match self
-            .send(|c| Self::auth(c.post(&url), api_key, compat.protocol).json(&body))
+            .send(base_url, |c| Self::auth(c.post(&url), api_key, compat.protocol).json(&body))
             .await
         {
             Ok(r) => r,
@@ -504,7 +562,7 @@ impl Gateway {
             };
             let retry_body = build_body_with_compat(model, &outgoing, false, &retry_params, None, &compat);
             response = match self
-                .send(|c| Self::auth(c.post(&url), api_key, compat.protocol).json(&retry_body))
+                .send(base_url, |c| Self::auth(c.post(&url), api_key, compat.protocol).json(&retry_body))
                 .await
             {
                 Ok(r) => r,
@@ -582,7 +640,7 @@ impl Gateway {
         let body = json!({ "model": model, "input": input });
         observability::event(EventType::State, json!({ "kind": "gateway.request", "url": url, "purpose": "embedding", "inputs": input.len() }));
         let response = self
-            .send(|c| c.post(&url).bearer_auth(api_key).json(&body))
+            .send(base_url, |c| c.post(&url).bearer_auth(api_key).json(&body))
             .await
             .with_context(|| format!("请求渠道失败: {url}"))?;
         let status = response.status();
@@ -723,7 +781,7 @@ impl Gateway {
         observability::debug(&format!("[gateway] request body: {body}"));
 
         let mut response = match self
-            .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body))
+            .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body))
             .await
         {
             Ok(r) => r,
@@ -750,7 +808,7 @@ impl Gateway {
             };
             let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat);
             response = match self
-                .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
+                .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
                 .await
             {
                 Ok(r) => r,
@@ -778,7 +836,7 @@ impl Gateway {
             );
             let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat);
             response = match self
-                .send(|c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
+                .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
                 .await
             {
                 Ok(r) => r,
@@ -842,7 +900,10 @@ impl Gateway {
                 if data.is_empty() {
                     continue;
                 }
-                if !is_anthropic && data == "[DONE]" {
+                // [DONE] 两种协议都认（2026-10-08 修：Anthropic 官方不发，但 OpenAI
+                // 形状的中继/代理会补发；原先 !is_anthropic 才特判，导致 Anthropic 渠道
+                // 收到 [DONE] 进解析失败计数，整条流只有它时还触发误导性报错）
+                if data == "[DONE]" {
                     done = true;
                     break;
                 }

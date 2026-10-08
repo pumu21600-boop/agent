@@ -148,7 +148,13 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/workspace", get(get_workspace).post(set_workspace))
         .route("/api/approvals", post(decide_approval))
         .route("/api/approval-mode", post(set_approval_mode))
-        .route("/api/chat", post(chat))
+        // /api/chat 收 base64 附件（图片走前端压缩，但文档/音视频直线进 body）：
+        // axum Json 默认 2MB 上限会让 ~1.4MB 的附件整个请求 413（用户看到裸错误码）。
+        // 抬到 40MB——前端预检上限 25MB，base64 膨胀 4/3 后约 33MB，留足余量。
+        .route(
+            "/api/chat",
+            post(chat).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
         // P22-A 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
         .route("/api/headless/run", post(run_headless))
         // P22-B 定时任务：清单（含下次运行/通知）/ 新建改 / 删 / 立即运行

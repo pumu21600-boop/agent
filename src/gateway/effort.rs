@@ -18,9 +18,15 @@ const GPT_51_CODEX_MAX_EFFORTS: [&str; 4] = ["none", "medium", "high", "xhigh"];
 const GPT_51_CODEX_MINI_EFFORTS: [&str; 1] = ["medium"];
 const GENERIC_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 
-/// 模型 id 规范化：小写 + 去日期后缀（gpt-5.1-2025-06-09 → gpt-5.1）。
+/// 模型 id 规范化：小写 + 剥厂商前缀（中转常见的 `openai/gpt-5.1`）+ 去日期后缀
+/// （gpt-5.1-2025-06-09 → gpt-5.1）。
 fn normalize_model_id(id: &str) -> String {
-    let lower = id.trim().to_lowercase();
+    let trimmed = id.trim();
+    // 厂商前缀（`openai/gpt-5.1` → `gpt-5.1`）：聚合中转的 id 惯例。不剥的话
+    // starts_with("gpt-5.6") 这类族判定全不命中——temperature 支持性/effort 档位
+    // 解析都会按错族走（2026-10-08 修，与 replay/compat 的 rsplit('/') 同规）。
+    let bare = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let lower = bare.to_lowercase();
     // 尾 11 字节可能落在多字节字符中间（非 ASCII 模型名：中文/emoji/İ 这类
     // 大小写映射还会改变字节长度），必须先判字符边界再切，否则 panic——
     // 调用方在 tokio 任务里，panic 被运行时吞掉 = 这一轮无 error 无 done 静默死掉。
@@ -249,6 +255,18 @@ mod tests {
         assert_eq!(normalize_model_id("gpt-5.2-中文-2025-06-09"), "gpt-5.2-中文");
         // 档位解析链路同样不能炸
         assert_eq!(resolve_effort("gpt-5-中文测试", "high", None).as_deref(), Some("high"));
+    }
+
+    /// 2026-10-08 修：中转渠道常见的 `openai/gpt-5.1` 带厂商前缀——不剥的话
+    /// starts_with("gpt-5.6") 这类族判定全不命中（temperature 支持性/effort
+    /// 档位按错族走）。
+    #[test]
+    fn vendor_prefix_is_stripped() {
+        assert_eq!(normalize_model_id("openai/gpt-5.1"), "gpt-5.1");
+        assert_eq!(normalize_model_id("OpenAI/GPT-5.6-2026-01-01"), "gpt-5.6");
+        assert!(is_gpt_5_6_model("openai/gpt-5.6-mini"), "带前缀也要认出 5.6 族");
+        assert!(!supports_temperature("openai/gpt-5.6"), "5.6 族仍拒收 temperature");
+        assert!(supports_temperature("openai/gpt-5.5"), "5.5 族不受影响");
     }
 
     #[test]

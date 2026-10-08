@@ -168,6 +168,13 @@
         // output_tokens 兼容（个别反代用这个字段名）
         let (p, c, k) = usage_triple(&json!({"usage": {"prompt_tokens": 1, "output_tokens": 2}}));
         assert_eq!((p, c, k), (1, 2, 0));
+        // 2026-10-08 修：Anthropic 的 input_tokens 不含 cache_read/cache_creation，
+        // 而 OpenAI 的 prompt_tokens 是含缓存的总输入——补齐，否则锚点系统性低估
+        let (p, c, k) = usage_triple(&json!({"usage": {
+            "input_tokens": 100, "output_tokens": 50,
+            "cache_read_input_tokens": 64, "cache_creation_input_tokens": 32,
+        }}));
+        assert_eq!((p, c, k), (196, 50, 64), "100+64+32；cached 只报 cache_read");
     }
 
     #[test]
@@ -240,13 +247,16 @@
     }
 
     #[tokio::test]
-    async fn client_rebuild_picks_up_new_proxy_config() {
+    async fn loopback_base_url_bypasses_proxy() {
+        // 2026-10-08 修：环回渠道（本地模型服务 ollama/lmstudio/mnn/llamacpp 全是
+        // 127.0.0.1 端点）原先会走系统/环境代理——代理连自己的 localhost 回 502，
+        // 用户看到「渠道返回 502」而渠道本身没毛病。reqwest 默认不排除环回（注释里
+        // 写了多年的「ProxyOverride 环回绕代理」从未实现），现在 Gateway 对环回
+        // base_url 专用 no_proxy 客户端。本测试钉住：环境里挂着（死）代理时，
+        // 环回请求照旧直达渠道。
         init_logger();
         let g = Gateway::new();
 
-        // 本地 mock 渠道（曾直打 api.deepseek.com——2026-09-27 本机系统代理开关翻转后
-        // 该测试稳定失败：reqwest 的代理解析跟着注册表走，外网假设不再成立）。
-        // 回 401 即「网络层已通、渠道在拒假 key」；127.* 在 ProxyOverride 里天然绕代理。
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -254,7 +264,11 @@
         let stop2 = stop.clone();
         let mock = std::thread::spawn(move || {
             use std::io::Write;
-            let resp = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+            let resp = b"HTTP/1.1 401 Unauthorized
+Content-Type: application/json
+Content-Length: 2
+
+{}";
             while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut s, _)) => {
@@ -274,30 +288,52 @@
         });
         let base = format!("http://127.0.0.1:{port}/v1");
 
-        // 阶段1：代理指向死端口 → 必须失败（is_connect 分支）
+        // 环境里挂一个死代理——环回请求必须绕过它直达 mock（401 = 网络层已通）
         unsafe {
             std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
             std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1");
         }
         g.rebuild_client_for_test();
         let r1 = g.list_models(&base, "sk-dummy").await;
-        assert!(r1.is_err(), "死代理下应失败，实际 {:?}", r1.map(|v| v.len()));
-
-        // 阶段2：清掉死代理 → rebuild → 同一 Gateway 实例应拿到渠道业务响应
-        // （401 = 网络层已通，渠道在拒绝假 key——这正是"网络层恢复"的证据）
+        let msg1 = r1.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(
+            msg1.contains("401"),
+            "环回 base_url 应绕过（死）代理直达渠道拿到 401，实际: {msg1}"
+        );
+        // 清掉代理再 rebuild：行为不变（环回客户端与代理配置无关）
         unsafe {
             std::env::remove_var("HTTPS_PROXY");
             std::env::remove_var("HTTP_PROXY");
         }
         g.rebuild_client_for_test();
         let r2 = g.list_models(&base, "sk-dummy").await;
-        let msg = r2.err().map(|e| format!("{e:#}")).unwrap_or_default();
-        assert!(
-            msg.contains("401") && !msg.contains("请求渠道失败"),
-            "重建后应拿到渠道 401（网络层恢复），实际: {msg}"
-        );
+        let msg2 = r2.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(msg2.contains("401"), "清掉代理后仍应拿到 401，实际: {msg2}");
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         mock.join().unwrap();
+    }
+
+    /// 环回主机判定：本地模型端点的各种写法都要认出来。
+    #[test]
+    fn loopback_base_url_detection() {
+        for u in [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:1234/v1",
+            "http://127.5.6.7:8080",
+            "http://user:pass@127.0.0.1:8080/v1",
+            "http://[::1]:8080/v1",
+            "127.0.0.1:8080",
+        ] {
+            assert!(is_loopback_base_url(u), "{u} 应判为环回");
+        }
+        for u in [
+            "https://api.deepseek.com/v1",
+            "https://127.0.0.1.evil.com/v1",
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://2127.0.0.1/v1",
+        ] {
+            assert!(!is_loopback_base_url(u), "{u} 不应判为环回");
+        }
     }
     #[test]
     fn take_line_survives_utf8_split_across_chunks() {

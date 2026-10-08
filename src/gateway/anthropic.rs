@@ -23,12 +23,30 @@ const THINKING_BUDGET_MIN: u64 = 1024;
 /// 思考预算上限：预算取 max_tokens 一半，封顶 32k，防止大 max_tokens 时思考吃满一半。
 const THINKING_BUDGET_MAX: u64 = 32000;
 
-/// 是否 Anthropic 端点：provider_id=anthropic 或 base_url 含官方域。
+/// 是否 Anthropic 端点：provider_id=anthropic 或 base_url 的**主机名**是官方域。
+/// 2026-10-08 修：原先是整串 URL 子串匹配——`anthropic.com.example.com`（攻击性
+/// 域名/误配的中继）或路径里恰好含该子串的地址都会被判成 Messages 协议，请求体
+/// 整体重写成 Messages 形状发给 OpenAI 形状中继 → 400。改按主机段匹配。
 pub fn is_anthropic_endpoint(provider_id: Option<&str>, base_url: Option<&str>) -> bool {
     if provider_id == Some("anthropic") {
         return true;
     }
-    base_url.is_some_and(|b| b.to_lowercase().contains("anthropic.com"))
+    base_url.is_some_and(|b| {
+        let b = b.trim().to_lowercase();
+        // 剥 scheme 后取主机段（到第一个 / ? # 为止），再判「等于官方域或以 .官方域 结尾」
+        let after_scheme = b.split_once("://").map(|(_, r)| r).unwrap_or(&b);
+        let host = after_scheme
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        host == "anthropic.com" || host.ends_with(".anthropic.com")
+    })
 }
 
 /// Messages 端点 URL：已含 /messages 原样（兼容端点给全路径）；以 /v1 结尾补 /messages；其余补 /v1/messages。
@@ -222,10 +240,6 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
     if !system_parts.is_empty() {
         body["system"] = json!(system_parts.join("\n\n"));
     }
-    // Anthropic 温度域 0..1，且不与 top_p 同发（官方禁止同时改）
-    if let Some(t) = params.temperature {
-        body["temperature"] = json!(t.clamp(0.0, 1.0));
-    }
     if let Some(t) = tools {
         let defs: Vec<Value> = t
             .as_array()
@@ -258,6 +272,15 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
     {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
+    // Anthropic 温度域 0..1，且不与 top_p 同发（官方禁止同时改）；**思考开启时
+    // 官方还要求 temperature 不设或恰为 1**（2026-10-08 修：旧版无条件照发，
+    // 同发直接 400；降级重试只剥 thinking 便成功 → 误判「端点拒收思考」并
+    // mark_thinking_degraded 永久登记，根因（温度设置）反而一直藏着）。
+    if let Some(t) = params.temperature
+        && (body.get("thinking").is_none() || (t - 1.0).abs() <= f64::EPSILON)
+    {
+        body["temperature"] = json!(t.clamp(0.0, 1.0));
+    }
     body
 }
 
@@ -282,6 +305,8 @@ pub struct SseTranslator {
     tool_blocks: HashMap<usize, (usize, String, String)>,
     acc_prompt: Option<u64>,
     acc_cached: Option<u64>,
+    /// cache_creation_input_tokens（写缓存也算输入，2026-10-08 修：原先整个丢掉）
+    acc_cache_creation: Option<u64>,
     acc_completion: Option<u64>,
 }
 
@@ -289,10 +314,17 @@ impl SseTranslator {
     fn chunk(&self, delta: Value, finish: Value) -> Value {
         let mut chunk = json!({ "choices": [{ "delta": delta, "finish_reason": finish }] });
         if self.acc_prompt.is_some() || self.acc_completion.is_some() || self.acc_cached.is_some() {
+            // Anthropic 的 input_tokens **不含** cache_read/cache_creation，而 OpenAI 形状的
+            // prompt_tokens 是含缓存的总输入——下游锚点（report_api_usage 的 real = prompt
+            // + completion）按 OpenAI 口径消费，这里必须补齐，否则缓存命中越多锚点低估越狠
+            // （上下文圆环/压缩阈值系统性偏低）。cached_tokens 仍只报 cache_read。
+            let input = self.acc_prompt.unwrap_or(0);
+            let cache_read = self.acc_cached.unwrap_or(0);
+            let cache_creation = self.acc_cache_creation.unwrap_or(0);
             chunk["usage"] = json!({
-                "prompt_tokens": self.acc_prompt.unwrap_or(0),
+                "prompt_tokens": input + cache_read + cache_creation,
                 "completion_tokens": self.acc_completion,
-                "prompt_tokens_details": { "cached_tokens": self.acc_cached.unwrap_or(0) },
+                "prompt_tokens_details": { "cached_tokens": cache_read },
             });
         }
         chunk
@@ -312,6 +344,7 @@ impl SseTranslator {
                 let u = data.pointer("/message/usage").cloned().unwrap_or(json!({}));
                 self.acc_prompt = u.get("input_tokens").and_then(Value::as_u64);
                 self.acc_cached = u.get("cache_read_input_tokens").and_then(Value::as_u64);
+                self.acc_cache_creation = u.get("cache_creation_input_tokens").and_then(Value::as_u64);
                 Ok(Translated::Chunk(self.chunk(json!({}), json!(null))))
             }
             "content_block_start" => {
@@ -352,15 +385,20 @@ impl SseTranslator {
                         if args.is_empty() {
                             return Ok(Translated::Ignore);
                         }
-                        // 块序号 → 工具调用序号；起点缺失（罕见）也兜底分配新槽，绝不留空槽
-                        let call_idx = match self.tool_blocks.get(&block_idx) {
-                            Some((ci, _, _)) => *ci,
-                            None => {
-                                let ci = self.tool_blocks.len();
-                                self.tool_blocks.insert(block_idx, (ci, String::new(), String::new()));
-                                ci
-                            }
+                        // 块序号 → 工具调用序号。start 行丢失（该行 JSON 解析失败被吞/
+                        // 中继不发）时原先兜底分配空 id/name 的新槽——发出去就是空 name 的
+                        // 工具调用，下游「未知工具: 」+ 一张空名字的审批卡（正是空槽想避免
+                        // 的那种误审批）。Anthropic 的 SSE 严格有序（start 必先于 delta），
+                        // 先见到 delta 而没见过 start = start 永不会来，这段参数只能丢弃
+                        // （整轮无工具调用时上游的解析失败守卫会报错，不会静默空回答）。
+                        // 2026-10-08 修。
+                        let Some((ci, _, name)) = self.tool_blocks.get(&block_idx) else {
+                            return Ok(Translated::Ignore);
                         };
+                        if name.is_empty() {
+                            return Ok(Translated::Ignore);
+                        }
+                        let call_idx = *ci;
                         Ok(Translated::Chunk(self.chunk(
                             json!({ "tool_calls": [{ "index": call_idx, "function": { "arguments": args } }] }),
                             json!(null),
@@ -553,7 +591,10 @@ mod tests {
         };
         // message_start：input usage（含缓存读）
         let c = feed(&mut tr, json!({"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":64}}})).unwrap();
-        assert_eq!(c["usage"]["prompt_tokens"], json!(100));
+        // 2026-10-08 修：prompt_tokens 补齐缓存字段（100+64）——Anthropic 的
+        // input_tokens 不含 cache_read/cache_creation，而 OpenAI 形状的 prompt_tokens
+        // 是含缓存的总输入，下游锚点按后者消费
+        assert_eq!(c["usage"]["prompt_tokens"], json!(164));
         assert_eq!(c["usage"]["prompt_tokens_details"]["cached_tokens"], json!(64));
         // 思考增量
         let c = feed(&mut tr, json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"我想"}})).unwrap();
@@ -576,7 +617,7 @@ mod tests {
         let c = feed(&mut tr, json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":55}})).unwrap();
         assert_eq!(c["choices"][0]["finish_reason"], json!("tool_calls"));
         assert_eq!(c["usage"]["completion_tokens"], json!(55));
-        assert_eq!(c["usage"]["prompt_tokens"], json!(100), "usage 累积：末尾分片带全量");
+        assert_eq!(c["usage"]["prompt_tokens"], json!(164), "usage 累积：末尾分片带全量（100+64 缓存读）");
         // message_stop
         assert!(matches!(tr.translate(&json!({"type":"message_stop"})), Ok(Translated::Done)));
         // 错误事件 → Err 人话
@@ -595,5 +636,102 @@ mod tests {
             };
             assert_eq!(c["choices"][0]["finish_reason"], json!(want), "{raw} → {want}");
         }
+    }
+}
+
+#[cfg(test)]
+mod b20261008_tests {
+    use super::*;
+
+    fn params() -> ChatParams {
+        ChatParams { provider_id: Some("anthropic".into()), ..Default::default() }
+    }
+
+    /// 2026-10-08 修：思考开启时 Anthropic 要求 temperature 不设或恰为 1——
+    /// 旧版无条件照发，400 后被降级重试剥 thinking 成功 → 误判「端点拒收思考」
+    /// 并 mark_thinking_degraded 永久登记（根因是温度设置，被错误归因）。
+    #[test]
+    fn temperature_dropped_when_thinking_enabled() {
+        let msgs = json!([{"role":"user","content":"hi"}]);
+        let mut p = params();
+        p.thinking = Some("high".into());
+        p.temperature = Some(0.5);
+        p.max_tokens = Some(8192);
+        let body = build_body("claude-x", &msgs, false, &p, None);
+        assert!(body.get("thinking").is_some(), "思考应开启");
+        assert!(body.get("temperature").is_none(), "思考开启时不得发 temperature: {}", body);
+        // 温度恰为 1 时保留（官方允许）
+        p.temperature = Some(1.0);
+        let body = build_body("claude-x", &msgs, false, &p, None);
+        assert_eq!(body["temperature"], json!(1.0), "temperature=1 可随思考同发");
+        // 思考关时温度照发
+        p.thinking = Some("off".into());
+        p.temperature = Some(0.3);
+        let body = build_body("claude-x", &msgs, false, &p, None);
+        assert!(body.get("thinking").is_none(), "off 不发 thinking");
+        assert_eq!(body["temperature"], json!(0.3), "思考关闭时 temperature 照发");
+    }
+
+    /// 2026-10-08 修：Anthropic 的 input_tokens 不含 cache_read/cache_creation，
+    /// 而 OpenAI 形状的 prompt_tokens 是含缓存的总输入——下游锚点按后者消费，
+    /// 不补齐则缓存命中越多锚点低估越狠（上下文圆环/压缩阈值系统性偏低）。
+    #[test]
+    fn usage_prompt_includes_cache_fields() {
+        let mut tr = SseTranslator::default();
+        let c = tr
+            .translate(&json!({"type":"message_start","message":{"usage":{
+                "input_tokens":100,"cache_read_input_tokens":64,"cache_creation_input_tokens":32
+            }}}))
+            .unwrap();
+        let Translated::Chunk(v) = c else { panic!("应产出 chunk") };
+        assert_eq!(v["usage"]["prompt_tokens"], json!(196), "100+64+32");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], json!(64), "cached 只报 cache_read");
+    }
+
+    /// 2026-10-08 修：端点判定原先是整串 URL 子串匹配——anthropic.com.example.com
+    /// 这种域名/路径里含子串的中继都会被判成 Messages 协议，请求体整体重写后 400。
+    #[test]
+    fn endpoint_match_is_host_scoped() {
+        assert!(is_anthropic_endpoint(Some("anthropic"), None));
+        assert!(is_anthropic_endpoint(None, Some("https://api.anthropic.com/v1")));
+        assert!(is_anthropic_endpoint(None, Some("https://api.anthropic.com")));
+        assert!(!is_anthropic_endpoint(None, Some("https://anthropic.com.example.com/v1")));
+        assert!(!is_anthropic_endpoint(None, Some("https://relay.example.com/anthropic.com/v1")));
+        assert!(!is_anthropic_endpoint(None, Some("https://evil.com/?x=anthropic.com")));
+        assert!(!is_anthropic_endpoint(None, Some("https://open.bigmodel.cn/api/paas/v4")));
+    }
+
+    /// 2026-10-08 修：start 行丢失（JSON 解析失败被吞）时 input_json_delta 的兜底
+    /// 槽没有 id/name——发出去就是空 name 的工具调用（下游「未知工具」+ 空审批卡）。
+    /// Anthropic SSE 严格有序，先见 delta 未见 start = start 永不会来，丢弃该段。
+    #[test]
+    fn orphan_input_json_delta_is_dropped() {
+        let mut tr = SseTranslator::default();
+        let out = tr
+            .translate(&json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"{\"a\":1}"
+            }}))
+            .unwrap();
+        assert!(
+            matches!(out, Translated::Ignore),
+            "没见过 content_block_start 的 tool_use 参数必须丢弃"
+        );
+        // 正常路径不受影响：start 之后的 delta 照常产出
+        let _ = tr
+            .translate(&json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"call_1","name":"read_file"
+            }}))
+            .unwrap();
+        let out = tr
+            .translate(&json!({"type":"content_block_delta","index":0,"delta":{
+                "type":"input_json_delta","partial_json":"{\"a\":1}"
+            }}))
+            .unwrap();
+        let Translated::Chunk(v) = out else { panic!("应产出 chunk") };
+        assert_eq!(v["choices"][0]["delta"]["tool_calls"][0]["index"], json!(0));
+        assert_eq!(
+            v["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"a\":1}")
+        );
     }
 }

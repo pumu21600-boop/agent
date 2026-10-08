@@ -68,6 +68,48 @@ fn merge_file_history(mut file_msgs: Vec<Value>, req_history: &[Value], message:
     file_msgs
 }
 
+/// 把投影通知（文档收件/媒体转接结果）并进最后一条 user 消息。
+/// 纯函数（可单测）：2026-10-08 修——原先是 handler 里的内联块，且无条件把
+/// content 整体换成字符串，第 1 步挂上去的原生多模态 parts（图片/音频）被静默
+/// 丢掉（「截图 + 合同.pdf」同发时模型只收到文档通知，截图从未进入上下文）。
+/// 数组形态：所有 text part 合成一条（投影在前、原正文在后），非 text part
+/// （image_url/input_audio/video_url）原样保留；字符串形态维持旧行为。
+fn apply_projections_to_last_user(history: &mut [Value], projections: &[String]) {
+    if projections.is_empty() {
+        return;
+    }
+    let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") else {
+        return;
+    };
+    match &last_msg["content"] {
+        Value::Array(arr) => {
+            let mut parts = arr.clone();
+            let orig = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            parts.retain(|p| p.get("type").and_then(Value::as_str) != Some("text"));
+            let combined = if orig.trim().is_empty() {
+                projections.join("\n\n")
+            } else {
+                format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
+            };
+            parts.insert(0, json!({ "type": "text", "text": combined }));
+            last_msg["content"] = json!(parts);
+        }
+        _ => {
+            let orig = last_msg["content"].as_str().unwrap_or("").trim().to_string();
+            let combined = if orig.is_empty() {
+                projections.join("\n\n")
+            } else {
+                format!("{}\n\n{}", projections.join("\n\n"), orig)
+            };
+            last_msg["content"] = json!(combined);
+        }
+    }
+}
+
 /// 流式对话：base_url/model/key 全部来自已保存设置（请求级 api_key 可覆盖）。
 pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
     let message = req.message.trim().to_string();
@@ -259,6 +301,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
     // 审计 07：SSE 断线感知——send 失败即对端没了（关网页/断网/刷新）。
     // cancel_on_disconnect 开 → 看门狗取消本轮；关（默认）→ 任务跑完，刷新可续聊。
     let peer_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 任务结束标志（看门狗退出用；None = 本功能关着）。2026-10-08 修（M2）：
+    // 任务正常跑完后 tx 随任务 drop、不再有 send，peer_gone 永远为 false →
+    // 看门狗每 2s 空转到页面关闭，每个请求泄漏一个永久任务。
+    let mut watchdog_done: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     let cancel_on_disconnect = state
         .settings
         .read()
@@ -269,9 +315,18 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         let watch_reg = state.cancel.clone();
         let watch_sid = session_id.clone();
         let watch_gone = peer_gone.clone();
+        let task_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch_done = task_done.clone();
+        watchdog_done = Some(task_done);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // 顺序要害：**先查结束再查断线**——任务结束后 flag 可能已被同会话
+                // 新一轮 try_begin 复用，这时的 cancel 会误杀新轮（客户端在 done
+                // 之后才掉线的场景）。
+                if watch_done.load(std::sync::atomic::Ordering::Relaxed) {
+                    break; // 本轮已结束：不收尾（flag 可能属于新一轮）
+                }
                 if watch_gone.load(std::sync::atomic::Ordering::Relaxed) {
                     watch_reg.cancel(&watch_sid);
                     break;
@@ -286,6 +341,16 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 peer_gone.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         };
+        // 看门狗退出信号：任务体任何出口（含 panic / 提前 return）都置位
+        struct DoneGuard(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                if let Some(f) = &self.0 {
+                    f.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _done_guard = DoneGuard(watchdog_done);
         // D2：本轮取消标志（会话级）——新会话不再复位别人的标志，停止只停本会话。
         // N1：标志已在进入 handler 时占位登记（同会话并发在门口就 409）。
         // 守卫在任务结束（含提前 return / panic）时注销登记，不留「永远在跑」的僵尸会话。
@@ -330,7 +395,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 }
                 let is_vid = att.is_video();
                 let is_aud = att.is_audio();
-                let is_img = att.is_image();
+                // 未知扩展名的 is_image 兜底只对**转接路径**成立（媒体理解按图片试一
+                // 次）；原生内联必须是真图片 mime——data:application/octet-stream
+                // 塞进 image_url，渠道直接 400、整轮失败（2026-10-08 修）。
+                let is_img = att.is_image() && att.effective_mime().starts_with("image/");
 
                 let supports_natively = (is_img && active_cfg.capabilities.vision)
                     || (is_vid && active_cfg.capabilities.video)
@@ -358,6 +426,14 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                                     "data": att.raw_base64(),
                                     "format": att.audio_format()
                                 }
+                            }));
+                        } else if att.is_video() {
+                            // 视频按 OpenAI 的 video_url 形状发（2026-10-08 修：原先
+                            // 也走 image_url，data:video/mp4 塞进 image_url 两种协议
+                            // 路径都必 400——Anthropic 转换器只认 image/* mime）
+                            parts.push(json!({
+                                "type": "video_url",
+                                "video_url": { "url": att.data_url() }
                             }));
                         } else {
                             parts.push(json!({
@@ -622,22 +698,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             // 文档附件与媒体转接共用同一份投影；注意这段必须在 forward 分支**外**——
             // 原来嵌在分支里，纯文档消息（无转接附件）的收件通知从来没进过模型上下文
             // （2026-10-06 真机实锤：模型收不到附件路径，靠 dir 翻目录才找到文件）。
-            if !projections.is_empty()
-                && let Some(last_msg) = history.iter_mut().rev().find(|m| m["role"] == "user") {
-                    let orig = match &last_msg["content"] {
-                        Value::String(s) => s.clone(),
-                        Value::Array(arr) => {
-                            arr.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n")
-                        }
-                        _ => "".to_string(),
-                    };
-                    let combined = if orig.trim().is_empty() {
-                        projections.join("\n\n")
-                    } else {
-                        format!("{}\n\n{}", projections.join("\n\n"), orig.trim())
-                    };
-                    last_msg["content"] = json!(combined);
-                }
+            apply_projections_to_last_user(&mut history, &projections);
         }
         // 请求级覆盖 + 角色/降级渠道组装（与无头会话同一路径；提示见 notices）
         let ch = assemble_turn_channels(&state, &s, &active_cfg, &req_model, &req_base_url, &req_api_key);
@@ -1111,4 +1172,68 @@ fn persist_attachment(att: &MediaAttachment, ws: &std::path::Path) -> Option<Str
         .ok()?;
     std::fs::write(&target, decoded).ok()?;
     Some(final_name)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    /// 2026-10-08 修：投影块曾无条件把 content 换成字符串，原生多模态 parts
+    /// （图片/音频）被静默丢掉——「截图 + 合同.pdf」同发时模型只收到文档通知。
+    #[test]
+    fn projections_preserve_native_multimodal_parts() {
+        let mut history = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "看看这张截图和合同"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}},
+            ]
+        })];
+        apply_projections_to_last_user(&mut history, &["[📄 文档附件已收到：contract.pdf]".into()]);
+        let parts = history[0]["content"].as_array().expect("应仍是数组");
+        assert_eq!(parts.len(), 2, "图片 part 必须保留: {parts:?}");
+        assert_eq!(parts[0]["type"], json!("text"));
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("文档附件已收到"), "投影应在正文里: {text}");
+        assert!(text.contains("看看这张截图和合同"), "原正文应保留: {text}");
+        assert!(text.find("文档附件").unwrap() < text.find("看看这张").unwrap(), "投影在前");
+        assert_eq!(parts[1]["type"], json!("image_url"), "图片 part 原样");
+    }
+
+    /// 音频 part 同样保留；多个 text part 合成一条，不留重复正文。
+    #[test]
+    fn projections_merge_text_parts_and_keep_audio() {
+        let mut history = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "第一段"},
+                {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}},
+                {"type": "text", "text": "第二段"},
+            ]
+        })];
+        apply_projections_to_last_user(&mut history, &["[Audio understanding]: 说了啥".into()]);
+        let parts = history[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2, "两个 text part 应合成一条: {parts:?}");
+        assert_eq!(parts[0]["type"], json!("text"));
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("第一段") && text.contains("第二段"), "两段正文都在: {text}");
+        assert_eq!(parts[1]["type"], json!("input_audio"), "音频 part 原样");
+    }
+
+    /// 纯文本消息维持旧行为（整体替换为字符串）；无投影/无 user 消息时不动。
+    #[test]
+    fn projections_on_plain_string_and_noops() {
+        let mut history = vec![json!({"role": "user", "content": "原文"})];
+        apply_projections_to_last_user(&mut history, &["投影".into()]);
+        assert_eq!(history[0]["content"], json!("投影\n\n原文"));
+        // 无投影：不动
+        let mut h2 = vec![json!({"role": "user", "content": "x"})];
+        apply_projections_to_last_user(&mut h2, &[]);
+        assert_eq!(h2[0]["content"], json!("x"));
+        // 没有 user 消息：不动（不 panic）
+        let mut h3: Vec<Value> = vec![json!({"role": "system", "content": "s"})];
+        apply_projections_to_last_user(&mut h3, &["投影".into()]);
+        assert_eq!(h3.len(), 1);
+        assert_eq!(h3[0]["content"], json!("s"));
+    }
 }

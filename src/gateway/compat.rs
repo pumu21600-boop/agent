@@ -232,9 +232,13 @@ pub fn resolve(
 
 /// OpenAI 新系模型（gpt-5*/o 系）要求 max_completion_tokens；其余一律 max_tokens
 /// （国产/中转端点普遍只认 max_tokens；上游 usesMaxTokens 名单是它们目录的镜像）。
+/// 2026-10-08 修：中转渠道常见的 `openai/gpt-5.1` 这类带厂商前缀的 id 也要认出来
+/// （与 replay::developer_role_for_model 的 rsplit('/') 同规）——不然给 gpt-5 系发
+/// max_tokens 直接 400，且剥参重试不覆盖这个字段。
 fn max_tokens_field_for(model_id: &str) -> &'static str {
     let id = model_id.trim().to_lowercase();
-    if id.starts_with("gpt-5") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+    let norm = id.rsplit('/').next().unwrap_or(&id);
+    if norm.starts_with("gpt-5") || norm.starts_with("o1") || norm.starts_with("o3") || norm.starts_with("o4") {
         "max_completion_tokens"
     } else {
         "max_tokens"
@@ -268,6 +272,16 @@ mod tests {
 
         let c = resolve(Some("openai"), Some("https://api.openai.com/v1"), "gpt-4o-mini", None);
         assert_eq!(c.max_tokens_field, "max_tokens");
+
+        // 2026-10-08 修：中转渠道的 `openai/gpt-5.1` 这类带厂商前缀的 id——
+        // 不剥前缀会给 gpt-5 系发 max_tokens（该族只要 max_completion_tokens，400），
+        // 且 gpt-5.6 的 temperature 拒收判定也会失效
+        let c = resolve(Some("custom"), Some("https://relay.example.com/v1"), "openai/gpt-5.1", None);
+        assert_eq!(c.max_tokens_field, "max_completion_tokens", "带前缀也要认出 gpt-5 系");
+        let c = resolve(Some("custom"), Some("https://relay.example.com/v1"), "openai/gpt-5.6", None);
+        assert!(!c.supports_temperature, "带前缀的 5.6 仍拒收 temperature");
+        let c = resolve(Some("custom"), Some("https://relay.example.com/v1"), "zhipu/glm-4.6", None);
+        assert_eq!(c.max_tokens_field, "max_tokens", "非 gpt-5 系不受影响");
     }
 
     #[test]

@@ -67,26 +67,38 @@ pub(crate) fn record_usage(ctx: &UsageCtx, base_url: &str, provider_id: Option<&
 
 /// 从非流式响应里取 usage 三路（prompt / completion / cached；渠道不回 usage 时全 0）。
 /// 字段兼容：OpenAI 系 / DeepSeek 系 / Anthropic（input_tokens、output_tokens、cache_read_input_tokens）。
+/// Anthropic 口径注意（2026-10-08 修）：它的 input_tokens **不含** cache_read/cache_creation，
+/// 而 OpenAI 的 prompt_tokens 是含缓存的总输入——下游锚点按 OpenAI 口径消费，Anthropic
+/// 响应必须把两个 cache 字段补齐，否则缓存命中越多锚点低估越狠（上下文圆环系统性偏低）。
 pub(crate) fn usage_triple(data: &Value) -> (u64, u64, u64) {
     let u = match data.get("usage") {
         Some(u) => u,
         None => return (0, 0, 0),
     };
+    let cache_read = u
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
     let p = u
         .get("prompt_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| u.get("input_tokens").and_then(Value::as_u64))
+        // OpenAI 形状的 prompt_tokens 已含缓存，直接取；Anthropic 形状才需要补
+        .or_else(|| {
+            u.get("input_tokens")
+                .and_then(Value::as_u64)
+                .map(|input| {
+                    input
+                        + cache_read
+                        + u.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                })
+        })
         .unwrap_or(0);
     let c = u
         .get("completion_tokens")
         .and_then(Value::as_u64)
         .or_else(|| u.get("output_tokens").and_then(Value::as_u64))
         .unwrap_or(0);
-    let k = u
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    (p, c, k)
+    (p, c, cache_read)
 }
