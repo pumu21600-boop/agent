@@ -144,6 +144,21 @@ impl ScheduleTask {
         if self.session_mode == "fixed" && self.session_id.trim().is_empty() {
             return Err("固定会话模式要填会话 id".into());
         }
+        // 审批策略字段的值域（2026-10-08 补）：这两个字段直接改变无人值守会话的
+        // 权限面，垃圾值会让无头会话落到不可预期的策略上。合法值仍由用户在
+        // 设置→定时的高级选项里选；模型经 settings 工具改它们另有拦截。
+        if !matches!(self.on_approval.as_str(), "" | "deny" | "approve") {
+            return Err(format!(
+                "on_approval 只能是 deny / approve（现在是「{}」）",
+                self.on_approval
+            ));
+        }
+        if !matches!(self.approval_mode.as_str(), "" | "read-only" | "auto" | "full-access") {
+            return Err(format!(
+                "approval_mode 只能是 read-only / auto / full-access（现在是「{}」）",
+                self.approval_mode
+            ));
+        }
         if !self.workspace.trim().is_empty() && !std::path::Path::new(self.workspace.trim()).is_dir() {
             return Err(format!("工作区目录不存在: {}", self.workspace.trim()));
         }
@@ -633,6 +648,24 @@ mod tests {
         let mut t = task("0 9 * * *", "new", "");
         t.kind = "weird".into();
         assert!(t.validate().unwrap_err().contains("未知任务类型"));
+    }
+
+    /// 2026-10-08 修：审批策略字段的值域检查。这两个字段直接改变无人值守会话的
+    /// 权限面，垃圾值会让无头会话落到不可预期的策略上；合法值与 UI 高级选项一致。
+    #[test]
+    fn validate_rejects_garbage_approval_posture() {
+        let mut t = task("0 9 * * *", "new", "");
+        t.on_approval = "approve".into();
+        t.approval_mode = "full-access".into();
+        assert!(t.validate().is_ok(), "UI 高级选项的合法值组合必须放行");
+        t.on_approval = "yes-please".into();
+        assert!(t.validate().unwrap_err().contains("on_approval 只能是"));
+        t.on_approval = "approve".into();
+        t.approval_mode = "yolo".into();
+        assert!(t.validate().unwrap_err().contains("approval_mode 只能是"));
+        // 空串 = 用默认（deny / config 默认档）
+        let t = task("0 9 * * *", "new", "");
+        assert!(t.validate().is_ok());
     }
 
     /// 单次任务（once_ts）：不要求 cron；启用的必须设在未来；

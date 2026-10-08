@@ -33,22 +33,10 @@ pub(super) async fn post_mcp(
                 Ok(c) => c,
                 Err(e) => return err(format!("server 配置不合法: {e}")),
             };
-            if !crate::mcp::valid_name(&cfg.name) {
-                return err("名称非法（非空、仅字母数字-_、禁止包含 __）".into());
-            }
-            // transport 合法性 + 该 transport 的必需字段（早失败好过调用时才报错）
-            match cfg.transport.as_str() {
-                "http" | "HTTP" | "Http" | "sse" | "SSE" | "Sse" => {
-                    if !cfg.url.trim().starts_with("http://") && !cfg.url.trim().starts_with("https://") {
-                        return err("http/sse transport 需要 http(s):// 开头的 url".into());
-                    }
-                }
-                "stdio" | "STDIO" | "Stdio" => {
-                    if cfg.command.trim().is_empty() {
-                        return err("stdio transport 需要 command".into());
-                    }
-                }
-                other => return err(format!("未知 transport: {other}（stdio | http | sse）")),
+            // transport 合法性 + 必需字段 + 名称规则：与 settings 工具的整表替换
+            // 共用同一份校验（mcp::validate_server_cfg）
+            if let Err(e) = crate::mcp::validate_server_cfg(&cfg) {
+                return err(e);
             }
             s.mcp_servers.retain(|c| c.name != cfg.name);
             s.mcp_servers.push(cfg);

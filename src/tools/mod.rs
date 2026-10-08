@@ -210,14 +210,14 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent_spawn",
-            description: "P22-C 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理默认审批从紧——需要审批的操作按拒绝处理并回给它自己调整；要放行请在 on_approval 传 approve。子代理失败/超时会以错误文本返回，你可重派或换路。",
+            description: "P22-C 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "子任务描述：要它做什么、产出什么（说清楚边界，它看不到你的对话历史）" },
                     "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 功能桥接里的子代理席位，未配则跟主渠道）" },
-                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "可选：子代理的审批档（缺省 auto）" },
-                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（缺省 deny 拒绝并回喂；approve 才放行高危）" },
+                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "可选：子代理的审批档（不得高于你当前会话的档位；缺省跟随父会话）" },
+                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（仅 deny 生效：无人值守会话没有用户来批准，模型自选放行等于自己批准自己）" },
                     "timeout_secs": { "type": "integer", "description": "可选：整轮超时秒数（0 = 默认 1800）" },
                     "label": { "type": "string", "description": "可选：一句话标签，方便你在结果里识别是哪个子代理" }
                 },

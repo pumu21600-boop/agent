@@ -988,6 +988,30 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(SEP) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// MCP server 配置的保存前校验（transport 合法性 + 该 transport 的必需字段）。
+/// HTTP 端点与 settings 工具的整表替换**共用**这一份（2026-10-08 修：settings
+/// 工具的 mcp_servers 替换原先零校验，模型可写入启动任意命令的 stdio server，
+/// 借 MCP 通道拿任意代码执行——与 POST /api/mcp 的校验面倒挂）。
+pub fn validate_server_cfg(cfg: &crate::config::settings::McpServerCfg) -> Result<(), String> {
+    if !valid_name(&cfg.name) {
+        return Err("名称非法（非空、仅字母数字-_、禁止包含 __）".into());
+    }
+    match cfg.transport.as_str() {
+        "http" | "HTTP" | "Http" | "sse" | "SSE" | "Sse" => {
+            if !cfg.url.trim().starts_with("http://") && !cfg.url.trim().starts_with("https://") {
+                return Err("http/sse transport 需要 http(s):// 开头的 url".into());
+            }
+        }
+        "stdio" | "STDIO" | "Stdio" => {
+            if cfg.command.trim().is_empty() {
+                return Err("stdio transport 需要 command".into());
+            }
+        }
+        other => return Err(format!("未知 transport: {other}（stdio | http | sse）")),
+    }
+    Ok(())
+}
+
 /// Windows 子进程跑起来必需的最小环境集（PATH 让 npx/node/python 这类命令能找到自己）。
 const ENV_WHITELIST: [&str; 13] = [
     "SystemRoot", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE",

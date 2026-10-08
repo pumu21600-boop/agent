@@ -256,6 +256,43 @@ impl SubagentDispatcher {
             if args.label.trim().is_empty() { String::new() } else { format!("：{label}") }
         );
 
+        // 审批策略钳制（2026-10-08 修）：无人值守会话没有 UI 来回答审批。模型自选
+        // on_approval=approve = 自己批准自己（连 undo_checkpoint 红线都被 auto_approve
+        // 吸收）；approval_mode 传 full-access 同理是自抬权。策略：
+        // ① on_approval 一律 deny（子代理没有用户在场，放行高危必须用户明示）；
+        // ② 档位不得高于父会话当前档——只允许更严，不允许借子代理升权。
+        let parent_mode = self
+            .state
+            .session_approval
+            .read()
+            .ok()
+            .and_then(|m| m.get(parent).cloned())
+            .or_else(|| self.state.approval_mode.read().ok().map(|m| m.clone()))
+            .unwrap_or_default();
+        let mode_rank = |m: &str| match m {
+            "read-only" | "suggest" | "sandbox" => 0,
+            "full-access" | "local" | "full-auto" => 2,
+            _ => 1, // auto / auto-edit / 空（走 config 默认档）
+        };
+        let requested_mode = args.approval_mode.trim();
+        let child_mode = if requested_mode.is_empty() || mode_rank(requested_mode) > mode_rank(&parent_mode) {
+            parent_mode.clone()
+        } else {
+            requested_mode.to_string()
+        };
+        if !args.on_approval.trim().is_empty() && !args.on_approval.eq_ignore_ascii_case("deny") {
+            observability::event(
+                EventType::State,
+                json!({
+                    "kind": "subagent.approval_clamped",
+                    "parent": parent,
+                    "requested_on_approval": args.on_approval,
+                    "requested_mode": requested_mode,
+                    "effective_mode": child_mode,
+                }),
+            );
+        }
+
         let result = crate::server::run_headless_inner(
             self.state.clone(),
             crate::server::HeadlessRequest {
@@ -264,9 +301,9 @@ impl SubagentDispatcher {
                 model,
                 base_url,
                 api_key,
-                approval_mode: args.approval_mode.clone(),
+                approval_mode: child_mode,
                 plan_mode: false,
-                on_approval: args.on_approval.clone(),
+                on_approval: "deny".to_string(),
                 timeout_secs: args.timeout_secs,
                 budget_tokens: 0,
                 config_id: String::new(),

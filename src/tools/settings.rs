@@ -174,6 +174,18 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
     // 3) MCP 整表替换。2026-10-04 放开权限轮起「装了就能用、无首装确认」，不再有
     //    逐服务的确认态需要保留（早先按 same_config 保留确认状的分支随确认制一起退役）
     if let Some(servers) = &p.mcp_servers {
+        // 2026-10-08 修：与 POST /api/mcp 共用同一份校验。原先整表替换零校验——
+        // 模型可写入启动任意命令的 stdio server（command: cmd.exe + args），
+        // sync_configs 一拉就起进程，等于借 MCP 通道拿免审批任意代码执行。
+        let mut seen: Vec<&str> = Vec::with_capacity(servers.len());
+        for srv in servers {
+            crate::mcp::validate_server_cfg(srv)
+                .map_err(|e| format!("MCP server「{}」不合法: {e}", srv.name))?;
+            if seen.contains(&srv.name.as_str()) {
+                return Err(format!("MCP server 名称重复: {}（整表替换里 name 必须唯一）", srv.name));
+            }
+            seen.push(&srv.name);
+        }
         s.mcp_servers = servers.clone();
         changed.push("mcp_servers".into());
     }
@@ -198,6 +210,27 @@ pub(crate) fn apply_patch(s: &mut Settings, p: &SettingsPatch) -> Result<Vec<Str
             t.cron = t.cron.trim().to_string();
             t.message = t.message.trim().to_string();
             t.session_id = t.session_id.trim().to_string();
+            // 审批策略是用户的决定（2026-10-08 修）：模型经 settings 工具把任务改成
+            // on_approval=approve / approval_mode=full-access = 造一个持久化的无人值守
+            // 全批通道（与 schedule_run 判 Dangerous 需逐次确认的口径倒挂）。UI 高级
+            // 选项仍可改（用户明示通道）；工具这条路不许动这两个字段——连收紧也不许，
+            // 规则简单且响度一致：审批策略只归用户。
+            let prev = s.schedules.iter().find(|x| !t.id.trim().is_empty() && x.id == t.id);
+            let posture_changed = match prev {
+                Some(old) => {
+                    !old.on_approval.eq_ignore_ascii_case(&t.on_approval)
+                        || !old.approval_mode.eq_ignore_ascii_case(&t.approval_mode)
+                }
+                None => {
+                    t.on_approval.eq_ignore_ascii_case("approve") || t.approval_mode.eq_ignore_ascii_case("full-access")
+                }
+            };
+            if posture_changed {
+                return Err(format!(
+                    "定时任务「{}」的审批策略（on_approval / approval_mode）只能由用户在设置→定时的高级选项里改：无人值守任务自动放行高危操作必须用户明示。请保留原值或留空。",
+                    t.name
+                ));
+            }
             t.validate().map_err(|e| format!("定时任务「{}」不合法: {e}", t.name))?;
             if t.id.trim().is_empty() {
                 t.id = uuid::Uuid::new_v4().to_string();
@@ -804,5 +837,118 @@ mod tests {
         let p = parse_patch(&json!({"features.self_mod": false})).expect("自改总闸点号路径应合法");
         apply_patch(&mut s, &p).expect("features.self_mod=false 应可应用");
         assert!(!s.features.self_mod, "自改总闸可经点号路径 features.self_mod 关闭");
+    }
+}
+
+#[cfg(test)]
+mod approval_posture_tests {
+    use super::*;
+
+    fn cfg() -> crate::config::settings::Config {
+        crate::config::settings::Config {
+            id: "cfg-a".into(),
+            name: "主力".into(),
+            provider_id: "custom".into(),
+            base_url: "https://relay.example.com/v1".into(),
+            model: "m-a".into(),
+            models: vec!["m-a".into()],
+            key_cipher: None,
+            context_length: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            thinking: None,
+            thinking_style: None,
+            capabilities: Default::default(),
+            capabilities_user_set: false,
+        }
+    }
+
+    fn test_settings() -> Settings {
+        let mut s = Settings::default();
+        s.configs.push(cfg());
+        s.active_config_id = Some("cfg-a".into());
+        s
+    }
+
+    fn patch(json: Value) -> SettingsPatch {
+        serde_json::from_value(json).expect("patch 应可解析")
+    }
+
+    fn sched(id: &str, on_approval: &str, approval_mode: &str) -> Value {
+        json!({
+            "id": id,
+            "name": "巡检",
+            "cron": "0 9 * * *",
+            "message": "跑一遍构建",
+            "on_approval": on_approval,
+            "approval_mode": approval_mode,
+        })
+    }
+
+    /// 2026-10-08 修：mcp_servers 整表替换原先零校验——模型可写入启动任意命令的
+    /// stdio server 借 MCP 通道拿任意代码执行。现在与 POST /api/mcp 共用校验。
+    #[test]
+    fn mcp_servers_table_replacement_is_validated() {
+        let mut s = test_settings();
+        // 先铺一条合法的，之后所有非法补丁都不得动它
+        let p = patch(json!({"mcp_servers": [{"name": "ok-srv", "transport": "http", "url": "https://mcp.example.com/"}]}));
+        apply_patch(&mut s, &p).unwrap();
+        // 非法：stdio 缺 command
+        let p = patch(json!({"mcp_servers": [{"name": "bad", "transport": "stdio"}]}));
+        let e = apply_patch(&mut s, &p).unwrap_err();
+        assert!(e.contains("不合法") && e.contains("command"), "{e}");
+        // 非法：transport 乱值 / 名称非法 / 重名 / http 缺 url
+        let p = patch(json!({"mcp_servers": [{"name": "x", "transport": "carrier-pigeon"}]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("未知 transport"));
+        let p = patch(json!({"mcp_servers": [{"name": "a__b", "transport": "http", "url": "https://x.example.com/"}]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("名称非法"));
+        let p = patch(json!({"mcp_servers": [
+            {"name": "dup", "transport": "http", "url": "https://a.example.com/"},
+            {"name": "dup", "transport": "http", "url": "https://b.example.com/"}
+        ]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("名称重复"));
+        let p = patch(json!({"mcp_servers": [{"name": "nourl", "transport": "http"}]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("url"));
+        // 校验失败不得落盘（表保持原样）
+        assert_eq!(s.mcp_servers.len(), 1);
+        assert_eq!(s.mcp_servers[0].name, "ok-srv");
+        // 合法 stdio：command 是进程名，格式层面合法（与 POST /api/mcp 同规，
+        // 拦「启动任意命令」靠的是审批档位与用户授权，不是格式校验）
+        let p = patch(json!({"mcp_servers": [{"name": "cli", "transport": "stdio", "command": "cmd.exe", "args": ["/C", "whoami"]}]}));
+        apply_patch(&mut s, &p).unwrap();
+        assert_eq!(s.mcp_servers[0].name, "cli");
+    }
+
+    /// 2026-10-08 修：模型经 settings 工具把定时任务改成 approve/full-access =
+    /// 造持久化无人值守全批通道。工具路径一律拦截；用户明示的 UI 通道不受影响
+    /// （已在库的任务原值带回时放行——get→改→set 往返不误伤）。
+    #[test]
+    fn schedule_approval_posture_is_user_only() {
+        let mut s = test_settings();
+        // 新建任务带 approve：拒
+        let p = patch(json!({"schedules": [sched("", "approve", "auto")]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("只能由用户"));
+        // 新建任务带 full-access：拒
+        let p = patch(json!({"schedules": [sched("", "deny", "full-access")]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("只能由用户"));
+        // 新建任务 deny/auto：过
+        let p = patch(json!({"schedules": [sched("", "deny", "auto")]}));
+        apply_patch(&mut s, &p).unwrap();
+        assert_eq!(s.schedules.len(), 1);
+        // 把已存任务（deny）改成 approve：拒
+        let id = s.schedules[0].id.clone();
+        let p = patch(json!({"schedules": [sched(&id, "approve", "auto")]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("只能由用户"));
+        // 原值带回（deny→deny）改别的字段：过
+        let p = patch(json!({"schedules": [sched(&id, "deny", "auto")]}));
+        apply_patch(&mut s, &p).unwrap();
+        // 用户已在 UI 设了 approve 的任务，模型原值带回：过（不误伤用户明示的配置）
+        s.schedules[0].on_approval = "approve".into();
+        let p = patch(json!({"schedules": [sched(&id, "approve", "auto")]}));
+        apply_patch(&mut s, &p).unwrap();
+        // 乱值在 validate 层就拒（两条写入路同一道闸）
+        let p = patch(json!({"schedules": [sched("", "yes-please", "auto")]}));
+        assert!(apply_patch(&mut s, &p).unwrap_err().contains("on_approval 只能是"));
     }
 }
