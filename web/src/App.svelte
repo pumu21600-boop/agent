@@ -4288,6 +4288,9 @@
         const text = String(params.text || '');
         if (text) {
           input = text;
+          // 程序化赋值不触发 input 事件，autoRows 不会跑；且 DOM 要等 tick 才刷——
+          // 不 await 就量高度，量到的是旧内容（空），框停在 1 行（用户实锤）
+          await tick();
           resetComposerHeight();
           composerInputEl?.focus();
         }

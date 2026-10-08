@@ -24,7 +24,6 @@
     background: var(--bg); color: var(--fg);
   }
   h3 { margin: 0 0 2px; font-size: 14px; font-weight: 650; }
-  .dim { color: var(--dim); font-size: 12px; margin: 0 0 10px; }
   label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
   textarea, select {
     width: 100%; font: inherit; color: var(--fg); background: var(--bg);
@@ -48,9 +47,8 @@
 </head>
 <body>
   <h3>插件制作器</h3>
-  <p class="dim">说清你想做的插件。确定后在选定工作区新建对话，输入框自动带上规范提示词——你审一遍，自己回车发。</p>
   <label for="req">插件制作要求</label>
-  <textarea id="req" placeholder="例如：一个待办面板，列出工作区 TODO.md 里没做完的项，前面带复选框，能勾掉并写回文件…"></textarea>
+  <textarea id="req"></textarea>
   <label for="ws">工作区</label>
   <select id="ws"><option>读取中…</option></select>
   <div class="row">
