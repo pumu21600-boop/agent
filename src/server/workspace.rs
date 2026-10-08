@@ -39,7 +39,15 @@ pub(super) async fn list_workspace_files() -> Json<Value> {
                 format!("{rel}/{name}")
             };
             let p = e.path();
-            if p.is_dir() {
+            // 符号链接/junction 不跟随（2026-10-08 修）：is_dir() 跟链，工作区内一个
+            // 指向区外的联接就能把整棵外目录展开，文件名泄进「@上下文」选择器。这些
+            // 路径内容读取时本就会被 resolve_workspace_path 拒（canonicalize 后不在
+            // 工作区内），列出来只会给出点了报错的选项，不如不列。
+            let ft = e.file_type().ok();
+            if ft.map(|t| t.is_symlink()).unwrap_or(false) {
+                continue;
+            }
+            if ft.map(|t| t.is_dir()).unwrap_or(false) {
                 // 深度上限：防目录联接（junction）成环导致死循环
                 if SKIP_DIRS.contains(&name.as_str()) || rel.matches('/').count() >= 12 {
                     continue;

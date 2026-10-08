@@ -123,11 +123,21 @@ fn probe_env_trim_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeRes
     }
 }
 
+/// 探针标记文件的进程级序号：**两条探测链（直跑 / 经档位 spawn）必须共用**——
+/// 曾各持一个 static SEQ，同进程两个测试并发跑时都从 0 开始，生成同名标记文件，
+/// 一边的 remove_file 把另一边刚写的标记删掉，`type` 报「系统找不到指定的文件」，
+/// 全量测试每隔几轮就红一次（单跑全过）。2026-10-08 修。
+static PROBE_MARKER_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 探针标记文件名（进程 id + 全局自增序号，跨探测链/跨测试线程唯一）。
+fn probe_marker_name() -> String {
+    let seq = PROBE_MARKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!(".agent_probe_read_{}_{seq}.txt", std::process::id())
+}
+
 fn probe_workspace_read_via(tier: &dyn SandboxTier, limits: SandboxLimits) -> ProbeResult {
     const TOKEN: &str = "agent-sandbox-read-probe";
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let marker_name = format!(".agent_probe_read_{}_{seq}.txt", std::process::id());
+    let marker_name = probe_marker_name();
     let root = workspace_root();
     let marker = root.join(&marker_name);
     if let Err(e) = std::fs::write(&marker, TOKEN) {
@@ -295,11 +305,9 @@ pub fn probe_privilege_strip(_limits: SandboxLimits) -> ProbeResult {
 /// 一旦按打包形态分发（exe 同级没有源码）就必然假失败（真机抓到）。
 pub fn probe_workspace_read(limits: SandboxLimits) -> ProbeResult {
     const TOKEN: &str = "agent-sandbox-read-probe";
-    // 标记名带进程号 + 自增序号：并发自检（测试并行 / 界面同时点两次）互不踩——
-    // 固定名曾出现同进程两个探针互相删标记的「file not found」假失败。
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let marker_name = format!(".agent_probe_read_{}_{seq}.txt", std::process::id());
+    // 标记名走进程级共用序号（probe_marker_name）：曾与「经档位链」各持一个 SEQ，
+    // 同进程并发跑时同名互删标记，`type` 假失败（全量测试周期性红）。
+    let marker_name = probe_marker_name();
     let root = workspace_root();
     let marker = root.join(&marker_name);
     if let Err(e) = std::fs::write(&marker, TOKEN) {

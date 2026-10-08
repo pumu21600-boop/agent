@@ -130,8 +130,13 @@ impl Logger {
         let mut rotated: Option<u64> = None;
         match self.file.lock() {
             Ok(mut f) => {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.flush();
+                // 2026-10-08 修：write_all/flush 的错误原来被 `let _ =` 吞掉——磁盘满/
+                // 文件被独占打开/AV 锁文件时事件静默丢失，时间线面板空无一物且连「写
+                // 失败」本身都无从诊断。改为失败即向 stderr 报警（只喊一次：事件高频，
+                // 逐条刷屏会把控制台冲爆）。
+                if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.flush()) {
+                    warn_write_failed("日志", &e);
+                }
                 let n = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
                 if self.max_bytes > 0 && n.is_multiple_of(ROTATE_CHECK_EVERY) {
                     // 持锁检查 + 轮转，避免并发写者踩到换文件
@@ -170,6 +175,15 @@ impl Logger {
 /// 归档路径：`<file>.1` 最新、`<file>.N` 最旧。
 fn backup_path(path: &Path, n: usize) -> PathBuf {
     PathBuf::from(format!("{}.{n}", path.display()))
+}
+
+/// 写盘失败告警（只喊一次）：落盘即完整是日志/台账的契约，写失败必须留下信号——
+/// 否则磁盘满或文件被独占时所有事件静默消失，时间线面板空了都没有诊断线索。
+pub(crate) fn warn_write_failed(what: &str, e: &std::io::Error) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[logger] {what}写盘失败（后续同类错误只报一次）: {e}");
+    }
 }
 
 /// 旧归档倒位：`.N` 丢弃，`.N-1`→`.N` … `.1`→`.2`，把 `.1` 腾给刚归档的当前文件。

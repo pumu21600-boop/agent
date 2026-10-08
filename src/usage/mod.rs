@@ -126,14 +126,17 @@ impl Ledger {
     fn append(&self, line: &str) {
         let mut full = line.to_string();
         full.push('\n');
-        if let Ok(mut f) = self.file.lock() {
-            let _ = f.write_all(full.as_bytes());
-            let _ = f.flush();
-            let n = self.bytes.fetch_add(full.len() as u64, Ordering::Relaxed) + full.len() as u64;
-            let w = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
-            if n > LEDGER_MAX_BYTES && w.is_multiple_of(ROTATE_CHECK_EVERY.min(64)) {
-                self.rotate(&mut f);
-            }
+        // 2026-10-08 修：错误同样不能吞——台账静默丢失意味着 SPEND 不增长，
+        // 花费硬闸（红线 1）会失效，超支也拦不住。锁中毒也改用 into_inner
+        // （数据仍可用，与全仓其余锁的用法一致）。
+        let mut f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = f.write_all(full.as_bytes()).and_then(|_| f.flush()) {
+            crate::observability::warn_write_failed("台账", &e);
+        }
+        let n = self.bytes.fetch_add(full.len() as u64, Ordering::Relaxed) + full.len() as u64;
+        let w = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > LEDGER_MAX_BYTES && w.is_multiple_of(ROTATE_CHECK_EVERY.min(64)) {
+            self.rotate(&mut f);
         }
     }
 

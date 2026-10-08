@@ -4,7 +4,9 @@
 //! 新建对话不清空历史；标题取首条用户消息。核心循环每关键点发 Snapshot 事件，server
 //! 按 session_id 落盘；前端启动拉 /api/sessions 列表、点选切换。落盘即续命。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Context;
 use chrono::{SecondsFormat, Utc};
@@ -129,6 +131,11 @@ pub struct SessionMeta {
 
 pub struct SessionManager {
     dir: PathBuf,
+    /// 按会话 id 的写锁（2026-10-08 修）：save/update_usage/rename/set_flags 全是
+    /// 「读整文件→改一个字段→整文件回写」，无锁时两个写者交错会把先写者的更新整体
+    /// 抹掉（典型：任务收尾的最后一次 Snapshot 与用户点「置顶」同时落，最终回答
+    /// 从会话文件里消失）。条目数随会话数增长，每个就一把空锁，可忽略。
+    locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// session_id 只允许 uuid 安全字符，直接拼文件名防路径穿越。
@@ -171,7 +178,16 @@ fn fmt_ts(iso: &str) -> String {
 impl SessionManager {
     /// dir 为日志目录，会话文件落 `<dir>/sessions/`。
     pub fn new(log_dir: &Path) -> Self {
-        Self { dir: log_dir.join("sessions") }
+        Self { dir: log_dir.join("sessions"), locks: RwLock::new(HashMap::new()) }
+    }
+
+    /// 取（或建）某会话的写锁。持锁期间只做本会话文件的读-改-写，不调其他会拿
+    /// 本锁的方法（get/write 都不拿锁），无死锁面。
+    fn session_lock(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut m = self.locks.write().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     fn path(&self, id: &str) -> PathBuf {
@@ -224,6 +240,8 @@ impl SessionManager {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
+        let lock = self.session_lock(id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(&self.dir).with_context(|| format!("建会话目录失败: {}", self.dir.display()))?;
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         // 用量快照随文件保留：save 由消息侧高频调用，不能把 update_usage 写的快照抹掉
@@ -268,6 +286,8 @@ impl SessionManager {
         if !safe_id(id) {
             anyhow::bail!("非法 session id");
         }
+        let lock = self.session_lock(id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut f = self.get(id).ok_or_else(|| anyhow::anyhow!("会话不存在: {id}"))?;
         f.usage = Some(usage);
         self.write(&f)
@@ -346,6 +366,8 @@ impl SessionManager {
     /// 改会话标题（P8 TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
     /// 不动 updated_at：list 与「上次做到哪」都按它排序，改名不该把老会话顶到最前（与 set_flags 口径一致，F7）。
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        let lock = self.session_lock(id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut f) = self.get(id) else { return Ok(()) };
         f.title = title.chars().take(60).collect();
         self.write(&f)
@@ -353,6 +375,8 @@ impl SessionManager {
 
     /// DSH 式侧边栏：置顶 / 归档标记（其余字段原样保留；不动 updated_at）。
     pub fn set_flags(&self, id: &str, pinned: Option<bool>, archived: Option<bool>) -> anyhow::Result<()> {
+        let lock = self.session_lock(id);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mut f) = self.get(id) else {
             anyhow::bail!("会话不存在: {id}");
         };
@@ -760,5 +784,71 @@ mod tests {
         let pos_b = order.iter().position(|id| id == &b).unwrap();
         let pos_a = order.iter().position(|id| id == &a).unwrap();
         assert!(pos_a > pos_b, "改名后的老会话不该被顶到前面: {order:?}");
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 2026-10-08 修：按 id 写锁的语义——同 id 必须拿到同一把锁（互斥），
+    /// 不同 id 互不影响（否则并发扬不到，反而把所有会话写串行化）。
+    #[test]
+    fn session_lock_semantics() {
+        let dir = std::env::temp_dir().join(format!("agent-sess-locksem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = SessionManager::new(&dir);
+        let a1 = m.session_lock("a");
+        let a2 = m.session_lock("a");
+        assert!(Arc::ptr_eq(&a1, &a2), "同 id 必须是同一把锁");
+        let b = m.session_lock("b");
+        assert!(!Arc::ptr_eq(&a1, &b), "不同 id 不同锁");
+        let g = a1.lock().unwrap();
+        assert!(a2.try_lock().is_err(), "同 id 第二把必须互斥");
+        assert!(b.try_lock().is_ok(), "不同 id 不得被堵");
+        drop(g);
+        assert!(a2.try_lock().is_ok(), "释放后同 id 可再拿");
+    }
+
+    /// 并发写不互吃：消息侧 save 与用户置顶 set_flags 交替打同一个会话文件，
+    /// 跑完两条线的更新都必须还在（无锁时后写者用陈旧基线整份回写，先写者的
+    /// 更新被抹掉——典型症状是「最终回答从会话文件里消失」）。
+    #[test]
+    fn concurrent_save_and_flags_both_land() {
+        let dir = std::env::temp_dir().join(format!("agent-sess-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = std::sync::Arc::new(SessionManager::new(&dir));
+        let id = m.new_id();
+        m.save(&id, &[json!({"role": "user", "content": "hi"})], None).unwrap();
+        std::thread::scope(|s| {
+            let mm = m.clone();
+            let i = id.clone();
+            s.spawn(move || {
+                for n in 0..80 {
+                    mm.save(
+                        &i,
+                        &[
+                            json!({"role": "user", "content": format!("m{n}")}),
+                            json!({"role": "assistant", "content": format!("a{n}")}),
+                        ],
+                        None,
+                    )
+                    .unwrap();
+                }
+            });
+            let mm2 = m.clone();
+            let i2 = id.clone();
+            s.spawn(move || {
+                for n in 0..80 {
+                    mm2.set_flags(&i2, Some(n % 2 == 0), None).unwrap();
+                }
+            });
+        });
+        let f = m.get(&id).expect("会话文件必须在");
+        assert_eq!(f.messages.len(), 2, "消息不得被 set_flags 的回写抹掉");
+        assert_eq!(f.messages[1]["content"], "a79", "应留下最后一轮 save 的内容");
+        // 最后一轮 set_flags 是 n=79（奇数 → false）
+        assert!(!f.pinned, "pinned 应是最后一轮 set_flags 写的值");
     }
 }
