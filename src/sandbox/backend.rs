@@ -68,7 +68,11 @@ impl SandboxTier for RestrictedTier {
         "沙箱"
     }
     fn describe(&self) -> String {
-        "Job Objects 管进程树（kill-on-close 团灭、内存/进程数上限）+ 受限 token 剥特权 + 白名单环境（密钥进不来）+ 默认断网。".into()
+        // 2026-10-08 修：删掉「+ 默认断网」——restricted 档不实现网络隔离
+        // （allow_network 只有 appcontainer 的能力 SID 路径消费，这里设了也没人读），
+        // 对用户宣称不存在的隔离面比不宣称更糟。断网是 appcontainer 档的事。
+        // 挂账：restricted 档要真断网需另接 Windows 防火墙/驱动层，未做。
+        "Job Objects 管进程树（kill-on-close 团灭、内存/进程数上限）+ 受限 token 剥特权 + 白名单环境（密钥进不来）。不出网的隔离请用 appcontainer 实验档。".into()
     }
     fn spawn(&self, spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
         let mut spec = SandboxSpec { restricted: true, appcontainer: false, ..spec.clone() };

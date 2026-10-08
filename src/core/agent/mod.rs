@@ -792,10 +792,13 @@ pub async fn run_task(
                 }
                 (None, None) => true,
             };
+            // 判级基准必须是本任务钉住的 ws（与下面 exec_cfg.workspace 同一个）：
+            // 后台任务（定时/子代理/无头）运行中用户切了全局工作区时，用全局
+            // workspace_root 判级会和执行期按不同基准——越界判定与并行分组全错。
             let (risk, _) = crate::core::rules::evaluate_risk(
                 &call.name,
                 &serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({})),
-                &tools::workspace_root(),
+                &ws,
             );
             decisions.push(Decision {
                 approved,

@@ -260,8 +260,10 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
         entry.load_error = Some(e); // apiVersion 不匹配 → 拒载（UI 会显示「请升级」）
         return entry;
     }
-    // P21 红线3：plugins/ 是用户自装位（非随包内置）——未声明 source 默认 user，要验签
-    entry.origin = contract::origin_of(&mf, "plugins");
+    // P21 红线3：本注册表只扫**应用根** plugins/（main.rs 启动时传入，随包内置位），
+    // 位置即 app——与 ui::scan 对同一目录的判定保持一致（否则同一插件面板免验签、
+    // 工具半边要 pin）。workspace/plugins 的目录形态不过这里（ui::scan 管面板与技能）。
+    entry.origin = contract::origin_of(&mf, "app");
     if let Some(t) = mf.get("title").and_then(Value::as_str) {
         entry.title = t.to_string();
     }
@@ -507,7 +509,14 @@ fn pipe_write<T>(mem: &wasmtime::Memory, store: &mut wasmtime::Store<T>, ptr: i3
 /// 读插件内存字符串：len>0 按长度；len==0 按 0 终止扫描。
 fn read_cstr<T>(mem: &wasmtime::Memory, store: &wasmtime::Store<T>, ptr: i32, len: i32) -> Result<String, String> {
     let (mut buf, start) = if len > 0 {
-        (vec![0u8; len as usize], ptr as usize)
+        // 2026-10-08 修：len 来自插件 unpack 的返回值（不可信）——i32::MAX 会先
+        // vec![0u8; 2GB] 把宿主 OOM/abort，mem.read 随后才报错。插件 memory 上限
+        // 64MB，合法返回值不可能超过它；超了按恶意/劣质插件拒。
+        let len = len as usize;
+        if len > WASM_MEMORY_LIMIT {
+            return Err(format!("插件返回的长度 {len} 超过 memory 上限（{WASM_MEMORY_LIMIT}），已拒读"));
+        }
+        (vec![0u8; len], ptr as usize)
     } else {
         // 0 终止：从 ptr 读到页尾，找 0（扫描窗封顶 1MB——插件导出 64MB memory
         // 时不再一次性分配整个内存，2026-10-08 修）

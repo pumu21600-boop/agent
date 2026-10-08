@@ -456,14 +456,53 @@ pub fn red_line_hold(tool_name: &str, args: &Value, _workspace_root: &Path) -> b
     })
 }
 
+/// 按空白切 token，但**尊重双引号**：`-c foo.bar="a b"` 的值是一个完整 token。
+/// git 自身与 cmd 都按引号切参数，判级侧用 `split_whitespace` 不尊重引号时，
+/// `-c x="a b" reset` 会被切成 `["-c", "x=\"a", "b\"", "reset"]`，`i += 2` 跳过
+/// `b"` 后把 `reset` 当成普通参数——破坏性操作的子命令整个从判定里消失，
+/// 按 `_ => norm()` 静默放行（2026-10-08 实测：`git -c x="a b" push` 判 Normal）。
+/// 返回 None = 引号不配对：解析不可靠，调用方按高危处理（不静默放行）。
+fn split_git_tokens(s: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut has = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_q = !in_q;
+                has = true; // 空引号 "" 也是 token（git 认它）
+            }
+            c if c.is_whitespace() && !in_q => {
+                if has {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if in_q {
+        return None;
+    }
+    if has {
+        out.push(cur);
+    }
+    Some(out)
+}
+
 /// 剥掉 git 全局参数，取出真正的子命令与其后的参数。
 /// `git -C repo push` / `git -c core.pager=cat log` 不能被误判成子命令 `-C` / `-c`。
-fn git_subcommand(cmd_args: &str) -> (String, Vec<String>) {
-    let toks: Vec<&str> = cmd_args.split_whitespace().collect();
+/// None = 引号不配对无法可靠解析（调用方按高危处理）。
+fn git_subcommand(cmd_args: &str) -> Option<(String, Vec<String>)> {
+    let toks = split_git_tokens(cmd_args)?;
     let mut i = 0usize;
     while i < toks.len() {
-        let t = toks[i];
-        if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
+        let t = &toks[i];
+        if matches!(t.as_str(), "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path") {
             i += 2; // 选项 + 值
             continue;
         }
@@ -475,7 +514,7 @@ fn git_subcommand(cmd_args: &str) -> (String, Vec<String>) {
             || (t.starts_with("-c") && t.len() > 2);
         if inline
             || matches!(
-                t,
+                t.as_str(),
                 "--no-pager" | "-p" | "--paginate" | "--bare" | "--literal-pathspecs"
                     | "--no-optional-locks" | "--no-replace-objects" | "--version" | "--help"
             )
@@ -486,8 +525,8 @@ fn git_subcommand(cmd_args: &str) -> (String, Vec<String>) {
         break;
     }
     let sub = toks.get(i).map(|s| s.to_lowercase()).unwrap_or_default();
-    let rest = toks.iter().skip(i + 1).map(|s| s.to_string()).collect();
-    (sub, rest)
+    let rest = toks.iter().skip(i + 1).cloned().collect();
+    Some((sub, rest))
 }
 
 /// 参数里是否出现某个精确 token（`--force` 不会命中 `--force-with-lease` 这类前缀）。
@@ -511,8 +550,11 @@ const GIT_FORCE_TOKENS: &[&str] = &[
 /// v2 修 v1 的「只读白名单过宽」：白名单只认**不带写参数**的形式
 /// （`git tag -d` 不再因为子命令是 tag 就放行），未知子命令一律常规档，不静默放行。
 fn risk_git(cmd_args: &str, ws: &Path) -> (RiskLevel, String) {
-    let (sub, rest) = git_subcommand(cmd_args.trim());
     let say = |r: RiskLevel, why: &str| (r, format!("{why}: git {}", cmd_args.trim()));
+    let Some((sub, rest)) = git_subcommand(cmd_args.trim()) else {
+        // 引号不配对：git 与 cmd 的解析都不确定，判级侧不许猜——按高危处理
+        return say(RiskLevel::Dangerous, "Git 参数引号不配对，无法可靠判级");
+    };
     if sub.is_empty() {
         return say(RiskLevel::Safe, "Git 只读查询"); // 裸 git 打印帮助
     }
@@ -1060,6 +1102,27 @@ mod tests {
         assert_eq!(evaluate_risk("shell", &json!({"command": "git -C . status"}), &ws()).0, RiskLevel::Safe);
     }
 
+    // —— 2026-10-08 P0：全局选项的值里带引号+空格时，split_whitespace 会把值拆开，
+    // `i += 2` 跳过中段后真子命令落进 rest 只参与 flag 检查，破坏性操作降级 Normal ——
+    #[test]
+    fn test_git_quoted_global_value_cannot_mask_subcommand() {
+        // 引号值是一个完整 token（git/cmd 都这么解析），子命令必须被认出来
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-c foo.bar="a b" push origin main"#}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-c foo.bar="a b" clean -fd"#}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-C "my repo" reset --hard HEAD"#}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"--git-dir="a b" rebase -i"#}), &ws()).0, RiskLevel::Dangerous);
+        // 带引号值的只读子命令照旧 Safe（不许为修洞把只读全打成高危）
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-c foo.bar="a b" status"#}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-c foo.bar="a b" log --oneline"#}), &ws()).0, RiskLevel::Safe);
+        // shell 路径同源
+        assert_eq!(evaluate_risk("shell", &json!({"command": r#"git -c foo.bar="a b" push"#}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("shell", &json!({"command": r#"git -c foo.bar="a b" status"#}), &ws()).0, RiskLevel::Safe);
+        // 引号不配对：解析不可靠 → 高危（不静默放行）
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"-c foo.bar="a b push"#}), &ws()).0, RiskLevel::Dangerous);
+        // 提交信息带引号+空格：子命令仍是 commit（Normal），不能误判
+        assert_eq!(evaluate_risk("git", &json!({"args": r#"commit -m "fix: a b""#}), &ws()).0, RiskLevel::Normal);
+    }
+
     // —— v2：push 从 shell 与 git 工具走，语义必须一致（都需审批，不能一边硬禁一边放行）——
     #[test]
     fn test_git_push_uniform_risk() {
@@ -1067,6 +1130,14 @@ mod tests {
         assert_eq!(evaluate_risk("git", &json!({"args": "push --force-with-lease"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("shell", &json!({"command": "git push"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("shell", &json!({"command": "git.exe push"}), &ws()).0, RiskLevel::Dangerous);
+    }
+
+    // `checkout --`（-- 是最后一个 token）不能 panic：路径列表为空 → 按切分支判
+    #[test]
+    fn test_git_checkout_bare_double_dash_no_panic() {
+        assert_eq!(evaluate_risk("git", &json!({"args": "checkout --"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("git", &json!({"args": "checkout -- ."}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("git", &json!({"args": "checkout main"}), &ws()).0, RiskLevel::Normal);
     }
 
     #[test]
