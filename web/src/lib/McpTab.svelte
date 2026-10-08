@@ -80,7 +80,10 @@
           command: mcpForm.command.trim(),
           args,
         };
-    mcpAction('save', null, null, srv);
+    // 2026-10-08 修：mcpAction(action, name, server) 是三参——曾按 App.svelte 旧签名
+    // 传 4 参（'save', null, null, srv），server 收到 null、srv 被 JS 静默丢弃，
+    // 后端 400「缺少 server 配置」，UI 添加 MCP 这条路 100% 不可用。
+    mcpAction('save', null, srv);
     resetMcpForm();
     addOpen = false;
   }

@@ -97,7 +97,12 @@
             <!-- 用户 2026-10-02：技能统一归全局（保存时项目级旧副本自动搬走），标签直说全局 -->
             <label>{skillEditor.isNew ? '新建技能' : `编辑技能：${skillEditor.name}`}（全局技能）</label>
             <div class="sub-row">
-              <input placeholder="技能名" bind:value={skillEditor.name} style="max-width:200px" disabled={skillEditor.isNew ? false : skillEditor.source === 'global'} />
+              <!-- 2026-10-08 修：已存在技能的名字一律禁改。原条件只禁全局技能的改名、
+                   却放行项目级——而后端 save 只认新名字，旧项目级副本搬不掉（项目级压过
+                   全局，列表里旧名照常生效），用户以为改名完成实则旧的还在跑。
+                   要改名走删除+新建（后端 /api/skills 没有 old_name 参数，不禁改就是
+                   提供一个静默做错的入口） -->
+              <input placeholder="技能名" bind:value={skillEditor.name} style="max-width:200px" disabled={!skillEditor.isNew} />
               <input placeholder="一句话描述" bind:value={skillEditor.description} />
             </div>
             <textarea class="agents-editor" rows="14" spellcheck="false" bind:value={skillEditor.content}></textarea>

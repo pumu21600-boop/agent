@@ -19,6 +19,7 @@
   --veil: rgba(255, 255, 255, 0.07);
   --tint-blue-bg: #1f2c44;
   --tint-blue-fg: #cdd2dd;
+  --tint-cyan-bg: #12303a;
   --tint-cyan-fg: #22d3ee;
   --tint-green-bg: #1d3a28;
   --tint-green-fg: #8fe3ae;
@@ -26,6 +27,18 @@
   --tint-red-fg: #ff9b9b;
   --tint-yellow-bg: #241f14;
   --tint-yellow-fg: #facc15;
+  /* 2026-10-08 补：orange/purple/pink/gray 四组原先只在 light 定义，深色（默认态）
+     下 var() 无值 → 声明 invalid at computed-value time：color 退化继承值、
+     background 退化 transparent、border-color 退化 currentColor——所有「警告」橙色态
+     （未验签徽章/审查报告/cron 提示）在深色下掉成灰色透明底，切到浅色才正常。 */
+  --tint-orange-bg: #3d2a12;
+  --tint-orange-fg: #f0a35e;
+  --tint-purple-bg: #2c2244;
+  --tint-purple-fg: #c4a7f0;
+  --tint-pink-bg: #3d1c2c;
+  --tint-pink-fg: #f0a0c0;
+  --tint-gray-bg: #26262b;
+  --tint-gray-fg: #a7abb5;
   /* 成熟化品牌强调色：单色系唯一行动色（发送/主按钮/用户气泡/激活态） */
   --brand: #4f7cff;
   --brand-hover: #3d6bf5;

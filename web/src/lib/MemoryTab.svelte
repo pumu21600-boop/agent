@@ -36,7 +36,10 @@
       memData = r;
       if (!memDirty) memText = memTextOf(r, memTab);
     } catch (e) {
-      if (!memData) memMsg = `读取失败: ${e.message || e}`;
+      // 2026-10-08 修：原来只在首次加载（memData 空）时报错——首屏成功之后所有
+      // 回读失败被静默吞掉，框里留着旧内容，用户以为盘上就是这内容，继续编辑保存
+      // 会把外部改动覆盖掉。回读失败一律亮出来（保存前/换 tab 都会回读）。
+      memMsg = `读取失败: ${e.message || e}`;
     }
   }
   function pickMemTab(t) {

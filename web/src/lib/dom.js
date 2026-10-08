@@ -1,22 +1,26 @@
 // DOM/CSS 纯助手(P19 范式 App.svelte 拆分):无组件状态依赖,App 与各视图组件共用。
 // 给每条顶层规则的选择器加 #app 前缀：压过 Svelte scoped 样式（.composer.s-xxx 两级类名）；
 // @media/@keyframes 等整块原样保留
-// 2026-10-08 修两处 CSS 语法盲区：① 选择器按逗号切分时不识别引号/[]/()——
+// 2026-10-08 修三处 CSS 语法盲区：① 选择器按逗号切分时不识别引号/[]/()——
 // [data-x="a,b"]、:is(.a, .b) 会被切碎成语法错误规则，整条注入静默失效；
 // ② 找声明块收尾的 '}' 不跳过字符串与注释——content: "}" 会提前截断，
-// 后续全部错位。两个 helper 都按字符扫描处理。
+// 后续全部错位；③ 找选择器结束的 '{'、@ 块括号配对、逗号切分都不跳过注释——
+// 注释里含 { } , 时（/* .b { color: blue } */）会把注释里的 { 当选择器结束、
+// 注释里的 , 当选择器分隔，产出 `#app /* .b {` 这类废规则，紧跟的真实规则
+// 被整条吞掉后浏览器静默丢弃。三个 helper 都按字符扫描处理。
 export function escalateCss(css) {
   let out = '';
   let i = 0;
   const n = css.length;
-  // 顶层逗号切分：引号 / [] / () 内部的逗号不是选择器分隔符
+  // 顶层逗号切分：引号 / [] / () / 注释内部的逗号不是选择器分隔符
   const splitSelector = (sel) => {
     const parts = [];
     let cur = '';
     let quote = '';
     let bracket = 0;
     let paren = 0;
-    for (const ch of sel) {
+    for (let k = 0; k < sel.length; k++) {
+      const ch = sel[k];
       if (quote) {
         cur += ch;
         if (ch === quote) quote = '';
@@ -25,6 +29,14 @@ export function escalateCss(css) {
       if (ch === '"' || ch === "'") {
         quote = ch;
         cur += ch;
+        continue;
+      }
+      if (ch === '/' && sel[k + 1] === '*') {
+        // 注释整体搬运（含里面的 , { }），不当分隔符
+        const e = sel.indexOf('*/', k + 2);
+        const stop = e === -1 ? sel.length : e + 2;
+        cur += sel.slice(k, stop);
+        k = stop - 1;
         continue;
       }
       if (ch === '[') bracket++;
@@ -41,8 +53,9 @@ export function escalateCss(css) {
     parts.push(cur);
     return parts;
   };
-  // 声明块收尾：跳过字符串与 /* */ 注释，声明值里的 } 不是块结束
-  const findBlockEnd = (from) => {
+  // 从 from 起找第一个「真」括号：跳过字符串与 /* */ 注释。
+  // wantOpen=true 找 '{'（选择器结束），false 找 '}'（声明块结束）。
+  const findBrace = (from, wantOpen) => {
     let quote = '';
     for (let j = from; j < n; j++) {
       const ch = css[j];
@@ -59,23 +72,42 @@ export function escalateCss(css) {
         j = e === -1 ? n : e + 1;
         continue;
       }
-      if (ch === '}') return j;
+      if (wantOpen ? ch === '{' : ch === '}') return j;
     }
     return -1;
   };
   while (i < n) {
-    const brace = css.indexOf('{', i);
+    const brace = findBrace(i, true);
     if (brace === -1) {
       out += css.slice(i);
       break;
     }
     const selector = css.slice(i, brace);
     if (selector.trim().startsWith('@')) {
+      // @ 块括号配对同样跳字符串/注释：块内注释里的 { } 会把深度算错，
+      // 后续规则被整段吞进 @ 块（同样静默丢失）。
       let depth = 1;
       let j = brace + 1;
+      let quote = '';
       while (j < n && depth > 0) {
-        if (css[j] === '{') depth++;
-        else if (css[j] === '}') depth--;
+        const ch = css[j];
+        if (quote) {
+          if (ch === quote) quote = '';
+          j++;
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          quote = ch;
+          j++;
+          continue;
+        }
+        if (ch === '/' && css[j + 1] === '*') {
+          const e = css.indexOf('*/', j + 2);
+          j = e === -1 ? n : e + 1;
+          continue;
+        }
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
         j++;
       }
       out += css.slice(i, j);
@@ -89,7 +121,7 @@ export function escalateCss(css) {
         .join(', ');
       out += `${prefixed}{`;
       // 跳过这条规则的声明块，直到它的关闭 '}'（声明不嵌套）
-      const close = findBlockEnd(brace + 1);
+      const close = findBrace(brace + 1, false);
       const end = close === -1 ? n : close + 1;
       out += css.slice(brace + 1, end);
       i = end;

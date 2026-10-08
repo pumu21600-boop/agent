@@ -80,6 +80,12 @@
   function wsLabel(w) {
     return String(w).split(/[\\/]/).filter(Boolean).pop() || w;
   }
+  // 2026-10-08 修：options={fn()} 在模板里不建依赖（Svelte4 只跟踪表达式直接引用
+  // 的变量，函数体里读的 schedConfigs/workspace/recentWorkspaces 换了不重算）——
+  // 真机实锤：列表还在加载时开编辑器，供应商下拉永远只有「跟随当前激活配置」一项。
+  // 改走响应式声明：$: 语句跟踪函数体依赖，源数据一换选项就重算。
+  $: configOpts = configOptions();
+  $: wsOpts = wsOptions();
   function configOptions() {
     const opts = [{ value: '', label: '跟随当前激活配置' }];
     for (const c of schedConfigs) {
@@ -130,6 +136,10 @@
   }
   async function loadSchedules() {
     schedLoading = true;
+    // 只清上一次加载留下的「读取失败」：操作反馈（已保存/触发失败…）留到下一次操作，
+    // 不被加载抹掉。2026-10-08 修：这行原在 try/catch 之后——catch 刚设的错误
+    // 在同一同步块里又被无条件擦掉，「服务没起时读取失败」永远看不见（死代码）。
+    if (schedMsg.startsWith('读取失败')) schedMsg = '';
     try {
       const [r, st] = await Promise.all([
         fetch('/api/schedules').then((r) => r.json()),
@@ -337,7 +347,7 @@
               <Select
                 value={schedEditor.workspace || ''}
                 title="工作区"
-                options={wsOptions()}
+                options={wsOpts}
                 on:change={(e) => (schedEditor.workspace = e.detail)}
               />
             </div>
@@ -347,7 +357,7 @@
                 <Select
                   value={schedEditor.config_id || ''}
                   title="供应商（执行配置）"
-                  options={configOptions()}
+                  options={configOpts}
                   on:change={(e) => {
                     schedEditor.config_id = e.detail;
                     schedEditor.model = ''; // 换配置清掉模型覆盖，回落到该配置默认
