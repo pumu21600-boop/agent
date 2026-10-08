@@ -573,7 +573,7 @@
   function autoRows(e) {
     const el = e.target;
     el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   }
 
   // 程序化改动 input 后手动回收高度（不触发 input 事件，autoRows 不会跑）
@@ -581,7 +581,7 @@
     const el = composerInputEl;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
   }
 
   function scrollToBottom() {
@@ -9932,7 +9932,7 @@
     font-size: 14px;
     line-height: 1.5;
     padding: 8px 6px 6px;
-    max-height: 160px;
+    max-height: 200px;
     font-family: inherit;
   }
   .composer-input::placeholder {
