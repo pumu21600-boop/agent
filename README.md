@@ -1,7 +1,8 @@
 # agent —— Windows 原生自主编码 Agent
 
 技术栈：Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。
-当前进度：**P28 完成**（插件/MCP/Skill 分家：MCP 搬独立国 src/mcp/、ui-ext/ 并入 plugins/、/api/ext→/api/plugins 与字段/信任键改名带迁移，隔离冒烟实锤；详见 docs/workorders/031）；P27 壳面板归属 + 取消及时性 + CI 时区修复（native 身份章 / X-Agent-Client / select! 中断 / 不赌运行环境时区，0.29.x）；此前 **P23 完成**（供应商预设收敛到五个——OpenAI 兼容/Anthropic/DeepSeek/StepFun/GLM，旧预设 id 契约知识保留在端点探测、存量渠道不受影响；**Anthropic Messages 原生协议适配器**：请求侧 OpenAI 会话形状→Messages 形状、响应侧 SSE 事件流合成回 OpenAI 分片、下游零改动，思考=thinking 预算自动取输出上限一半；**思考参数 400 自适应降级**：端点拒收思考字段自动剥参重试+登记+下一轮人话提示，两协议通用）；此前 P22 完成（无头会话 / 定时任务 / 子代理并行 / 主动记忆提醒，收尾期反馈批次见 ROADMAP P22.1）；P21 成本台账 + 红线收口（每次模型调用在网关单点记账，token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位/费用，价格表带生效时间，按供应商/模型出报表；红线一 = 全局花费上限硬闸，红线二 = 第三方插件来源验签（pin 内容指纹））；此前 P20.4 内置浏览器搬进桌面壳（壳里跑 child webview 真页面，服务经 CDP + 控制通道驱动，壳不在自动回落无头）、P20 浏览器内核（CDP 直连 + 语义定位点击 + DOM 增量 diff）与沙箱统一（SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / 内置插件试点；App.svelte 拆分未落地——仍 8919 行单文件）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
+当前进度：**0.32.x**（P28 之后的工作未再编 P 号，按日期轮次记录在 ROADMAP「2026-10 轮次」段：2026-10-03 并三档审批（sandbox 档并入 read-only）与自改机制重构；10-04 放开权限轮（红线只留审批档位 + API key，MCP/config/渠道/插件信任全放开）；10-05 文档处理全链路（xlsx/docx/pptx/pdf 四技能保真内核）；10-06 插件重整 16→9（自改→中枢、星云→记忆库、css-ui 注入→css-ui 工具、用量→用量价格）；10-07 技能目录迁移到应用目录；10-08 持续 bug 修复轮（判级绕过/数据丢失/前端断链等 ~60 项）。版本号以 Cargo.toml 为准。
+历史进度链：P28 完成（插件/MCP/Skill 分家：MCP 搬独立国 src/mcp/、ui-ext/ 并入 plugins/、/api/ext→/api/plugins 与字段/信任键改名带迁移，隔离冒烟实锤；详见 docs/workorders/031）；P27 壳面板归属 + 取消及时性 + CI 时区修复（native 身份章 / X-Agent-Client / select! 中断 / 不赌运行环境时区，0.29.x）；此前 **P23 完成**（供应商预设收敛到五个——OpenAI 兼容/Anthropic/DeepSeek/StepFun/GLM，旧预设 id 契约知识保留在端点探测、存量渠道不受影响；**Anthropic Messages 原生协议适配器**：请求侧 OpenAI 会话形状→Messages 形状、响应侧 SSE 事件流合成回 OpenAI 分片、下游零改动，思考=thinking 预算自动取输出上限一半；**思考参数 400 自适应降级**：端点拒收思考字段自动剥参重试+登记+下一轮人话提示，两协议通用）；此前 P22 完成（无头会话 / 定时任务 / 子代理并行 / 主动记忆提醒，收尾期反馈批次见 ROADMAP P22.1）；P21 成本台账 + 红线收口（每次模型调用在网关单点记账，token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位/费用，价格表带生效时间，按供应商/模型出报表；红线一 = 全局花费上限硬闸，红线二 = 第三方插件来源验签（pin 内容指纹））；此前 P20.4 内置浏览器搬进桌面壳（壳里跑 child webview 真页面，服务经 CDP + 控制通道驱动，壳不在自动回落无头）、P20 浏览器内核（CDP 直连 + 语义定位点击 + DOM 增量 diff）与沙箱统一（SandboxTier trait 包住三档 + 档位探测链 + UI 明示档位）；P19 巨石拆分（server.rs 九域 / 内置插件试点；App.svelte 此后拆出 lib/ 组件库——McpTab/ScheduleTab/SkillsTab/MemoryTab/ReviewModal 等，主文件仍是万行级大件）；P18 契约收敛（插件二合一 / 存储一门 / 钩子四挂点 / draft 隔离区）；P17 搜索 + MCP 资源 + 组件总线 v1；
 P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启用）。
 逐阶段排产与踩坑记录见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
@@ -13,16 +14,16 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 - **执行沙箱**：`SandboxTier` 统一接口包住三档——Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）为默认档；`[sandbox] mode = "appcontainer"` 为实验特性（LowBox + 能力 SID、默认断网，探测链 canary 不过自动回退受限档并在 UI/审计注明）；**档位探测链**（快速探针跑在生效档上，解析结果进程内缓存）+ 设置 → 插件 →「宿主能力」区沙箱行明示当前生效档位（`GET /api/sandbox/info`，行上「检测」按钮真拉受限进程跑探针套件）。浏览器工具走 Chromium 自带站点隔离，不进 Windows 沙箱。
 - **上下文工程**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页读大文件。
 - **恢复与撤销**：danger≥1 工具执行前拍影子仓库检查点；撤销只回退本任务改过的文件（绝不整树 reset）；对话流内显示「N 个文件已更改 +x −y ↩ 撤销」。
-- **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）；HANDOFF 交接文档（手动或上下文 ≥80% 自动）。
+- **会话**：每会话一个文件落盘（`<日志目录>/sessions/<id>.json`），刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）。（2026-10-01 起 HANDOFF 交接文档已移除——会话落盘 + 滚动摘要已保障跨任务续命。）
 - **记忆**：双层存储（全局 `~/.agent` + 项目 `<workspace>/.agent/memory`）、events.log 事件流水（默认脱敏）、AGENTS.md 双层注入、滚动摘要；系统约定（`prompts/system.md`）**每轮任务实时读盘**，面板保存即生效。
 - **记忆库与星云**：会话压成检索正文，EMBEDDING 角色席位走真语义向量（未配置时用本地双字哈希向量），词法+向量混合排序；前端体积渲染星云（离线烘焙 cubemap）按上下文长度驱动光点大小，支持检索高亮与相似会话。
 - **Skills**：`<workspace>/skills/` 与 `~/.agent/skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
-- **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio + Streamable HTTP 双 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**第三方验签**：来源为 `user` 的插件（自装 / 工作区 / plugins 目录）要点「信任」固定内容指纹后才加载，文件被改动即停用；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
+- **插件（契约 v1，二合一）**：一个目录 + 一份 manifest.json = 一个插件，面板与工具按清单声明、不分类型；MCP 保持独立层（stdio / Streamable HTTP / SSE 三种 transport）；工具经 WASM 引擎（纯计算沙箱、零 host function）；面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 **draft 隔离区**（内存、权限清空、一键转正）；**第三方验签**：来源为 `user` 的插件（自装 / 工作区 / plugins 目录）要点「信任」固定内容指纹后才加载，文件被改动即停用；**钩子**四挂点（config.toml `[hooks]`，before_tool 仅否决权、超时放行）。
 - **用量台账与成本红线（P21）**：每次模型调用在网关单点记账（`logs/usage/ledger.jsonl`）——token 分 prompt / completion / cache 三路、请求次数、失败与取消、延迟分位、**记账时算定冻结**的费用；**「用量价格」插件**（`plugins/usage/`，随包内置试点）在右侧面板多一个页签，显示**当前对话**的 token / 请求次数 / 费用，插件自带价格设置页（美元/人民币切换，单价 = 每百万 token，键是「渠道 host + 模型 id」——同模型名不同供应商互不混淆）；**红线一** = 全局花费上限硬闸（`[cost] spend_cap_usd`，累计达到即拒绝新模型请求，看全量台账）；**红线二** = 第三方插件来源验签；`[roles] budget` 降级渠道（单任务超 token 预算后剩余步骤改走便宜渠道）。
 - **模型配置**：渠道/模型/角色三层解耦；API Key 按配置 DPAPI 加密保存；模型能力标记（工具/视觉/视频/音频）；思考档位按厂商规范适配（reasoning_content / thinking_param / effort_param 等）。
 - **观测**：JSONL 六类事件（含 `kind` 子类，schema 定死）、日志按大小轮转（归档保多份，`[logging].keep_archives`）、trace 时间线面板、eval 黑盒评测（`cargo run --bin eval`，12 个任务，断言含负向事件 `no_sse_event`）。
-- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量价格」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 角色分工 / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签含「插件 / 第三方」两组与「宿主能力」区——Git 运行时行（哪个 git 在生效 + 重新检测）与沙箱自检行，2026-10-06 插件重整后从插件搬家到这）。
-- **工程**：clippy 零告警、CI（clippy + 全量测试 + 前端构建）、单测主 bin 229 项 + eval 5 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
+- **界面**：Svelte 经典聊天布局 + 深/浅双主题 + 顶栏三面板（终端 / 产物与预览 / **网页**——ZCode 式内置浏览器：多标签页、地址栏、后退前进刷新，桌面壳里是**真实网页**（child webview，可直接点击/滚动/输入，还能开真 DevTools），普通浏览器打开时回落截图帧流；agent 的 browser 工具打开的页面同场可见）+ 右侧面板页签含**插件贡献的 dock 页签**（如「用量价格」：当前对话 token/请求/费用）；设置面板八分区（外观 / 模型配置 / 功能桥接（原「角色分工」） / 记忆 / 技能 / MCP / 插件 / **定时**——cron 到点唤醒 agent，完成记录可回看；插件页签含「插件 / 第三方」两组与「宿主能力」区——Git 运行时行（哪个 git 在生效 + 重新检测）与沙箱自检行，2026-10-06 插件重整后从插件搬家到这）。
+- **工程**：CI（clippy + 全量测试 + 前端构建，clippy 有存量告警未清、以 CI 实际结果为准）、单测主 bin 400 项 + eval 8 项（含沙箱 / 浏览器内核真机冒烟 / MCP / WASM / 服务自管理）、发布打包脚本（一键出可独立运行的 win64 目录与 zip）；写盘全部走**原子写**（临时文件 + rename），写入中途失败不会留下半截文件。
 
 ## 目录结构
 
@@ -30,7 +31,7 @@ P14 记忆库星云；P13 桌面壳 = P20.4 起的内置浏览器宿主（已启
 agent/
 ├── src/                  # Rust 后端
 │   ├── main.rs           # 启动（app_root 定位资源 → 配置/日志/工作区/记忆层装配）
-│   ├── server/            # axum：静态页 + 全部 HTTP/SSE 接口 + 审批门 + 网关装配（P19 起拆子模块，现 15 个：mod/plugins/settings/workspace/chat/sessions/usage/headless/schedule/subagent/memory/system/gate/git/webpanel）
+│   ├── server/            # axum：静态页 + 全部 HTTP/SSE 接口 + 审批门 + 网关装配（P19 起拆子模块，现 16 个：mod/plugins/settings/workspace/chat/sessions/usage/headless/schedule/subagent/memory/system/gate/git/webpanel/ui_events）
 │   ├── service.rs        # 服务自管理（start/stop/status/--install/双击智能启动）
 │   ├── skills.rs         # SKILL.md 目录约定（frontmatter 解析、索引注入、读写）
 │   ├── core/             # 核心循环、取消注册表（会话级）、审批规则引擎（rules.rs）
@@ -40,17 +41,17 @@ agent/
 │   ├── browser/          # P20 浏览器内核：cdp.rs（CDP WebSocket 客户端 + 浏览器发现拉起）+ 会话管理与 DOM 快照/diff
 │   ├── sandbox/          # 执行沙箱：backend.rs（SandboxTier trait 三档）+ probes.rs（探针与档位探测链）
 │   ├── context/          # 上下文工程：token 估算/压缩/裁剪
-│   ├── recovery/         # 影子仓库检查点 + HANDOFF 交接
+│   ├── recovery/         # 影子仓库检查点（HANDOFF 交接已于 2026-10-01 移除）
 │   ├── session/          # 会话落盘与恢复
 │   ├── tools/            # 工具系统（内置 + 并行调度 + git 发现链）
 │   ├── memory/           # 记忆 v1（events.log/AGENTS.md/摘要）+ library.rs 记忆库索引
-│   ├── plugin/           # 插件核心（P28 后 6 文件）：contract.rs（契约 v1）+ draft.rs（草稿隔离区）+ trust.rs（pin 验签）+ ui.rs（面板扫描）+ wasm.rs（WASM 工具桥）+ mod.rs（工具总线 ToolBrief）
-│   ├── mcp/              # MCP 独立国（P28）：stdio + Streamable HTTP 双 transport + OAuth（mod.rs + oauth.rs）
+│   ├── plugin/           # 插件核心（P28 后 7 文件）：contract.rs（契约 v1）+ draft.rs（草稿隔离区）+ trust.rs（pin 验签）+ ui.rs（面板扫描）+ wasm.rs（WASM 工具桥）+ mod.rs（工具总线 ToolBrief）+ review.rs（静态审核）
+│   ├── mcp/              # MCP 独立国（P28）：stdio / Streamable HTTP / SSE 三 transport + OAuth（mod.rs + oauth.rs）
 │   ├── usage/            # P21 用量台账：ledger.jsonl 记账（费用冻结）+ prices.rs 价格匹配 + 按会话/分组报表 + 花费硬闸 + 重算
 │   ├── storage.rs        # 存储一门：内核保留区唯一落盘入口 + 插件命名空间数据
 │   └── hooks.rs          # 钩子四挂点（before_tool / after_tool / session_end / budget_exceeded）
 ├── web/                  # Svelte + Vite 聊天界面（含 galaxy/ 体积星云渲染）
-├── plugins/               # 插件面板（每个目录 = 一块面板，如 board/ 项目文件、trace/ 时间线、usage/ 用量价格）
+├── plugins/               # 内置插件（9 个：board 项目文件 / browser 浏览器 / css-ui 界面微调 / disconnect-cancel 断线取消 / nebula 记忆库 / roles 功能桥接 / selfmod 中枢 / trace 时间线 / usage 用量价格；其中 browser 只带技能、selfmod 无面板）
 ├── desktop/              # P13 Tauri 桌面壳（脚手架，搁置）
 ├── evals/                # eval 评测：tasks/ 12 个任务 + mcp-http-server.mjs（http 冒烟工具）
 ├── skills/               # 项目级技能（每个技能一个目录 + SKILL.md）
@@ -110,7 +111,7 @@ agent.exe run 批量清理 --approve --json     # 放行高危操作 + 输出完
 
 **定时任务（P22-B）**：设置 → 定时 页签维护（5 段 cron，本地时区；`0 9 * * 1-5` = 工作日 9 点）。到点自动唤醒 agent 跑一轮：每轮新会话或固定会话两种模式，审批档与高危策略随任务设置（无人值守，高危默认拒绝）；停机期间过点的任务重启后补跑一次；完成结果进「完成记录」，会话落在侧栏可直接回看。任务类型两种：**固定消息**（到点发你写的话）与**记忆提醒**（P22-D：到点先检索最近 N 天的对话记录，让 agent 从中找出「要跟进 / 待办」的事项列出来；窗口内没有可回顾的对话会自动跳过本轮）。
 
-**子代理（P22-C）**：主会话可用 `subagent_spawn` 工具把独立子任务派给子代理——它在一条**独立会话**里跑完整轮（看不到你的对话历史），最终回答回注给你；一轮派多个即并行（并发度 `[subagent] max_concurrent`/`per_parent` 控制，满员排队）。子代理默认审批从紧（高危操作拒绝并回喂，派发时可放行），花销记在你这条任务上（台账按父任务聚合、并入你的 token 预算）；模型可用「角色分工」里的**子代理席位**单独指定（主会话旗舰、子代理跑量用便宜模型）。子代理会话落在侧栏可回看，点「停止」会连带停掉它的全部子代理。
+**子代理（P22-C）**：主会话可用 `subagent_spawn` 工具把独立子任务派给子代理——它在一条**独立会话**里跑完整轮（看不到你的对话历史），最终回答回注给你；一轮派多个即并行（并发度 `[subagent] max_concurrent`/`per_parent` 控制，满员排队）。子代理默认审批从紧（高危操作拒绝并回喂，派发时可放行），花销记在你这条任务上（台账按父任务聚合、并入你的 token 预算）；模型可用「功能桥接」里的**子代理席位**单独指定（主会话旗舰、子代理跑量用便宜模型）。子代理会话落在侧栏可回看，点「停止」会连带停掉它的全部子代理。
 
 ## 本机工具链（2026-09-14 装齐）
 
@@ -152,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 
 ```
 agent.exe            服务二进制（start/stop/status 自管理内置）
-config.toml  providers.json  prompts\  plugins\  plugins\
+config.toml  providers.json  prompts\  plugins\
 web\dist\            前端产物（由 exe 托管）
 tools\git-runtime.zip 内置 MinGit（未跑 bundle_git.ps1 时缺，缺了就要系统 git）
 start.bat  stop.bat  README.md  LICENSE
@@ -194,7 +195,7 @@ cd web; npm ci; npm run build
 - 字段改完**自动保存并立刻生效**（无"保存/应用"按钮）：供应商下拉、Base URL、API Key（失焦/回车即存）、模型下拉、「获取模型」弹窗。
 - **API Key 按配置独立加密保存**（DPAPI）：同一供应商换地址=独立一格 key，互不串；key 密文不出现明文，重启仍在；
   也支持环境变量 `DEEPSEEK_API_KEY` 兜底。key 永不写日志。
-- **角色分工**：SUMMARY（滚动摘要）/ TITLE（会话标题）/ EMBEDDING（记忆库向量）可各指定专用渠道；
+- **角色分工**（设置分区名「功能桥接」）：SUMMARY（滚动摘要）/ TITLE（会话标题）/ EMBEDDING（记忆库向量）可各指定专用渠道；
   前两者未配置回落主渠道，EMBEDDING **不走主渠道兜底**（未配置用本地哈希向量）。
 - **能力标记**：模型支持工具/视觉/视频/音频由你在配置里勾选（用户标记优先于按模型名推导，可一键重新推导）。
 - 用中转渠道：新建一套配置 → 选供应商 → Base URL 填中转地址 → 填 key → 获取并勾选模型。
@@ -254,7 +255,6 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | POST | `/api/sessions/meta` | 置顶 / 归档 / 重命名 |
 | POST | `/api/sessions/fork` | 分叉会话（复制消息/摘要/工作区） |
 | POST | `/api/sessions/batch` | 批量归档 / 取消归档 / 置顶 |
-| POST | `/api/handoff` | 手动生成 HANDOFF.md |
 | GET | `/api/changes?baseline=` | 本任务相对基线的改动文件清单（产物标签） |
 | GET | `/api/checkpoints` | 影子仓库检查点列表（≤20） |
 | POST | `/api/checkpoints/restore` | 撤销：逐文件回退检查点之后 agent 改过的文件 |
@@ -274,7 +274,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 | GET | `/api/memory/library` | 记忆库光点数据（每次调用做有界增量同步） |
 | POST | `/api/memory/library/reindex` | 强制重建向量 |
 | POST | `/api/memory/search` | 检索（`query` 或 `like=<会话id>`） |
-| GET / POST | `/api/mcp` | MCP server（stdio / http 双 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
+| GET / POST | `/api/mcp` | MCP server（stdio / http / sse 三 transport）+ 工具插件状态 / 配置管理与生命周期动作 |
 | GET / POST | `/api/skills` | 技能列表 / 保存·删除·读取 |
 | GET | `/api/plugins` | 插件统一清单（面板 + 工具 + draft，一份列表）|
 | POST | `/api/plugins/create` | 新建插件脚手架（工作区 plugins/，不等于放行）|
@@ -291,12 +291,13 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
 ## MCP 双 transport
 
-设置 → MCP → 添加 server，transport 二选一：
+设置 → MCP → 添加 server，transport 三选一：
 
 | transport | 配置 | 说明 |
 | --- | --- | --- |
 | `stdio` | 命令 + 参数（+ 可选 env） | 本地子进程，换行分隔 JSON-RPC；子进程环境是白名单重建的，主服务的密钥绝不进去 |
 | `http` | url（+ 可选自定义请求头） | 远端 **Streamable HTTP**：POST JSON-RPC，响应支持 `application/json` 与 `text/event-stream`（读 `data:` 帧、按 id 取匹配帧，心跳与串扰帧跳过）；`initialize` 响应里的 `Mcp-Session-Id` 会自动回带 |
+| `sse` | url（+ 可选自定义请求头） | 远端 **SSE 长连接**：GET 建立事件流收响应、POST 发请求，适合只提供 SSE transport 的 server |
 
 - 请求头（如 `Authorization: Bearer …`）按每行一条 `Key: Value` 填，只存在本地 `settings.json` 与内存，**不进日志**。
 - 传输层失败（连不上 / 非 2xx / 解析不出）标记离线，下次调用自动重连重握手；server 自己报的协议错误照实显示。
@@ -343,8 +344,8 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 - **draft 隔离区**（模型自产，`source=model_generated`）：只在内存（重启即失）、权限一律清空；
   设置 → 插件 里「转正」（落盘持久化、来源改 user）或「丢弃」。
 - **右侧面板 dock 插槽**：manifest 声明 `ui:[{slot:"dock",title:"用量价格"}]` 的启用插件，在右侧「产物/预览/网页」旁多一个页签（内置 `usage` 插件就是这么落的）；停用即页签消失。
-- **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮。
-- **插件自带技能**：manifest `skills: "skills"`（相对目录，每子目录一个 SKILL.md）→ 技能进系统提示索引，模型 read_skill 可读（返回头部带技能目录，脚本资产用绝对路径跑）。纯技能插件不需要 entry/ui（内置 GitHub / Word / 表格 / PDF / 演示文稿 / 浏览器 六个生态插件就是这么落的）；停用插件或未验签的第三方插件不贡献技能。技能页只列自己建的技能，插件技能的管理（启停/信任）都在插件页；composer 的 `$` 技能选择菜单含插件技能，新建同名技能可覆盖插件版。
+- **插件自带设置页**：manifest `settings_entry`（如 `prices.html`）→ 设置 → 插件卡片上多一个「设置」按钮（dock 插槽插件除外——它们的设置页从面板内进入，如「用量价格」的「价格设置 →」链接）。
+- **插件自带技能**：manifest `skills: "skills"`（相对目录，每子目录一个 SKILL.md）→ 技能进系统提示索引，模型 read_skill 可读（返回头部带技能目录，脚本资产用绝对路径跑）。纯技能插件不需要 entry/ui（内置 browser 就是这么落的；2026-10-06 插件整顿时 Word/表格/演示/PDF/GitHub 五个生态插件已降级为仓库根 skills/ 下的全局技能）；停用插件或未验签的第三方插件不贡献技能。技能页只列自己建的技能，插件技能的管理（启停/信任）都在插件页；composer 的 `$` 技能选择菜单含插件技能，新建同名技能可覆盖插件版。
 - **启用/停用**：停用 = 拒新调用 + 在跑调用等完（工具从总线消失、面板 404、总线不再转发）。
 - **第三方验签（P21 红线二）**：manifest `source` 为 `user` 的插件（自装 plugins、当前工作区 plugins、`plugins/` 目录与裸文件；未声明 source 的自装位也按 user）**必须先被信任才加载**——设置 → 插件 →「信任」会把插件的**内容指纹**（canonical sha256）记进 `settings.json`，之后每次加载都重新算指纹比对；对不上（文件被改/被换）立即停用并提示重新信任。随包内置（`built_in`）与模型自产草稿（`model_generated`，权限已清空 + 内存态）不在此列；draft「转正」会**自动 pin**（转正即用户的信任决定）。
 - 参考实现：`plugins/board/`（项目文件）。清单写坏不会静默：标红给原因，「打开」禁用。
@@ -369,7 +370,7 @@ schema 见 [docs/jsonl-schema.md](docs/jsonl-schema.md)。
 
 右侧面板在「产物 / 预览 / 网页」旁多一个**用量**页签（manifest 声明 `ui:[{slot:"dock"}]`；插件停用则页签与价格设置一起消失，**台账与硬闸照常跑**——内核不受插件停用影响）。插件经只读桥 `usage.session` 拉当前会话统计，显示输入 token（含缓存命中）/ 输出 token / 请求次数 / 本次对话费用，页脚一行累计花费与上限。
 
-**价格设置**（插件自带页 `prices.html`，设置 → 插件 → 用量 →「设置」打开）：
+**价格设置**（插件自带页 `prices.html`，从右侧「用量」面板内的「价格设置 →」链接打开）：
 
 - 一行 = **渠道 host + 模型 id** + 三个单价（输入 / 缓存输入 / 输出），单位**每百万 token**；host 从已保存的渠道下拉带出，`*` 是通配兜底（精确匹配优先于通配）。
 - **同模型 id 不同供应商是两行**——键含 host，中转与官方同名的模型永远不会搞混。

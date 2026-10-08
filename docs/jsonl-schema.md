@@ -161,7 +161,7 @@
 | --- | --- | --- |
 | `usage.ledger_ready` | 用量台账就绪（启动扫盘后） | `records`、`spend_usd`、`unpriced` |
 | `usage.ledger_rotated` | 台账超 32MB 归档成 `ledger.jsonl.1` | `limit_bytes` |
-| `usage.prices_invalid` | prices.json 解析失败（按空表处理） | `path`、`error` |
+| `usage.ledger_init_failed` | 台账目录初始化失败（启动时） | `dir`、`error` |
 | `cost.cap_blocked` | 全局花费上限硬闸拦下一次模型请求 | `session`、`purpose`、`model`、`spend_usd`、`cap_usd` |
 | `cost.downgraded` | 任务超 token 预算，剩余步骤改走降级渠道 | `step`、`from`、`to` |
 | `plugin.trust_pinned` | 插件内容指纹被 pin（用户点信任 / draft 转正自动） | `key`、`digest`、`by` |

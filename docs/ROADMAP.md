@@ -69,6 +69,21 @@
 | 终版代码审查修复轮（2026-09-29，审查报告 19 项：9 真 bug + 9 健壮性缺陷 + 1 项降级） | SSE 字节缓冲（含 eval 漏扫同款）、重命名冲突 orig 后缀、失败不动 updated_at、SSRF 预检 + 开关等；后端真机冒烟 5/5 | ✅ 已完成（用户真机已验） |
 | P2 收口（2026-09-30） | 版本 bump 0.32.0 + 本大表补登（P1/P2/两修复轮/收口）+ clippy 22 条基线清零：browser 根四类型 OutlineNode/DomNode/HostMode/BrowserSession 升 pub(crate) 对齐子模块已升级函数的可见性，另清 gateway 测试 field_reassign_with_default（--all-targets 全绿零告警） | ✅ 已完成（0.32.0，随本轮推送） |
 
+## 2026-10 轮次（P 号停编，按日期记录；版本以 Cargo.toml 为准）
+
+| 轮次 | 内容 | 状态 |
+|---|---|---|
+| 10-01 UI 收敛轮 | 右侧边栏统一标签页（五标签默认开/×只在激活标签/+号加面板/关光出「打开标签页」选择页）；「项目文件」面板定稿（真树按需展开/双击预览/预览可编辑保存/图片走 raw）；聊天区 ZCode 化（思考跟随/双计时/去气泡，用户消息仍靠右）；提示噪音再砍（结果已在屏幕上别再弹确认） | ✅ 已完成 |
+| 10-02 插件放开 + 审核准入 | 功能类都可插件化、全开放权限 + 准入审核（应用商店模式）；三关完工（manifest 校验 + 静态审核 + pin 验签）；高危键对第三方永关 | ✅ 已完成 |
+| 10-03 并三档审批 + 自改机制重构 | sandbox 档并入 read-only（旧值自动迁移，代码仍按别名收）；自改机制五阶段三档（改设置/装插件/定时任务/技能/工作区别）+ UI_OPS 表 + 后端读清单 + 设置 schema + 桥并表 | ✅ 已完成（v0.32.5） |
+| 10-04 放开权限轮 | 红线只留审批档位 + API key：MCP 去每服务审批档/去首装确认/菜单收一行 + 启动预连；config.toml/渠道/插件信任全放开；set_config 保注释 + 类型对齐（v0.32.7~10）；定时任务加上下文上限与执行模型选择 | ✅ 已完成（v0.32.12~13） |
+| 10-05 文档处理全链路轮 | 收件分流（.doc/.xls/.ppt/od* 转 OOXML，soffice 装了才用）+ 四技能保真内核（xlsx/pptx/docx patch-replace-edit/pdf）+ check.js 验收 + 可点预览链接；Word/表格/演示/PDF 多步任务真机全过（v0.32.17） | ✅ 已完成（已推送） |
+| 10-05~06 设置即时生效三连锤 + 工作区别名缺口 | settings.json 三种写入面（端点/工具/文件直改）全补事件 + 500ms 文件监听；alias 端点不播 settings_changed 的缺口补上（v0.32.18~20） | ✅ 已完成（已推送） |
+| 10-06 插件/技能重整 | 插件 16→9（自改→中枢、星云→记忆库、css-ui 注入→css-ui工具、用量→用量价格——后两个是用户给的名字）；5 个生态插件降级为全局技能搬进 skills/；git 分完整版/-Slim 两档；插件删除三件套（remove 端点 + UI + 工具 action） | ✅ 已完成（v0.32.25~26） |
+| 10-07 技能目录迁移 + 时间线归属收敛 | 技能根 = agent 应用目录 skills/（项目级旧副本整体迁移，保 references/scripts 资产）；时间线只显示当前对话（session 参数即范围，插件面板靠宿主 setCurSession 广播重拉）；日志轮转吃掉任务边界的根因修复（gateway.request 只写摘要） | ✅ 已完成（v0.32.24） |
+| 10-08 持续 bug 修复轮（token 用不完，循环探查） | 五+三路并行 Explore 普查 → 逐项读码复核 → 小批次修复 + 回归 + 全量。~55 项：4 个 P0 安全洞（search 参数注入/两处 Unicode panic/doctext zip 炸弹/DNS rebinding/SVG XSS/browser file:// 越权/审批自授权三洞/shell 判级残余）+ 数据丢失类（settings 并发写互吃/set_config 类型洞/restore rename+ CJK/多模态附件被覆盖/context 不变量反转/headless 丢排队消息/时间线跨会话误闭合/cancel 丢唤醒/技能资产销毁/守卫 panic 泄漏）+ 前端断链（价格页丢未 blur 输入/插件面板假死/CSS 注入语法盲区/首包 1MB 延迟加载）。wasmtime 燃料/epoch 在本平台炸进程已弃用（结论写死在注释） | ✅ 已完成（v0.32.28，已推送） |
+| 10-08 续 bug 修复轮（本轮） | 第二轮五+三路普查。判级/安全：git 全局选项引号值绕过（split_whitespace 把真子命令吞掉，push/clean 降级 Normal，已实测）、插件 origin_of 自声明 source 免验签（model_generated 后门）、判级 workspace 基准用全局而非任务钉住值。数据丢失：session 落盘把「读不出」当新会话覆写元数据、memory sync 无串行化 + 固定 tmp 名、settings 写锁 7 处漏挂、skills delete 兜底误删项目级、plugin remove 裸文件连坐删 plugins/ 根。前端：McpTab 添加 MCP 四参调用 100% 不可用、ScheduleTab 读取失败提示被当场清掉、深色主题缺 orange 等 4 组 tint、escalateCss 注释盲区、MemoryTab 回读失败静默、ScheduleTab 下拉不建依赖、SkillsTab 改名留旧副本。eval：切换工作区不验 HTTP 状态码（会驱动到用户真实项目）、SSE 断流不验 done（假绿）、会话泄漏、setup 路径未消毒、AGENTS.md 豁免假绿。收尾：sandbox_selftest 空结果假绿、session_approval/approval_meta 只增不减、storage 读错误吞、wasm read_cstr 超大分配、recovery rename 键不匹配、best_window Unicode panic、文档漂移（README 11 处/契约端点/ROADMAP 补登） | ✅ 已完成（本地提交） |
+
 ## 二、对话（施工单）协作约定
 
 1. **一阶段一个对话**：用户发"施工单 NNN"开局，单内含目标/验收标准/禁止事项；本对话只做该单，超出边界不碰。
@@ -90,7 +105,7 @@
 4. **商汤中转 401 code 16 Forbidden** = key 无效；key 走 DPAPI，页面显示尾 4 位（key_hint）供自查，完整 key 永不出内存/日志。
 5. **换模型立即生效**：/api/chat 已支持请求级 model/base_url 覆盖，前端发送时携带当前下拉框值。
 6. **key 按配置独占（2026-09-02 起）**：v2.4 起 key_cipher 存进每套配置，同地址不同配置各有各的 key。此前按 base_url 共享导致「新建配置显示别的配置 key 尾 4 位、输新 key 会覆盖别的配置」。旧 settings.json 的 keys 映射在 load 时自动迁移（仅作迁移源，运行时不再读写）。
-7. **本机直跑（local 档）红线**：脱沙箱=完整用户 token + 继承父环境（含 API key），仅当 `config.toml [agent] allow_unsandboxed = true` 才生效，未开时自动回退 full-auto 并 SSE 提示；无论哪档都保留超时整树击杀。审计看 JSONL `sandbox.spawn` 的 `restricted` 字段。
+7. **本机直跑（full-access 档）红线**：脱沙箱=完整用户 token + 继承父环境（含 API key），仅当 `config.toml [agent] allow_unsandboxed = true` 才生效，未开时自动回退 auto 并 SSE 提示；无论哪档都保留超时整树击杀。审计看 JSONL `sandbox.spawn` 的 `restricted` 字段。（2026-10-08 注：档名 full-auto/local 是 10-03 并三档前的旧称，现读作 full-access。）
 8. **受限 token 必须带 logon SID**：窗口站/桌面的 ACL 按登录会话 SID 授权，受限 SID 白名单缺了它，powershell 等 .NET 进程起手 0xC0000142 DLL 初始化失败。
 9. **SeChangeNotifyPrivilege 剥不掉**：`CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 只把特权置禁用不删名字，且系统固定保留 SeChangeNotifyPrivilege（遍历绕过，无害）；探针按名字白名单断言，别用 whoami 输出数个数。
 10. **沙箱内存上限探针别用 powershell**：受限 token 下 .NET 启动即 0xC0000142；且 PS 里 `New-Object byte[]` 分配失败会当非终止错误吞掉继续跑，结论不可信。用原生 hog（src/bin/sandbox_hog.rs）做差分。
@@ -163,7 +178,7 @@
 4. **E1 拆分**（tools/mod.rs 单文件拆分）：纯机械、无行为收益，低优先级。（✅ 2026-09-29 随 P2 件 6 完成：tools 工具族五国拆分，mod.rs 1808→760）
 5. **MCP OAuth / WASM 宿主函数**：分别需对照服务端 / ABI 变更，继续留口。
 6. **settings.json 旧格式迁移垫片**：版本兼容问题，留待大版本。
-7. **prices.json 补全**：目前只带 DeepSeek 一条样例；用户常用渠道的单价（含 StepFun step-5-preview）按公开价目手填后报表才有费用列。
+7. ~~**prices.json 补全**~~：prices.json 已于 P21.1 退役删除——价格表搬进 settings.json `cost` 节（设置 → 用量价格面板内维护），本待办作废。
 
 **状态更正（本次梳理）**：P13 桌面壳**已启用**（P20.4 起 = 内置浏览器宿主，非搁置）；P20.3 的“桌面壳待定”已定（保留壳），两行状态已改。
 

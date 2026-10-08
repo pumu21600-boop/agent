@@ -155,13 +155,19 @@ SSE 事件链 与 插件 `postMessage` 桥 共用同一张 `ops` 表与同一个
 以下约束是现状**刻意设计**的，改造时必须完整保留：
 
 - **`self_mod` 总闸**：`features.self_mod` 关闭时，所有自改动作一律拒绝并指路，只读不闸。
-- **红线键任何档位必问**：`base_url` / `model` / `provider_id` / `active_config_id`（以及切工作区、跑定时任务、删配置）
-  经 `red_line_hold` 强制弹卡，不受审批档位影响。
+- **红线键（2026-10-08 校正）**：2026-10-04 放开权限轮后 `red_line_hold` 只剩
+  `("ui","undo_checkpoint")`（撤销检查点）一项任何档位必问；渠道四件套
+  （`base_url`/`model`/`provider_id`/`active_config_id`）已降为按审批档位判级，
+  `api_key` 与切工作区改为 out_of_scope 直接拒。**红线只剩审批档位 + API key**
+  （用户 2026-10-04 拍板）。
 - **破坏类操作继续走具名路径**：例如删除会话（`delete_session`）当前**刻意没有**塞进通用 `fire_event` 白名单，
   就是为了让 `rules` 能**按参数**判级、并在工具层完成确认。通用化后，这类操作应在 op 元数据里标 `risk: destructive`
   并保留「按参数判级 + 必问」的语义，而不是简单并进一条宽松的通用通道。
 - **范围外保留范围外**：`api_key` / 价格表 / 信任插件 仍不进模型可改范围；`config.toml` 改文件仍需重启且同样必问。
-- **审批档位本身**：agent 没有任何通道可改（read-only / sandbox / auto / full-access），用户须手动切。
+- **审批档位本身（2026-10-08 校正）**：档位已并三档（read-only / auto / full-access，
+  sandbox 档 2026-10-03 取消、旧值自动迁移 read-only）；agent 经 `set_config` 改
+  `config.toml` 的 `default_approval` 有通道但**必经用户确认**（rules.rs 判 Dangerous），
+  不是「任何通道都没有」。
 
 ---
 
