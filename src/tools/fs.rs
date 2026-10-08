@@ -27,6 +27,14 @@ pub(crate) fn read_file(ws: &Path, args: &str, max_chars: usize, unconfined: boo
     if meta.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
+    // 体积上限（2026-10-08 修）：原先无脑 read_to_string 整读，工作区里一个几 GB 的
+    // 日志/构建产物就把进程撑爆。输出本就有 max_chars 截断，整读没有意义。
+    if meta.len() > READ_FILE_MAX_BYTES {
+        return Err(format!(
+            "文件过大（{} 字节，上限 2MB）：read_file 不整读大文件。大文件用 read_page 分页读，或用 shell / search 取片段。",
+            meta.len()
+        ));
+    }
     let text = std::fs::read_to_string(&full).map_err(|e| read_text_err(&full, e))?;
     Ok(cap(&text, max_chars))
 }
@@ -44,20 +52,68 @@ pub(crate) fn read_page(ws: &Path, args: &str, max_chars: usize, unconfined: boo
     if full.metadata().map_err(|e| format!("读取失败: {e}"))?.is_dir() {
         return Err("目标是目录，不是文件".to_string());
     }
-    let text = std::fs::read_to_string(&full).map_err(|e| read_text_err(&full, e))?;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
+    // 两遍流式扫描（2026-10-08 修）：第一遍逐行数总数（读完即丢，不存内容），
+    // 第二遍只取目标页——内存与文件大小无关，GB 级日志也能分页读。
+    // 原先 read_to_string 整读：分页形同虚设，大文件直接把进程撑爆。
+    use std::io::{BufRead, BufReader};
+    let mut reader = BufReader::new(
+        std::fs::File::open(&full).map_err(|e| format!("读取失败: {e}"))?,
+    );
+    let mut buf = Vec::new();
+    let mut lines_total = 0usize;
+    loop {
+        buf.clear();
+        let got = reader.read_until(b'\n', &mut buf).map_err(|e| format!("读取失败: {e}"))?;
+        if got == 0 {
+            break;
+        }
+        lines_total += 1;
+    }
+    if lines_total == 0 {
         return Ok(format!("{rel} 是空文件"));
     }
-    let pages = lines.len().div_ceil(page_size);
+    let pages = lines_total.div_ceil(page_size);
     let page = (page as usize).min(pages);
     let start = (page - 1) * page_size;
-    let end = (start + page_size).min(lines.len());
-    let body = lines[start..end].join("\n");
+    let end = (start + page_size).min(lines_total);
+    let mut reader = BufReader::new(
+        std::fs::File::open(&full).map_err(|e| format!("读取失败: {e}"))?,
+    );
+    let mut skipped = 0usize;
+    while skipped < start {
+        buf.clear();
+        let got = reader.read_until(b'\n', &mut buf).map_err(|e| format!("读取失败: {e}"))?;
+        if got == 0 {
+            break;
+        }
+        skipped += 1;
+    }
+    let mut body_lines: Vec<String> = Vec::with_capacity(end - start);
+    while body_lines.len() < end - start {
+        buf.clear();
+        let got = reader.read_until(b'\n', &mut buf).map_err(|e| format!("读取失败: {e}"))?;
+        if got == 0 {
+            break;
+        }
+        let line = String::from_utf8(buf.clone()).map_err(|_| {
+            read_text_err(
+                &full,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "文件含非 UTF-8 字节"),
+            )
+        })?;
+        // 剥行尾 \n / \r\n（与 str::lines() 语义一致，只剥一个 \r）
+        body_lines.push(
+            line.strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(&line)
+                .to_string(),
+        );
+    }
+    let body = body_lines.join("\n");
     let out = format!(
         "{} 第 {page}/{pages} 页（共 {} 行，本页 {}-{} 行）\n{}",
         rel,
-        lines.len(),
+        lines_total,
         start + 1,
         end,
         body
@@ -68,6 +124,10 @@ pub(crate) fn read_page(ws: &Path, args: &str, max_chars: usize, unconfined: boo
 /// 文件类工具的统一体积上限：`write_file` 的 content、`edit_file` 的目标文件与编辑结果
 /// 共用（审查 N2——edit_file 原先无上限，模型误编辑大文件时整文件读入内存）。
 pub(crate) const MAX_FILE_BYTES: usize = 512 * 1024;
+
+/// read_file 的整读上限（2026-10-08 修）：输出本就有 max_chars 截断，整读几 GB 的
+/// 日志/构建产物只会把进程撑爆；更大的文件走 read_page 分页或 shell/search 取片段。
+pub(crate) const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 pub(crate) fn write_file(ws: &Path, args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;

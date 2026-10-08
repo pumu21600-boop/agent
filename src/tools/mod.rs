@@ -899,6 +899,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 2026-10-08 修：read_file 无脑整读，GB 级日志/构建产物把进程撑爆。
+    /// 现在 >2MB 明确拒（指路 read_page/shell），read_page 流式分页照旧能读。
+    #[tokio::test]
+    async fn read_file_rejects_huge_file_and_read_page_still_pages() {
+        init_logger();
+        let dir = workspace_root().join(".p8-test-readbig");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        // 2MB 出头，行数少而单行长——整读该拒、分页该过
+        let big_line = "x".repeat(4096);
+        let mut body = String::new();
+        while body.len() < 2 * 1024 * 1024 + 4096 {
+            body.push_str(&big_line);
+            body.push('\n');
+        }
+        std::fs::write(dir.join("huge.log"), &body).ok();
+        let e = execute(&cfg(), "read_file", r#"{"path":".p8-test-readbig/huge.log"}"#).await.unwrap_err();
+        assert!(e.contains("文件过大") && e.contains("read_page"), "应拒并指路: {e}");
+        let r = execute(&cfg(), "read_page", r#"{"path":".p8-test-readbig/huge.log","page":1,"page_size":10}"#).await.unwrap();
+        assert!(r.contains("第 1/") && r.contains("本页 1-10 行"), "分页头应正确: {}", &r[..r.len().min(120)]);
+        // 空文件与无尾换行文件的语义不变
+        std::fs::write(dir.join("empty.txt"), "").ok();
+        let r = execute(&cfg(), "read_page", r#"{"path":".p8-test-readbig/empty.txt","page":1}"#).await.unwrap();
+        assert!(r.contains("空文件"));
+        std::fs::write(dir.join("notrail.txt"), "a\nb").ok();
+        let r = execute(&cfg(), "read_page", r#"{"path":".p8-test-readbig/notrail.txt","page":1}"#).await.unwrap();
+        assert!(r.contains("共 2 行") && r.contains("本页 1-2 行"), "无尾换行应算 2 行: {r}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn unsandboxed_inherits_full_env() {
         init_logger();

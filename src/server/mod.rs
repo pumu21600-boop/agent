@@ -367,9 +367,30 @@ fn split_host(h: &str) -> (&str, Option<u16>) {
 }
 
 /// 回环主机名（大小写不敏感）：`localhost` / `127.0.0.0/8` / `::1`。
+/// `127.` 前缀必须跟满四段数字（0-255）：DNS 标签可以是纯数字，攻击者注册
+/// `127.0.0.1.evil.com` 指向 127.0.0.1，浏览器即视同源——前缀匹配会让整个
+/// DNS rebinding 防护失效（2026-10-08 修）。
 fn is_loopback_host(h: &str) -> bool {
     let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
-    h == "localhost" || h == "::1" || h == "0:0:0:0:0:0:0:1" || h.starts_with("127.")
+    if h == "localhost" || h == "::1" || h == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    let mut octets = h.split('.');
+    if octets.next() != Some("127") {
+        return false;
+    }
+    let mut n = 1u8;
+    for o in octets {
+        let ok = !o.is_empty()
+            && o.len() <= 3
+            && o.bytes().all(|b| b.is_ascii_digit())
+            && o.parse::<u16>().is_ok_and(|v| v <= 255);
+        if !ok {
+            return false;
+        }
+        n += 1;
+    }
+    n == 4
 }
 
 /// 给 text/html 响应加 Cache-Control: no-cache，防止 index.html 缓存旧入口引用旧资源
@@ -683,6 +704,20 @@ mod tests {
         assert!(check_origin("127.0.0.1:5173", None).is_ok());
         // 缺 Host 头：拒（HTTP/1.0 老客户端）
         assert!(check_origin("", None).is_err());
+        // 2026-10-08 修：`127.` 前缀匹配曾让纯数字标签域名整个穿过防护——
+        // 攻击者注册 127.0.0.1.evil.com 指向 127.0.0.1，浏览器即视同源
+        let e = check_origin("127.0.0.1.evil.com:5173", None).expect_err("127. 前缀域名必须拒");
+        assert!(e.contains("不是本机地址"), "{e}");
+        // Origin 侧同样变体
+        assert!(check_origin("127.0.0.1:5173", Some("http://127.0.0.1.evil.com:5173")).is_err());
+        // 端口伪装：四段不完整/超段/非数字一律拒
+        for bad in ["127.evil.com", "127.0.0", "127.0.0.1.2", "127.0.0.256", "127x.0.0.1"] {
+            assert!(!is_loopback_host(bad), "{bad} 不应判为回环");
+        }
+        // 合法形态照旧放行（含前导零与尾点）
+        for good in ["127.0.0.1", "127.1.2.3", "127.000.000.001", "127.0.0.1.", "LOCALHOST"] {
+            assert!(is_loopback_host(good), "{good} 应判为回环");
+        }
     }
 
     #[test]

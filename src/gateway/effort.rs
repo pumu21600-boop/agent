@@ -21,7 +21,11 @@ const GENERIC_EFFORTS: [&str; 3] = ["low", "medium", "high"];
 /// 模型 id 规范化：小写 + 去日期后缀（gpt-5.1-2025-06-09 → gpt-5.1）。
 fn normalize_model_id(id: &str) -> String {
     let lower = id.trim().to_lowercase();
-    if lower.len() >= 11 {
+    // 尾 11 字节可能落在多字节字符中间（非 ASCII 模型名：中文/emoji/İ 这类
+    // 大小写映射还会改变字节长度），必须先判字符边界再切，否则 panic——
+    // 调用方在 tokio 任务里，panic 被运行时吞掉 = 这一轮无 error 无 done 静默死掉。
+    // 日期后缀形如 -dddd-dd-dd 全是 ASCII，非边界时本就不可能匹配，跳过即等价。
+    if lower.len() >= 11 && lower.is_char_boundary(lower.len() - 11) {
         let tail = &lower[lower.len() - 11..];
         let d = tail.as_bytes();
         // 形如 -\d{4}-\d{2}-\d{2}
@@ -230,6 +234,21 @@ mod tests {
         assert_eq!(normalize_model_id("gpt-5.2"), "gpt-5.2");
         assert_eq!(normalize_effort("HIGH"), "high");
         assert_eq!(normalize_effort(" custom-tag "), "custom-tag");
+    }
+
+    /// 2026-10-08 修：非 ASCII 模型名尾 11 字节落在多字节字符中间，
+    /// 原先直接 panic（字节下标不是字符边界）。日期后缀全是 ASCII，
+    /// 非边界时跳过剥离即可，行为不变。
+    #[test]
+    fn non_ascii_model_id_does_not_panic() {
+        // "gpt-5-" + 4 个汉字 = 6 + 12 = 18 字节；18-11=7 正落在「中」中间
+        assert_eq!(normalize_model_id("gpt-5-中文测试"), "gpt-5-中文测试");
+        // İ 小写映射 2 字节 → 3 字节，长度变化同样不能炸
+        assert_eq!(normalize_model_id("gpt-5.1-İ-İ-İ"), "gpt-5.1-i̇-i̇-i̇");
+        // 带日期后缀的非 ASCII 名照旧剥后缀
+        assert_eq!(normalize_model_id("gpt-5.2-中文-2025-06-09"), "gpt-5.2-中文");
+        // 档位解析链路同样不能炸
+        assert_eq!(resolve_effort("gpt-5-中文测试", "high", None).as_deref(), Some("high"));
     }
 
     #[test]

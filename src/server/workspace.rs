@@ -158,7 +158,7 @@ pub(super) async fn read_workspace_raw(
     if path.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 path" }))));
     }
-    let res = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), String> {
+    let res = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, &'static str, Option<&'static str>), String> {
         let full = crate::tools::resolve_workspace_path(&path)?;
         let meta = std::fs::metadata(&full).map_err(|e| format!("读取失败: {e}"))?;
         if !meta.is_file() {
@@ -190,15 +190,33 @@ pub(super) async fn read_workspace_raw(
             "flac" => "audio/flac",
             _ => "application/octet-stream",
         };
-        Ok((bytes, ct.to_string()))
+        // 同源 XSS 防护（2026-10-08 修）：SVG 从应用源 Serve，用户点开 markdown 里的
+        // raw 链接（同标签页导航）即执行其中脚本 → 可读 /api/settings、POST /api/shell。
+        // CSP 禁脚本执行；<img> 内嵌走图片上下文，本来就不跑脚本，渲染不受影响。
+        let csp = if ext == "svg" {
+            Some("default-src 'none'; style-src 'unsafe-inline'; img-src data: *")
+        } else {
+            None
+        };
+        Ok((bytes, ct, csp))
     })
     .await;
     match res {
-        Ok(Ok((bytes, ct))) => Ok((
-            [(axum::http::header::CONTENT_TYPE, ct), (axum::http::header::CACHE_CONTROL, "no-store".to_string())],
-            bytes,
-        )
-            .into_response()),
+        Ok(Ok((bytes, ct, csp))) => {
+            use axum::http::{HeaderMap, HeaderValue};
+            let mut headers = HeaderMap::new();
+            headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static(ct));
+            headers.insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            // 禁 MIME 嗅探：无扩展名/错扩展名的文件不能被浏览器当成 text/html 渲染
+            headers.insert(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            if let Some(csp) = csp {
+                headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(csp));
+            }
+            Ok((headers, bytes).into_response())
+        }
         Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
     }
@@ -566,5 +584,48 @@ mod tests {
         let key = alias_into(&mut s, &gone, "搬走的项目");
         assert_eq!(key, gone);
         assert_eq!(s.workspace_aliases.get(&gone).map(String::as_str), Some("搬走的项目"));
+    }
+
+    /// 2026-10-08 修：SVG 直出必须带禁脚本的 CSP + nosniff——否则点开 markdown 里的
+    /// raw 链接（同标签页导航）即执行 SVG 内脚本，可读 /api/settings、POST /api/shell。
+    #[tokio::test]
+    async fn raw_svg_gets_script_killing_csp_and_nosniff() {
+        let dir = crate::tools::workspace_root().join(".p8-test-raw");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("x.svg"),
+            "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+        )
+        .ok();
+        let mut params = std::collections::HashMap::new();
+        params.insert("path".to_string(), ".p8-test-raw/x.svg".to_string());
+        let resp = read_workspace_raw(Query(params)).await.unwrap();
+        let h = resp.headers();
+        let csp = h
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok());
+        assert!(csp.is_some_and(|c| c.contains("default-src 'none'")), "SVG 必须带禁脚本 CSP: {csp:?}");
+        assert_eq!(
+            h.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            h.get(axum::http::header::X_CONTENT_TYPE_OPTIONS).and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        // 非 SVG：nosniff 照带（禁 MIME 嗅探），但不加 CSP（不影响 PDF/音视频内嵌渲染）
+        std::fs::write(dir.join("y.png"), &[0x89, 0x50, 0x4e, 0x47]).ok();
+        let mut p2 = std::collections::HashMap::new();
+        p2.insert("path".to_string(), ".p8-test-raw/y.png".to_string());
+        let resp2 = read_workspace_raw(Query(p2)).await.unwrap();
+        assert!(
+            resp2.headers().get(axum::http::header::CONTENT_SECURITY_POLICY).is_none(),
+            "非 SVG 不加 CSP"
+        );
+        assert_eq!(
+            resp2.headers().get(axum::http::header::X_CONTENT_TYPE_OPTIONS).and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

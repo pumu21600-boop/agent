@@ -5,13 +5,18 @@ use super::*;
 /// 极简 HTML → 文本：剔 script/style，去标签，解常见实体，压缩空行。
 pub(crate) fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
-    let mut skip_until: Option<&str> = None;
-    let lower = html.to_lowercase();
-    let mut i = 0usize;
+    let mut skip_until: Option<&[u8]> = None;
+    // 小写副本逐字节 ASCII 映射：标签判定只涉及 ASCII（<script/<style/>），
+    // 等长映射保证与 html 字节偏移一一对应。不能用 to_lowercase()——完整
+    // Unicode 映射会改变字节长度（U+212A K→k 少 2 字节、İ→i̇ 多 1 字节），
+    // 拿 html 的偏移切 lower 要么 panic 要么静默切错内容（2026-10-08 修）。
+    let lower: Vec<u8> = html.bytes().map(|b| b.to_ascii_lowercase()).collect();
     let bytes = html.as_bytes();
+    let mut i = 0usize;
+
     while i < html.len() {
         if let Some(end_tag) = skip_until {
-            match lower[i..].find(end_tag) {
+            match find_sub(&lower[i..], end_tag) {
                 Some(p) => {
                     i += p + end_tag.len();
                     skip_until = None;
@@ -23,11 +28,11 @@ pub(crate) fn html_to_text(html: &str) -> String {
         match bytes[i] {
             b'<' => {
                 let rest = &lower[i..];
-                if rest.starts_with("<script") {
-                    skip_until = Some("</script>");
-                } else if rest.starts_with("<style") {
-                    skip_until = Some("</style>");
-                } else if let Some(end) = rest.find('>') {
+                if rest.starts_with(b"<script") {
+                    skip_until = Some(b"</script>");
+                } else if rest.starts_with(b"<style") {
+                    skip_until = Some(b"</style>");
+                } else if let Some(end) = rest.iter().position(|&c| c == b'>') {
                     i += end + 1;
                     out.push(' ');
                     continue;
@@ -67,6 +72,14 @@ pub(crate) fn html_to_text(html: &str) -> String {
         }
     }
     collapsed.trim().to_string()
+}
+
+/// 字节切片里找子串（needle 为 ASCII 标签名；独立纯函数便于单测）。
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// web_fetch / web_search 共用的 HTTP 客户端（浏览器 UA：搜索页与部分站点会按 UA 拦爬虫）。
@@ -596,6 +609,22 @@ mod tests {
         let client = web_client().unwrap();
         let r = send_with_ssrf_guard(&client, "http://127.0.0.1:9/x").await;
         assert!(r.is_err() && r.unwrap_err().contains("SSRF"), "环回目标应在发送前被拒");
+    }
+
+    #[test]
+    fn html_to_text_survives_unicode_case_mapping() {
+        // 2026-10-08 修：İ 的小写映射 2 字节→3 字节（U+212A 则反向少 2 字节），
+        // 偏移错位后拿 html 的字节下标切 to_lowercase() 副本会 panic 或切错内容。
+        // ASCII 等长小写副本后：标签照剥、正文按原样保留。
+        let html = "a\u{0130}<b>bold</b><script>evil()</script>tail";
+        let t = html_to_text(html);
+        assert!(t.contains("bold"), "加粗正文应保留: {t:?}");
+        assert!(!t.contains("evil"), "script 块应被剥掉: {t:?}");
+        assert!(t.contains("tail"), "script 后的正文应保留: {t:?}");
+        // 大写SCRIPT/Script 变体同样剥（ASCII 小写副本覆盖）
+        let t2 = html_to_text("<SCRIPT>evil()</SCRIPT><Style>x{}</Style>ok");
+        assert!(!t2.contains("evil") && !t2.contains("x{}"), "大小写变体应剥掉: {t2:?}");
+        assert!(t2.contains("ok"), "style 后正文应保留: {t2:?}");
     }
 
     #[test]
