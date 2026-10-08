@@ -172,9 +172,9 @@ pub async fn panel_screenshot(id: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("截图 base64 解码失败: {e}"))
 }
 
-/// 面板帧（P21）：screencast 最新 JPEG（内存直出，零 CDP 往返）；
+/// 面板帧：screencast 最新 JPEG（内存直出，零 CDP 往返）；
 /// 没有帧（screencast 刚起步/失败）时回落 captureScreenshot（PNG）。
-/// P22：轮询即「有客户端要帧」的信号，驱动 screencast 门控（壳里看真页面不编码）。
+/// 轮询即「有客户端要帧」的信号，驱动 screencast 门控（壳里看真页面不编码）。
 /// `native` = 调用方就是壳里那个客户端：轮询帧对它来说是"壳里看真页面"，本来就不该
 /// 因此把壳的 webview 显示出来（显示只归壳面板自己的 activate/viewport 管）。
 pub async fn panel_frame(id: &str, native: bool) -> Result<(Vec<u8>, &'static str), String> {
@@ -196,7 +196,7 @@ pub async fn panel_frame(id: &str, native: bool) -> Result<(Vec<u8>, &'static st
 }
 
 /// 面板设置标签页视口（截图尺寸跟随面板大小——固定 1280×900 会在窄面板里
-/// 显示得又小又留大黑边，ZCode 的面板浏览器就是视口=面板尺寸）。P22：x/y 是面板
+/// 显示得又小又留大黑边，视口=面板尺寸才对）。x/y 是面板
 /// 内容区在壳窗口里的左上角（shell 模式据此把 child webview 摆到面板位置上）。
 /// `native` = 调用方就是壳里那个客户端（见 BrowserSession::panel_showing 的注释）——
 /// **只有它的 x/y 是壳窗口坐标**。浏览器直开 5173 的第二个客户端也走这个接口（截图要跟
@@ -404,9 +404,9 @@ pub async fn panel_close_tab(id: &str) -> Result<Value, String> {
 /// 服务端：前端的「⋯」点击一律发 toggle，由这里翻转，两边不会失同步。
 pub(crate) static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 「⋯」菜单开合（P20.4 补丁四）。shell 模式下开菜单 = 让壳建一个**透明置顶的菜单
+/// 「⋯」菜单开合（补丁四）。shell 模式下开菜单 = 让壳建一个**透明置顶的菜单
 /// webview** 铺在面板矩形上（`shell::menu`）：它压在下层内容 webview 之上，菜单因此浮在
-/// 网页上面——**网页纹丝不动、不被遮也不被藏**（对齐 ZCode；主界面的 HTML 菜单做不到，
+/// 网页上面——**网页纹丝不动、不被遮也不被藏**（主界面的 HTML 菜单做不到，
 /// 因为 child webview 是 HWND，永远盖在 Svelte 之上）。菜单页由服务同源提供
 /// （/menu.html，锚点走 URL query），点击经同源 fetch 调 open-external/devtools 端点。
 /// 无头模式没有壳：菜单是前端 HTML 下拉（盖在截图上，z-index 正常），这里只记账。
@@ -441,7 +441,7 @@ pub async fn panel_overlay(
     Ok(json!({ "ok": true, "open": true, "shell": true, "tab": tab }))
 }
 
-/// 面板上报可见标签页（驱动 screencast 与驻留；对齐 ZCode activateTab）。
+/// 面板上报可见标签页（驱动 screencast 与驻留）。
 /// 空 id = 「面板不看了」——shell 模式下这是壳里 webview 隐藏的唯一信号。
 /// `native` = 调用方就是壳里那个客户端：只有它的「在看/不看」能置壳里 webview 的显隐
 /// （浏览器直开 5173 的第二个客户端切走页签，不该把壳里的网页一起藏了）。

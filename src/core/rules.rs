@@ -1,11 +1,11 @@
-//! 细粒度审批规则引擎（P9，v1 转正）
+//! 细粒度审批规则引擎（v1 转正）
 //!
 //! 替代“一刀切”的审批机制：
 //! - Safe (0): 只读安全操作、查看代码、单元测试、只读 Git，完全静默放行；
 //! - Normal (1): 工作区内的正常代码创建与修改，按常规放行并记录改动；
 //! - Dangerous (2): 文件删除、工作区外部篡改、git 破坏性操作与高危命令，强制拦截卡点弹窗。
 //!
-//! v1 相对 v0（P8.5 提前落地的初版）修正的判定缺陷：
+//! v1 相对 v0（提前落地的初版）修正的判定缺陷：
 //! 1. shell 命令不再整体前缀匹配——先按命令分隔符拆成多条子命令，逐条判定取最高风险，
 //!    堵住 `cargo test && del /f x` 这类串联绕过；
 //! 2. 高危/安全名单改按「程序名 token」精确匹配，不再用子串——
@@ -48,13 +48,13 @@ impl RiskLevel {
 ///
 /// **锚点**：与 `src/tools/mod.rs` 的注册表保持一致——那边新增工具，这边必须同步登记，
 /// 否则未登记工具会走 Dangerous 默认策略（见 `evaluate_risk` 末尾分支）。
-/// P11 的 MCP 工具接入时同样在此登记。
+/// 的 MCP 工具接入时同样在此登记。
 const KNOWN_TOOLS: &[&str] = &[
     "read_file", "read_page", "read_skill", "search", "web_fetch", "web_search", "write_file",
     "edit_file", "shell", "git",
-    // P21 浏览器内核：统一 browser 工具（method 判别；逐方法分级见 evaluate_risk）
+    // 浏览器内核：统一 browser 工具（method 判别；逐方法分级见 evaluate_risk）
     "browser",
-    // P22-C 子代理派发（核心循环拦截，实现见 server/subagent.rs）
+    // 子代理派发（核心循环拦截，实现见 server/subagent.rs）
     "subagent_spawn",
     // 2026-10-03 agent 自改设置（get/set；分级与红线见 risk_settings / red_line_hold）
     "settings",
@@ -155,7 +155,7 @@ const SENSITIVE_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".jks", ".
 
 /// 评估具体工具调用的风险等级并给出判定依据。
 pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (RiskLevel, String) {
-    // P11（施工单 016）：MCP 动态工具——档位由 plugin 层按「首装确认 + server 配置」判定：
+    // （施工单 016）：MCP 动态工具——档位由 plugin 层按「首装确认 + server 配置」判定：
     // 未确认/禁用/未知 → Dangerous（总架构 §7 tool poisoning 防线）；确认后 Normal/Dangerous。
     if let Some(rest) = tool_name.strip_prefix(crate::plugin::wasm::PREFIX) {
         return match crate::plugin::wasm::risk_for(tool_name) {
@@ -183,7 +183,7 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
             (RiskLevel::Safe, "只读安全查询操作".into())
         }
 
-        // P21 浏览器内核：统一 browser 工具按 method 分级——只读方法（导航/快照/
+        // 浏览器内核：统一 browser 工具按 method 分级——只读方法（导航/快照/
         // 列表/等待等）视为只读；click/fill/type/press/select/check/drag/evaluate
         // 会改变远端页面状态或执行页面脚本，按常规改动审批
         "browser" => {
@@ -201,7 +201,7 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         // 读技能：只读 SKILL.md，恒定 Safe
         "read_skill" => (RiskLevel::Safe, "读取技能文件（只读）".into()),
 
-        // P22-C 子代理派发：自身只发起一次独立会话（花销与隔离由服务层并发度/审批策略管），
+        // 子代理派发：自身只发起一次独立会话（花销与隔离由服务层并发度/审批策略管），
         // 按常规处理；子代理自己那轮的工具有它自己的审批门（无人值守默认拒绝高危）
         "subagent_spawn" => (RiskLevel::Normal, "派发子代理任务".into()),
 
@@ -950,7 +950,7 @@ fn is_within_root(root: &Path, target: &Path) -> bool {
     t == r || t.starts_with(&format!("{r}/"))
 }
 
-/// 「同类操作」的范围标识（P9 A3：会话内同类允许 的记忆键）。
+/// 「同类操作」的范围标识（A3：会话内同类允许 的记忆键）。
 ///
 /// 粒度取「工具名 + 风险档 + 参数特征」，既不能粗到「放行整个 shell」，
 /// 也不细到「只放行这一条命令」：
@@ -1102,7 +1102,7 @@ mod tests {
         assert_eq!(evaluate_risk("shell", &json!({"command": "git -C . status"}), &ws()).0, RiskLevel::Safe);
     }
 
-    // —— 2026-10-08 P0：全局选项的值里带引号+空格时，split_whitespace 会把值拆开，
+    // —— 2026-10-08 全局选项的值里带引号+空格时，split_whitespace 会把值拆开，
     // `i += 2` 跳过中段后真子命令落进 rest 只参与 flag 检查，破坏性操作降级 Normal ——
     #[test]
     fn test_git_quoted_global_value_cannot_mask_subcommand() {
@@ -1283,7 +1283,7 @@ mod tests {
         assert_eq!(evaluate_risk("write_file", &json!({"path": ".git/config", "content": "..."}), &ws()).0, RiskLevel::Dangerous);
     }
 
-    // —— P16：edit_file 与 write_file 共用同一套路径判定（敏感/遍历/越界）——
+    // —— edit_file 与 write_file 共用同一套路径判定（敏感/遍历/越界）——
     #[test]
     fn test_edit_file_path_rules_match_write_file() {
         let args = |p: &str| json!({"path": p, "old_string": "a", "new_string": "b"});
@@ -1513,7 +1513,7 @@ mod tests {
         assert!(!should_ask_approval("full-access", RiskLevel::Dangerous));
     }
 
-    // —— P19：绝对路径越界且目标尚不存在——canonicalize 必失败，词面判定必须兜住 ——
+    // —— 绝对路径越界且目标尚不存在——canonicalize 必失败，词面判定必须兜住 ——
     #[test]
     fn test_write_file_absolute_outside_is_dangerous_even_if_missing() {
         let r = evaluate_risk(

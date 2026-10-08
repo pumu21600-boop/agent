@@ -1,4 +1,4 @@
-//! 长活子进程的生命周期保险丝（P20.4 起）—— Job Object + KILL_ON_JOB_CLOSE。
+//! 长活子进程的生命周期保险丝（起）—— Job Object + KILL_ON_JOB_CLOSE。
 //!
 //! 为什么需要：服务进程被**硬杀**（`agent.exe stop` 走 taskkill /F、崩溃、重启）时，
 //! `Child::kill()` 那套优雅路径根本来不及跑，子进程会作为孤儿继续活着、占着端口与

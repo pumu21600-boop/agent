@@ -1,7 +1,7 @@
 //! 思考标签分割 —— 移植自 OpenClaw `packages/markdown-core/src/reasoning-tag-parser.ts`（v2026.8.2）。
 //!
 //! 上游把 14 种标签一律视为思考通道（<think>/<thinking>/<thought>/<reasoning>/<internal>/
-//! <antthinking>/antml:* / mm:*）。本产品 P7.7 只认 <think>，免费反代吐 <thinking>、
+//! <antthinking>/antml:* / mm:*）。本产品只认 <think>，免费反代吐 <thinking>、
 //! <reasoning> 时会漏剥离进正文——这里对齐上游词表，增量流式语义保持一致：
 //! 标签可跨分片断裂，用 hold 缓冲半截标签；未闭合时流尾按当前通道归位。
 

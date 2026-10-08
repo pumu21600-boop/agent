@@ -52,7 +52,7 @@ impl ThinkingFormat {
     }
 }
 
-/// 传输协议维度（P23）：同一渠道走 OpenAI Chat Completions 还是 Anthropic Messages。
+/// 传输协议维度：同一渠道走 OpenAI Chat Completions 还是 Anthropic Messages。
 /// 与 ThinkingFormat 正交——Anthropic 协议的思考参数在 anthropic.rs 里按 Messages 规范组装。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Protocol {
@@ -75,7 +75,7 @@ impl Protocol {
 /// 端点兼容性档（请求组装与响应解析都按它走）。
 #[derive(Debug, Clone)]
 pub struct Compat {
-    /// 传输协议（P23）：Anthropic 端点走 Messages 适配器，其余走 OpenAI Completions
+    /// 传输协议：Anthropic 端点走 Messages 适配器，其余走 OpenAI Completions
     pub protocol: Protocol,
     pub thinking_format: ThinkingFormat,
     /// "max_tokens" 或 "max_completion_tokens"（OpenAI 新系模型要求后者）
@@ -169,7 +169,7 @@ pub fn resolve(
     format_override: Option<ThinkingFormat>,
 ) -> Compat {
     let class = endpoint_class(provider_id, base_url);
-    // 传输协议（P23）：provider_id=anthropic 或官方域 → Messages 协议，其余 OpenAI Completions
+    // 传输协议：provider_id=anthropic 或官方域 → Messages 协议，其余 OpenAI Completions
     let protocol = if super::anthropic::is_anthropic_endpoint(provider_id, base_url) {
         Protocol::AnthropicMessages
     } else {

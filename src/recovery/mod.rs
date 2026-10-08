@@ -1,4 +1,4 @@
-//! 错误恢复 —— 总架构 §14 / 施工单 007（P6）
+//! 错误恢复 —— 总架构 §14 / 施工单 007
 //!
 //! 「假设一定会崩，把能恢复做成默认」：
 //! - checkpoint：把工作区文件提交进影子仓库 `<workspace>/.agent/shadow`
@@ -48,7 +48,7 @@ fn shadow_gitdir(ws: &Path) -> PathBuf {
     ws.join(".agent").join("shadow").join(".git")
 }
 
-/// git 面板的数据源（对着 ZCode git 面板的 source 选择器：未暂存 / 上一轮…）。
+/// git 面板的数据源（scope 选择器：未暂存 / 上一轮…）。
 /// - `Shadow`：影子仓库相对某个检查点 = 「本任务改动」（默认，产物/git 一直用这条）
 /// - `Workspace`：工作区自己的真仓库相对 HEAD = 「未提交改动」
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

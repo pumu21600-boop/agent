@@ -1,4 +1,4 @@
-//! HTTP 层（P19 巨石拆分：路由域子模块见同目录各文件）
+//! HTTP 层（巨石拆分：路由域子模块见同目录各文件）
 //!
 //! 本文件只留全局件：AppState / router / 来源校验与缓存中间件 / SSE 事件封装 / 内置冒烟页。
 //! 路由域端点在 chat / gate / settings / workspace / sessions / memory / ext / git / system。
@@ -74,7 +74,7 @@ use usage::*;
 use webpanel::*;
 use workspace::*;
 
-// P22-A 无头会话的进程内入口：定时任务（P22-B）不走 HTTP 直接唤醒
+// 无头会话的进程内入口：定时任务不走 HTTP 直接唤醒
 pub(crate) use headless::{HeadlessRequest, run_headless_inner};
 
 
@@ -98,21 +98,21 @@ pub struct AppState {
     pub system_prompt: Arc<String>,
     /// 系统约定文件 prompts/system.md：记忆面板可编辑，每轮任务实时读盘（保存即生效）
     pub prompt_path: Arc<PathBuf>,
-    /// 会话落盘（P6.1 多会话）：Snapshot 事件按 session_id 写入
+    /// 会话落盘（多会话）：Snapshot 事件按 session_id 写入
     pub session: Arc<crate::session::SessionManager>,
     /// 日志目录（记忆库索引 <log_dir>/memory/library.json 的落点）
     pub log_dir: Arc<PathBuf>,
-    /// P7 记忆层（events.log / AGENTS.md / index；开关在 [memory]）
-    /// P8.2：工作区可切换 → 记忆层跟着重开，用 RwLock 换引用
+    /// 记忆层（events.log / AGENTS.md / index；开关在 [memory]）
+    /// 工作区可切换 → 记忆层跟着重开，用 RwLock 换引用
     pub memory: Arc<std::sync::RwLock<Arc<crate::memory::Memory>>>,
-    /// P8.2 记忆配置（切换工作区时重开 Memory 用）
+    /// 记忆配置（切换工作区时重开 Memory 用）
     pub mem_cfg: Arc<crate::config::MemoryConfig>,
     /// 挂起的工具审批：approval id → 决定通道（施工单 005）
     pub approvals: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
-    /// P9 A3：挂起审批的附加信息 —— approval id → (scope, session_id)，
+    /// A3：挂起审批的附加信息 —— approval id → (scope, session_id)，
     /// 供「本会话内同类允许」在用户决定时回写记忆。
     pub approval_meta: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
-    /// P9 A3：会话内已授权的审批范围 —— session_id → scope 集合（见 core::rules::approval_scope）。
+    /// A3：会话内已授权的审批范围 —— session_id → scope 集合（见 core::rules::approval_scope）。
     /// **仅内存，不落 settings.json**；清空会话时一并清除，服务重启即失效。
     pub approved_scopes: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
     /// 当前审批档位（侧栏切换即时生效，含进行中的请求）
@@ -120,11 +120,11 @@ pub struct AppState {
     /// 每会话审批档覆盖（M1）：并发多会话各跑各的档位，互不覆盖；
     /// 没有条目的会话用上面的全局默认档。仅内存，重启即失效（与档位本身语义一致）。
     pub session_approval: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
-    /// P8 角色映射（config.toml [roles]：summary/title/embedding 的配置名）
+    /// 角色映射（config.toml [roles]：summary/title/embedding 的配置名）
     pub roles_cfg: Arc<crate::config::RolesConfig>,
-    /// P8 网关级配置（config.toml [gateway]：max_rpm / fallback_configs）
+    /// 网关级配置（config.toml [gateway]：max_rpm / fallback_configs）
     pub gateway_cfg: Arc<crate::config::GatewayConfig>,
-    /// P22-C 子代理并行度（config.toml [subagent]：max_concurrent / per_parent）
+    /// 子代理并行度（config.toml [subagent]：max_concurrent / per_parent）
     pub subagent_cfg: Arc<crate::config::SubagentConfig>,
 }
 
@@ -160,16 +160,16 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
             "/api/chat",
             post(chat).layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
-        // P22-A 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
+        // 无头会话：程序化唤醒一条会话跑完整轮，结构化返回（子代理/定时/CLI 的共同底座）
         .route("/api/headless/run", post(run_headless))
-        // P22-B 定时任务：清单（含下次运行/通知）/ 新建改 / 删 / 立即运行
+        // 定时任务：清单（含下次运行/通知）/ 新建改 / 删 / 立即运行
         .route(
             "/api/schedules",
             get(list_schedules).post(save_schedule).delete(delete_schedule),
         )
         .route("/api/schedules/run", post(run_schedule_now))
         .route("/api/schedules/cron-text", get(cron_text))
-        // P22-B 完成记录 × 掉一条（落盘；壳重启/弹窗重开都不复活）
+        // 完成记录 × 掉一条（落盘；壳重启/弹窗重开都不复活）
         .route("/api/schedules/notice", delete(dismiss_schedule_notice))
         .route("/api/session", get(get_session).delete(clear_session))
         .route("/api/sessions", get(list_sessions))
@@ -204,18 +204,18 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/ui/events", get(crate::server::ui_events::ui_events_stream))
         // 反向：前端上报界面状态（ui 工具 state 方法读它；open/close 识别 no-op）
         .route("/api/ui/state", post(crate::server::ui_events::ui_state_post))
-        // P18 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
+        // 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
         .route("/api/plugins/draft", post(submit_draft).delete(discard_draft))
         .route("/api/plugins/promote", post(promote_draft))
-        // P21 红线3：第三方插件验签（pin/unpin 内容指纹）
+        // 红线3：第三方插件验签（pin/unpin 内容指纹）
         .route("/api/plugins/trust", post(trust_plugin))
         // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查；本端点只审不信，供界面预审
         .route("/api/plugins/review", post(review_plugin))
-        // P21 成本台账：按供应商/模型的 token、次数、费用报表 + 价格表与重算
+        // 成本台账：按供应商/模型的 token、次数、费用报表 + 价格表与重算
         .route("/api/usage", get(get_usage))
         .route("/api/usage/prices", get(get_usage_prices).put(put_usage_prices))
         .route("/api/usage/recompute", post(post_usage_recompute))
-        // P18 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
+        // 存储一门（027）：插件命名空间的结构化读写（内核保留区不在任何插件写路径上）
         .route("/api/plugin/data", get(read_plugin_data).put(write_plugin_data).delete(delete_plugin_data))
         .route("/api/workspace/file", post(write_workspace_file))
         // 组件总线 v0：扩展静态资源（路径式路由，扩展内相对 URL 天然可用）
@@ -227,8 +227,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         .route("/api/cancel", get(cancel_status))
         .route("/api/sandbox/selftest", get(sandbox_selftest))
         .route("/api/sandbox/info", get(sandbox_info))
-        // P20.1 网页面板：多标签管理 + 截图渲染 + 坐标回传（与 agent 浏览器工具共享实例）
-        // P21：帧流（screencast）替代逐次截图轮询；activate 上报可见页驱动驻留
+        // 网页面板：多标签管理 + 截图渲染 + 坐标回传（与 agent 浏览器工具共享实例）
+        // 帧流（screencast）替代逐次截图轮询；activate 上报可见页驱动驻留
         .route("/api/browser/state", get(browser_state))
         .route("/api/browser/new", post(browser_new))
         .route("/api/browser/navigate", post(browser_navigate))

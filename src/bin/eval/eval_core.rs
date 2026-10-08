@@ -1,10 +1,10 @@
-//! eval 评测体系（施工单 015，P10-B）
+//! eval 评测体系（施工单 015）
 //!
 //! **HTTP 黑盒驱动**：对运行中的服务发真实对话（/api/chat SSE），断言文件系统与
 //! SSE 事件流。主服务代码零改动——本模块只被 `src/bin/eval.rs`（CLI 壳）引用。
 //!
 //! 断言 8 种：file_exists / file_not_exists / file_contains / file_not_contains /
-//! no_new_files / files_unchanged / sse_event / no_sse_event（P20：负向事件断言）。
+//! no_new_files / files_unchanged / sse_event / no_sse_event（：负向事件断言）。
 //!
 //! 任务定义（evals/tasks/*.json）：
 //! `name / prompt / plan_mode / approval_mode / timeout_secs / setup_files / assertions`
@@ -224,7 +224,7 @@ pub fn run_assertion(
             }
         }),
         "sse_event" => sse_events.contains(&a.event),
-        // P20：负向事件断言——如 auto 档「零确认」要求审批卡事件（approval_request）绝不出现
+        // 负向事件断言——如 auto 档「零确认」要求审批卡事件（approval_request）绝不出现
         "no_sse_event" => !sse_events.contains(&a.event),
         _ => false, // 未知类型一律失败（防任务集手滑静默通过）
     };
@@ -503,7 +503,7 @@ mod tests {
         assert!(run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &sse).0);
         assert!(run_assertion(&a("sse_event", "", "", "done"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("sse_event", "", "", "plan_proposal"), &ws, &before, &sse).0);
-        // P20：负向事件断言（事件缺席=通过，出现=失败）
+        // 负向事件断言（事件缺席=通过，出现=失败）
         assert!(run_assertion(&a("no_sse_event", "", "", "approval_request"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("no_sse_event", "", "", "done"), &ws, &before, &sse).0);
         assert!(!run_assertion(&a("unknown_kind", "", "", ""), &ws, &before, &sse).0, "未知断言类型必须失败");

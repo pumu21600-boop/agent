@@ -1,5 +1,5 @@
 <script>
-  // 工作区切换弹窗（P19 自 App.svelte 按视图拆出）：路径输入自持，应用/关闭经事件回宿主。
+  // 工作区切换弹窗（自 App.svelte 按视图拆出）：路径输入自持，应用/关闭经事件回宿主。
   export let open = false;
   export let msg = '';
   export let workspace = '';

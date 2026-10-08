@@ -1,9 +1,9 @@
-//! P10-A（施工单 014）：trace 时间线的只读解析。
+//! （施工单 014）：trace 时间线的只读解析。
 //!
 //! 数据源是 logs/agent.jsonl（固定 4 字段：ts / session_id / event_type / payload，
 //! schema 见 docs/jsonl-schema.md——本模块**只读**，写端 schema 一律不碰）。
 //!
-//! 任务切分：以 `state kind:"task.start"` 为边界（P10 补记的事件）；
+//! 任务切分：以 `state kind:"task.start"` 为边界（补记的事件）；
 //! 旧日志没有该事件，兜底用「tool_call 且 step==0」近似切分。
 //! `model_chunk` 为流式分片（单任务可上千条），按**连续段聚合**成一条
 //! `{count, first_ts, last_ts, chars}`，时间线展示不逐分片渲染。

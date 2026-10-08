@@ -3,18 +3,18 @@
 // 剧本（按最后一条 user 消息判断，且只在请求带 tools 时生效）：
 //   「读 <路径>」  → read_file 工具调用（不写路径则读 prompts/system.md）
 //   「编辑 <路径>」→ edit_file 工具调用（old=「状态：TODO」→ new=「状态：已完成」）
-//   「派子代理」    → subagent_spawn 工具调用（P22-C：子代理独立会话跑 read_file 闭环）
+//  「派子代理」→ subagent_spawn 工具调用（：子代理独立会话跑 read_file 闭环）
 //   「派两个」      → 一轮两个 subagent_spawn（验证并行派发与并发度排队）
 //   「重试失败」    → 连续两轮相同的 read_file（必失败：文件不存在），验证「失败后重试
-//                    不判死循环」——旧护栏会当场终止并弹天书横幅（P22 用户反馈）
+//                   不判死循环」——旧护栏会当场终止并弹天书横幅（用户反馈）
 //   「死循环」     → 每轮都返回工具调用（验证步数上限）
 //   「慢循环」     → 同死循环，但每步先等 1.5s（验证运行中插话 / steering）
 //   「慢流」       → 30 片 × 300ms 的长流（验证中途取消）
 //   其余          → 普通流式回复；已回填 tool 消息 → 返回最终回答
 // 注意：工具剧本必须**显式触发**（不能"带 tools 参数就吐工具调用"）——否则任何
-// 普通消息都会被卷进工具循环，慢流 / 纯流式冒烟全测不到（P16 真机踩过）。
+// 普通消息都会被卷进工具循环，慢流 / 纯流式冒烟全测不到（真机踩过）。
 // 另：子代理剧本必须带 !hasToolMsg 守卫——子代理那轮的 user 消息里也含「子代理」字样，
-// 不加守卫会让子代理再派子代理（P22-C v1 禁嵌套，真机上就演变成递归刷额度）。
+// 不加守卫会让子代理再派子代理（v1 禁嵌套，真机上就演变成递归刷额度）。
 import http from 'node:http';
 
 const PORT = 9399;
@@ -109,11 +109,11 @@ http
         const loopForever = /死循环/.test(lastText);
         // 慢循环：同死循环，但每步先等 1.5s——留出「运行中插话」的窗口（验证 steering）
         const slowLoop = /慢循环/.test(lastText);
-        // 多步剧本（P20）：「清洗」= read_file → write_file → 最终回答；
+        // 多步剧本：「清洗」= read_file → write_file → 最终回答；
         // 「浏览 <url>」= browser navigate → click → snapshot → 最终回答（按 example.com 语义点链接）
         const browseUrl = (lastText.match(/浏览\s*(\S+)/) || [])[1];
         const cleaning = /清洗/.test(lastText);
-        // P22-C 子代理剧本（必须 !hasToolMsg：子代理那轮的 user 消息也含「子代理」字样）
+        // 子代理剧本（必须 !hasToolMsg：子代理那轮的 user 消息也含「子代理」字样）
         const spawnTwo = hasToolsParam && !hasToolMsg && /派两个/.test(lastText);
         const spawnOne = hasToolsParam && !hasToolMsg && /派子代理/.test(lastText);
         // 重试失败剧本：前两轮发同一个必失败的 read_file（文件不存在），验证失败重试放行
@@ -127,7 +127,7 @@ http
             browseUrl ||
             cleaning ||
             (!hasToolMsg && /读|编辑|插件搜索/.test(lastText)));
-        // P23 降级剧本：「降级」= 请求带思考字段（thinking/enable_thinking/reasoning_effort/
+        // 降级剧本：「降级」= 请求带思考字段（thinking/enable_thinking/reasoning_effort/
         // chat_template_kwargs）就 400 拒收；剥参重试（不带思考字段）才 200——验证网关
         // 「400 → 剥参重试 → 登记渠道 → 下一轮人话提示」全链路
         if (/降级/.test(lastText)) {
@@ -167,7 +167,7 @@ http
             emitFinal('两次读取都失败了：访问超时/文件不存在，建议稍后重试或换个别的方式。（mock 重试失败剧本闭环）');
           }
         } else if (spawnTwo) {
-          // P22-C：一轮两个派发——验证并行组 + per_parent 上限排队（第二个等第一个完）。
+          // 一轮两个派发——验证并行组 + per_parent 上限排队（第二个等第一个完）。
           // 注意 emitToolCall 内部会 end 响应，两个调用必须都用「不收尾」的裸帧写。
           const calls = [
             { id: 'call-1', args: { task: '读 prompts/system.md', label: '子代理甲' } },
@@ -212,7 +212,7 @@ http
               // 动作后观察周期：再拿一次快照验证点击效果（对齐 browser-use 技能纪律）
               emitToolCall(res, 'browser', { method: 'snapshot' });
             } else if (toolMsgCount === 3) {
-              // 收尾：显式关掉浏览器进程（close_browser，P21 承 P20 的 browser_close）
+              // 收尾：显式关掉浏览器进程（close_browser，承既定约定）
               emitToolCall(res, 'browser', { method: 'close_browser' });
             } else {
               emitFinal('已按剧本完成浏览：打开页面、语义点击链接、复核快照并关闭浏览器。（mock 浏览循环闭环）');
@@ -228,7 +228,7 @@ http
               emitFinal('已清洗 data.csv 并写出 clean.csv（去空行、去重复行）。（mock 清洗循环闭环）');
             }
           } else if (!loopForever && /插件搜索/.test(lastText)) {
-            // 插件工具剧本（P19）：调用目录形态工具插件 wasm__web_search__search，
+            // 插件工具剧本：调用目录形态工具插件 wasm__web_search__search，
             // 验证 模型 → 审批门（wasm 工具风险研判）→ WASM 引擎 → 结果回填 全链路
             emitToolCall(res, 'wasm__web_search__search', { query: '插件契约 v1' });
           } else if (!loopForever && /编辑/.test(lastText)) {
@@ -244,7 +244,7 @@ http
             // 慢循环额外做两件事：每步等 1.5s（留插话窗口）、交替两个路径——
             // 路径写死会让核心循环的「重复工具调用」检测提前终止，跑不满步数。
             // 交替基准用**本请求内**的 tool 消息数（原来是全局计数器，父子多个请求
-            // 互相踩会错拍——P22-C 真机踩过，子代理被误判重复调用终止）。
+            // 互相踩会错拍—— 真机踩过，子代理被误判重复调用终止）。
             const pathMatch = lastText.match(/读\s*([^\s，。]+)/);
             const path = pathMatch ? pathMatch[1] : 'prompts/system.md';
             // 交替目标必须与 path 不同：路径本身就是它时，连续两轮仍会撞重复调用检测
@@ -283,7 +283,7 @@ http
         }
       });
     } else if (req.method === 'POST' && req.url.includes('/messages')) {
-      // P23 Anthropic Messages 协议 mock：请求按 Messages 形状解析（system 顶层 / content 块 /
+      // Anthropic Messages 协议 mock：请求按 Messages 形状解析（system 顶层 / content 块 /
       // tool_use·tool_result / input_schema），响应按官方 SSE 事件流吐出
       // （message_start → thinking/text/tool_use 块 → message_delta → message_stop）。
       // 最终回答带「翻译回声」：收到的 tool_result 数量与内容、system 长度——

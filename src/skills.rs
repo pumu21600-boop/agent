@@ -2,7 +2,7 @@
 //! 目录：`<workspace>/skills/`（项目级）与 `~/.agent/skills/`（全局），每个技能一个文件夹，内含 SKILL.md。
 //! SKILL.md 支持 `---` 围栏 frontmatter，字段 name / description；缺省 name 用文件夹名。
 //! 注入策略：system 提示只注入「名字 + 一句话描述」的索引，模型按需用 read_skill 工具拉全文。
-//! P25 加固（对齐 ZCode skills 扫描）：①符号链接三级拒绝（技能目录 / SKILL.md / references 内文件）——
+//! 加固：①符号链接三级拒绝（技能目录 / SKILL.md / references 内文件）——
 //! 链接是文件级逃逸面（SKILL.md → 外部任意文件），拒绝即无逃逸，不判定指向何处；
 //! ②references/ 渐进披露——大技能的参考文档不放全文，索引里报篇数，模型按需 read_skill(name, ref) 拉单篇。
 
@@ -18,7 +18,7 @@ pub struct Skill {
     pub source: String,
     pub dir: String,
     pub content: String,
-    /// P25：references/ 下的参考文件名（渐进披露；read_skill 带 ref 参数按需拉全文）
+    /// references/ 下的参考文件名（渐进披露；read_skill 带 ref 参数按需拉全文）
     pub refs: Vec<String>,
     /// 生态轮：贡献这个技能的插件名（非插件技能为空串）
     pub plugin: String,
@@ -262,7 +262,7 @@ pub fn read_for_agent(name: &str) -> Result<String, String> {
     })
 }
 
-/// P25：读技能的单篇参考资料（references/<ref>）。ref 名同样过 valid_name，
+/// 读技能的单篇参考资料（references/<ref>）。ref 名同样过 valid_name，
 /// 落点文件是链接一律拒（逃逸防护与 SKILL.md 同级）。
 pub fn read_ref(name: &str, ref_name: &str) -> Result<String, String> {
     valid_name(name)?;
@@ -483,7 +483,7 @@ pub fn index_prompt() -> String {
         } else {
             &sk.description
         };
-        // P25：references 渐进披露——索引只报篇数，模型按需 read_skill(name, ref) 拉单篇
+        // references 渐进披露——索引只报篇数，模型按需 read_skill(name, ref) 拉单篇
         let refs_hint = if sk.refs.is_empty() {
             String::new()
         } else {
@@ -602,7 +602,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(global.join("zz-typo-folder"));
     }
 
-    /// P25：references 渐进披露——list 报篇数、read_ref 按名读单篇、穿越名被拒。
+    /// references 渐进披露——list 报篇数、read_ref 按名读单篇、穿越名被拒。
     #[test]
     fn refs_listing_and_read_ref() {
         let name = "zz-test-skill-ref";
@@ -622,7 +622,7 @@ mod tests {
         delete(name).expect("清理失败");
     }
 
-    /// P25：链接类入口逃逸防护——用 junction（普通权限可建）指向外部带 SKILL.md 的目录，
+    /// 链接类入口逃逸防护——用 junction（普通权限可建）指向外部带 SKILL.md 的目录，
     /// 必须整体拒载。顺带覆盖符号链接（无权限造时 junction 这条也够证明 reparse 判定生效）。
     #[test]
     fn linked_skill_dir_rejected() {

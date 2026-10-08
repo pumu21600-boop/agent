@@ -1,4 +1,4 @@
-//! 取消模型 —— 施工单 001 / 任务 C；P16-D2 会话化；P16-N1 同会话并发拒登
+//! 取消模型 —— 施工单 001 / 任务 C；会话化；同会话并发拒登
 //!
 //! 一个在跑的任务 = 一个 [CancelFlag]（原子位，置位即停；网关与核心循环每个决策点查它）。
 //! [CancelRegistry] 把这些标志按 `session_id` 登记：每轮任务开始 `try_begin()` 注册（标志
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Default)]
 pub struct CancelFlag {
     flag: AtomicBool,
-    /// P26：异步等待用——工具执行（如卡在浏览器 CDP 调用里）只靠轮询 is_set
+    /// 异步等待用——工具执行（如卡在浏览器 CDP 调用里）只靠轮询 is_set
     /// 要等工具自己超时（用户点「结束回答」后新消息会白等几十秒进队列）。
     /// set() 时唤醒所有等待者，agent 循环用 select! 当场中断工具执行。
     notify: tokio::sync::Notify,

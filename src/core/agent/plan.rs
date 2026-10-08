@@ -1,6 +1,6 @@
 use super::*;
 
-/// P9 B3：从模型回复解析 ```plan 围栏块（施工单 013 B3：计划产物结构化）。
+/// B3：从模型回复解析 ```plan 围栏块（施工单 013 B3：计划产物结构化）。
 /// 行前缀容错匹配（中英文冒号、markdown 加粗/列表符都剥），小节顺序 目标→步骤→文件。
 /// 解析结果全空（无任何有效字段）返回 None。
 pub fn parse_plan(text: &str) -> Option<Plan> {
@@ -56,7 +56,7 @@ pub fn parse_plan(text: &str) -> Option<Plan> {
     }
 }
 
-/// P12 018：同轮 write_file 同路径写冲突检测——返回应跳过的索引集合。
+/// 018：同轮 write_file 同路径写冲突检测——返回应跳过的索引集合。
 /// 输入 (工具名, arguments JSON)；仅认 write_file；路径小写 + 反斜杠归一后判重。
 pub(crate) fn write_conflict_skips(calls: &[(String, String)]) -> std::collections::HashSet<usize> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

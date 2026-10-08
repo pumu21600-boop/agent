@@ -99,7 +99,7 @@
 | `src/gateway/mod.rs` | 1. 在 `Gateway::complete` 中增加对返回 JSON 中 `error` 字段的显式解析，彻底堵住反代以 `200 OK` 返回业务错误导致的误判漏洞。 |
 | `src/config/settings.rs` | 1. 在 `ModelCapabilities::infer_from_model_id` 中为 `mimo` 模型系列补充 `video: true` 与 `audio: true`，标定原生全模态支持。 |
 | `src/session/mod.rs` | 1. 在 `first_user_title` 提取首条消息生成标题时，剥离前置的 `[Image understanding...]` / `[Audio understanding...]` / `[... omitted ...]` 等标签，避免侧栏标题污染。 |
-| `src/core/rules.rs` | 1. 新增细粒度工具调用审批规则引擎（P9 规划）；<br>2. 区分只读安全（Safe=0）、常规操作（Normal=1）与高危破坏/系统命令（Dangerous=2）。 |
+| `src/core/rules.rs` | 1. 新增细粒度工具调用审批规则引擎（规划）；<br>2. 区分只读安全（Safe=0）、常规操作（Normal=1）与高危破坏/系统命令（Dangerous=2）。|
 | `src/core/agent.rs` | 1. 接入 `evaluate_risk`，针对不同风险等级执行智能审批，高危命令携带原因与风险等级上报前端。 |
 | `src/core/mod.rs` | 1. 导出 `rules` 模块。 |
 | `web/src/App.svelte` | 1. 增加剪贴板 `paste`、文件 `drop` 及 `fileInput` 📎 按钮选取；<br>2. 待发送区域展示附件卡片（名称、大小缩略、移除按钮）；<br>3. 消息气泡内渲染图片（带大图模态框）、原生 `<audio>` 与 `<video>` 控件；<br>4. 设置中增加音频、视频专职角色绑定；<br>5. 前端能力推导补充 `mimo` 的全模态支持。 |

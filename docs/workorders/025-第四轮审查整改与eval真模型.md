@@ -1,0 +1,64 @@
+# 施工单 025 —— 第四轮审查整改 + eval 接真模型（用户直派，2026-09-18）
+
+## 起因
+
+用户拿来第四份外部模型审查报告（`agent-copy_第四轮审查报告_20260918.md`，增量复审 024），
+并给了一条真模型渠道（`https://apihub.agnes-ai.com/v1`，模型 `agnes-3.0-flash`）让「接真模型」。
+报告复核：第三轮 N1–N4 全部闭环（含入库打 tag、工作区干净）；新发现两项，均由本轮的
+「并发多会话」能力伴生：
+
+| 编号 | 报告内容 | 处理 |
+|---|---|---|
+| **M1** | 审批档位跨会话共享：`state.approval_mode` 是全局 `RwLock`，每个 `/chat` 覆写它；两个会话带**不同档位**并行时会互相覆盖，后到者生效（安全语义被削弱） | **本轮修复**（按会话存） |
+| **M2** | steering 轮次交界竞态：排队消息若落在「收尾 drain 之后、取消守卫注销之前」的窗口，要等下一次活动才被处理 | **本轮修复**（收尾改序 + 入队复查接管） |
+| M3 | 未做 backlog（MCP resources/prompts、组件总线 v1、eval 接真模型、E1 拆分、桌面壳） | eval 接真模型**本轮完成**，其余维持留口 |
+
+## 交付
+
+### A. 审批档位会话化（M1）
+
+- `AppState` 新增 `session_approval: RwLock<HashMap<session_id, mode>>`：`/chat` 把请求档位写进
+  **本会话**（不再写全局），`/api/approval-mode` 带 `session` 时只改该会话、不带时改全局默认档。
+- `ChatGate::effective_mode()`：本会话显式切过档就用本会话的，否则回落全局默认；判定与
+  `sandbox_enabled` 都现读——「侧栏切档对**本会话**进行中的请求即时生效」的原语义保留，
+  但不再波及别的会话。前端 `pickApproval` 带上 `currentSessionId`。
+- 单测 `approval_mode_is_per_session`：A 会话切完全访问不影响 B；全局默认变更只影响没切过档的会话。
+
+### B. steering 收尾窗口收口（M2）
+
+原顺序是「先 drain 再看要不要续跑，守卫在任务结束时才注销」——消息若在 drain 之后、注销之前
+到达，就会排队等下一次活动。两处改动把窗口关掉：
+
+- **收尾改序**：先 `drop(run)`（注销占位）**再** drain。注销之后到达的消息会走正常路径自己起
+  一轮（不再进队列）；drain 到还有排队消息则**重新抢占位**续跑一轮，抢不到就放回队列
+  （在跑的那一轮收尾必取走）。取消路径同样先注销再清队列（停止语义 = 这一轮和没轮上的都作废）。
+- **入队复查**：入队后立刻再试一次占位——抢到说明上一轮确实刚结束（收尾 drain 已跑过），
+  本次请求直接把队列里的消息跑掉（历史取会话快照 + 队列消息，JSONL `chat.takeover`），
+  不再让消息悬空等待。
+- 两条合起来的时序分析：任一消息要么被在跑那一轮的收尾 drain 取走，要么被入队方的复查接管，
+  要么（占位已释放时）自己走正常路径起一轮——不存在「进了队列没人取」。
+
+### C. eval 接真模型（M3 的其中一项，用户给渠道）
+
+- `eval_core` 驱动补**自动批准**：收到 `approval_request` 即 POST `/api/approvals` 批准
+  （审批门本身另有单测与真机矩阵覆盖；不自动批的话 auto 档下每个 shell 调用都等人点、
+  120 秒到点即拒，评测必然超时），并累计 `auto_approved` 次数。
+- 隔离实例（临时目录 + 独立端口，不碰用户常驻服务与 settings）配真渠道
+  `apihub.agnes-ai.com/v1` + `agnes-3.0-flash`，key 走 `DEEPSEEK_API_KEY` 环境变量（B2 回落链），
+  先冒烟（一问一答正常）再跑全套。
+- **结果：11 个任务 47/47 断言全过、0 驱动失败**（delete-file 10.9s / edit-existing-file 23.6s /
+  fix-code-bug 4.5s / fix-json 8.4s / hello-file 5.9s / multi-file-scaffold 6.3s /
+  plan-approve-execute 22.2s（含第二轮 followup）/ plan-mode-write-guard 7.6s / read-only-plan 9.6s /
+  run-tests-and-report 2.8s / search-and-report 3.2s）。跑完自动恢复原工作区。
+
+## 验证
+
+- `cargo test`：155 过 + 1 ignored（+1：审批档会话隔离），eval 5 过。
+- `cargo clippy --all-targets -- -D warnings`：零告警。
+- 真模型 eval：见上（47/47）。
+
+## 遗留（与报告 M3 一致）
+
+- MCP `resources` / `prompts`（仍只 tools）；组件总线 v1（写操作 / 宿主 UI 注入点）
+- E1 `tools/mod.rs` 拆分（纯机械，无行为收益）；Tauri 桌面壳（web 定稿后启用）
+- 跨平台 / 多用户多代理 / 真 tokenizer：与定位相悖，不做

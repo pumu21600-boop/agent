@@ -1,4 +1,4 @@
-//! 第三方插件来源验签（施工单 030，P21 红线 3）—— **pin digest 模型**。
+//! 第三方插件来源验签 —— **pin digest 模型**。
 //!
 //! 诉求（ROADMAP 红线 3）：第三方插件要能验明来源再跑。真实密码学签名体系（CA / 私钥
 //! 分发 / 吊销列表）工程面远超「窄而刚」单阶段容量，且 manifest 里自称的签名字串在无密钥
@@ -24,11 +24,11 @@ use sha2::{Digest, Sha256};
 use crate::observability::{try_event, EventType};
 
 /// digest 计算域前缀（换算法必须换前缀，历史 pin 全部失效重pin——与坑 15 同规）。
-const DOMAIN: &[u8] = b"zcode-plugin-digest-v1\n";
+const DOMAIN: &[u8] = b"agent-plugin-digest-v1\n";
 /// 目录递归深度上限（防病态目录树；插件不该有深层嵌套）。
 const MAX_DEPTH: usize = 6;
 
-/// pin 键：`plugins:<name>`（P28 目录合并后唯一 kind；旧 `ui-ext:<name>` 键由
+/// pin 键：`plugins:<name>`（目录合并后唯一 kind；旧 `ui-ext:<name>` 键由
 /// settings 迁移改写，这里不再认第二种）。
 pub fn key_of(kind: &str, name: &str) -> String {
     format!("{kind}:{name}")
@@ -145,7 +145,7 @@ pub fn reject_reason(state: &TrustState) -> String {
     }
 }
 
-/// pin 键 → 插件位置（P28 合并后单一 kind：目录形态工作区优先，裸 .wat/.wasm 旧形态兜底）。
+/// pin 键 → 插件位置（合并后单一 kind：目录形态工作区优先，裸 .wat/.wasm 旧形态兜底）。
 pub fn resolve(key: &str) -> Option<PathBuf> {
     let (kind, name) = key.split_once(':')?;
     if kind != crate::plugin::ui::DIR || name.is_empty() || name.contains(['/', '\\', ':']) {
@@ -188,7 +188,7 @@ pub fn pin_from_manifest_paths(paths: &[String]) -> Vec<(String, String)> {
             continue;
         }
         let Some(dir) = path.parent() else { continue };
-        // P28 目录合并：plugins/<name>/manifest.json → 唯一 kind=plugins
+        // 目录合并：plugins/<name>/manifest.json → 唯一 kind=plugins
         let Some(name) = dir.file_name().and_then(|s| s.to_str()) else { continue };
         if let Ok(d) = digest_dir(dir) {
             out.push((key_of("plugins", name), d));
@@ -279,13 +279,13 @@ mod tests {
     #[test]
     fn pin_from_manifest_paths_single_kind() {
         let root = tmp("promote");
-        // P28 合并后一个形态：plugins/<name>/manifest.json → 唯一 kind=plugins
+        // 合并后一个形态：plugins/<name>/manifest.json → 唯一 kind=plugins
         let dir = root.join("plugins").join("calc");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("manifest.json"), "{}").unwrap();
         std::fs::write(dir.join("calc.wat"), "(module)").unwrap();
         let pins = pin_from_manifest_paths(&[dir.join("manifest.json").display().to_string()]);
-        assert_eq!(pins.len(), 1, "P28 起单一 kind，不再双表");
+        assert_eq!(pins.len(), 1, "单一 kind，不再双表");
         assert_eq!(pins[0].0, "plugins:calc");
         assert!(!pins[0].1.is_empty(), "digest 必须非空（空 digest 无法验签）");
         // 裸文件路径不产 pin（只认 manifest.json）

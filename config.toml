@@ -12,21 +12,21 @@ base_url = "https://api.deepseek.com"
 model = "deepseek-chat"
 # 换渠道示例（形如 OpenAI 兼容的 /chat/completions 前缀）：
 # base_url = "https://<渠道域名>/v1"
-# P8 本地限流：每分钟最多发起多少次模型请求；0=不限。超出时请求排队等待（不报错）
+# 本地限流：每分钟最多发起多少次模型请求；0=不限。超出时请求排队等待（不报错）
 max_rpm = 0
-# P8 降级链：主渠道当轮调用失败时按序切换的配置（写 settings 里的配置名，逗号分隔多个）
+# 降级链：主渠道当轮调用失败时按序切换的配置（写 settings 里的配置名，逗号分隔多个）
 # fallback_configs = ["配置 2", "商汤主力"]
 
-# P8 角色映射：辅助功能用专用渠道（写 settings 里的配置名或配置 id）；
+# 角色映射：辅助功能用专用渠道（写 settings 里的配置名或配置 id）；
 # 未配置的角色回落主渠道。EMBEDDING 不走主渠道兜底——未配置时记忆库用本地哈希向量。
 [roles]
 # summary = "配置 2"   # 滚动摘要专用渠道
 # title = "配置 2"     # 会话标题生成专用渠道
 # embedding = "配置 2" # 向量嵌入专用渠道（须支持 OpenAI 兼容 /embeddings）
-# budget = "配置 2"    # P21 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
-# subagent = "配置 2"  # P22-C 子代理专用渠道（未配 = 回落主渠道；主会话旗舰、子代理跑量用便宜模型）
+# budget = "配置 2"    #  降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+# subagent = "配置 2"  #  子代理专用渠道（未配 = 回落主渠道；主会话旗舰、子代理跑量用便宜模型）
 
-# P22-C 子代理并行度（docs/subagent-draft.md 第 1 节）
+# 子代理并行度（docs/subagent-draft.md 第 1 节）
 [subagent]
 # 全局并发子代理上限（0 = 不允许派发子代理）
 max_concurrent = 3
@@ -34,7 +34,7 @@ max_concurrent = 3
 per_parent = 2
 
 [cost]
-# P21 成本台账红线：全局花费上限（美元，硬闸）。台账累计花费达到即拒绝新的模型请求
+# 成本台账红线：全局花费上限（美元，硬闸）。台账累计花费达到即拒绝新的模型请求
 # （主对话与摘要/标题等辅助调用同一道闸），调高上限即恢复；0 = 不限（默认）。
 # 单价表在同级 prices.json（美元 / 1M tokens，带生效时间；缺省全部记录未计价）。
 spend_cap_usd = 0.0
@@ -53,7 +53,7 @@ keep_archives = 3
 # 上限只防死循环，而防死循环有取消/重复调用保护/花费硬闸三道缰绳，不该由步数砍任务）
 max_steps = 0
 tool_result_max_chars = 8000
-# 审批默认档（P19 四档，前端可即时切换）：read-only / sandbox / auto / full-access
+# 审批默认档（四档，前端可即时切换）：read-only / sandbox / auto / full-access
 # 只读=写/执行逐次询问 · 沙箱=只在沙箱执行，工作区与电脑都不改 ·
 # 自动=可动工作区与整台电脑（越界写按高危先问） · 完全访问=全免审 + 本机直跑（需 allow_unsandboxed）
 default_approval = "auto"
@@ -61,25 +61,25 @@ default_approval = "auto"
 allow_unsandboxed = true
 # 完全访问档下，执行类命令是否仍要审批（false=连审批一起跳过，Codex Full Access 等价）
 unsandboxed_approval = false
-# P12 019：沙箱隔离模式与网络出向见下方 [sandbox] 节
+# 019：沙箱隔离模式与网络出向见下方 [sandbox] 节
 
 [sandbox]
-# P12 019：隔离模式（实验特性）："restricted"（默认，受限 token 权限笼）| "appcontainer"（LowBox + 能力 SID）
+# 019：隔离模式（实验特性）："restricted"（默认，受限 token 权限笼）| "appcontainer"（LowBox + 能力 SID）
 # appcontainer 模式：默认断网（无 INTERNET_CLIENT 能力）；工作区目录自动授 ACE；异常时切回 restricted 即可
 # mode = "restricted"  # 切 appcontainer：mode = "appcontainer"（实验特性，真机验证 cmd/git 可用、默认断网）
 # allow_network = false
 
 [context]
-# P5 上下文预算：全 messages 超过此 token 估算值才触发裁剪
+# 上下文预算：全 messages 超过此 token 估算值才触发裁剪
 budget_tokens = 96000
 recent_tool_results_kept = 6
 
 [recovery]
-# P6 恢复与续命：danger≥1 工具执行前拍影子仓库检查点（<workspace>/.agent/shadow）
+# 恢复与续命：danger≥1 工具执行前拍影子仓库检查点（<workspace>/.agent/shadow）
 checkpoint_enabled = true
 
 [memory]
-# P7 记忆 v1：总开关（false 时 events.log/index/AGENTS.md 注入/滚动摘要全停）
+# 记忆 v1：总开关（false 时 events.log/index/AGENTS.md 注入/滚动摘要全停）
 enabled = true
 # 敏感落盘：false（默认）时 events.log 里的 sk-/Bearer/api_key 打码后才写
 persist_sensitive = false

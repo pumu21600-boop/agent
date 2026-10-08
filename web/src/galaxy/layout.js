@@ -58,7 +58,7 @@ export function buildScene(items, opts = {}) {
     if (i > 0) {
       // 半径按"前一个团的体量"递推，但至少按 sqrt(i) 外扩——避免一堆 1 条的
       // 小项目被线性累加推到很远，整片星云散成孤岛。
-      // P14 十轮收紧：之前 1.5/130/460 的间距把场景撑得太空旷（用户："空间太大"）
+      // 十轮收紧：之前 1.5/130/460 的间距把场景撑得太空旷（用户："空间太大"）
       acc = Math.max(acc + prevSigma * 1.15 + 90, 330 * Math.sqrt(i));
       const ang = i * 2.399963229728653;
       x = Math.cos(ang) * acc;

@@ -1,11 +1,11 @@
 use super::*;
 
-/// 计量上下文（P21 用量台账）：一次模型调用的归属信息。
+/// 计量上下文（用量台账）：一次模型调用的归属信息。
 /// provider / model 由 channel 推导（host + 预设 id），调用方只报「谁、干什么用」。
 #[derive(Debug, Clone)]
 pub struct UsageCtx {
     pub session_id: String,
-    /// P22 子代理花销记父任务：子会话填父任务 id；主会话为 None
+    /// 子代理花销记父任务：子会话填父任务 id；主会话为 None
     pub parent_session: Option<String>,
     /// 用途：main（主循环）| summary（滚动摘要）| title（标题）| media（媒体旁路）
     pub purpose: &'static str,

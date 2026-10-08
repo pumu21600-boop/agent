@@ -1,6 +1,6 @@
 // Classic 4D Perlin noise "cnoise" - Stefan Gustavson / Ashima Arts (MIT license)
 // https://github.com/ashima/webgl-noise
-// Used by the P14 nebula bake; same noise lib as wwwtyro/space-3d (Unlicense).
+// Used by the  nebula bake; same noise lib as wwwtyro/space-3d (Unlicense).
 export const CNOISE_4D = String.raw`vec4 mod289(vec4 x)
 {
   return x - floor(x * (1.0 / 289.0)) * 289.0;

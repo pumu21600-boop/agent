@@ -1,4 +1,4 @@
-//! MCP client（施工单 016/021，P11/P15）—— stdio 与 streamable HTTP 双 transport
+//! MCP client（施工单 016/021，/）—— stdio 与 streamable HTTP 双 transport
 //!
 //! 总架构 §7：MCP 借生态省自研；进程级隔离天然防崩；tool poisoning 用
 //! 「首装确认 + 同级审批」对冲（确认前一律 Dangerous）。
@@ -18,7 +18,7 @@
 //! 显式 kill；服务被硬杀/崩溃时 Job 句柄随进程消失，node 进程树整树团灭不留孤儿。
 //! 崩溃只标记离线，绝不拖垮主服务。
 //!
-//! 独立国（P28 分家）：MCP 自己的配置（settings.json `mcp_servers`）、自己的 OAuth
+//! 独立国（分家）：MCP 自己的配置（settings.json `mcp_servers`）、自己的 OAuth
 //! （`oauth` 子模块 + `mcp_tokens.json`）、自己的 `mcp__` 工具前缀——与「插件」
 //! （`crate::plugin`）互不隶属，唯一过境点是共享的工具总线类型 `crate::plugin::ToolBrief`。
 
@@ -47,7 +47,7 @@ fn is_http(cfg: &McpServerCfg) -> bool {
     cfg.transport.eq_ignore_ascii_case("http")
 }
 
-/// P25：SSE transport（MCP 2024-11-05 的 HTTP+SSE transport）。
+/// SSE transport（MCP 2024-11-05 的 HTTP+SSE transport）。
 fn is_sse(cfg: &McpServerCfg) -> bool {
     cfg.transport.eq_ignore_ascii_case("sse")
 }
@@ -60,7 +60,7 @@ struct HttpState {
     session_id: Option<String>,
 }
 
-/// SSE transport 运行态（P25；MCP 2024-11-05 的 HTTP+SSE transport）：
+/// SSE transport 运行态（MCP 2024-11-05 的 HTTP+SSE transport）：
 /// GET 一条长连接收 server→client 的 message 事件，client→server 走 endpoint 事件
 /// 给出的 POST URL。reader 线程把 message 帧推进 rx；主侧按 id 配对。
 #[derive(Debug)]
@@ -91,7 +91,7 @@ struct ServerState {
     reader: Option<BufReader<ChildStdout>>,
     /// HTTP transport 态（Some 即代表该 server 走 http）
     http: Option<HttpState>,
-    /// SSE transport 态（P25；Some 即代表该 server 走 sse）
+    /// SSE transport 态（Some 即代表该 server 走 sse）
     sse: Option<SseState>,
     next_id: u64,
 }
@@ -108,7 +108,7 @@ impl ServerState {
         self.stdin = None;
         self.reader = None;
         self.http = None;
-        self.sse = None; // P25：丢 rx → reader 线程下一次 send 失败即自行退出
+        self.sse = None; // 丢 rx → reader 线程下一次 send 失败即自行退出
         self.online = false;
     }
 }
@@ -323,7 +323,7 @@ fn spawn_stdio(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
     }
     let mut cmd = Command::new(&cfg.command);
     cmd.args(&cfg.args)
-        // 密钥不进子进程（与 P3 沙箱同一红线）：MCP server 不继承主服务环境，
+        // 密钥不进子进程（与沙箱同一红线）：MCP server 不继承主服务环境，
         // 白名单重建 + 用户在 server 配置里显式填的 env 才注入。
         .env_clear()
         .envs(sanitize_env(&cfg.env))
@@ -401,7 +401,7 @@ fn rpc_round(
     }
 }
 
-/// SSE transport（P25）：GET 长连接 + reader 线程。
+/// SSE transport：GET 长连接 + reader 线程。
 /// 首事件 `endpoint` 给出 client→server 的 POST URL（可能相对路径，按 base origin 补全）；
 /// 之后 `message` 事件的 data 即 JSON-RPC 帧，推进 rx 由 sse_round 按 id 配对。
 fn spawn_sse(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
@@ -473,7 +473,7 @@ fn spawn_sse(st: &mut ServerState, cfg: &McpServerCfg) -> Result<(), String> {
     Ok(())
 }
 
-/// OAuth Bearer 值（P24）：配置了 oauth 且有 token 返回 Some；无 token 返回人话 Err。
+/// OAuth Bearer 值：配置了 oauth 且有 token 返回 Some；无 token 返回人话 Err。
 /// http / sse 两种 transport 共用。
 fn oauth_bearer(cfg: &McpServerCfg, url: &str) -> Result<Option<String>, String> {
     let Some(oauth) = &cfg.oauth else { return Ok(None) };
@@ -593,7 +593,7 @@ fn http_round(
     for (k, v) in &cfg.headers {
         rb = rb.header(k.as_str(), v.as_str());
     }
-    // P24 OAuth：配置了 oauth 的远端服务，Bearer 从 token 存取取（近过期自动刷新）
+    // OAuth：配置了 oauth 的远端服务，Bearer 从 token 存取取（近过期自动刷新）
     if let Some(token) = oauth_bearer(&cfg, &url)? {
         rb = rb.header("Authorization", format!("Bearer {token}"));
     }
@@ -616,7 +616,7 @@ fn http_round(
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
         let snip: String = body.chars().take(300).collect();
-        // P24：OAuth 服务吃 401/403——token 过期/被撤销，人话指路重新授权
+        // OAuth 服务吃 401/403——token 过期/被撤销，人话指路重新授权
         if matches!(status.as_u16(), 401 | 403) && cfg.oauth.is_some() {
             return Err(offline(
                 st,
@@ -1274,7 +1274,7 @@ data: \"result\":{\"n\":7}}";
         assert_eq!(init_sid.as_deref(), Some("-"), "首个请求不该自带会话头");
     }
 
-    /// resources / prompts（P17）：握手发现能力 → 合成工具可调用 → 清单进 catalogs（UI 展示）。
+    /// resources / prompts：握手发现能力 → 合成工具可调用 → 清单进 catalogs（UI 展示）。
     #[test]
     fn http_resources_and_prompts_end_to_end() {
         let _guard = test_lock();
@@ -1375,7 +1375,7 @@ data: \"result\":{\"n\":7}}";
         assert!(prompt.contains("[user] 请评审：{{path}}"), "{prompt}");
     }
 
-    /// P25：SSE transport 全握手——GET 长连接收 message 帧、POST 走 endpoint 事件给的地址。
+    /// SSE transport 全握手——GET 长连接收 message 帧、POST 走 endpoint 事件给的地址。
     /// mock：首连接 GET 回 endpoint 事件；随后每个 POST 202，并把对应响应帧写进 SSE 流。
     #[test]
     fn sse_transport_handshake_and_tools() {

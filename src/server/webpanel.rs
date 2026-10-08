@@ -1,4 +1,4 @@
-//! 网页面板后端（P20.1）——右侧「网页」面板：多标签管理 + 截图渲染 + 坐标回传。
+//! 网页面板后端——右侧「网页」面板：多标签管理 + 截图渲染 + 坐标回传。
 //!
 //! 与 agent 的 browser_* 工具共享同一无头浏览器（多标签互不干扰）；面板不走审批门
 //! （用户亲自操作，非模型调用），但照受全局来源校验中间件保护（仅本机回环可访问）。
@@ -77,7 +77,7 @@ pub struct ScreenshotQuery {
     pub native: Option<bool>,
 }
 
-/// GET /api/browser/frame?id= —— 面板帧（P21）：screencast 最新 JPEG，内存直出零 CDP
+/// GET /api/browser/frame?id= —— 面板帧：screencast 最新 JPEG，内存直出零 CDP
 /// 往返；无帧时后端回落 captureScreenshot（PNG）。前端 <img> 轮询源。
 /// `native=0`（壳外浏览器客户端）只拿帧，不因此显示壳里的 webview。
 pub(super) async fn browser_frame(headers: HeaderMap, Query(q): Query<ScreenshotQuery>) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
@@ -177,7 +177,7 @@ pub(super) async fn browser_reload(Json(req): Json<Value>) -> Result<Json<Value>
 }
 
 /// POST /api/browser/viewport —— 设置标签页视口（截图尺寸跟随面板大小）。
-/// x/y = 面板内容区在壳窗口里的左上角（P22 shell 模式把 child webview 摆过去）。
+/// x/y = 面板内容区在壳窗口里的左上角（shell 模式把 child webview 摆过去）。
 /// `native`：只有壳里那个客户端量的 x/y 是壳窗口坐标，才能挪壳里的 webview；壳外
 /// 浏览器直开 5173 的第二个客户端传 false（它的矩形只用于自己的截图尺寸）。
 pub(super) async fn browser_viewport(headers: HeaderMap, Json(req): Json<Value>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

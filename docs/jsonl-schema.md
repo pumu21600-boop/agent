@@ -5,7 +5,7 @@
 - 默认：`logs/agent.jsonl`（相对工程根目录）
 - 可通过 `config.toml` 的 `[logging]` 节改 `dir` / `file` / `max_mb` / `keep_archives`
 - 追加写（append-only），进程每次启动生成新的 `session_id`
-- **轮转**（2026-09-14 补，P16 起多份归档）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成
+- **轮转**（2026-09-14 补，多份归档）：单文件超过 `[logging].max_mb`（默认 20MB）就归档成
   `agent.jsonl.1`（最新）再开新文件，旧归档依次倒位成 `.2`…`.N`，保留份数走 `[logging].keep_archives`
   （默认 3，0 = 归档即删）；启动时检查一次，运行中每 500 条复查一次，
   轮转本身记一条 `state / log.rotated`；`max_mb = 0` 关闭轮转
@@ -31,9 +31,9 @@
 
 | event_type | 含义 | 状态 |
 | --- | --- | --- |
-| `thought` | 模型思考 / 推理内容（完整段落） | 已使用（P2） |
-| `tool_call` | 工具调用 | 已使用（P2） |
-| `tool_result` | 工具结果 | 已使用（P2） |
+| `thought` | 模型思考 / 推理内容（完整段落）| 已使用 |
+| `tool_call` | 工具调用 | 已使用 |
+| `tool_result` | 工具结果 | 已使用 |
 | `model_chunk` | 模型流式分片 | 已使用 |
 | `state` | 状态快照（启动、网关请求/响应、循环、取消等） | 已使用 |
 | `error` | 错误 | 已使用 |
@@ -51,14 +51,14 @@
 }
 ```
 
-### 4.2 tool_call / tool_result —— 工具调用与结果（P2 核心循环）
+### 4.2 tool_call / tool_result —— 工具调用与结果（核心循环）
 
 ```json
 { "step": 0, "id": "call-1", "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }
 { "step": 0, "id": "call-1", "name": "read_file", "ok": true, "chars": 1234, "truncated": false, "preview": "前 300 字符…" }
 ```
 
-### 4.3 thought —— 完整思考段落（P2 起）
+### 4.3 thought —— 完整思考段落（起）
 
 ```json
 { "step": 0, "text": "该轮模型返回的完整 reasoning_content" }
@@ -75,57 +75,57 @@
 | `loop.finish` | 核心循环终止（模型给出纯文本） | `step`、`content_chars` |
 | `settings.updated` | 设置保存 | `provider_id`、`model` |
 | `cancel` | 取消事件 | `flag`（置位）、或 `phase`（`before_request`/`streaming`/`tool`/`loop`） |
-| `sandbox.spawn` | 沙箱/本机直跑拉起进程（P3/P4） | `pid`、`app`、`working_dir`、`restricted`（false=本机直跑）、`timeout_ms`、`memory_mb`、`active_processes` |
-| `sandbox.exit` | 沙箱进程树收割（P3） | `pid`、`exit_code`、`timed_out`、`stdout_chars`、`stderr_chars` |
-| `sandbox.selftest` | 沙箱探针套件结果（P3） | `ok` |
-| `sandbox.tier.resolved` | 档位探测链解析完成（P20） | `effective`、`ok`（探测链是否全绿） |
-| `sandbox.tier.fallback` | 请求档不可用自动回退（P20；仅 AppContainer→受限 一种） | `requested`、`effective`、`reason` |
+| `sandbox.spawn` | 沙箱/本机直跑拉起进程（/）| `pid`、`app`、`working_dir`、`restricted`（false=本机直跑）、`timeout_ms`、`memory_mb`、`active_processes` |
+| `sandbox.exit` | 沙箱进程树收割 | `pid`、`exit_code`、`timed_out`、`stdout_chars`、`stderr_chars` |
+| `sandbox.selftest` | 沙箱探针套件结果 | `ok` |
+| `sandbox.tier.resolved` | 档位探测链解析完成 | `effective`、`ok`（探测链是否全绿）|
+| `sandbox.tier.fallback` | 请求档不可用自动回退（仅 AppContainer→受限 一种）| `requested`、`effective`、`reason` |
 | `gateway.client_rebuild` | 网关 HTTP 客户端热重建（网络自愈） | `note` |
 | `settings.channel_changed` | 配置渠道地址变更，模型清单作废 | `base_url` |
-| `approval.requested` | 工具调用待审批（P4） | `id`、`tool` |
-| `approval.decided` | 审批决定（P4） | `id`、`approved` |
-| `context.compacted` | 上下文超预算触发裁剪（P5） | `step`、`archived_tools`、`folded_messages`、`tokens_before`、`tokens_after` |
-| `checkpoint.created` | 影子仓库检查点已提交（P6） | `id`、`ts`、`reason`（任务起点/工具名+参数头/任务结束快照） |
-| `checkpoint.restored` | 撤销：回退检查点之后 agent 改过的文件（P6） | `id` |
-| `checkpoint.skipped` | 检查点失败/停用，不阻断工具（P6） | `reason` |
-| `checkpoint.summary` | 任务改动统计条（P6.1） | `baseline`、`files`、`additions`、`deletions` |
-| `session.saved` | 会话消息落盘（P6，每步/终止时） | `session`（会话 id）、`messages`（条数） |
-| `session.cleared` | 删除单条会话（P6.1） | `session` |
-| `handoff.written` | 交接文档已生成（P6） | `path`、`trigger`（auto/manual）、`context_pct`（auto 时） |
-| `memory.summarized` | 滚动摘要已生成并注入（P7） | `step`、`chars` |
-| `memory.summary_skipped` | 摘要调用失败，降级保留占位符（P7） | `step`、`note` |
-| `model.truncated` | 模型输出被 max_tokens 截断（P7.6），SSE 已提示用户 | `step`、`max_output_tokens` |
-| `gateway.retry_429` | 渠道 429 退避重试中（P7.5） | `attempt`、`wait_ms` |
-| `task.start` | 任务开始（P10 trace 的任务切分锚点） | — |
+| `approval.requested` | 工具调用待审批 | `id`、`tool` |
+| `approval.decided` | 审批决定 | `id`、`approved` |
+| `context.compacted` | 上下文超预算触发裁剪 | `step`、`archived_tools`、`folded_messages`、`tokens_before`、`tokens_after` |
+| `checkpoint.created` | 影子仓库检查点已提交 | `id`、`ts`、`reason`（任务起点/工具名+参数头/任务结束快照）|
+| `checkpoint.restored` | 撤销：回退检查点之后 agent 改过的文件 | `id` |
+| `checkpoint.skipped` | 检查点失败/停用，不阻断工具 | `reason` |
+| `checkpoint.summary` | 任务改动统计条 | `baseline`、`files`、`additions`、`deletions` |
+| `session.saved` | 会话消息落盘（每步/终止时）| `session`（会话 id）、`messages`（条数）|
+| `session.cleared` | 删除单条会话 | `session` |
+| `handoff.written` | 交接文档已生成 | `path`、`trigger`（auto/manual）、`context_pct`（auto 时）|
+| `memory.summarized` | 滚动摘要已生成并注入 | `step`、`chars` |
+| `memory.summary_skipped` | 摘要调用失败，降级保留占位符 | `step`、`note` |
+| `model.truncated` | 模型输出被 max_tokens 截断，SSE 已提示用户 | `step`、`max_output_tokens` |
+| `gateway.retry_429` | 渠道 429 退避重试中 | `attempt`、`wait_ms` |
+| `task.start` | 任务开始（trace 的任务切分锚点）| — |
 | `gateway.error` | 渠道返回非 2xx | `status`、`body` |
-| `gateway.throttle` | 本地限流排队（P8 `max_rpm`） | `wait_ms` |
-| `gateway.fallback` | 降级链切换渠道（P8） | `step`、`from`、`to`、`base_url` |
-| `config.changed` | 配置新建/删除/切换（P8.5） | `action`（new/delete/apply）、`provider_id`、`model` |
-| `approval.mode` | 审批档位切换（P9，进行中请求即时生效） | `mode` |
-| `plan.mode` | 本轮任务处于 Plan 档（P9） | `mode`（plan）、`step` |
-| `plan.blocked` | Plan 档拦截非只读工具并回喂模型（P9） | `step`、`tool`、`reason` |
-| `plan.proposed` | 最终回答解析出结构化计划（P9） | `step`、`steps`、`files` |
-| `tools.parallel` | 同轮多个只读工具并行执行（P12） | `step`、`count` |
-| `write.conflict` | 同轮写同一路径，后者跳过并回喂（P12） | `step`、`tool`、`arguments` |
-| `sandbox.appcontainer.warn` | AppContainer 属性装配失败退化的提示（P12） | `message` |
-| `memory.agents_saved` | 约定文件保存（P10.5；scope=system/global/project） | `scope`、`path` |
-| `memory.reindex` | 记忆库强制重建向量（P14） | — |
-| `memory.search` | 记忆库检索（P14） | `query`、`hits`、`mode` |
-| `memory.similar` | 「相似会话」检索（P14） | `id`、`hits` |
+| `gateway.throttle` | 本地限流排队（`max_rpm`）| `wait_ms` |
+| `gateway.fallback` | 降级链切换渠道 | `step`、`from`、`to`、`base_url` |
+| `config.changed` | 配置新建/删除/切换 | `action`（new/delete/apply）、`provider_id`、`model` |
+| `approval.mode` | 审批档位切换（进行中请求即时生效）| `mode` |
+| `plan.mode` | 本轮任务处于 Plan 档 | `mode`（plan）、`step` |
+| `plan.blocked` | Plan 档拦截非只读工具并回喂模型 | `step`、`tool`、`reason` |
+| `plan.proposed` | 最终回答解析出结构化计划 | `step`、`steps`、`files` |
+| `tools.parallel` | 同轮多个只读工具并行执行 | `step`、`count` |
+| `write.conflict` | 同轮写同一路径，后者跳过并回喂 | `step`、`tool`、`arguments` |
+| `sandbox.appcontainer.warn` | AppContainer 属性装配失败退化的提示 | `message` |
+| `memory.agents_saved` | 约定文件保存（scope=system/global/project）| `scope`、`path` |
+| `memory.reindex` | 记忆库强制重建向量 | — |
+| `memory.search` | 记忆库检索 | `query`、`hits`、`mode` |
+| `memory.similar` | 「相似会话」检索 | `id`、`hits` |
 | `session.created` | 新建空会话立即落盘（09-14 补） | `session`、`workspace` |
 | `session.titled` | 会话标题自动生成 | `title` |
 | `workspace.switched` | 切换工作区 | `from`、`to` |
 | `workspace.removed` | 从项目列表移除工作区（不删目录） | `path` |
 | `workspace.aliased` | 项目重命名（空名=清除别名） | `path`、`name` |
-| `git.committed` | 界面手动提交（P10.5） | `id`、`files`、`manual` |
+| `git.committed` | 界面手动提交 | `id`、`files`、`manual` |
 | `attachments.gitignored` | 附件目录自动写入工作区 .gitignore | `path` |
 | `media.error` | 多模态理解调用失败（DSH 转接规范） | `modality`、`model`、`url`、`error` |
-| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补；P16 起多份倒位） | `bytes`、`limit_bytes`、`keep` |
+| `log.rotated` | 日志超限归档成 `<file>.1`（2026-09-14 补；多份倒位）| `bytes`、`limit_bytes`、`keep` |
 | `steer` | 「立即发送（引导）」的消息并入了正在跑的一轮（025/027）：核心循环每个决策点取一次；没赶上本轮、在收尾续跑一轮的记 `phase: "followup"` | `count`、`step`（并入时所在步）；续跑时 `phase`、`session` |
 | `chat.steered` | 同会话运行中再发消息 → 进队列（027） | `session`、`mode`（`queue`=排队等本轮结束 / `immediate`=立即并进本轮）、`pending`（积压条数） |
 | `chat.rejected` | 同会话运行中再发消息被拒（025：仅带附件的「立即发送」不支持） | `session`、`reason`（`session_busy_attachments`） |
 
-### 4.x P18 新增 kind（施工单 027，只增）
+### 4.x 新增 kind（施工单 027，只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -138,24 +138,24 @@
 | `hook.after_tool` | 工具执行后通知挂点已跑 | `ok` |
 | `hook.session_end` | 任务结束挂点已跑 | `session`、`ok` |
 | `hook.budget_exceeded` | 单任务累计 token 超预算通知 | `tokens`、`budget`（通知载荷） |
-| `browser.launch` | 内置浏览器已拉起（P20） | `exe`、`port`（CDP 调试端口） |
-| `browser.stale` | 浏览器会话失活（进程退出/连接断开），已清理待重拉（P20） | — |
-| `browser.navigate` | 页面导航（P20；P20.2 起经统一 browser 工具的 navigate 方法） | `url`、`tab` |
-| `browser.click` | 页面点击完成（P20） | `target`（语义定位描述）、`x`、`y`、`tab` |
-| `browser.type` | 页面输入完成（P20；P20.2 起 type/fill 均记 type） | `target`、`chars`、`tab` |
-| `browser.close` | 浏览器关闭（工具/空转/idle 收割，P20） | `reason`（tool/idle/dead） |
-| `browser.tab.new` | 新标签页（P20.1） | `id`、`agent`、`url` |
-| `browser.tab.close` | 关标签页（P20.1） | `id` |
-| `browser.tab.suspend` | 后台标签页挂起 frozen（P20.2 驻留） | `id` |
-| `browser.tab.restore` | 挂起标签页解冻恢复（P20.2） | `id` |
-| `browser.dialog` | 页面弹出 JS 弹窗（P20.2） | `id`、`type` |
-| `browser.tab.new` | 新开标签页（agent 工作页或面板「+」，P20.1） | `id`、`agent`、`url` |
-| `browser.tab.close` | 关闭标签页（P20.1） | `id` |
+| `browser.launch` | 内置浏览器已拉起 | `exe`、`port`（CDP 调试端口）|
+| `browser.stale` | 浏览器会话失活（进程退出/连接断开），已清理待重拉 | — |
+| `browser.navigate` | 页面导航（经统一 browser 工具的 navigate 方法）| `url`、`tab` |
+| `browser.click` | 页面点击完成 | `target`（语义定位描述）、`x`、`y`、`tab` |
+| `browser.type` | 页面输入完成（ type/fill 均记 type）| `target`、`chars`、`tab` |
+| `browser.close` | 浏览器关闭（工具/空转/idle 收割）| `reason`（tool/idle/dead）|
+| `browser.tab.new` | 新标签页 | `id`、`agent`、`url` |
+| `browser.tab.close` | 关标签页 | `id` |
+| `browser.tab.suspend` | 后台标签页挂起 frozen（驻留）| `id` |
+| `browser.tab.restore` | 挂起标签页解冻恢复 | `id` |
+| `browser.dialog` | 页面弹出 JS 弹窗 | `id`、`type` |
+| `browser.tab.new` | 新开标签页（agent 工作页或面板「+」）| `id`、`agent`、`url` |
+| `browser.tab.close` | 关闭标签页 | `id` |
 | `plugin.draft_submitted` | 模型自产插件进入 draft 隔离区 | `plugin`、`files`、`tools` |
 | `plugin.draft_promoted` | draft 一键转正落盘 | `plugin`、`paths` |
 | `plugin.draft_discarded` | draft 丢弃 | `plugin` |
 
-### 4.x P21 新增 kind（施工单 030，只增）
+### 4.x 新增 kind（施工单 030，只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -173,7 +173,7 @@
 > 台账本身**不是** JSONL 事件流：每次模型调用的完整计量（token 三路 / 状态 / 延迟 / 费用）
 > 落独立的 `<日志目录>/usage/ledger.jsonl`，字段见 README「用量台账与成本红线」。
 
-### 4.x P22 新增 kind（施工单 P22-A 无头会话 / P22-B 定时任务 / P22-C 子代理，只增）
+### 4.x 新增 kind（无头会话 / 定时任务 / 子代理，只增）
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
@@ -215,7 +215,7 @@
 - `state` 的 `kind` 只增不改名；新增 kind 必须同步更新本文件
 - 每行必须完整，验收可用 `tail -1` / 逐行 JSON 解析校验
 
-## 7. 项目记忆 events.log（P7，区别于本文件）
+## 7. 项目记忆 events.log（区别于本文件）
 
 `<workspace>/.agent/memory/events.log` 是**记忆层**事件流水（跟 git 仓库走），
 与本文件的进程日志（`logs/agent.jsonl`，不入库）是两回事：

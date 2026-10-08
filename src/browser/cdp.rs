@@ -1,4 +1,4 @@
-//! CDP（Chrome DevTools Protocol）客户端 —— P20 浏览器内核；P21 增补两件事：
+//! CDP（Chrome DevTools Protocol）客户端 —— 浏览器内核；增补两件事：
 //! ① **事件广播通道**——actor 把每条 CDP 事件复制一份进 broadcast（screencast 帧、
 //!    JS dialog 事件由标签页级订阅者消费；等待器机制不变）；② **隔离世界求值**
 //!    （`Page.createIsolatedWorld` + 带 contextId 的 `Runtime.evaluate`，快照/定位/求值

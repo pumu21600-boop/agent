@@ -1,4 +1,4 @@
-//! Agent 桌面壳（P13 → P22）—— 窗口 + 托盘 + 服务保活 + **child webview 宿主**
+//! Agent 桌面壳—— 窗口 + 托盘 + 服务保活 + **child webview 宿主**
 //!
 //! 设计（窄而刚 v1）：
 //! - WebView 直接加载 http://127.0.0.1:5173（前端零改动，agent.exe 是唯一真源）；
@@ -8,7 +8,7 @@
 //! - agent.exe 路径按开发机布局解析（desktop/ 的上两级 target/release）；
 //!   未来打包分发时改为同级目录探测（留口）。
 //!
-//! P22 内置浏览器改造：浏览器不再由服务另起一个无头 Edge 进程，而是**把网页变成
+//! 内置浏览器改造：浏览器不再由服务另起一个无头 Edge 进程，而是**把网页变成
 //! 壳窗口里的 child webview**（真页面、真交互、复用 App 自己的 WebView2 运行时）。
 //! - 主窗口 WebView2 环境带 `--remote-debugging-port`（tauri.conf.json 的
 //!   additionalBrowserArguments），child webview 带同一份 args 以复用同一环境——
@@ -50,7 +50,7 @@ const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 const GUARD_PORT: u16 = 9224;
 /// child webview 弹窗防护：window.open 直接掐掉（on_new_window 再兜一层）
 const POPUP_GUARD_JS: &str = "window.open = function () { return null; };";
-/// 主 webview 的身份标记（P27）：给本壳窗口里所有 `/api/browser/*` 请求打上
+/// 主 webview 的身份标记：给本壳窗口里所有 `/api/browser/*` 请求打上
 /// `X-Agent-Client: shell`。服务端据此分辨「壳里那个客户端」和「用户在普通浏览器里
 /// 开的第二个客户端」——浏览器客户端量的 x/y 是它自己窗口的坐标，不认出来的话会被
 /// 当成壳窗口坐标去挪壳里的 child webview，页面整体漂到错误位置（用户实锤「界面卡位」）。
@@ -89,7 +89,7 @@ const SHELL_CLIENT_JS: &str = r#"(function () {
 /// 「⋯」菜单浮层的 webview label（与 src/browser/shell.rs 的 MENU_LABEL 一致）
 const MENU_LABEL: &str = "wv-menu";
 
-/// 窗口控制 API 注入（无边框窗，对齐 ZCode：原生黑条撤掉，─/▢/✕ 做进内容行）。
+/// 窗口控制 API 注入（无边框窗：原生黑条撤掉，─/▢/✕ 做进内容行）。
 /// 与 SHELL_CLIENT_JS 同一周期补打机制——前端不依赖 npm 包，壳注入即用；
 /// 浏览器里打开的第二个客户端没有这个 API，前端据此隐藏窗口按钮（不显示按了没反应的按钮）。
 const WIN_CTRL_JS: &str = r#"(function () {
@@ -134,7 +134,7 @@ fn win_hide(win: tauri::Window) {
     let _ = win.hide();
 }
 
-/// 当前是否最大化（前端据此把按钮切成还原图标，对齐 ZCode 全屏态）
+/// 当前是否最大化（前端据此把按钮切成还原图标）
 #[tauri::command]
 fn win_is_maximized(win: tauri::Window) -> bool {
     let m = win.is_maximized().unwrap_or(false);
@@ -161,7 +161,7 @@ fn win_start_resize(win: tauri::Window, dir: String) {
 }
 
 /// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/agent.exe`
-/// （开发机布局；P13 原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
+/// （开发机布局；原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
 /// 服务——以前服务总是手动起着的，bug 一直被掩盖。start.bat 改靠壳保活后必须修）。
 /// 打包分发时改为同级目录探测（留口）。
 fn service_exe() -> PathBuf {
@@ -442,7 +442,7 @@ fn dispatch(app: &tauri::AppHandle, op: &Value) {
             }
         }
         "menu" => {
-            // 「⋯」菜单浮层（P20.4 补丁四）：透明置顶的 child webview 铺在面板矩形上，
+            // 「⋯」菜单浮层（补丁四）：透明置顶的 child webview 铺在面板矩形上，
             // 菜单页由服务同源提供（URL query 带锚点与 tab）。它压在下层内容 webview
             // 之上——菜单因此浮在网页上面，网页纹丝不动（HTML 菜单做不到：HWND 永远
             // 盖在主界面之上）。按需创建 = 最新的子窗口 = 天然置顶；同名先关旧的。
@@ -518,7 +518,7 @@ fn main() {
                         let _ = w.hide();
                     }
                 });
-                // 身份标记补打（P27）：壳窗口里的前端页面是启动时加载的，用户可能在浏览器里
+                // 身份标记补打：壳窗口里的前端页面是启动时加载的，用户可能在浏览器里
                 // 还开着一个旧版页面——两者都往服务端报面板矩形，服务端只认带壳标记的那个。
                 // 页面刷新会丢掉注入，故按周期重打（脚本幂等，重复执行零副作用）。
                 let marker = win.clone();

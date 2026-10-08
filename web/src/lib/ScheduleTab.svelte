@@ -10,7 +10,7 @@
   export let workspace = '';
   export let recentWorkspaces = [];
 
-  // —— P22-B 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
+  // —— 定时任务（cron 到点唤醒无头会话；结果走通知列表）——
   let schedulesData = [];
   let scheduleNotices = [];
   // 用户 2026-10-05 实锤：完成记录改成小字一行，右边给个 × 关掉——原来整行按钮太占地方，
@@ -31,7 +31,7 @@
       });
   }
   let schedMsg = '';
-  // P27 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）
+  // 通用确认弹窗（桌面壳 WebView2 不实现 window.confirm，同 App 侧 ConfirmModal）
   let confirmModal = null;
   function confirmAsk(text) {
     return new Promise((resolve) => {

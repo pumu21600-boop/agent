@@ -1,4 +1,4 @@
-//! 组件总线 v0 —— UI 插槽（施工单 021，P15）
+//! 组件总线 v0 —— UI 插槽（施工单 021）
 //!
 //! 总架构 §7 的「双总线」后半：工具总线早已统一（内置 + mcp__ + wasm__），组件总线此前
 //! 只有设计留口。v0 交付**最小但真能用**的一档——静态 UI 扩展 + 受限数据桥。
@@ -35,7 +35,7 @@ use serde_json::Value;
 use crate::plugin::{contract, ToolBrief};
 use crate::plugin::trust;
 
-/// 插件目录名（应用根与工作区同名；P18 起「扩展」术语退役，概念统一为「插件」）。
+/// 插件目录名（应用根与工作区同名；「扩展」术语退役，概念统一为「插件」）。
 pub const DIR: &str = "plugins";
 
 /// settings.features 的功能键全集（manifest `feature` 与 toggle_plugin 的联动只认这些）。
@@ -62,7 +62,7 @@ pub fn disabled() -> Vec<String> {
         .clone()
 }
 
-/// 一个插件的描述（GET /api/plugins 直出；P18 契约 v1：面板与工具插件同构）。
+/// 一个插件的描述（GET /api/plugins 直出；契约 v1：面板与工具插件同构）。
 #[derive(Debug, Clone, Serialize)]
 pub struct UiExt {
     pub name: String,
@@ -73,12 +73,12 @@ pub struct UiExt {
     pub entry: String,
     /// 位置："app"（应用根）| "workspace"（当前工作区）| "draft"（内存草稿）
     pub source: String,
-    /// P18 契约 v1：来源 built_in / user / model_generated（manifest `source` 声明，
+    /// 契约 v1：来源 built_in / user / model_generated（manifest `source` 声明，
     /// 未声明按位置默认）
     pub origin: String,
-    /// P18：模型自产草稿（内存态不入盘、权限已清空、转正后持久化）
+    /// 模型自产草稿（内存态不入盘、权限已清空、转正后持久化）
     pub draft: bool,
-    /// P18 契约版本（读入时的实际值；拒载时 0）
+    /// 契约版本（读入时的实际值；拒载时 0）
     pub api_version: u32,
     /// 是否覆盖了同名的内置插件（工作区同名优先；界面显式提示，避免"看起来是内置那个"）
     pub shadowed: bool,
@@ -87,30 +87,30 @@ pub struct UiExt {
     /// manifest 是否可用（false 时 error 有原因）
     pub ok: bool,
     pub error: Option<String>,
-    /// P17：启用状态（设置里的停用名单；停用的插件不加载、不参与界面插槽与数据桥）
+    /// 启用状态（设置里的停用名单；停用的插件不加载、不参与界面插槽与数据桥）
     pub enabled: bool,
-    /// P17：宿主界面插槽声明（manifest `ui: [{slot, title}]`；v1 支持 toolbar / composer）
+    /// 宿主界面插槽声明（manifest `ui: [{slot, title}]`；v1 支持 toolbar / composer）
     pub ui: Vec<Value>,
-    /// P17/P18：权限声明（composer.insert / workspace.write / bus.publish / notify / storage / clipboard）
+    /// /权限声明（composer.insert / workspace.write / bus.publish / notify / storage / clipboard）
     /// ——宿主只认这里声明过的动作，没声明的请求一律拒绝
     pub permissions: Vec<String>,
-    /// P18：工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
+    /// 工具清单（工具插件经 wasm 桥接入统一清单；面板插件为空）
     pub tools: Vec<ToolBrief>,
     /// 生态轮：插件自带的技能名清单（manifest `skills: "<相对目录>"`，每子目录一个 SKILL.md）；
     /// 纯技能插件没有 entry/ui，卡片上以此展示它贡献了什么
     pub skills: Vec<String>,
-    /// P21：插件自带设置页（manifest settings_entry，如 prices.html）——
+    /// 插件自带设置页（manifest settings_entry，如 prices.html）——
     /// 宿主在设置→插件卡片上渲染「设置」按钮，点了在插件面板里打开该页
     pub settings_entry: String,
     /// 权限放开轮（用户 2026-10-02 拍板）：manifest `feature: "<settings.features 的键>"`——
     /// 声明后插件的启用开关就是这个功能的总开关（host 侧 toggle_plugin 同步写
     /// settings.features），一个能力只留一个开关，不搞「插件停用 + 功能关闭」双闸
     pub feature: String,
-    /// P21 红线3：验签键（`plugins:<name>`；draft 为空串）
+    /// 红线3：验签键（`plugins:<name>`；draft 为空串）
     pub trust_key: String,
-    /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
+    /// 红线3：内容指纹（user 来源才算；内置/draft 为空串）
     pub digest: String,
-    /// P21 红线3：是否可信任（内置/已 pin/模型自产 = true；未 pin 或内容已变 = false）
+    /// 红线3：是否可信任（内置/已 pin/模型自产 = true；未 pin 或内容已变 = false）
     pub trusted: bool,
 }
 
@@ -124,7 +124,7 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
     if ws != app {
         collect(&ws.join(DIR), "workspace", &mut out, disabled);
     }
-    // P18：模型自产 draft 插件并入统一清单（内存态、权限已清空、重启即失）
+    // 模型自产 draft 插件并入统一清单（内存态、权限已清空、重启即失）
     for d in crate::plugin::draft::list() {
         let entry = d
             .manifest
@@ -177,7 +177,7 @@ pub fn scan(disabled: &[String]) -> Vec<UiExt> {
     out
 }
 
-/// 统一清单（P28 目录合并）：面板扫描 + 工具注册表合成一份。同目录名既声明面板又
+/// 统一清单（目录合并）：面板扫描 + 工具注册表合成一份。同目录名既声明面板又
 /// 带工具的合成一条（工具半边并入同一条目），不再像合并前那样一个插件出两行。
 pub fn scan_all(disabled: &[String]) -> Vec<UiExt> {
     let mut out = scan(disabled);
@@ -264,7 +264,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             return e;
         }
     };
-    // P18 契约 v1：apiVersion 不匹配 → 拒载 + 提示升级（不做 shim）；缺失按 v1 读入（老目录迁移）
+    // 契约 v1：apiVersion 不匹配 → 拒载 + 提示升级（不做 shim）；缺失按 v1 读入（老目录迁移）
     if let Err(err) = contract::check_api_version(&v) {
         e.error = Some(err);
         return e;
@@ -282,7 +282,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
     if let Some(en) = v.get("entry").and_then(Value::as_str) {
         e.entry = en.to_string();
     }
-    // P21：插件自带设置页（如「用量价格」插件的价格设置页）；必须不出目录
+    // 插件自带设置页（如「用量价格」插件的价格设置页）；必须不出目录
     if let Some(se) = v.get("settings_entry").and_then(Value::as_str) {
         match resolve_in(dir, se) {
             Ok(p) if p.is_file() => e.settings_entry = se.to_string(),
@@ -304,7 +304,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             return e;
         }
     }
-    // P17：界面插槽与写操作权限（只认白名单里的插槽名与动作名）
+    // 界面插槽与写操作权限（只认白名单里的插槽名与动作名）
     if let Some(ui) = v.get("ui").and_then(Value::as_array) {
         e.ui = ui
             .iter()
@@ -338,7 +338,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             }
         }
     }
-    // P21 红线3：第三方插件（origin=user）先 pin 后代跑——算内容指纹、对 pin 表，
+    // 红线3：第三方插件（origin=user）先 pin 后代跑——算内容指纹、对 pin 表，
     // 未 pin / 内容已变 → 拒载（ok=false + 人话理由 + 审计），元数据照常带回供界面提示
     e.trust_key = trust::key_of(DIR, name);
     if e.origin == contract::ORIGIN_USER {
@@ -361,7 +361,7 @@ fn load_one(dir: &Path, name: &str, source: &str, disabled: &[String]) -> UiExt 
             }
         }
     }
-    // 入口必须真实存在且不出目录；P28 合并后纯工具插件（清单既无 entry 也无 ui）
+    // 入口必须真实存在且不出目录；合并后纯工具插件（清单既无 entry 也无 ui）
     // 不要求入口页——entry 留空、前端按空隐藏「打开」，工具半边由 wasm 注册表补齐。
     let declares_panel = v.get("entry").is_some() || v.get("ui").is_some();
     if declares_panel {
@@ -686,7 +686,7 @@ mod tests {
         d
     }
 
-    /// P21：给测试里的 user 来源插件 pin 指纹（与 promote 自动 pin 同路），
+    /// 给测试里的 user 来源插件 pin 指纹（与 promote 自动 pin 同路），
     /// 否则验签门会按设计拒载。用完由调用方 install 空表清场。
     fn pin_dir(name: &str, dir: &Path) {
         let digest = trust::digest_dir(dir).unwrap();
@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(e.title, "记忆看板");
         assert_eq!(e.version, "1.2.3");
         assert_eq!(e.source, "workspace");
-        // P21：workspace 来源 = user → 未 pin 显式拒载（元数据照常带回，界面能提示）
+        // workspace 来源 = user → 未 pin 显式拒载（元数据照常带回，界面能提示）
         assert!(!e.ok, "未 pin 的第三方插件不加载");
         assert!(!e.trusted);
         assert!(e.error.as_deref().unwrap_or("").contains("信任"), "{:?}", e.error);

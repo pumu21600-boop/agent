@@ -1,4 +1,4 @@
-//! 审批门 ChatGate + 档位切换/审批决定端点（P19 自 server.rs 按域拆出）
+//! 审批门 ChatGate + 档位切换/审批决定端点（自 server.rs 按域拆出）
 
 use super::*;
 
@@ -13,13 +13,13 @@ pub(super) struct ChatGate {
     pub(super) allow_unsandboxed: bool,
     pub(super) unsandboxed_approval: bool,
     pub(super) pending: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
-    /// P9 A3：本次请求所属会话（会话内同类允许的作用域）
+    /// A3：本次请求所属会话（会话内同类允许的作用域）
     pub(super) session_id: String,
-    /// P9 A3：挂起审批的元信息（id → scope/session），ask 时写入、decide 时取用
+    /// A3：挂起审批的元信息（id → scope/session），ask 时写入、decide 时取用
     pub(super) meta: Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
-    /// P9 A3：会话内已授权的审批范围（与 AppState.approved_scopes 同一份）
+    /// A3：会话内已授权的审批范围（与 AppState.approved_scopes 同一份）
     pub(super) approved: Arc<std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
-    /// P9 B1：本次请求的 Plan 档（请求级 plan_mode 带入）
+    /// B1：本次请求的 Plan 档（请求级 plan_mode 带入）
     pub(super) plan_mode: bool,
     pub(super) tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
     pub(super) cancel: Arc<CancelFlag>,
@@ -47,7 +47,7 @@ impl agent::ApprovalGate for ChatGate {
         self.steer.drain_immediate(&self.session_id)
     }
 
-    /// P9 B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。
+    /// B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。
     /// 风险判定复用 rules::evaluate_risk 单点，与审批档位共用同一套语义。
     fn plan_block_reason(&self, tool: &str, args_json: &str) -> Option<String> {
         if !self.plan_mode {
@@ -103,7 +103,7 @@ impl agent::ApprovalGate for ChatGate {
         !((mode == "full-access" || mode == "local") && self.allow_unsandboxed)
     }
 
-    /// P19：文件工具是否允许越出工作区——auto / full-access 档=true（auto 档越界写会按
+    /// 文件工具是否允许越出工作区——auto / full-access 档=true（auto 档越界写会按
     /// Dangerous 先弹审批；full-access 全免审），read-only 档锁死工作区。
     /// 每步现读：运行中切档，下一个决策步即按新档位执行。
     fn file_tools_unconfined(&self) -> bool {
@@ -240,7 +240,7 @@ pub(super) async fn decide_approval(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "缺少 id" })));
     };
     let approved = req.get("approved").and_then(Value::as_bool).unwrap_or(false);
-    // P9 A3：remember=true 表示「本会话内同类操作不再询问」
+    // A3：remember=true 表示「本会话内同类操作不再询问」
     let remember = req.get("remember").and_then(Value::as_bool).unwrap_or(false);
     let meta = state.approval_meta.lock().ok().and_then(|mut m| m.remove(id));
     let sender = state.approvals.lock().unwrap_or_else(|e| e.into_inner()).remove(id);

@@ -3,7 +3,7 @@
 //! 约定：后续所有代码统一走本模块落日志，业务数据禁止直接 println。
 //! 每条记录固定 4 个字段：ts / session_id / event_type / payload。
 //! 写盘方式：追加写、单行一条 JSON + '\n'、写完立即 flush（落盘即完整，不许半行）。
-//! 轮转（2026-09-14 补，P16 多份归档）：单文件超过上限就归档成 `<file>.1`（最新），
+//! 轮转（2026-09-14 补，多份归档）：单文件超过上限就归档成 `<file>.1`（最新），
 //! 旧归档依次倒位为 `.2`…`.N`、超出 N 份的最旧归档丢弃——启动时检查一次，
 //! 运行中每 500 条复查一次；上限与保留份数走 config.toml [logging].max_mb / keep_archives。
 //! schema 见 docs/jsonl-schema.md。
@@ -57,7 +57,7 @@ impl EventType {
 pub struct Logger {
     file: Mutex<File>,
     session_id: String,
-    /// P10-A：当前日志文件完整路径（trace 查询接口用）
+    /// 当前日志文件完整路径（trace 查询接口用）
     path: PathBuf,
     /// 轮转上限（字节），0 = 不轮转
     max_bytes: u64,
@@ -106,7 +106,7 @@ impl Logger {
         &self.session_id
     }
 
-    /// P10-A：当前 JSONL 文件路径（未初始化时 None）。
+    /// 当前 JSONL 文件路径（未初始化时 None）。
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -262,7 +262,7 @@ pub fn try_event(event_type: EventType, payload: Value) {
     }
 }
 
-/// P10-A：当前 JSONL 日志文件路径（logger 未初始化时 None）。
+/// 当前 JSONL 日志文件路径（logger 未初始化时 None）。
 pub fn log_path() -> Option<&'static Path> {
     LOGGER.get().map(|l| l.path())
 }
@@ -311,7 +311,7 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // —— P16（报告 E4）：保留多份归档，最旧的按份数上限丢弃 ——
+    // —— （报告 E4）：保留多份归档，最旧的按份数上限丢弃 ——
     #[test]
     fn rotate_keeps_multiple_archives_and_drops_oldest() {
         let path = tmp_path("multi");

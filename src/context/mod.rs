@@ -1,4 +1,4 @@
-//! 上下文工程 v1 —— 施工单 006（P5）
+//! 上下文工程 v1 —— 施工单 006
 //!
 //! 1. token 启发式估算：CJK ≈1 token/字，ASCII ≈1 token/4 字符，其余 ≈1/2——无 tokenizer 依赖。
 //! 2. 工具结果头尾压缩：头部 60% + 尾部 40%，中间插省略标记（替代旧的单向硬截断）。
@@ -176,7 +176,7 @@ pub struct CompactStats {
     pub folded_messages: usize,
     pub tokens_before: u64,
     pub tokens_after: u64,
-    /// P7：被折叠掉的原始消息（供滚动摘要；不折叠时为空）
+    /// 被折叠掉的原始消息（供滚动摘要；不折叠时为空）
     pub folded: Vec<Value>,
 }
 
@@ -267,7 +267,7 @@ pub fn compact_messages(
         }
         if !folded_ranges.is_empty() {
             let folded_count: usize = folded_ranges.iter().map(|(s, e)| e - s).sum();
-            // P7：把被折叠的原始消息带出来，供滚动摘要压缩
+            // 把被折叠的原始消息带出来，供滚动摘要压缩
             stats.folded = folded_ranges
                 .iter()
                 .flat_map(|(s, e)| out[*s..*e].to_vec())
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn compact_returns_folded_messages_for_summary() {
-        // P7：折叠发生时，被折叠的原始消息要带出来供滚动摘要
+        // 折叠发生时，被折叠的原始消息要带出来供滚动摘要
         let long_result = "r".repeat(6000);
         let mut messages = vec![json!({ "role": "system", "content": "sys" })];
         for i in 0..8 {

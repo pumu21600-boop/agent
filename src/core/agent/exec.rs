@@ -1,6 +1,6 @@
 use super::*;
 
-/// P22-C：执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
+/// 执行一个工具调用——`subagent_spawn` 在核心循环拦截交给派发器
 /// （子代理跑在独立会话，实现见 server/subagent.rs）；其余走工具注册表。
 pub(crate) async fn exec_tool_call(
     cfg: &crate::tools::ExecConfig,

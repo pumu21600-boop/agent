@@ -1,7 +1,7 @@
 //! 工具系统（总架构 §5）—— 注册表 + 内置工具（施工单 002 / 005）。
 //!
-//! P4 第一批：read_file / search / web_fetch（只读，danger 0）、write_file（写，danger 1）、
-//! shell / git（执行，danger 2，走 P3 沙箱）。审批策略（suggest/auto-edit/full-auto）在核心循环
+//! 第一批：read_file / search / web_fetch（只读，danger 0）、write_file（写，danger 1）、
+//! shell / git（执行，danger 2，走沙箱）。审批策略（suggest/auto-edit/full-auto）在核心循环
 //! 按 danger_level 判定，工具层只管执行。
 //! shell / git 是阻塞的沙箱调用，包在 spawn_blocking 里。
 
@@ -47,7 +47,7 @@ fn workspace_slot() -> &'static RwLock<PathBuf> {
     WORKSPACE.get_or_init(|| RwLock::new(crate::config::app_root()))
 }
 
-/// 工作目录根（P8.2 起运行时可切换：/api/workspace 设置，默认工程根）。
+/// 工作目录根（起运行时可切换：/api/workspace 设置，默认工程根）。
 pub fn workspace_root() -> PathBuf {
     workspace_slot().read().map(|p| p.clone()).unwrap_or_else(|_| crate::config::app_root())
 }
@@ -210,7 +210,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent_spawn",
-            description: "P22-C 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
+            description: " 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -370,7 +370,7 @@ pub fn find(name: &str) -> Option<&'static ToolSpec> {
     all().iter().find(|t| t.name == name)
 }
 
-/// 发给 OpenAI 兼容请求的 tools 数组（P11：含已启用+已确认的 MCP 动态工具）。
+/// 发给 OpenAI 兼容请求的 tools 数组（：含已启用+已确认的 MCP 动态工具）。
 pub fn definitions() -> Vec<Value> {
     let mut out: Vec<Value> = all()
         .iter()
@@ -392,11 +392,11 @@ pub fn definitions() -> Vec<Value> {
 
 /// 执行工具，返回文本结果；Err 的内容会作为 tool 消息回填给模型（不中断循环）。
 pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String, String> {
-    // P11：MCP 动态工具分发（进程隔离自带边界，不走本地沙箱/工作区约束）
+    // MCP 动态工具分发（进程隔离自带边界，不走本地沙箱/工作区约束）
     if name.starts_with(crate::mcp::PREFIX) {
         return crate::mcp::call_tool(name, args).await;
     }
-    // P11 017：WASM 插件工具分发（纯计算沙箱，自带边界）
+    // 017：WASM 插件工具分发（纯计算沙箱，自带边界）
     if name.starts_with(crate::plugin::wasm::PREFIX) {
         return crate::plugin::wasm::call_tool(name, args).await;
     }
@@ -409,7 +409,7 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
                 .get("name")
                 .and_then(|x| x.as_str())
                 .ok_or("缺少 name 参数")?;
-            // P25：带 ref 读 references/ 单篇；不带读 SKILL.md 全文（生态轮：头部带技能
+            // 带 ref 读 references/ 单篇；不带读 SKILL.md 全文（生态轮：头部带技能
             // 目录——插件技能的脚本资产要用绝对路径跑）
             match v.get("ref").and_then(|x| x.as_str()) {
                 Some(r) => crate::skills::read_ref(name, r),
@@ -423,7 +423,7 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         "web_search" => web_search(args, cfg.max_chars).await,
         "shell" => shell(args, cfg).await,
         "git" => git(args, cfg).await,
-        // P21 浏览器内核：统一 browser 工具（method 判别，协议对齐 ZCode）。
+        // 浏览器内核：统一 browser 工具（method 判别，统一命令协议）。
         // Chromium 自带站点隔离即边界，不进 Windows 沙箱；审批门按 method 分级
         // （只读 Safe / 页面操作 Normal，见 core/rules.rs）。
         "browser" => crate::browser::command(args, cfg.max_chars).await,
@@ -441,7 +441,7 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
     }
 }
 
-/// 供服务层复用（P17 组件总线写操作）：在工作区内写一个相对路径的文件。
+/// 供服务层复用（组件总线写操作）：在工作区内写一个相对路径的文件。
 /// 边界与 write_file 工具一致——越界硬拦、512KB 上限、原子写。
 pub fn write_workspace_relative(rel: &str, content: &str) -> Result<usize, String> {
     if content.len() > MAX_FILE_BYTES {
@@ -462,7 +462,7 @@ pub fn resolve_workspace_path(rel: &str) -> Result<PathBuf, String> {
 }
 
 fn cap(s: &str, max: usize) -> String {
-    // P5 起工具结果统一走头尾压缩（替代旧的单向硬截断）
+    // 工具结果统一走头尾压缩（替代旧的单向硬截断）
     crate::context::compress(s, max)
 }
 
@@ -666,7 +666,7 @@ mod tests {
         std::fs::remove_dir_all(&outside).ok();
     }
 
-    // —— P19：fs_unconfined（auto / full-access 档）放行绝对路径读写整台电脑 ——
+    // —— fs_unconfined（auto / full-access 档）放行绝对路径读写整台电脑 ——
     #[tokio::test]
     async fn fs_unconfined_reaches_outside_workspace() {
         init_logger();

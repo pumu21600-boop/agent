@@ -1,12 +1,12 @@
 //! 记忆系统 v1 —— 总架构 §9 / 施工单 009
 //!
-//! 双层存储：全局 `~/.agent/` + 项目 `<workspace>/.agent/memory/`（与 P6 影子仓库同根）。
+//! 双层存储：全局 `~/.agent/` + 项目 `<workspace>/.agent/memory/`（与影子仓库同根）。
 //! - index.json（全局层）：项目身份登记（git remote 优先，无则 git 根路径），防串项目。
 //! - events.log（项目层）：任务/工具/交接/检查点的事件流水，跟 git 仓库走沉淀"经验"；
 //!   默认脱敏（sk-/Bearer/api_key 打码），`persist_sensitive=true` 才存原文。
 //! - AGENTS.md：全局 + 项目双层读取注入 system prompt；项目缺失时生成模板（开箱即用）。
 //!
-//! 语义记忆/向量检索留接口（P8 EMBEDDING 再补），本单只做"流水 + 摘要 + 约定"。
+//! 语义记忆/向量检索留接口（EMBEDDING 再补），本单只做"流水 + 摘要 + 约定"。
 
 pub mod library;
 
@@ -189,7 +189,7 @@ impl Memory {
         out
     }
 
-    // —— P10.5 设置面板「记忆」分区（只读状态 + AGENTS.md 编辑）——
+    // —— 设置面板「记忆」分区（只读状态 + AGENTS.md 编辑）——
     pub fn global_dir(&self) -> &Path {
         &self.global_dir
     }
@@ -310,7 +310,7 @@ pub fn sanitize(text: &str) -> String {
             i = j;
             continue;
         }
-        // 密钥字段：名字与分隔符照抄，值打码（键名族大小写不敏感 + 词边界——
+        // 密钥字段：名字与分隔符沿用约定，值打码（键名族大小写不敏感 + 词边界——
         // 不查边界会把 "passwords are rotated" 里的 "are" 也掩掉）
         let mut handled = false;
         let at_word_start = i == 0 || {

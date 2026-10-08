@@ -1,4 +1,4 @@
-//! MCP 接入 + 插件清单/draft 隔离区/命名空间存储/静态资源服务（P19 自 server.rs 按域拆出）
+//! MCP 接入 + 插件清单/draft 隔离区/命名空间存储/静态资源服务（自 server.rs 按域拆出）
 
 use super::*;
 
@@ -64,7 +64,7 @@ pub(super) async fn post_mcp(
                 }
                 // 只重连+重新发现；配置不动（ensure_online 用管理器内已同步的 cfg）
             }
-            // P24 OAuth：发起授权（后台线程跑 discovery→授权→换 token，立即返回快照）
+            // OAuth：发起授权（后台线程跑 discovery→授权→换 token，立即返回快照）
             "oauth_authorize" => {
                 let Some(name) = &req.name else { return err("缺少 name".into()) };
                 let Some(c) = s.mcp_servers.iter().find(|c| &c.name == name) else {
@@ -75,7 +75,7 @@ pub(super) async fn post_mcp(
                     Err(e) => return err(e),
                 }
             }
-            // P24 OAuth：撤销授权（删 token + 强制下线；下次调用回「未授权」人话）
+            // OAuth：撤销授权（删 token + 强制下线；下次调用回「未授权」人话）
             "oauth_revoke" => {
                 let Some(name) = &req.name else { return err("缺少 name".into()) };
                 if !s.mcp_servers.iter().any(|c| &c.name == name) {
@@ -95,7 +95,7 @@ pub(super) async fn post_mcp(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
         }
         *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-        // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+        // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
         crate::plugin::wasm::set_disabled(&s.disabled_plugins);
         crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：插件技能根同步停用
         crate::mcp::sync_configs(&s.mcp_servers);
@@ -160,7 +160,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
             .into_iter()
             .map(|(n, o, t)| (n, (o, t)))
             .collect();
-    // P17：resources / prompts 清单（声明了能力的 server 才有内容）
+    // resources / prompts 清单（声明了能力的 server 才有内容）
     let catalogs = crate::mcp::catalogs();
     let servers: Vec<Value> = s
         .mcp_servers
@@ -179,7 +179,7 @@ fn get_mcp_inner(state: &AppState) -> Json<Value> {
                 "tools": tools.iter().map(|(n, d)| json!({"name": n, "desc": d})).collect::<Vec<_>>(),
                 "resources": res,
                 "prompts": prompts,
-                // P24：OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）
+                // OAuth 配置 + 授权状态（tx=事务快照，oauth=token 态）
                 "oauth": c.oauth,
                 "oauth_status": crate::mcp::oauth::tx_status(&c.name),
             })
@@ -196,7 +196,7 @@ pub(super) async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         .unwrap_or_else(|e| e.into_inner())
         .disabled_plugins
         .clone();
-    // P18 二合一（027）：面板插件 + 工具插件（wasm 桥）+ 内存 draft，一份清单
+    // 二合一（027）：面板插件 + 工具插件（wasm 桥）+ 内存 draft，一份清单
     let extensions = crate::plugin::ui::scan_all(&disabled);
     Json(json!({
         "plugins": extensions,
@@ -342,7 +342,7 @@ pub(super) async fn remove_plugin(
     }
 }
 
-/// POST /api/plugins/toggle —— 启用/停用扩展（P17，落 settings.json 的停用名单）。
+/// POST /api/plugins/toggle —— 启用/停用扩展（落 settings.json 的停用名单）。
 pub(super) async fn toggle_plugin(
     State(state): State<AppState>,
     Json(req): Json<Value>,
@@ -375,7 +375,7 @@ pub(super) async fn toggle_plugin(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：停用的插件不贡献技能
     emit_plugin_settings_changed(&synced_feature);
@@ -383,7 +383,7 @@ pub(super) async fn toggle_plugin(
         EventType::State,
         json!({ "kind": "plugin.toggle", "name": name, "enabled": enabled, "synced_feature": synced_feature }),
     );
-    // P18 二合一：回包清单含工具插件
+    // 二合一：回包清单含工具插件
     let list = crate::plugin::ui::scan_all(&s.disabled_plugins);
     (StatusCode::OK, Json(json!({ "ok": true, "plugins": list })))
 }
@@ -406,7 +406,7 @@ fn emit_plugin_settings_changed(synced_feature: &str) {
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": keys }));
 }
 
-/// POST /api/plugins/draft —— 模型自产插件提交进 draft 隔离区（P18 027）。
+/// POST /api/plugins/draft —— 模型自产插件提交进 draft 隔离区（027）。
 /// 规范化（source=model_generated、权限清空）在 draft::submit 里强制执行。
 pub(super) async fn submit_draft(
     State(state): State<AppState>,
@@ -438,7 +438,7 @@ pub(super) async fn submit_draft(
 }
 
 /// POST /api/plugins/promote —— draft 一键转正（落盘持久化、来源改 user、重扫注册表）。
-/// P21 红线3：转正是用户显式动作 = 信任决定，落盘后**自动 pin** 内容指纹（不 pin 就会被
+/// 红线3：转正是用户显式动作 = 信任决定，落盘后**自动 pin** 内容指纹（不 pin 就会被
 /// 自己的验签门拦下，转正等于白做）。
 pub(super) async fn promote_draft(
     State(state): State<AppState>,
@@ -480,7 +480,7 @@ pub(super) async fn promote_draft(
     }
 }
 
-/// POST /api/plugins/trust {key, action} —— 第三方插件验签的 pin / unpin（P21 红线3）。
+/// POST /api/plugins/trust {key, action} —— 第三方插件验签的 pin / unpin（红线3）。
 /// key 形如 `plugins:<name>`；pin 时按当前位置重算 digest。
 ///
 /// **准入审核（用户 2026-10-02 拍板）**：pin 是加载的前置条件，所以 pin 前必须先过
@@ -655,7 +655,7 @@ fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
     if disabled.iter().any(|d| d == name) {
         return (StatusCode::NOT_FOUND, "插件已停用").into_response();
     }
-    // P21 红线3：第三方验签门与清单拒载同一把尺子——未 pin / 内容已变的插件不服务任何资产
+    // 红线3：第三方验签门与清单拒载同一把尺子——未 pin / 内容已变的插件不服务任何资产
     // （否则「清单里显示未受信任、面板 iframe 却能打开」自相矛盾）
     let list = crate::plugin::ui::scan(&disabled);
     if let Some(e) = list.iter().find(|e| e.name == name)
@@ -667,7 +667,7 @@ fn serve_plugin(state: &AppState, name: &str, rel: &str) -> Response {
         )
             .into_response();
     }
-    // P18（027）：draft 面板资产走内存 overlay——键必须与提交时的文件名完全一致，
+    // （027）：draft 面板资产走内存 overlay——键必须与提交时的文件名完全一致，
     // 不做路径拼接（构造上无穿越）；命中即返回，未命中落回磁盘路径。
     let eff_rel = if rel.trim().is_empty() {
         crate::plugin::draft::entry_file(name)

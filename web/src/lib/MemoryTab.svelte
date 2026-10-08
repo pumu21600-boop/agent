@@ -8,7 +8,7 @@
   // 「打开记忆库」:关设置 + 开星云(两个状态都在 App 侧)
   const openGalaxy = () => dispatch('openGalaxy');
 
-  // —— P10.5 记忆分区（三类约定文件编辑 + 状态）——
+  // —— 记忆分区（三类约定文件编辑 + 状态）——
   // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md。
   // 文本框始终显示文件当前内容：进入分区/切 chips/保存后都回读一次盘。
   let memData = null;

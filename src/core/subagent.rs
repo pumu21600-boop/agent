@@ -1,4 +1,4 @@
-//! P22-C 子代理调度：核心循环的派发接口（trait 只此一个，实现见 server/subagent.rs）
+//! 子代理调度：核心循环的派发接口（trait 只此一个，实现见 server/subagent.rs）
 //!
 //! 纪律（docs/subagent-draft.md）：子代理 = 独立会话，主会话「一会话一轮」不变量
 //! 一根手指都不碰。核心循环只认这个 trait——派发、并发度、取消级联、成本归属的

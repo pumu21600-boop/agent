@@ -39,7 +39,7 @@ pub(crate) fn read_file(ws: &Path, args: &str, max_chars: usize, unconfined: boo
     Ok(cap(&text, max_chars))
 }
 
-/// 分页读取大文件（P5）：按行分页，页码越界自动钳到最后/第一页。
+/// 分页读取大文件：按行分页，页码越界自动钳到最后/第一页。
 pub(crate) fn read_page(ws: &Path, args: &str, max_chars: usize, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let rel = v.get("path").and_then(Value::as_str).ok_or("缺少 path 参数")?;
@@ -142,7 +142,7 @@ pub(crate) fn write_file(ws: &Path, args: &str, unconfined: bool) -> Result<Stri
     Ok(format!("已写入 {} 字节 → {}", content.len(), rel))
 }
 
-/// 局部修改（P16）：文件里唯一出现的 old_string → new_string。
+/// 局部修改：文件里唯一出现的 old_string → new_string。
 /// 大文件改几行用它，省 token 也避免重写全文时误伤其他内容。
 pub(crate) fn edit_file(ws: &Path, args: &str, unconfined: bool) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;

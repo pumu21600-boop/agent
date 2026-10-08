@@ -9,9 +9,9 @@ pub(crate) fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
     msgs.iter().skip(1).filter(|m| !is_summary_msg(m)).cloned().collect()
 }
 
-/// P7 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
-/// P8 角色映射：优先走 [roles] summary 专用渠道，失败回落主渠道再降级占位符。
-/// P21：辅助调用记用量台账（purpose=summary），归属会话由 sid 带入。
+/// 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。
+/// 角色映射：优先走 [roles] summary 专用渠道，失败回落主渠道再降级占位符。
+/// 辅助调用记用量台账（purpose=summary），归属会话由 sid 带入。
 pub(crate) async fn summarize_folded(
     gateway: &Arc<Gateway>,
     primary: &Channel,
@@ -72,8 +72,8 @@ pub(crate) async fn summarize_folded(
     (!out.is_empty()).then_some(out)
 }
 
-/// P8 TITLE 角色：用最终回答生成 ≤20 字会话标题。失败返回 None（保留机械截断标题）。
-/// P21：辅助调用记用量台账（purpose=title）。
+/// TITLE 角色：用最终回答生成 ≤20 字会话标题。失败返回 None（保留机械截断标题）。
+/// 辅助调用记用量台账（purpose=title）。
 pub(crate) async fn generate_title(gateway: &Arc<Gateway>, ch: &Channel, answer: &str, sid: &str) -> Option<String> {
     let text: String = answer.chars().take(1200).collect();
     let req = json!([

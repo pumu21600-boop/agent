@@ -1,11 +1,11 @@
-//! AppContainer 沙箱模式原语（施工单 019，P12）—— P3 受限 token 沙箱的升级路径
+//! AppContainer 沙箱模式原语（施工单 019）—— 受限 token 沙箱的升级路径
 //!
 //! 机制：LowBox token（由 CreateProcess 的 SECURITY_CAPABILITIES 启动属性自动创建，
 //! 见 proc.rs 的 appcontainer 分支）。
 //! - 默认**无网络出向**：不授予 INTERNET_CLIENT 能力 SID（S-1-15-3-3）即断网；
 //!   `allow_network = true` 时 profile 创建带该能力；
 //! - 文件/注册表默认全拒：工作区目录由 icacls 授 AppContainer SID 的 ACE（幂等）；
-//! - Job 保险丝照用（超时整树击杀），与 P3 语义一致。
+//! - Job 保险丝照用（超时整树击杀），与此前语义一致。
 //!
 //! 开关：config.toml `[sandbox] mode = "appcontainer"`（默认 "restricted" 向后兼容）；
 //! 实验特性，异常时切回 "restricted" 即可。

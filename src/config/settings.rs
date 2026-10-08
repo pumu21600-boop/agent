@@ -1,22 +1,22 @@
 //! 用户设置持久化 —— settings.json（工程根目录）
 //!
-//! 架构设计（P8.5 彻底重构）：
+//! 架构设计（彻底重构）：
 //! 1. **单一真理源**：废除顶层冗余镜像字段与位置元组手抄；每套配置独立自治。
 //! 2. **Config 为一等实体**：包含渠道信息、模型选择、DPAPI 专属密钥、采样与思考参数、模型多模态能力标记。
 //! 3. **RolesSettings 角色路由**：支持主力模型、会话摘要、标题生成及多模态视觉/视频/音频解析路由。
 //! 4. **DPAPI 密钥隔离**：按配置独立加密保存（CryptProtectData），不入日志、不出内存。
 //!
-//! ## 配置面地图（P1 收敛：三类五面，写入口各一）
+//! ## 配置面地图（收敛：三类五面，写入口各一）
 //!
 //! | 面 | 性质 | 写入口（grep 实证唯一） |
 //! |----|------|------------------------|
 //! | `config.toml` | 静态种子（随包只读） | 无运行时写（启动一次性读入） |
 //! | `providers.json` | 预设目录（随包只读） | 无运行时写（`gateway::providers::init` 一次性读入） |
-//! | `settings.json` | **唯一运行时用户配置** | `crate::storage::write_settings`（P18 存储一门，原子写 + 审计） |
-//! | `mcp_tokens.json` | 运行时状态·机密（DPAPI 逐条加密） | `crate::mcp::oauth` 内部原子写（P28 独立国自持） |
+//! | `settings.json` | **唯一运行时用户配置** | `crate::storage::write_settings`（存储一门，原子写 + 审计）|
+//! | `mcp_tokens.json` | 运行时状态·机密（DPAPI 逐条加密）| `crate::mcp::oauth` 内部原子写（独立国自持）|
 //! | `plugin_data/` | 运行时状态·插件命名空间 KV | `crate::storage::plugin_write_at` / `plugin_delete_at`（键名白名单） |
 //!
-//! 旧字段名兼容（P1 起）：serde alias 垫片退役，统一走 `parse_settings` →
+//! 旧字段名兼容（起）：serde alias 垫片退役，统一走 `parse_settings` →
 //! `migrate_legacy_field_names` 单一迁移入口（纯函数、带单测；未来改名只追加一行）。
 
 use std::collections::BTreeMap;
@@ -35,7 +35,7 @@ use crate::gateway::providers;
 
 const ENTROPY: &[u8] = b"agent-gateway-settings-v1";
 
-/// 模型能力标记（P8.5：支持工具调用、图片解析、视频解析、音频解析）。
+/// 模型能力标记（：支持工具调用、图片解析、视频解析、音频解析）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     #[serde(default = "default_true")]
@@ -63,11 +63,11 @@ impl Default for ModelCapabilities {
     }
 }
 
-// P23.1（用户拍板）：按模型名「智能推导」能力的机制整体退役——聚合渠道上模型名与真实能力
+// （用户拍板）：按模型名「智能推导」能力的机制整体退役——聚合渠道上模型名与真实能力
 // 对不上（统计不过来），预测错的徽章/门控比没有更糟。能力一律以用户手动勾选为准：
 // 新建/迁移配置用 Default（tools 开、其余关，user_set=false），媒体门控只认勾选值。
 
-/// 角色路由配置（P8.5：支持主力、摘要、标题及多模态视觉/视频/音频路由，解决 config.toml 割裂）。
+/// 角色路由配置（：支持主力、摘要、标题及多模态视觉/视频/音频路由，解决 config.toml 割裂）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RolesSettings {
     /// 滚动摘要专用配置名或 id（未设回落主力渠道）
@@ -88,11 +88,11 @@ pub struct RolesSettings {
     /// 向量嵌入专用配置名或 id（记忆库语义检索；未设时用本地哈希向量，不用主渠道兜底）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<String>,
-    /// P21：预算降级渠道——单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
+    /// 预算降级渠道——单任务累计 token 超 [hooks] budget_tokens 后，剩余步骤改走它
     /// （B3 解析链：settings.roles.budget > config.toml [roles].budget > 不降级）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
-    /// P22-C：子代理专用渠道（B3 解析链：settings.roles.subagent > config.toml [roles].subagent
+    /// 子代理专用渠道（B3 解析链：settings.roles.subagent > config.toml [roles].subagent
     /// > 回落主渠道；派发时的请求级 model 覆盖优先于此）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<String>,
@@ -154,7 +154,7 @@ impl FeatureSettings {
     }
 }
 
-/// 成本台账设置（P21 插件化后由「用量价格」插件的价格设置页维护）。
+/// 成本台账设置（插件化后由「用量价格」插件的价格设置页维护）。
 /// 单价一律以**美元 / 1M tokens** 规范存储（台账与硬闸的口径）；界面按 `currency` 显示，
 /// 人民币值按 `usd_cny_rate` 折算——切币种只换展示，不动历史账。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -201,7 +201,7 @@ pub struct ModelPrice {
 /// B1 清除语义（施工单 012 固化，前后端任何一方改动必须对照本条）：
 /// `0`=清除长度类（context_length/max_output_tokens）；负数=清除采样类（temperature/top_p）；
 /// 空串/auto=清除思考类（thinking/thinking_style）；clear_key=true=清 key。
-/// P8.3「思考档位被吞」事故即源于此约定未成文。
+/// 「思考档位被吞」事故即源于此约定未成文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub id: String,
@@ -234,7 +234,7 @@ pub struct Config {
     pub thinking: Option<String>,
     /// 思考/协议规范形态覆盖（思考形态词表，只增不改名——B4 固化）：
     /// 空=auto 端点探测；none/openai/deepseek/zai/qwen/qwen-chat-template；
-    /// P8.3 旧值（thinking_object/reasoning_effort/enable_thinking*）自动映射。
+    /// 旧值（thinking_object/reasoning_effort/enable_thinking*）自动映射。
     /// 新形态入词表必须附真实渠道冒烟记录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_style: Option<String>,
@@ -338,7 +338,7 @@ pub fn infer_protocol_preset(model_id: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(Default)]
 pub struct Settings {
-    /// 当前激活配置 ID（P1 起旧字段名 `active_profile_id` 由 parse_settings 迁移收口，垫片退役）
+    /// 当前激活配置 ID（起旧字段名 `active_profile_id` 由 parse_settings 迁移收口，垫片退役）
     #[serde(default)]
     pub active_config_id: Option<String>,
 
@@ -350,7 +350,7 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<RolesSettings>,
 
-    /// P8.2 工作区：agent 实际操作的项目目录（None=工程根）
+    /// 工作区：agent 实际操作的项目目录（None=工程根）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
 
@@ -362,12 +362,12 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_aliases: BTreeMap<String, String>,
 
-    /// P11（施工单 016）：MCP server 配置（stdio transport；工具以 mcp__<server>__<tool> 接入）
+    /// （施工单 016）：MCP server 配置（stdio transport；工具以 mcp__<server>__<tool> 接入）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerCfg>,
 
-    /// P28：停用的插件名单（plugins/ 目录名；停用的不加载、不参与面板插槽与数据桥）。
-    /// P1 起旧字段名 `disabled_extensions` 由 parse_settings 迁移收口（垫片退役），落盘写新名。
+    /// 停用的插件名单（plugins/ 目录名；停用的不加载、不参与面板插槽与数据桥）。
+    /// 旧字段名 `disabled_extensions` 由 parse_settings 迁移收口（垫片退役），落盘写新名。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_plugins: Vec<String>,
 
@@ -376,14 +376,14 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
 
-    /// P21 红线3（第三方插件验签）：已 pin 的内容指纹表。
-    /// 键 = `plugins:<name>`（P28 目录合并后唯一 kind；旧 `ui-ext:<name>` 键读入时自动迁移），
+    /// 红线3（第三方插件验签）：已 pin 的内容指纹表。
+    /// 键 = `plugins:<name>`（目录合并后唯一 kind；旧 `ui-ext:<name>` 键读入时自动迁移），
     /// 值 = canonical digest（sha256）。
     /// user 来源插件必须在这里有且 digest 一致才会加载；draft 转正时自动写入。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub trusted_plugins: BTreeMap<String, String>,
 
-    /// P21 成本台账：展示币种 / 汇率 / 模型价格表（美元 / 1M tokens 规范存储）
+    /// 成本台账：展示币种 / 汇率 / 模型价格表（美元 / 1M tokens 规范存储）
     #[serde(default)]
     pub cost: CostSettings,
 
@@ -391,11 +391,11 @@ pub struct Settings {
     #[serde(default)]
     pub features: FeatureSettings,
 
-    /// P22-B 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
+    /// 定时任务清单（cron 唤醒无头会话；设置→定时 页签维护）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedules: Vec<crate::schedule::ScheduleTask>,
 
-    /// P22-B 完成记录里被用户 × 掉的通知 key（notice_key = ts+task_id）。
+    /// 完成记录里被用户 × 掉的通知 key（notice_key = ts+task_id）。
     /// notices 缓冲本身重启即失，但桌面壳重启不重建 agent.exe 服务、设置弹窗每次重开
     /// 都重建组件，× 不落盘就会「明明叉掉了又回来」（2026-10-05 用户实锤）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -424,7 +424,7 @@ pub(crate) fn shared_settings() -> Option<std::sync::Arc<std::sync::RwLock<Setti
 }
 
 
-/// MCP OAuth 配置（P24，形状对齐 ZCode McpOAuthConfig）：
+/// MCP OAuth 配置（授权码 / client_credentials 两种流程）：
 /// authorization_code=浏览器授权码流程（远程托管 MCP 服务登录）；
 /// client_credentials=机器凭据直换 token（无浏览器）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,7 +449,7 @@ fn default_oauth_type() -> String {
     "authorization_code".to_string()
 }
 
-/// P11：单个 MCP server 的连接与策略配置。
+/// 单个 MCP server 的连接与策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerCfg {
     /// 服务名（工具名 mcp__<name>__<tool>；禁止包含 "__"）
@@ -470,7 +470,7 @@ pub struct McpServerCfg {
     /// http：自定义请求头（鉴权等；值只在内存与 settings.json，绝不进日志）
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
-    /// http：OAuth 登录配置（P24；None=用手工 headers 或无需鉴权）
+    /// http：OAuth 登录配置（None=用手工 headers 或无需鉴权）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<McpOAuthCfg>,
     /// 启停（false 时工具不下发、不可调用）
@@ -581,7 +581,7 @@ impl Settings {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        // P18 存储一门：settings.json 落盘只走 `storage::write_settings`（原子写 + 审计
+        // 存储一门：settings.json 落盘只走 `storage::write_settings`（原子写 + 审计
         // 都在那里面）；这里是仓内唯一调用点。
         crate::storage::write_settings(&Self::path(), &json)
     }
@@ -922,7 +922,7 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
     s.migrate_provider_keys_to_urls();
     // v2.3 -> v2.4：key 从按 base_url 共享改为按配置独占
     s.migrate_url_keys_to_configs();
-    // P28 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
+    // 目录合并：旧信任键迁移（纯函数与 load/单测共用一把尺子）
     migrate_legacy_trust_keys(&mut s.trusted_plugins);
     // 确保存在有效激活配置
     s.ensure_active_config();
@@ -934,14 +934,14 @@ fn new_config_id() -> String {
 }
 
 /// settings.json 解析唯一入口：先过一遍旧字段名迁移（纯函数），再按类型反序列化。
-/// P1 起 serde alias 垫片退役——旧字段名兼容只走这一条路（load 与单测共用）。
+/// serde alias 垫片退役——旧字段名兼容只走这一条路（load 与单测共用）。
 fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
     let mut v: serde_json::Value = serde_json::from_str(text)?;
     migrate_legacy_field_names(&mut v);
     serde_json::from_value(v)
 }
 
-/// P1 配置面收敛：settings.json 旧字段名一次迁净（新旧并存以新名为准，旧键删除）。
+/// 配置面收敛：settings.json 旧字段名一次迁净（新旧并存以新名为准，旧键删除）。
 /// 纯函数，load 与单测共用；未来改名只在此追加一行。
 fn migrate_legacy_field_names(v: &mut serde_json::Value) {
     let Some(obj) = v.as_object_mut() else { return };
@@ -958,7 +958,7 @@ fn migrate_legacy_field_names(v: &mut serde_json::Value) {
     }
 }
 
-/// P28 目录合并迁移：信任表旧键 `ui-ext:<name>` → `plugins:<name>`（合并后唯一 kind）。
+/// 目录合并迁移：信任表旧键 `ui-ext:<name>` → `plugins:<name>`（合并后唯一 kind）。
 /// 目标键已存在则保留新键、丢旧键；抽成纯函数让 load 与单测共用同一把尺子。
 fn migrate_legacy_trust_keys(map: &mut BTreeMap<String, String>) {
     if !map.keys().any(|k| k.starts_with("ui-ext:")) {

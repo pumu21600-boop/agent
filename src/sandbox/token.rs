@@ -4,8 +4,8 @@
 //! （当前用户 / Everyone / BUILTIN\Users / Authenticated Users）。
 //! 受限 token 的访问检查 = 正常 SID 要过 + 受限 SID 也要过，等于给 ACL 再套一层白名单：
 //! 工作目录（用户 SID 授权）与系统目录（Users 授权）可达；管理员面、他人文件不可达。
-//! 不降完整性等级：低 IL 会挡住 P4 shell 在工作目录内写文件（工作目录对象默认中 IL）。
-//! AppContainer / 完整性策略留 P12。全程不需要管理员权限。
+//! 不降完整性等级：低 IL 会挡住 shell 在工作目录内写文件（工作目录对象默认中 IL）。
+//! AppContainer / 完整性策略另行处理。全程不需要管理员权限。
 
 use std::{ffi::c_void, ptr};
 

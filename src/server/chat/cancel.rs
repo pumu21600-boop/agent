@@ -20,7 +20,7 @@ pub(crate) async fn cancel(State(state): State<AppState>, Query(q): Query<Cancel
         Json(json!({ "cancelled": true, "scope": "all", "count": count }))
     } else {
         let hit = state.cancel.cancel(session);
-        // P22-C：父任务被停 → 级联停它的全部活跃子代理（子代理跑在独立会话，标志互不相通）
+        // 父任务被停 → 级联停它的全部活跃子代理（子代理跑在独立会话，标志互不相通）
         let cascaded = subagent::cancel_children(session);
         observability::event(
             EventType::State,
@@ -46,5 +46,5 @@ pub(crate) async fn cancel_status(State(state): State<AppState>, Query(q): Query
     }
 }
 
-// —— P10-A（施工单 014）：trace 时间线 ——
+// —— （施工单 014）：trace 时间线 ——
 

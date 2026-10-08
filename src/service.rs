@@ -1,4 +1,4 @@
-//! 服务自管理（P13 前置）：双击即用 + 后台常驻 + 开机自启，不再依赖 start/stop.bat。
+//! 服务自管理（前置）：双击即用 + 后台常驻 + 开机自启，不再依赖 start/stop.bat。
 //!
 //! 行为：
 //! - 无参数双击：5173 已在跑 → 直接打开浏览器；未跑 → 自己以后台方式再起一个（隐藏窗口，
@@ -6,7 +6,7 @@
 //! - `agent.exe start`：后台启动服务（已跑则只开浏览器），与双击等价但不阻塞终端。
 //! - `agent.exe stop`：结束其他 agent.exe 服务进程（不杀自己）。
 //! - `agent.exe status`：打印 5173 监听状态与进程信息。
-//! - `agent.exe run <消息> [选项]`：P22-A 无头会话一次性唤醒——打本地服务跑完整轮，
+//! - `agent.exe run <消息> [选项]`：无头会话一次性唤醒——打本地服务跑完整轮，
 //!   把最终回答打印到终端（程序化唤醒的 CLI 入口；选项见 parse_run_args）。
 //! - `agent.exe --install`：写 HKCU Run 开机自启（最小化启动）；`--uninstall` 移除。
 //! - `agent.exe --minimized`：后台子进程入口（隐藏窗口跑服务）。
@@ -219,7 +219,7 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
             false
         }
         "run" => {
-            // P22-A 无头会话 CLI：在独立线程里跑阻塞 HTTP（reqwest 阻塞客户端不进
+            // 无头会话 CLI：在独立线程里跑阻塞 HTTP（reqwest 阻塞客户端不进
             // tokio 运行时），run_cli 所有出口都直接退进程，join 只是兜底。
             let rest: Vec<String> = argv[2..].to_vec();
             let host = host.to_string();
@@ -252,7 +252,7 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
     }
 }
 
-/// P22-A `run` 子命令的解析结果。
+/// `run` 子命令的解析结果。
 pub(super) struct RunArgs {
     pub message: String,
     pub session_id: String,
@@ -410,7 +410,7 @@ fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
 mod tests {
     use super::*;
 
-    /// P22-A：`run` 子选项解析——消息多词拼接、各 flags、缺省值（安全侧）。
+    /// `run` 子选项解析——消息多词拼接、各 flags、缺省值（安全侧）。
     #[test]
     fn parse_run_args_covers_words_flags_and_defaults() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

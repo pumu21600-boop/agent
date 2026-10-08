@@ -1,9 +1,9 @@
-//! 会话列表/元信息/分叉/批量/打开/清空/HANDOFF 端点（P19 自 server.rs 按域拆出）
+//! 会话列表/元信息/分叉/批量/打开/清空/HANDOFF 端点（自 server.rs 按域拆出）
 
 use super::*;
 use super::workspace::{apply_workspace, canon_workspace, same_workspace};
 
-/// GET /api/sessions —— 会话列表（新→旧）+ 项目名（P6.1 多会话）。
+/// GET /api/sessions —— 会话列表（新→旧）+ 项目名（多会话）。
 /// `?scope=workspace` 只返回当前工作区的会话（composer @ 上下文「选对话加入」用；
 /// 工作区比对与时间线同一把尺子 same_workspace，别在前端拿裸字符串比）。
 pub(super) async fn list_sessions(
@@ -279,7 +279,7 @@ pub(super) async fn clear_session(State(state): State<AppState>, axum::extract::
     };
     match state.session.delete(id) {
         Ok(()) => {
-            // P9 A3：删会话即撤销其「会话内同类允许」记忆（仅内存，从不落盘）
+            // A3：删会话即撤销其「会话内同类允许」记忆（仅内存，从不落盘）
             if let Ok(mut m) = state.approved_scopes.lock() {
                 m.remove(id);
             }
@@ -296,5 +296,5 @@ pub(super) async fn clear_session(State(state): State<AppState>, axum::extract::
     }
 }
 
-// 注：P6 交接文档生成（/api/handoff 手动 + 核心循环 80% 自动）已按用户要求移除
+// 注：交接文档生成（/api/handoff 手动 + 核心循环 80% 自动）已按用户要求移除
 // （2026-10-01）——会话落盘与滚动摘要已保障跨任务续命，不再另生 HANDOFF.md。

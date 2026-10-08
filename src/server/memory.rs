@@ -1,4 +1,4 @@
-//! 系统约定读写 + 记忆库/语义检索端点（P19 自 server.rs 按域拆出）
+//! 系统约定读写 + 记忆库/语义检索端点（自 server.rs 按域拆出）
 
 use super::*;
 use super::chat::find_channel;
@@ -158,7 +158,7 @@ pub(super) async fn get_memory_library(State(state): State<AppState>) -> Json<Va
     Json(build_library(&state, false).await)
 }
 
-/// P22-D：定时任务「记忆提醒」到点前的记忆库同步（有界增量；配了嵌入渠道就走语义向量，
+/// 定时任务「记忆提醒」到点前的记忆库同步（有界增量；配了嵌入渠道就走语义向量，
 /// 没配走本地词法——与记忆库面板同一路径，只是没人看着时也要保新鲜）。
 pub(crate) async fn sync_library_for_schedule(state: &AppState) {
     let settings = state.settings.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -255,4 +255,4 @@ pub(super) async fn search_memory(State(state): State<AppState>, Json(req): Json
     }))
 }
 
-// —— P11（施工单 016）：MCP 插件 ——
+// —— （施工单 016）：MCP 插件 ——

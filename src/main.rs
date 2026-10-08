@@ -1,6 +1,6 @@
-//! 施工单 002（P1）：结构模块化 + 聊天 UI 骨架
+//! 施工单 002：结构模块化 + 聊天 UI 骨架
 //!
-//! 模块骨架对齐总架构 §17。核心循环 P2、沙箱 P3、工具 P4 依次后置。
+//! 模块骨架对齐总架构 §17。核心循环、沙箱、工具等依次后置。
 
 mod browser;
 mod config;
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     // —— 配置：config.toml（server/logging/gateway 种子）——
     let config = config::load(&manifest.join("config.toml"))?;
 
-    // —— 服务自管理（P13 前置）：start/stop/status/--install/双击智能启动——
+    // —— 服务自管理（前置）：start/stop/status/--install/双击智能启动——
     // 接管后直接返回，不跑服务；--minimized 后台子进程与无参服务进程继续往下走。
     let argv: Vec<String> = std::env::args().collect();
     if service::handle(&argv, &config.server.host, config.server.port) {
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
 
     // —— 设置：settings.json 持久化；首次用 config.toml 的 gateway 节作种子 ——
     let user_settings = config::settings::Settings::load(&config.gateway.base_url, &config.gateway.model);
-    crate::mcp::sync_configs(&user_settings.mcp_servers); // P11：启动同步 MCP server 配置
+    crate::mcp::sync_configs(&user_settings.mcp_servers); // 启动同步 MCP server 配置
     // 预连启用中的 MCP server（2026-10-04 用户拍板「装了就装了」）：异步拉起不阻塞启动
     // （npx 首发装包要几十秒），失败静默保持离线、工具调用路径会再试。
     for c in user_settings.mcp_servers.iter().filter(|c| c.enabled) {
@@ -79,13 +79,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     crate::plugin::wasm::set_plugins_dir(manifest.join("plugins"));
-    crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); // P11 017：启动扫描 WASM 插件
-    crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); // P18 027：停用名单贯通工具插件
+    crate::plugin::wasm::scan_and_load(&manifest.join("plugins")); //  017：启动扫描 WASM 插件
+    crate::plugin::wasm::set_disabled(&user_settings.disabled_plugins); //  027：停用名单贯通工具插件
     crate::plugin::ui::set_disabled(&user_settings.disabled_plugins); // 生态轮：同名单贯通插件技能根
     crate::skills::set_disabled(&user_settings.disabled_skills); // 2026-10-02：技能启停名单贯通（index_prompt/composer 过滤）
-    crate::plugin::trust::install(&user_settings.trusted_plugins); // P21 红线3：第三方插件验签（pin digest）
-    crate::hooks::install(config.hooks.clone()); // P18 027：钩子四挂点（config.toml [hooks]）
-    // P21 成本台账：价格表来自 settings.json（由「用量价格」插件的价格设置页维护），
+    crate::plugin::trust::install(&user_settings.trusted_plugins); // 红线3：第三方插件验签（pin digest）
+    crate::hooks::install(config.hooks.clone()); //  027：钩子四挂点（config.toml [hooks]）
+    // 成本台账：价格表来自 settings.json（由「用量价格」插件的价格设置页维护），
     // 初始化台账时扫一遍装入累计花费（费用已冻结在记录里，直接求和），最后装花费硬闸。
     usage::install_prices(&user_settings.cost.prices);
     usage::init(&log_dir.join("usage"));
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut gw = gateway::Gateway::new();
-    // P8 本地限流：[gateway] max_rpm>0 时打开（全渠道共用节流器）
+    // 本地限流：[gateway] max_rpm>0 时打开（全渠道共用节流器）
     gw.set_max_rpm(config.gateway.max_rpm);
     if config.gateway.max_rpm > 0 {
         observability::debug(&format!("[gateway] 本地限流已开启: {} rpm", config.gateway.max_rpm));
@@ -129,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         "用中文简洁回答。".to_string()
     });
     let approval_default = config.agent.default_approval.clone();
-    // P22：桌面壳 webview 控制通道（壳连进来后，内置浏览器搬进壳的 child webview；
+    // 桌面壳 webview 控制通道（壳连进来后，内置浏览器搬进壳的 child webview；
     // 没有壳时 start_listener 空转，浏览器照旧走无头模式）
     browser::shell::start_listener();
     // 开箱即用：启动时预定位 git.exe（发现链含 PATH/注册表/标准位置/捆绑目录），
@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = tools::git_exe() {
         observability::debug(&format!("[git] {e}（git 工具将不可用，其余功能不受影响）"));
     }
-    // P8.2 工作区：settings 里记了就用它（存在才生效），否则工程根
+    // 工作区：settings 里记了就用它（存在才生效），否则工程根
     let ws = match user_settings.workspace.as_deref() {
         Some(p) => {
             let path = std::path::PathBuf::from(p);
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => manifest.clone(),
     };
-    // P7 记忆层：双层存储 + index 登记 + AGENTS.md 模板（开箱即用）；工作区切换时热重开
+    // 记忆层：双层存储 + index 登记 + AGENTS.md 模板（开箱即用）；工作区切换时热重开
     let mem_cfg = std::sync::Arc::new(config.memory.clone());
     let memory = std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
         memory::Memory::open(&ws, &mem_cfg),
@@ -197,16 +197,16 @@ async fn main() -> anyhow::Result<()> {
         memory,
         mem_cfg,
         approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        // P9 A3：挂起审批的元信息 + 会话内已授权范围——均仅内存，重启即失效
+        // A3：挂起审批的元信息 + 会话内已授权范围——均仅内存，重启即失效
         approval_meta: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approved_scopes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         approval_mode: Arc::new(std::sync::RwLock::new(approval_default)),
         // M1：每会话审批档覆盖（并发会话各自独立）
         session_approval: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        // P8 角色映射与网关级配置（降级链/限流参数）
+        // 角色映射与网关级配置（降级链/限流参数）
         roles_cfg: Arc::new(config.roles.clone()),
         gateway_cfg: Arc::new(config.gateway.clone()),
-        // P22-C 子代理并行度（并发上限/单父任务上限）
+        // 子代理并行度（并发上限/单父任务上限）
         subagent_cfg: Arc::new(config.subagent.clone()),
     };
     // 2026-10-03 agent 自改设置轮：工具层（settings/schedule 等运维动作）经共享句柄触达 AppState
@@ -214,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
     let app = server::router(state.clone(), manifest.join("web").join("dist"));
     // 2026-10-05 外部改动监听：agent/用户直接改 settings.json（不走端点）也即时生效
     server::settings::start_external_reload(&state);
-    // P22-B 定时任务：2s 心跳到到唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
+    // 定时任务：2s 心跳到到唤醒无头会话（触发最多延迟 2s；每跳只读一次设置）
     schedule::start(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);

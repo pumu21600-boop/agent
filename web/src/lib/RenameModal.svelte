@@ -1,5 +1,5 @@
 <script>
-  // 重命名弹窗（P19 自 App.svelte 按视图拆出）：kind=session 会话 / project 项目。
+  // 重命名弹窗（自 App.svelte 按视图拆出）：kind=session 会话 / project 项目。
   // modal 对象由宿主持有（{ kind, value }），输入直接改 value（对象按引用共享）。
   export let modal = null;
   import { createEventDispatcher } from 'svelte';

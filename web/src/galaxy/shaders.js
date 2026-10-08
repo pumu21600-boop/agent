@@ -1,4 +1,4 @@
-// 记忆库星云的 GLSL。P14 八轮后改为「离线烘焙」架构（借鉴 wwwtyro/space-3d，Unlicense）：
+// 记忆库星云的 GLSL。八轮后改为「离线烘焙」架构（借鉴 wwwtyro/space-3d，Unlicense）：
 //   · BAKE_FS：打开视图时把星云一次性烘进 3×2 cubemap 图集——位移迭代噪声
 //     （6 步域位移，经典 4D Perlin，Ashima MIT）产生平滑无线的密度场，
 //     多层（青蓝气×3 / 暗尘带×1 / 橙锈纱×2）按 alpha 叠出照片级云雾
@@ -142,7 +142,7 @@ void main() {
 `;
 
 // 上采样 + ACES + 冷色深化 + 轻对比 + 暗角 + 抖动。
-// P14 八轮教训：屏幕空间的 ridged 刻丝全是"描线"——用户点名去掉；
+// 八轮教训：屏幕空间的 ridged 刻丝全是"描线"——用户点名去掉；
 // 照片感的细节全部来自烘焙层，合成只做分级。
 export const COMPOSITE_FS = `#version 300 es
 precision highp float;
@@ -194,7 +194,7 @@ void main() {
   vec3 sc = c * c * (3.0 - 2.0 * c);
   c = mix(c, sc, 0.42);
   c = clamp(mix(vec3(l2), c, 1.55), 0.0, 1.0);
-  // 暗角已删（P14 九轮）：星云铺满画面后，圆形暗角 = "中间亮四周黑"，
+  // 暗角已删（九轮）：星云铺满画面后，圆形暗角 = "中间亮四周黑"，
   // 整个屏幕看起来就是一颗球（用户："还是个球"）。参考照片没有暗角，星到边。
   c += (hash12(gl_FragCoord.xy) - 0.5) / 255.0;        // 抖动
   outColor = vec4(max(c, 0.0), 1.0);

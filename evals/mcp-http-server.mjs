@@ -57,7 +57,7 @@ function handle(msg) {
       return {
         result: {
           protocolVersion: '2024-11-05',
-          // tools + resources + prompts（P17：资源与提示词子集）
+          // tools + resources + prompts（：资源与提示词子集）
           capabilities: { tools: {}, resources: {}, prompts: {} },
           serverInfo: { name: 'mini-http-mcp', version: '0.1.0' },
         },

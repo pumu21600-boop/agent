@@ -1,4 +1,4 @@
-//! 内置浏览器统一命令模型（P21）—— 协议形状移植自 ZCode（zai-org/ZCode，Apache-2.0）
+//! 内置浏览器统一命令模型—— 协议形状移植自 ZCode（zai-org/ZCode，Apache-2.0）
 //! 的 `browserCommandSchema`：一个 `method` 判别联合覆盖全部浏览器动作，结构化错误码
 //! 不静默兜底。工具层只暴露一个 `browser` 工具（method + 该方法自己的参数），审批门
 //! 按 method 分级：只读方法 Safe、页面操作方法 Normal（与原五件套语义一致）。
@@ -293,7 +293,7 @@ pub enum BrowserCommand {    #[serde(rename = "navigate")]
     NewTab,
     #[serde(rename = "close")]
     Close { tab_id: Option<String> },
-    /// 关掉整个浏览器进程（承 P20 的 browser_close；回收本由 10 分钟空转收割负责，
+    /// 关掉整个浏览器进程（承既定约定的 browser_close；回收本由 10 分钟空转收割负责，
     /// 这里是显式提前释放——页面操作全部结束、不想留进程时用）。
     #[serde(rename = "close_browser")]
     CloseBrowser,

@@ -47,7 +47,7 @@
   let approvalBySession = {};
   $: approvalEffective = approvalBySession[currentSessionId || '@new'] || approvalMode;
   let chatPinned = true; // 是否钉在对话底部（决定是否自动滚屏）
-  // 上下文占用（P5 圆环+明细卡）。口径对齐 DSH token-meter：三个数语义分开——
+  // 上下文占用（圆环+明细卡）。口径对齐 DSH token-meter：三个数语义分开——
   // projected=下一次请求的预估占用（圆环分子，实报锚点+带符号增量）、
   // pressure=最近一次渠道实报的 prompt（锚点，没拿到时为 null）、window=模型窗口（圆环分母）
   let ctxUsage = { projected: 0, pressure: null, window: 0, breakdown: null };
@@ -56,12 +56,12 @@
   let temperature = null; // 采样温度（null=渠道默认）
   let topP = null; // 核采样（null=渠道默认）
   let thinking = ''; // 思考开关：''=渠道默认 / on / off
-  let thinkingStyle = 'auto'; // 生效的思考参数形态（P9，OpenClaw thinkingFormat 词表）
-  let capabilities = { tools: true, vision: false, video: false, audio: false }; // P8.5 模型能力标记（纯手动勾选）
-  let roles = {}; // P8.5 角色路由映射
+  let thinkingStyle = 'auto'; // 生效的思考参数形态（thinkingFormat 词表）
+  let capabilities = { tools: true, vision: false, video: false, audio: false }; //  模型能力标记（纯手动勾选）
+  let roles = {}; //  角色路由映射
   // 内置功能开关（插件页「内置」组功能行；后端 settings.features，缺省全开）
   let features = { roles: true, css_tool: true, galaxy: true };
-  // —— P8.2 工作区 ——
+  // —— 工作区 ——
   let workspace = '';
   let recentWorkspaces = [];
   let wsModalOpen = false;
@@ -79,7 +79,7 @@
   // —— 模型快选（输入栏）——
   let modelMenuOpen = false;
   let menuExpandedCfg = ''; // 模型快选菜单里展开的配置组（默认展开当前配置）
-  // —— ZCode 式加号菜单（用户 2026-10-02 改版：只剩 @ 与 / 两个入口）——
+  // —— 加号菜单（用户 2026-10-02 改版：只剩 @ 与 / 两个入口）——
   // @ = 上下文（对话 + 文件，见 openCtxPicker）；/ = 能力（模板 + 技能 + MCP/插件工具，
   // 一个菜单分组列出，$ 技能菜单并进来不再单列）
   let plusMenuOpen = false;
@@ -190,7 +190,7 @@
     syncCur();
   }
 
-  // —— P8.5 多模态媒体附件与大图预览 ——
+  // —— 多模态媒体附件与大图预览 ——
   let pendingAttachments = []; // 待发送附件列表 [{ name, mime, data, size }]
   let fileInput; // 隐藏文件选择器引用
   let previewImageModal = null; // 放大预览的图片 dataUrl
@@ -325,12 +325,12 @@
     }
   }
 
-  // —— P6 恢复与续命 / P6.1 多会话 ——
+  // —— 恢复与续命 /  多会话 ——
   let sessions = []; // 会话列表（新→旧）
   let currentSessionId = null; // 当前会话（null=下次发送自动新建）
   let projectName = ''; // 工作区目录名
 
-  // P9 B1 Plan/Act 手动档已移除：项目类任务由模型按系统提示自动规划步骤清单（todo list），普通聊天不规划
+  // B1 Plan/Act 手动档已移除：项目类任务由模型按系统提示自动规划步骤清单（todo list），普通聊天不规划
 
   // 无边框壳窗口控制 API（壳注入；浏览器客户端没有 → 隐藏窗口按钮/热区）
   let winApi = null;
@@ -408,7 +408,7 @@
     projMenuPath = null;
   }
 
-  // —— P8.2 工作区切换 ——
+  // —— 工作区切换 ——
   async function applyWorkspace(path) {
     try {
       const r = await fetch('/api/workspace', {
@@ -466,7 +466,7 @@
     chatPinned = chatBody.scrollTop + chatBody.clientHeight >= chatBody.scrollHeight - 60;
   }
 
-  // —— 上下文圆环（P5）——
+  // —— 上下文圆环——
   // 分子 = projected（下一次请求的预估占用），分母 = window（模型窗口）
   $: ctxPct = ctxUsage.window ? Math.min(100, Math.round((ctxUsage.projected / ctxUsage.window) * 100)) : 0;
   // 占用极少时百分比仍为 0，但弧保底 2%（实色弧可见，圆环"活"着）
@@ -492,11 +492,11 @@
       row('其他', b.other, 'var(--g5)'),
     ];
   })();
-  // —— ZCode 式输入框：思考模式选择器（常驻）——
+  // —— 输入框：思考模式选择器（常驻）——
   // 复用设置面板的 thinking 字段（唯一数据源）：off/on=明确设置；''=渠道默认
   let thinkMenuOpen = false;
   const THINK_LABELS = { '': '默认', on: '开启', off: '关闭', low: '低档', medium: '中档', high: '高档', max: '最大' };
-  // P23.2 思考三态机制：默认('')/关闭('off')/开启('on'+档位)。
+  // 思考三态机制：默认('')/关闭('off')/开启('on'+档位)。
   // 选「开启」后菜单不收起，才展开该厂商预设映射的档位（点档位才收尾）；
   // 档位到线上参数的映射在网关：anthropic=预算比例（低20%/中50%/高80%，GLM 端点归 effort 档）
   const THINKING_ON_VALUES = ['on', 'low', 'medium', 'high', 'max', 'xhigh', 'minimal'];
@@ -520,7 +520,7 @@
                 : '该渠道无标准开关参数——关不掉到设置改「思考参数形态」';
   function pickThinking(v, keepOpen = false) {
     thinking = v;
-    // 「开启」不收起菜单——档位要等开启后才出现（P23.2 三态机制）
+    // 「开启」不收起菜单——档位要等开启后才出现（三态机制）
     if (!keepOpen) thinkMenuOpen = false;
     // 同步进设置（持久化到当前配置，刷新/切会话不丢）
     autoSave({ thinking: v }, 0);
@@ -528,7 +528,7 @@
 
   // —— 审批档位菜单（输入栏内）——
   let approvalMenuOpen = false;
-  // 四档语义（P19）：
+  // 四档语义：
   // 只读 = 只读操作自动放行，写/执行逐次询问（shell 恒沙箱）
   // 自动 = 工作区与整台电脑都可动（越界写按高危先问），shell 恒沙箱
   // 完全访问 = 整台电脑可动且免审批，shell 本机直跑（需 config 总开关）
@@ -1007,7 +1007,7 @@
   // 「产物」空态/失败的原因（resolveBaseline 没基线、读取出错）——空也要说人话
   let rpArtifactsNote = '';
   // —— git 面板（用户 2026-10-07：审查+提交合成一个标签）——
-  // 范围选择器对应 ZCode 的 source selector：task=本任务改动（影子仓库检查点）、
+  // 范围选择器：task=本任务改动（影子仓库检查点）、
   // work=未提交改动（工作区真仓库相对 HEAD）——同时是提交的暂存区（勾选即入选）
   let rvSource = 'task';
   let rvBaseline = ''; // source='task' 时的基线；点「审查」进面板会带上它自己的
@@ -1018,7 +1018,7 @@
   let rvDiff = {}; // path → { loading, text, error }
   let rvMenu = null; // 行右键菜单 { x, y, path }
   // 打开 git 面板并把某个文件展开（产物行「审查」按钮用；变更条撤了，入口只剩产物行）。
-  // 对齐 ZCode：审查不是另开的 diff 标签，就是面板里那一行展开。
+  // 审查不是另开的 diff 标签，就是面板里那一行展开。
   function openReviewDiff(path, baseline) {
     if (!path) return;
     if (!rpTabs.some((t) => t.kind === 'git')) {
@@ -1114,7 +1114,7 @@
       rvDiff = { ...rvDiff, [f.path]: { loading: false, text: '', error: e.message || String(e) } };
     }
   }
-  // 统一 diff 文本 → 带行号的渲染行（ZCode 的 diff 有左右两个行号列 + 增删着色）
+  // 统一 diff 文本 → 带行号的渲染行（左右两个行号列 + 增删着色）
   function rvParse(text) {
     const out = [];
     let oldNo = 0;
@@ -1152,15 +1152,15 @@
   let rpPreviewCache = {}; // path → { loading, content, error, editing, draft, saving, savedAt }（标签切换不重拉）
   let dockPaneFrames = {}; // 插件标签的 iframe（bind:this），按插件名
 
-  // —— P20.1 网页（右侧面板「网页」页签）——
-  // P21：截图轮询改 screencast 帧端点（内存直出）；面板可见时 600ms 自动刷帧
-  // P22：桌面壳在跑时，页面是壳窗口里的 child webview（真页面真交互）——面板只留
+  // —— 网页（右侧面板「网页」页签）——
+  // 截图轮询改 screencast 帧端点（内存直出）；面板可见时 600ms 自动刷帧
+  // 桌面壳在跑时，页面是壳窗口里的 child webview（真页面真交互）——面板只留
   //      占位区并把矩形报给后端（壳里的 webview 摆到这块）；浏览器直开 5173 时
   //      仍是 screencast 帧流，两条路径由后端 state.mode + 是否在 Tauri 里共同决定。
   let webTabs = []; // { id, agent, title, url, loading, suspended, visible }
   // 思考过程展开态（按消息 id 记；流式 patch 换对象不丢开合——原生 details 在重渲染下会闪回，用户反馈展开不了）
   let thinkingOpenMap = {};
-  // —— 思考块与「工作中」计时（ZCode 同款，用户 2026-10-01）——
+  // —— 思考块与「工作中」计时（用户 2026-10-01）——
   // 思考块固定高度 + 自动跟随：新分片贴底；滚轮往上滚 → 暂停跟随（出「回到底部」按钮）；
   // 滚回最底 → 恢复跟随。时长两个口径：整轮「工作中/工作用时」（收尾冻结）与
   // 「思考 · 持续了 N 秒」（reasoning 分片的时间差累加，间隔 >5s 的按 5s 计）。
@@ -1250,12 +1250,12 @@
   let webShotT = 0; // 帧缓存穿透参数（自动刷新与动作后递增触发 <img> 重载）
   let webBodyW = 0;
   let webBodyH = 0; // 面板内容区实际尺寸（驱动浏览器视口跟随，截图铺满无黑边）
-  let webBodyEl = null; // 面板内容区元素（P22：量矩形给壳里的 child webview 定位）
+  let webBodyEl = null; // 面板内容区元素（：量矩形给壳里的 child webview 定位）
   let webStateReady = false; // 浏览器状态已加载过一次（就绪前不量矩形：web-tabbar 行随标签增删整行出现/消失，未定型前量的都是瞬态矩形）
   let webMode = 'headless'; // 后端宿主模式：shell（壳内真 webview）/ headless（帧流）
   let webMenuOpen = false; // 「⋯」菜单（仅无头模式的 HTML 下拉；壳模式是壳里浮层，前端不记状态）
   // 壳模式：「⋯」菜单是壳里一个**透明置顶的 webview**，浮在网页之上——网页纹丝不动、
-  // 不被遮也不被藏（对齐 ZCode）。前端把面板矩形和按钮矩形交给服务端，壳负责建浮层；
+  // 不被遮也不被藏。前端把面板矩形和按钮矩形交给服务端，壳负责建浮层；
   // 浮层自己关闭（点项/backdrop/Esc）时前端不知道，所以开合状态以服务端为准——这里
   // 的点击一律发 toggle。无头模式没有壳：菜单就是下面的 HTML 下拉（盖在截图上没问题）。
   function webMenuOverlay(body) {
@@ -1299,7 +1299,7 @@
   }
   // 原生托管：壳模式 + 本客户端就是壳 → 面板内容区让给 child webview
   $: webNative = webMode === 'shell' && inTauriShell();
-  // 右侧面板宽度（左缘拖拽可调，320–820；对齐 ZCode 的自由尺寸）
+  // 右侧面板宽度（左缘拖拽可调，320–820）
   let rpWidth = Number(localStorage.getItem('rpWidth')) || 420;
   let rpResizing = false;
   function startRpResize(e) {
@@ -1346,7 +1346,7 @@
   }
   // 空白页（about:blank）显示空态引导；有地址就渲染截图
   $: webShowShot = !!(webActive && webActive.url && webActive.url !== 'about:blank');
-  // P26：面板「正在展示网页」的布尔态（只用原始值，避免对象标识每 2s 轮询都变导致重复触发）。
+  // 面板「正在展示网页」的布尔态（只用原始值，避免对象标识每 2s 轮询都变导致重复触发）。
   // 后端在面板隐藏时会作废上次矩形（防收起再弹时旧矩形闪现），所以这个态每次
   // false→true（侧边栏重开/空白页加载出来/切回网页页签）都必须重发一次矩形，
   // 去重键先清——不然壳永远等不到矩形，网页不显示（用户实测实锤）。
@@ -1391,7 +1391,7 @@
     }
   }
 
-  // 面板可见页上报（对齐 ZCode activateTab；驱动 screencast 与后台挂起）
+  // 面板可见页上报（驱动 screencast 与后台挂起）
   function webActivate(id) {
     webApi('/api/browser/activate', {
       method: 'POST',
@@ -1401,7 +1401,7 @@
   }
 
   // 面板不看了（切走页签/关面板）：通知后端停帧流、放后台页去挂起；
-  // P22 原生托管下空白页（about:blank）也通知隐藏——壳里那个 webview 要让位给空态引导
+  // 原生托管下空白页（about:blank）也通知隐藏——壳里那个 webview 要让位给空态引导
   function webNotifyHidden() {
     // 清去重键：面板重新打开时即使矩形没变也要重发一遍——后端在面板收起时会作废
     // 上次矩形（防旧矩形闪现），等新矩形才显示 webview；键不清就永远等不到
@@ -1416,7 +1416,7 @@
   }
   $: if (rpTab !== 'web' || !rightPanelOpen || (webNative && !webShowShot)) webNotifyHidden();
 
-  // P20.4：agent 操作内置浏览器时，面板自动唤起并**跟随 agent 正在操作的页**
+  // agent 操作内置浏览器时，面板自动唤起并**跟随 agent 正在操作的页**
   // （用户要求「agent 操作时自动唤起右侧边栏」+ 预期「面板跟着 agent 走」）。
   // agent 自己的切页不抢用户视图（服务端 agent_activate 不写 visible_tab），但界面要
   // 能看见 agent 在哪儿干活——常驻每 2s 探一次，agent 最近 10s 有动作就跟随过去。
@@ -1498,7 +1498,7 @@
 
 
   // 帧自动刷新：面板开着且有页面时 600ms 一帧（screencast 内存直出，零 CDP 往返）。
-  // P22 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销
+  // 原生托管不看帧——壳里就是真页面，帧流停掉省编码开销
   let webFrameTimer = null;
   $: if (rpTab === 'web' && rightPanelOpen && webShowShot && !webNative && !webFrameTimer) {
     webFrameTimer = setInterval(() => { webShotT += 1; }, 600);
@@ -1535,7 +1535,7 @@
   }
 
   // 浏览器视口跟随面板内容区（16ms 节流≈每帧；截图铺满无黑边，网页按真实窗口宽度排版）。
-  // P22：x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
+  // x/y 一并上报——shell 模式下后端据此把壳里的 child webview 摆到这块区域。
   // **触发不能只靠 webBodyW/H 的响应式**：窗口横向拉伸时面板宽高都不变、只有 x 变，
   // 响应式不重算 → 壳里 webview 停在旧位置（真机错位 bug）。改用 ResizeObserver 看
   // 尺寸 + window resize 看位置，两条都汇进同一个防抖队列。
@@ -1589,7 +1589,7 @@
   // 面板在原生托管且停在「网页」时才需要跟（壳里 webview 的显隐与它联动）
   $: if (webNative && rpTab === 'web' && rightPanelOpen && webBodyEl) webWatchRect(true);
   $: if (!(webNative && rpTab === 'web' && rightPanelOpen)) webWatchRect(false);
-  // 自愈兜底（P27）：上面的同步全是**事件驱动**的，漏一个事件壳里 webview 就永久卡在
+  // 自愈兜底：上面的同步全是**事件驱动**的，漏一个事件壳里 webview 就永久卡在
   // 旧矩形上——用户看到的就是「网页浮在错误位置、盖住聊天列右侧」。漏事件的路径不止
   // 一种：只挪不变的位移（观察根容器已补）、渲染竞态量到的瞬态矩形、面板切走期间发生
   // 的布局变化（那时 webSyncViewport 直接 return）。所以再加一条 1s 心跳：重量一次
@@ -1972,7 +1972,7 @@
   // xlsx → 二维文本网格（SheetJS；每 sheet 一个 { name, rows[][] }，渲染侧全走文本插值）。
   // 2026-10-04 审计：原先 sheet_to_html 直出 {@html}——SheetJS 的 cell.h 存在时绕过
   // 转义、超链接 Target 原样拼进 href，模型往工作区写一个恶意 xlsx，打开预览就在
-  // 宿主 origin 执行任意脚本（连 P0）。现在只取显示文本（raw:false），不含任何标签。
+  // 宿主 origin 执行任意脚本（等同放任）。现在只取显示文本（raw:false），不含任何标签。
   async function loadXlsxHtml(path) {
     rpSet(path, { loading: true, error: '' });
     try {
@@ -2583,7 +2583,7 @@
 
   // —— CSS 规则导出 / 导入：把「微调规则」与「手写 CSS」打包成一个 JSON 文件，可备份、换机迁移 ——
   let cssImportInput;
-  const CSS_RULES_KIND = 'zcode-ui-css-rules';
+  const CSS_RULES_KIND = 'agent-ui-css-rules';
 
   function exportCssRules() {
     const payload = {
@@ -2888,7 +2888,7 @@
               else if (d.notice)
                 pushMsg(skey, { id: nextId(), role: 'system', content: '[通知] ' + d.notice });
               else if (d.title) {
-                loadSessions(true); // P8 TITLE：标题已生成，刷新会话列表
+                loadSessions(true); //  TITLE：标题已生成，刷新会话列表
                 if (d.title && d.title !== currentTitle) currentTitle = d.title; // 顶栏同步模型生成的标题
               }
               else if (d.context_usage) {
@@ -3067,7 +3067,7 @@
     (sessions.find((x) => x.id === currentSessionId)?.title ?? '') ||
     '新的对话';
 
-  // —— P6.1 多会话：列表 / 切换 / 新建（新建不清空历史）——
+  // —— 多会话：列表 / 切换 / 新建（新建不清空历史）——
   async function loadSessions(autoPick = false) {
     try {
       const r = await fetch('/api/sessions').then((r) => r.json());
@@ -3283,7 +3283,7 @@
     handle.addEventListener('pointerup', up);
     handle.addEventListener('pointercancel', up);
   }
-  // 终端面板高度（上缘拖拽可调，120–560，持久化）——对齐 ZCode 的可调尺寸
+  // 终端面板高度（上缘拖拽可调，120–560，持久化）
   let termH = Number(localStorage.getItem('termH')) || 260;
   let termResizing = false;
   function startTermResize(e) {
@@ -3318,7 +3318,7 @@
   let projMenuPath = null; // 打开了操作菜单的项目 path
   let viewMenuOpen = false;
   let renameModal = null; // { kind: 'session'|'project', target, value }
-  // P27 通用确认弹窗：桌面壳（Tauri WebView2）不实现 window.confirm/alert（静默无操作），
+  // 通用确认弹窗：桌面壳（Tauri WebView2）不实现 window.confirm/alert（静默无操作），
   // 全部确认/提示走应用内弹窗。{ text, okOnly, resolve }。
   let confirmModal = null;
   function confirmAsk(text, okOnly = false) {
@@ -3580,7 +3580,7 @@
     }
   }
 
-  // —— P6.1 改动统计条：撤销 = 工作树回滚到任务起点基线 ——
+  // —— 改动统计条：撤销 = 工作树回滚到任务起点基线 ——
   async function undoCheckpoint(cp) {
     if (!(await confirmAsk(`撤销本次任务的改动？\n${cp.files} 个文件将恢复到任务开始前（含删除本次新建的已跟踪文件）。\nshell 副作用不可回滚。`)))
       return;
@@ -3629,7 +3629,7 @@
         };
         out.push(asst);
       } else if (m.role === 'system') {
-        // P27：通知/错误随会话落盘（display_only），重启/切回会话后气泡还在
+        // 通知/错误随会话落盘（display_only），重启/切回会话后气泡还在
         out.push({ id: nextId(), role: 'system', content: contentText(m.content) });
       } else if (m.role === 'tool') {
         const asst = [...out].reverse().find(
@@ -3643,7 +3643,7 @@
   }
 
   // 审批决定：本地乐观标记 + 通知后端（后端也会回 approval_decided，幂等）。
-  // remember=true → 本会话内「同类操作」不再询问（P9 A3）；后端拒绝记忆 Dangerous 档。
+  // remember=true → 本会话内「同类操作」不再询问（A3）；后端拒绝记忆 Dangerous 档。
   async function decideApproval(id, approved, remember = false) {
     patchMessageApproval(id, approved);
     try {
@@ -3747,7 +3747,7 @@
     wallpaperMsg = '';
   }
 
-  // —— P10.5 设置分区（左侧导航）——
+  // —— 设置分区（左侧导航）——
   // 'params' 页签已并入「模型配置」；旧 localStorage 值回退到 model
   let settingsTab = ['appearance', 'model', 'roles', 'memory', 'skills', 'mcp', 'ext', 'schedule'].includes(localStorage.getItem('settingsTab'))
     ? localStorage.getItem('settingsTab')
@@ -3794,7 +3794,7 @@
     skillsLoading = false;
   }
 
-  // —— P11（施工单 016）：MCP 插件分区 ——
+  // —— （施工单 016）：MCP 插件分区 ——
   let mcpServers = [];
   let wasmPlugins = []; // WASM 工具插件清单（loadMcp 灌；此前漏声明，能力菜单一开就 ReferenceError）
   // git 运行时状态（插件分区顶部卡片）：系统装的 / 内置包解压的 / 不可用
@@ -3828,7 +3828,7 @@
       gitRuntime = null;
     }
   }
-  // P20 沙箱档位（运行状态卡首卡）：配置档 / 生效档（含 AC→受限回退与原因）/ 探测链
+  // 沙箱档位（运行状态卡首卡）：配置档 / 生效档（含 AC→受限回退与原因）/ 探测链
   let sandboxInfo = null;
   async function loadSandboxInfo(refresh) {
     try {
@@ -3858,7 +3858,7 @@
       }).then((r) => r.json());
       if (r.error) settingsMsg = `MCP ${action} 失败: ${r.error}`;
       if (action === 'refresh' && r.ok) settingsMsg = `已连接，发现 ${r.tools_found} 个工具`;
-      // P24：授权发起后带回事务快照（pending 时卡片里会给可点的授权链接）
+      // 授权发起后带回事务快照（pending 时卡片里会给可点的授权链接）
       if (action === 'oauth_authorize' && r.tx) settingsMsg = r.tx.message || '授权已发起';
       if (action === 'oauth_revoke') settingsMsg = '已撤销授权';
     } catch (e) {
@@ -4253,7 +4253,7 @@
       bridge: true, title: '读当前会话信息',
       run({ reply }) { reply(true, { id: currentSessionId, title: displayTitle }); },
     },
-    // —— P17 写操作（都要 manifest 里先声明权限）——
+    // —— 写操作（都要 manifest 里先声明权限）——
     'composer.insert': {
       bridge: true, perm: 'composer.insert', title: '往输入框插入文本',
       run({ reply, params }) {
@@ -4324,7 +4324,7 @@
         reply(true, { ok: true });
       },
     },
-    // —— P18 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
+    // —— 存储一门（027）：插件命名空间内的结构化读写（须声明 storage 权限）——
     // 后端按插件名隔离目录（plugin_data/<name>/），内核保留区（会话/设置/记忆）不在任何
     // 插件写路径上；键名白名单在前后端双重校验。
     'storage.read': {
@@ -4361,7 +4361,7 @@
         reply(!!r.ok, r.ok ? { ok: true, found: j.found } : j.error || '删除失败');
       },
     },
-    // —— P21 只读桥：「用量价格」插件（plugins/usage 试点）拉当前会话的用量统计 ——
+    // —— 只读桥：「用量价格」插件（plugins/usage 试点）拉当前会话的用量统计 ——
     'usage.session': {
       bridge: true, title: '读当前会话用量',
       async run({ reply, get, params }) {
@@ -4386,7 +4386,7 @@
         });
       },
     },
-    // —— P21 价格设置（保存/重算是写操作，须声明 usage.prices 权限）——
+    // —— 价格设置（保存/重算是写操作，须声明 usage.prices 权限）——
     'usage.prices': {
       bridge: true, title: '读价格表',
       async run({ reply, get }) { reply(true, await get('/api/usage/prices')); },
@@ -4421,7 +4421,7 @@
         reply(r.ok && j.ok !== false, r.ok ? j : j.error || '重算失败');
       },
     },
-    // —— P19 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
+    // —— 只读桥：trace 时间线面板（plugins/trace 试点）拉最近任务事件流 ——
     // 时间线**只显示当前对话**（用户 2026-10-07 拍板）：session 参数就是过滤范围，
     // 没有当前会话（新对话还没落 id）时后端返回空——不漏别会话的任务进来。
     'trace.recent': {
@@ -4688,7 +4688,7 @@
     if (!wasOpenSame) extPendingMsgs.push({ name: e.name, msg: { type: 'agent:init', payload: extInitPayload(e) } });
   }
 
-  /// 扩展启用/停用（P17）：写设置 + 刷新清单
+  /// 扩展启用/停用：写设置 + 刷新清单
   // 行内 tooltip：把版本/目录/工具/权限/界面插槽收进悬停提示，行体只留一句描述（用户 2026-09-30：单行紧凑，别占地方）
   function extTip(e) {
     const parts = [];
@@ -4722,7 +4722,7 @@
     }
   }
 
-  // P18 契约 v1（027）：draft 转正（落盘持久化、来源改 user）/ 丢弃（内存即清）
+  // 契约 v1（027）：draft 转正（落盘持久化、来源改 user）/ 丢弃（内存即清）
   async function promoteExt(e) {
     try {
       const r = await fetch('/api/plugins/promote', {
@@ -4813,7 +4813,7 @@
     }
   }
 
-  // P21 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
+  // 红线3：第三方插件来源验签——pin/unpin 内容指纹（user 来源插件先受信任才加载）
   // 准入审核（用户 2026-10-02 拍板）：pin 前静态审查，blocker 后端直接拒；审核报告按插件名缓存
   let extReviews = {}; // name -> report（{verdict, findings, files_scanned, bytes_scanned}）
   let reviewModal = null; // 打开中的审查报告：{ ext, report }（用户要「可视化界面，还要简洁」）
@@ -4911,7 +4911,7 @@
       theme_mode: themeMode,
       sessionId: currentSessionId,
       title: displayTitle,
-      // P17：告诉扩展「你是谁」（权限 / 插槽声明它自己在 manifest 里写）
+      // 告诉扩展「你是谁」（权限 / 插槽声明它自己在 manifest 里写）
       ext: ext ? { name: ext.name, title: ext.title, permissions: ext.permissions || [] } : null,
     };
   }
@@ -5017,7 +5017,7 @@
     loadSession(e.detail);
   }
 
-  // P10-A trace 时间线已插件化（P19）：plugins/trace 面板 + 宿主只读桥 trace.recent，
+  // trace 时间线已插件化：plugins/trace 面板 + 宿主只读桥 trace.recent，
   // 原内置弹窗（状态/函数/标记/样式）整体撤下——顶栏的插件按钮即入口。
 
   function nextId() {
@@ -5258,7 +5258,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="3.2"/><path d="M14.5 4.5v15"/><path d="M17.5 9.5h1M17.5 12.5h1" stroke-linecap="round"/></svg>
         </button>
 
-        <!-- 窗口控制（无边框壳，对齐 ZCode：原生黑条撤掉，按钮做进内容行）。
+        <!-- 窗口控制（无边框壳：原生黑条撤掉，按钮做进内容行）。
              只有桌面壳里才有 agentWinApi（壳每 2s 注入）；浏览器打开的第二个客户端不显示。
              侧栏展开时按钮在侧栏右端（见 brand 行），这里只兜收起态 -->
         {#if winApi && !rightPanelOpen}
@@ -5268,7 +5268,7 @@
             </button>
             <button class="head-btn win-btn" title={winMax ? '还原窗口' : '最大化'} aria-label={winMax ? '还原窗口' : '最大化'} on:click={() => winApi.toggleMax().then(refreshWinMax, refreshWinMax)}>
               {#if winMax}
-                <!-- 全屏态：两个叠放矩形 = 还原（对齐 ZCode） -->
+                <!-- 全屏态：两个叠放矩形 = 还原 -->
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="7.5" width="12" height="12" rx="2"/><path d="M8 7.5V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-1.5"/></svg>
               {:else}
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="5.5" y="5.5" width="13" height="13" rx="2"/></svg>
@@ -5749,7 +5749,7 @@
                   </button>
 
                   {#if thinkingStyle === 'deepseek' || thinkingStyle === 'openai' || thinkingStyle === 'anthropic'}
-                    <!-- P23.2 三态机制：开启后菜单不收起，才展开该厂商预设映射的档位。
+                    <!-- 三态机制：开启后菜单不收起，才展开该厂商预设映射的档位。
                          anthropic：低/中/高=预算 20%/50%/80%；
                          deepseek：低/中/高/最大=reasoning_effort；openai：低/中/高=reasoning_effort -->
                     <button class="bar-item" class:active={thinking === 'on'} on:click={() => pickThinking('on', true)}>
@@ -5836,7 +5836,7 @@
   </main>
 
   {#if rvMenu}
-    <!-- git 面板行的右键菜单（对齐 ZCode：预览 / 复制路径；行点击就地展开 diff） -->
+    <!-- git 面板行的右键菜单（预览 / 复制路径；行点击就地展开 diff） -->
     <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
     <div class="rv-menu-back" on:click={() => (rvMenu = null)} role="presentation"></div>
     <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -5866,7 +5866,7 @@
             >
               <svg class="rp-tab-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{@html rpTabIcon(t)}</svg>
               <span class="rp-tab-title">{t.kind === 'ext' ? rpExtTitle(t.name) : t.title}</span>
-              <!-- × 只在激活标签上且顶到标签最右（对齐 ZCode 参照实现）：五个标签也放得下，关别的先点它 -->
+              <!-- × 只在激活标签上且顶到标签最右：五个标签也放得下，关别的先点它 -->
               {#if rpTab === t.key}
                 <span class="rp-tab-x" title="关闭标签" role="button" tabindex="-1" on:click|stopPropagation={() => closeRpTab(t.key)}>×</span>
               {/if}
@@ -5935,7 +5935,7 @@
       </div>
       <div class="rp-body">
         {#if !rpVisibleTabs.length}
-          <!-- 标签全关掉后的选择页（对齐 ZCode「打开标签页」）：点卡片即开该面板 -->
+          <!-- 标签全关掉后的选择页：点卡片即开该面板 -->
           <div class="rp-open">
             <div class="rp-open-title">打开标签页</div>
             <div class="rp-open-sub">选择要在侧边面板中打开的标签。</div>
@@ -6286,7 +6286,7 @@
                     在默认浏览器中打开
                   </button>
                   {#if webNative}
-                    <!-- P22：壳里的 child webview 能开真 DevTools（无头时代做不到） -->
+                    <!-- 壳里的 child webview 能开真 DevTools（无头时代做不到） -->
                     <button on:click={() => { webCloseMenu(); webMenuAction('devtools'); }}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
                       开发者工具
@@ -6316,7 +6316,7 @@
                   <div class="web-empty-sub">粘贴或输入 URL 以打开网页。</div>
                 </div>
               {:else if webNative}
-                <!-- P22：壳窗口里的 child webview 就浮在这块区域上（原生 HWND 盖在 Svelte 之上），
+                <!-- 壳窗口里的 child webview 就浮在这块区域上（原生 HWND 盖在 Svelte 之上），
                      这里只留占位——点击/滚动/输入全部走真实网页，不再坐标回传 -->
                 <div class="web-native" aria-hidden="true"></div>
               {:else}
@@ -6368,7 +6368,7 @@
     </aside>
   {/if}
 
-  <!-- P17 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
+  <!-- 扩展间通信：其它已启用扩展常驻后台（不可见），消息由宿主转发。 -->
   {#each enabledExts.filter((e) => e.entry && !(e.ui || []).some((u) => u.slot === 'dock')) as e (e.name)}
     {#if !(extOpen && extCurrent && extCurrent.name === e.name)}
       <iframe
@@ -7193,7 +7193,7 @@
   }
   .sidebar {
     width: 300px;
-    box-sizing: border-box; /* P9 修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
+    box-sizing: border-box; /*  修复：宽=sidebarW 语义对齐（渲染宽不再多出 padding+border 25px，拖拽手柄贴手指） */
     flex: none;
     background: var(--g0);
     border-right: 1px solid var(--g1);
@@ -7852,7 +7852,7 @@
   .chat-head button, .chat-head input, .chat-head .plug-chip {
     -webkit-app-region: no-drag;
   }
-  /* 窗口控制按钮组（─/▢/✕）：ZCode 同款，纯文字 tooltip，hover 才显底色 */
+  /* 窗口控制按钮组（─/▢/✕）：纯文字 tooltip，hover 才显底色 */
   .win-ctrls {
     display: flex;
     align-items: center;
@@ -8067,7 +8067,7 @@
     border-left: 1px solid var(--g3);
     min-height: 0;
   }
-  /* 左缘拖拽调宽手柄（对齐 ZCode 的自由尺寸） */
+  /* 左缘拖拽调宽手柄 */
   .rp-resize {
     position: absolute;
     left: -3px;
@@ -8089,7 +8089,7 @@
     border-bottom: 1px solid var(--g3);
     position: relative; /* 溢出滑杆的锚点 */
   }
-  /* P17：常驻后台的扩展 iframe（扩展间通信要用；不显示但保持运行） */
+  /* 常驻后台的扩展 iframe（扩展间通信要用；不显示但保持运行） */
   .ext-hidden {
     position: absolute;
     width: 1px;
@@ -8121,7 +8121,7 @@
     border: none;
     background: var(--g1);
   }
-  /* P20.1 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
+  /* 网页面板（内置浏览器：截图渲染 + 坐标回传，与 agent 工具共享实例） */
   .web-wrap {
     flex: 1;
     min-height: 0;
@@ -8348,7 +8348,7 @@
     cursor: pointer;
     user-select: none;
   }
-  /* P22：壳里 child webview 的占位区（原生 HWND 盖在这块上面，这里只是撑出尺寸） */
+  /* 壳里 child webview 的占位区（原生 HWND 盖在这块上面，这里只是撑出尺寸） */
   .web-native {
     position: absolute;
     inset: 0;
@@ -8530,7 +8530,7 @@
   .rp-pane.hidden {
     display: none;
   }
-  /* 标签全关掉后的「打开标签页」选择页（对齐 ZCode；用户两轮反馈太紧凑 → 撑满面板宽度） */
+  /* 标签全关掉后的「打开标签页」选择页（用户两轮反馈太紧凑 → 撑满面板宽度） */
   .rp-open {
     margin: auto;
     text-align: center;
@@ -9192,7 +9192,7 @@
     color: var(--accent, #7c9ff5);
     text-decoration: underline;
   }
-  /* 用户消息不再画气泡（用户 2026-10-01：去掉气泡，ZCode 式纯文本）；
+  /* 用户消息不再画气泡（用户 2026-10-01：去掉气泡，纯文本）；
      模型回复也没有边框底色，工具/审批/思考块自己带边框即可 */
   .user-bubble {
     color: var(--g7);
@@ -9219,7 +9219,7 @@
     font-size: 12px;
     color: var(--g5);
   }
-  /* —— 思考块（ZCode 同款）：固定高度 + 自动跟随 + 「思考 · 持续了 N 秒」 —— */
+  /* —— 思考块：固定高度 + 自动跟随 + 「思考 · 持续了 N 秒」 —— */
   .work-line {
     font-size: 12px;
     color: var(--g5);
@@ -9347,7 +9347,7 @@
     background: var(--tint-red-bg);
     color: var(--tint-red-fg);
   }
-  /* P9 A4：风险档位徽章（安全/常规改动/高危操作，与 RiskLevel::label 对齐） */
+  /* A4：风险档位徽章（安全/常规改动/高危操作，与 RiskLevel::label 对齐） */
   .approval-risk {
     display: inline-block;
     padding: 1px 6px;
@@ -9580,7 +9580,7 @@
     font-size: 11px;
     color: var(--g5);
   }
-  /* —— git 面板（对齐 ZCode git pane）：范围选择/撤销/刷新 + 紧凑行 + 就地展开 diff —— */
+  /* —— git 面板：范围选择/撤销/刷新 + 紧凑行 + 就地展开 diff —— */
   .rv-head {
     flex: none;
     display: flex;
@@ -9634,7 +9634,7 @@
     font-family: monospace;
     font-size: 11.5px;
   }
-  /* 刷新：转圈图标（ZCode 同款），加载中不重复点 */
+  /* 刷新：转圈图标，加载中不重复点 */
   .rv-btn {
     flex: none;
     display: inline-flex;
@@ -9694,7 +9694,7 @@
     font-size: 12px;
     margin-top: 3px;
   }
-  /* 行：ZCode 的 h-8 紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头。
+  /* 行：紧凑行——文件名粗体 + 目录暗色，右侧增删 + 展开箭头。
      未提交档行首多一个提交勾选框：行改 flex，勾选框不参与伸缩、文件按钮吃掉余量、
      diff 展开块整行换行（flex-basis:100%），收起/展开两种态都不破版 */
   .rv-row {
@@ -9782,7 +9782,7 @@
   .rv-row.open .rv-chev {
     transform: rotate(180deg);
   }
-  /* 就地展开的 diff：左右行号列 + 增删着色（ZCode 的 diff 预览） */
+  /* 就地展开的 diff：左右行号列 + 增删着色 */
   .rv-diffwrap {
     flex: 1 1 100%; /* 父行是 flex-wrap：展开的 diff 独占一行，不跟勾选框/文件名并排 */
     background: var(--g0);
@@ -10369,7 +10369,7 @@
     background: var(--tint-red-bg);
     filter: brightness(1.12);
   }
-  /* —— P8.2 工作区切换 —— */
+  /* —— 工作区切换 —— */
   .menu-sep {
     height: 1px;
     background: var(--g2);
@@ -10380,7 +10380,7 @@
     font-size: 12px;
     padding: 8px 10px;
   }
-  /* P10.5 设置分区（左导航 + 内容区） */
+  /* 设置分区（左导航 + 内容区） */
   .settings-modal {
     width: 880px;
     max-width: 94vw;
@@ -10511,7 +10511,7 @@
     color: var(--g5);
     resize: vertical;
   }
-  /* P11 MCP 插件分区 */
+  /* MCP 插件分区 */
   .mcp-card {
     border: 1px solid var(--g3);
     border-radius: 10px;
@@ -10681,7 +10681,7 @@
     font-size: 12px;
     padding: 6px 8px;
   }
-  /* —— 插件页（用户 2026-09-30 指示：学 ZCode 紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
+  /* —— 插件页（用户 2026-09-30 指示：紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
      plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（用户 2026-10-02 要求
      与插件页同形式）也在用，跨组件共用 */
 </style>

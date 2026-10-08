@@ -1,6 +1,6 @@
-//! WASM 插件宿主（施工单 017 + 021，P11/P15；P18 027 契约化）—— 总架构 §7
+//! WASM 插件宿主（施工单 017 / 021 / 027）—— 总架构 §7
 //!
-//! **P18 定位调整**：WASM 不再是一种「插件」，降为插件工具的一种可选实现 / 沙箱轻量档。
+//! ** 定位调整**：WASM 不再是一种「插件」，降为插件工具的一种可选实现 / 沙箱轻量档。
 //! 用户可见术语只有「插件」；这里的代码是插件工具的执行引擎之一。
 //!
 //! 插件形态（两种，磁盘自动迁移读入）：
@@ -30,7 +30,7 @@
 //! 信任模型：plugins/ 目录文件由用户主动放置（本地可信），工具默认 Normal 档；
 //! 未知/加载失败 → Dangerous（与 MCP 防线对齐）。
 //!
-//! 生命周期（P18 027 定案 5「等完」）：停用 = `set_disabled` 名单 → 工具不再下发
+//! 生命周期（027 定案 5「等完」）：停用 = `set_disabled` 名单 → 工具不再下发
 //! （拒新调用）+ `call_tool` 拒之门外；在跑调用是 30s 内自终的独立实例，自然结束即「等完」，
 //! 超时击杀兜底——无需任务管理器。
 
@@ -89,15 +89,15 @@ pub struct PluginEntry {
     /// (工具名, 描述, schema)
     pub tools: Vec<(String, String, Value)>,
     pub load_error: Option<String>,
-    /// P18 契约：来源（built_in / user / model_generated）与元数据
+    /// 契约：来源（built_in / user / model_generated）与元数据
     pub origin: String,
     pub title: String,
     pub description: String,
     pub version: String,
     pub api_version: u32,
-    /// P21 红线3：内容指纹（user 来源才算；内置/draft 为空串）
+    /// 红线3：内容指纹（user 来源才算；内置/draft 为空串）
     pub digest: String,
-    /// P21 红线3：是否可信任（未 pin / 内容已变的 user 插件 = false，工具不下发）
+    /// 红线3：是否可信任（未 pin / 内容已变的 user 插件 = false，工具不下发）
     pub trusted: bool,
     /// draft 插件的内存字节（磁盘插件为 None；call_tool 优先用）
     pub inline: Option<Vec<u8>>,
@@ -126,7 +126,7 @@ static REGISTRY: OnceLock<RwLock<Vec<PluginEntry>>> = OnceLock::new();
 
 static PLUGINS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// P18：停用名单（settings.disabled_plugins 扩面到工具插件）。
+/// 停用名单（settings.disabled_plugins 扩面到工具插件）。
 /// 停用 = 不下发工具定义（拒新调用）；在跑调用等完（见模块头）。
 static DISABLED: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
 
@@ -178,7 +178,7 @@ pub fn has_plugin(stem: &str) -> bool {
 }
 
 /// 扫描目录并加载全部插件（幂等：全量重载）。目录不存在=清空。
-/// 兼容两种形态：裸 .wasm/.wat 文件（旧）+ `<name>/manifest.json` 目录（P18 契约形态）。
+/// 兼容两种形态：裸 .wasm/.wat 文件（旧）+ `<name>/manifest.json` 目录（契约形态）。
 pub fn scan_and_load(dir: &Path) -> usize {
     let mut out: Vec<PluginEntry> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -218,7 +218,7 @@ pub fn scan_and_load(dir: &Path) -> usize {
     n
 }
 
-/// P21 红线3：user 来源插件的验签门（内置/模型自产豁免）。
+/// 红线3：user 来源插件的验签门（内置/模型自产豁免）。
 /// 通过/豁免 → Ok(digest)；拒载 → Err(人话理由 + 审计)。
 fn trust_gate(stem: &str, origin: &str, path: &Path, is_dir: bool) -> Result<String, String> {
     if origin != contract::ORIGIN_USER {
@@ -260,7 +260,7 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
         entry.load_error = Some(e); // apiVersion 不匹配 → 拒载（UI 会显示「请升级」）
         return entry;
     }
-    // P21 红线3：本注册表只扫**应用根** plugins/（main.rs 启动时传入，随包内置位），
+    // 红线3：本注册表只扫**应用根** plugins/（main.rs 启动时传入，随包内置位），
     // 位置即 app——与 ui::scan 对同一目录的判定保持一致（否则同一插件面板免验签、
     // 工具半边要 pin）。workspace/plugins 的目录形态不过这里（ui::scan 管面板与技能）。
     entry.origin = contract::origin_of(&mf, "app");
@@ -273,7 +273,7 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     if let Some(v) = mf.get("version").and_then(Value::as_str) {
         entry.version = v.to_string();
     }
-    // P21 红线3：第三方工具插件先 pin 后代跑（未 pin / 内容已变 → 拒载，工具不下发）
+    // 红线3：第三方工具插件先 pin 后代跑（未 pin / 内容已变 → 拒载，工具不下发）
     match trust_gate(name, &entry.origin, dir, true) {
         Ok(d) => entry.digest = d,
         Err(reason) => {
@@ -297,7 +297,7 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     };
     bins.sort();
     match bins.len() {
-        // P28 合并后一个插件一个目录：纯面板插件（manifest 只声明面板、没有工具
+        // 合并后一个插件一个目录：纯面板插件（manifest 只声明面板、没有工具
         // 半边）合法——工具清单留空不算加载错误，「打开」半边由 ui 扫描负责。
         0 => entry,
         1 => {
@@ -321,7 +321,7 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     }
 }
 
-/// 加载单个插件：先过验签门（P21），再编译 + 实例化 + describe。
+/// 加载单个插件：先过验签门，再编译 + 实例化 + describe。
 fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
     // 旧形态裸文件默认 origin=user：同样要先 pin 后代跑
     let digest = match trust_gate(stem, contract::ORIGIN_USER, file, false) {
@@ -608,8 +608,8 @@ pub fn status() -> Vec<(String, bool, Vec<ToolBrief>, Option<String>)> {
         .collect()
 }
 
-/// P28 目录合并：工具半边转成统一清单（与 ui::scan 同目录同形态，由 ui::scan_all
-/// 合成一份）。纯面板的目录在这里 tools 为空、**不报错**（P28 起合法形态）；
+/// 目录合并：工具半边转成统一清单（与 ui::scan 同目录同形态，由 ui::scan_all
+/// 合成一份）。纯面板的目录在这里 tools 为空、**不报错**（起合法形态）；
 /// 纯工具插件 `entry` 为空（前端不渲染「打开」），能力以 `tools` 清单呈现。
 pub fn scan_plugins(disabled: &[String]) -> Vec<crate::plugin::ui::UiExt> {
     let reg = registry().read().unwrap_or_else(|e| e.into_inner());
@@ -670,7 +670,7 @@ mod tests {
         crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// P21：把 plugins 目录里的全部条目（裸文件 + 目录形态）pin 上（与 promote 自动 pin 同路），
+    /// 把 plugins 目录里的全部条目（裸文件 + 目录形态）pin 上（与 promote 自动 pin 同路），
     /// 让验签门放行——测的是别的行为时不至于被红线挡住。
     fn pin_plugins_dir(dir: &Path) {
         let mut pins = std::collections::BTreeMap::new();
@@ -731,7 +731,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
-        // P21：裸文件默认 user 来源 → 先 pin 后代跑（验签红线）
+        // 裸文件默认 user 来源 → 先 pin 后代跑（验签红线）
         pin_plugins_dir(&dir);
 
         let n = scan_and_load(&dir);
@@ -754,7 +754,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P18 契约：目录形态（manifest + 单工具文件）加载、apiVersion 拒载、停用过滤、
+    /// 契约：目录形态（manifest + 单工具文件）加载、apiVersion 拒载、停用过滤、
     /// draft inline 加载与调用——一次覆盖 027 的四个新行为。
     #[test]
     fn contract_dir_form_disabled_filter_and_inline() {
@@ -784,7 +784,7 @@ mod tests {
         std::fs::create_dir_all(&future).unwrap();
         std::fs::write(future.join("manifest.json"), r#"{"apiVersion":2}"#).unwrap();
         std::fs::write(future.join("f.wat"), ECHO_WAT).unwrap();
-        // P21：目录形态未声明 source → 默认 user（自装位）→ 先 pin 后代跑
+        // 目录形态未声明 source → 默认 user（自装位）→ 先 pin 后代跑
         pin_plugins_dir(&dir);
 
         let n = scan_and_load(&dir);
@@ -825,7 +825,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P21 红线3：第三方工具插件「先 pin 后代跑」全矩阵——
+    /// 红线3：第三方工具插件「先 pin 后代跑」全矩阵——
     /// 未 pin 拒载（工具不下发）→ pin 后放行 → 内容被改再次拒载（digest 不符）。
     #[test]
     fn untrusted_dir_plugin_is_blocked_until_pinned() {

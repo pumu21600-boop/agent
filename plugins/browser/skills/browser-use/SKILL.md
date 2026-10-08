@@ -10,7 +10,7 @@ description: 用内置浏览器打开/点击/输入/测试网页与本地页面
 
 ## 工具形态
 
-一个 `browser` 工具，按 `method` 判别动作（协议对齐 ZCode browser-use）：
+一个 `browser` 工具，按 `method` 判别动作：
 
 - 导航：`navigate`（返回快照）/ `back` / `forward` / `reload` / `wait_for`
 - 观察：`snapshot` / `get_state` / `element_info` / `list`
@@ -22,7 +22,7 @@ description: 用内置浏览器打开/点击/输入/测试网页与本地页面
 定位优先级：**ref（快照编号）→ text/label（语义）→ x/y（视口坐标）**。
 ref 是快照时钉在元素上的编号（如 e12），跨快照稳定；DOM 变了会失效。
 
-## 工作流纪律（按 ZCode control-browser 对齐）
+## 工作流纪律
 
 1. **navigate 后直接读返回的快照**，不要再立刻 snapshot 一次——navigate 已等加载完成并附带结构。
 2. **点击/输入前先 snapshot 拿最新 ref**；不要凭记忆用旧 ref。

@@ -1,4 +1,4 @@
-//! Anthropic Messages 协议适配器（P23）。
+//! Anthropic Messages 协议适配器。
 //!
 //! 边界协议翻译：请求侧把 OpenAI 会话形状（system 消息 / role:"tool" / tool_calls）
 //! 翻译成 Messages API 形状（system 顶层参数 / tool_use·tool_result 内容块 / max_tokens 必填 /
@@ -98,7 +98,7 @@ fn carries_tool_result(messages: &[Value]) -> bool {
     messages.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
 }
 
-/// 思考预算：按档位取 max_tokens 比例（P23.2 用户机制：Anthropic 档位 低/中/高），
+/// 思考预算：按档位取 max_tokens 比例（用户机制：Anthropic 档位 低/中/高），
 /// 夹在 [1024, 32000]，且必须 < max_tokens；放不下就不开思考。
 /// on/中=50%，低=20%，高=80%。
 pub fn thinking_budget(max_tokens: u64, requested: &str) -> Option<u64> {
@@ -554,7 +554,7 @@ mod tests {
         p.max_tokens = Some(8192);
         let b = build_body("claude-sonnet", &msgs, true, &p, None);
         assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":4096}), "on=预算取 max_tokens 一半");
-        // 档位比例（P23.2）：低=20%、高=80%
+        // 档位比例：低=20%、高=80%
         p.thinking = Some("low".into());
         let b = build_body("claude-sonnet", &msgs, true, &p, None);
         assert_eq!(b["thinking"]["budget_tokens"], json!(1638), "低=20%");

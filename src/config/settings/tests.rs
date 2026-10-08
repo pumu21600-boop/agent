@@ -108,7 +108,7 @@
 
     #[test]
     fn backward_compat_plugins_rename_migration() {
-        // P28 目录合并迁移：旧字段 disabled_extensions → disabled_plugins（serde alias），
+        // 目录合并迁移：旧字段 disabled_extensions → disabled_plugins（serde alias），
         // 旧信任键 ui-ext:<name> → plugins:<name>（load 迁移）；落盘只写新名。
         let legacy = r#"{
             "disabled_extensions": ["usage"],
@@ -128,7 +128,7 @@
 
     #[test]
     fn backward_compat_field_name_migration() {
-        // P1 配置面收敛：serde alias 垫片退役，旧字段名兼容收拢到 parse_settings 单一入口。
+        // 配置面收敛：serde alias 垫片退役，旧字段名兼容收拢到 parse_settings 单一入口。
         // ① 三组旧名各自迁入；② 新旧并存以新名为准（旧键删除）；③ 落盘不再写旧名。
         let legacy = r#"{
             "active_profile_id": "cfg-legacy",

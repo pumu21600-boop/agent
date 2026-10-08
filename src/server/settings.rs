@@ -1,4 +1,4 @@
-//! 供应商预设 / 设置读写 / 模型列表 / 配置管理端点（P19 自 server.rs 按域拆出）
+//! 供应商预设 / 设置读写 / 模型列表 / 配置管理端点（自 server.rs 按域拆出）
 
 use super::*;
 
@@ -42,16 +42,16 @@ pub struct SettingsUpdate {
     /// 当前模型最大输出长度（tokens；0=清除）
     #[serde(default)]
     pub max_output_tokens: Option<u64>,
-    /// 采样参数（P8；null/缺省=不动，0 或 -1=清除走渠道默认）
+    /// 采样参数（null/缺省=不动，0 或 -1=清除走渠道默认）
     #[serde(default)]
     pub temperature: Option<f64>,
     #[serde(default)]
     pub top_p: Option<f64>,
-    /// 思考开关（P9）："on"/"off"/档位（low/medium/high/xhigh/max/minimal）/""（空=清除走渠道默认）
+    /// 思考开关："on"/"off"/档位（low/medium/high/xhigh/max/minimal）/""（空=清除走渠道默认）
     #[serde(default)]
     pub thinking: Option<String>,
-    /// 思考参数形态覆盖（P9，OpenClaw thinkingFormat 词表）："auto"/""=端点探测；
-    /// none/openai/deepseek/zai/qwen/qwen-chat-template；P8.3 旧值自动映射
+    /// 思考参数形态覆盖（thinkingFormat 词表）："auto"/""=端点探测；
+    /// none/openai/deepseek/zai/qwen/qwen-chat-template；旧值自动映射
     #[serde(default)]
     pub thinking_style: Option<String>,
     /// 模型能力标记（工具调用/图片/视频/音频解析）。Some = 用户手动勾选并保存
@@ -75,7 +75,7 @@ pub(super) async fn list_providers() -> Json<Value> {
                 "name": p.name,
                 "default_base_url": p.default_base_url,
                 "default_model": p.default_model,
-                // P9：预设的思考形态覆盖（多数官方域名可探测，仅豆包/混元带值）
+                // 预设的思考形态覆盖（多数官方域名可探测，仅豆包/混元带值）
                 "thinking_format": p.thinking_format.map(|f| f.as_str()),
                 "key_optional": p.key_optional,
             })
@@ -148,7 +148,7 @@ pub(crate) fn apply_settings_update(s: &mut Settings, req: &SettingsUpdate) -> (
         if let Some(v) = req.max_output_tokens {
             c.max_output_tokens = if v == 0 { None } else { Some(v) };
         }
-        // P8 采样参数：temperature 0.0 是合法值（确定性输出），清除用负数
+        // 采样参数：temperature 0.0 是合法值（确定性输出），清除用负数
         if let Some(v) = req.temperature {
             c.temperature = if v < 0.0 { None } else { Some(v) };
         }
@@ -237,12 +237,12 @@ pub(super) async fn put_settings(
 /// 价格表灌回各子系统。HTTP 端点（put_settings / manage_configs / post_mcp）与
 /// agent 的 settings 工具共用这一道，保证「改设置即生效」只有一条路。
 pub(crate) fn sync_runtime(s: &Settings) {
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
     crate::plugin::ui::set_disabled(&s.disabled_plugins); // 生态轮：同名单贯通插件技能根
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
     crate::skills::set_disabled(&s.disabled_skills); // 2026-10-02：技能启停名单贯通
-    // P21：价格表同步刷新内存副本
+    // 价格表同步刷新内存副本
     crate::usage::install_prices(&s.cost.prices);
 }
 
@@ -440,7 +440,7 @@ fn config_state_json(s: &Settings) -> Value {
         "capabilities_user_set": active.capabilities_user_set,
         "has_key": key.is_some(),
         "key_hint": key_hint_of(key),
-        // P8.2 工作区 + P9/P8.5 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
+        // 工作区 + / 思考参数形态覆盖（前端按它渲染档位菜单与全协议规范）
         "workspace": crate::tools::workspace_root().display().to_string(),
         "recent_workspaces": s.recent_workspaces,
         "workspace_aliases": s.workspace_aliases,
@@ -451,7 +451,7 @@ fn config_state_json(s: &Settings) -> Value {
     })
 }
 
-/// 生效的思考参数形态（P9/P8.5，8大规范词表）：渠道覆盖 > 端点探测。
+/// 生效的思考参数形态（8 大规范词表）：渠道覆盖 > 端点探测。
 /// 值：none | openai | deepseek | zai | qwen | claude | moonshot | qwen-chat-template | auto
 fn effective_thinking_style(
     c: &crate::config::settings::Config,
@@ -460,9 +460,9 @@ fn effective_thinking_style(
     use gateway::compat::ThinkingFormat as TF;
     match c.thinking_style.as_deref() {
         Some("none") => "none",
-        // P23：Anthropic Messages 协议专属形态（开/关 + 自动预算），显式指定或探测判定都归它
+        // Anthropic Messages 协议专属形态（开/关 + 自动预算），显式指定或探测判定都归它
         Some("anthropic") => "anthropic",
-        // P8.3 旧词表别名 → 新词表
+        // 旧词表别名 → 新词表
         Some("thinking_object") => TF::Zai.as_str(),
         Some("reasoning_effort") => TF::Openai.as_str(),
         Some("enable_thinking" | "enable_thinking_budget") => TF::Qwen.as_str(),
@@ -546,7 +546,7 @@ mod tests {
         // 覆盖后 off 真的会发 enable_thinking:false
         let body = gateway::build_body("m", &json!([]), true, &p, None);
         assert_eq!(body["enable_thinking"], json!(false));
-        // P8.3 旧设置值自动映射：thinking_object → zai
+        // 旧设置值自动映射：thinking_object → zai
         c.thinking_style = Some("thinking_object".into());
         let p = build_chat_params(&c, preset);
         assert_eq!(p.thinking_format, Some(gateway::compat::ThinkingFormat::Zai));
@@ -622,7 +622,7 @@ mod tests {
             capabilities: Default::default(),
             capabilities_user_set: false,
         };
-        // 输入栏 🧠 菜单发的档位要能持久化（P8.3 期间被 put_settings 吞掉的老问题）
+        // 输入栏 🧠 菜单发的档位要能持久化（期间被 put_settings 吞掉的老问题）
         for lvl in ["low", "medium", "high", "on", "off"] {
             c.thinking = Some(lvl.into());
             let p = build_chat_params(&c, gateway::providers::find("openai"));

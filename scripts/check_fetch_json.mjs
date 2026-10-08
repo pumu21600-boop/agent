@@ -1,12 +1,12 @@
 // 前端 fetch 静态体检：抓「fetch 之后不解析 JSON」的漏网点。
 //
-// 为什么值得一个脚本：这个 bug 类在本仓已经复发两次（P20.1 网页面板改造丢了三处，
+// 为什么值得一个脚本：这个 bug 类在本仓已经复发两次（网页面板改造丢了三处，
 // 2026-09-24 又扫出十几处），而且两种死法都很难看——
 //   ① 把 fetch 的 Response 当数据用（r.path / r.extensions / r.title 恒 undefined）：
 //      界面静默显示空值或「已保存到 undefined」，没有任何报错；
 //   ② 把 Response 丢进 postMessage：结构化克隆直接抛
 //      "Failed to execute 'postMessage' on 'Window': Response object could not be cloned."，
-//      插件面板整个瘫掉，插件侧只看到这句天书（P21 用量面板与价格页就是这么瘫的）。
+//     插件面板整个瘫掉，插件侧只看到这句天书（用量面板与价格页就是这么瘫的）。
 // 判据很粗但够用：每个 fetch( 调用点，往后 16 行内必须出现 .json()（或 .text()），
 // 否则报错；确实不该解析的（流式 SSE、发了就忘的 DELETE、apiJson 自身）进白名单并写理由。
 //

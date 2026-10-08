@@ -1,4 +1,4 @@
-// 冒烟测试用 mock OAuth MCP server（P24；不是产品代码）。
+// 冒烟测试用 mock OAuth MCP server（不是产品代码）。
 // 用法：node scripts/mock_oauth_mcp.mjs
 // 实现一个最小 OAuth + MCP（Streamable HTTP）闭环：
 //   /.well-known/oauth-protected-resource → 授权服务器指向自己

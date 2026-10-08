@@ -11,16 +11,16 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
-# P24 MCP OAuth：PKCE verifier/state 随机源（lock 里本就经 reqwest 传递依赖存在，零新增下载面）
+# MCP OAuth：PKCE verifier/state 随机源（lock 里本就经 reqwest 传递依赖存在，零新增下载面）
 rand = "0.8"
-# P21 成本台账 / 红线3 插件验签：sha256 canonical digest（纯 Rust，不引 openssl/ring；
+# 成本台账 / 红线3 插件验签：sha256 canonical digest（纯 Rust，不引 openssl/ring；
 # lock 里本就经 wasmtime 传递依赖存在，不新增下载面）
 sha2 = "0.10"
 hex = "0.4"
 # 预览面板文档抽取（doctext.rs）：docx/pptx/xlsx = zip 容器 + deflate 流，zip 目录
 # 手写解析、只补一个纯 Rust inflate（miniz_oxide 后端，无 C 工具链依赖）
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# P20 浏览器内核：CDP 走 ws://127.0.0.1（环回、无 TLS），仅默认 handshake+connect 特性
+# 浏览器内核：CDP 走 ws://127.0.0.1（环回、无 TLS），仅默认 handshake+connect 特性
 tokio-tungstenite = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,9 +32,9 @@ tower-http = { version = "0.6", features = ["fs"] }
 uuid = { version = "1", features = ["v4"] }
 # DSH 式侧边栏「添加项目」：Win 原生 IFileDialog 选文件夹（server 本地进程弹原生窗口）
 rfd = "0.15"
-# P11 WASM 插件宿主（总架构 §7：自带沙箱即边界；wat feature 支持文本格式插件，零工具链依赖）
+# WASM 插件宿主（总架构 §7：自带沙箱即边界；wat feature 支持文本格式插件，零工具链依赖）
 wasmtime = "24"
-# 只对准 Windows：Win32 API 面按实际使用收窄（P20.3 专精化清掉零引用的
+# 只对准 Windows：Win32 API 面按实际使用收窄（专精化清掉零引用的
 # Win32_System_LibraryLoader；注意 ReadFile 经 Win32_System_IO 才能在
 # Storage::FileSystem 下解析到，勿删）
 windows-sys = { version = "0.52", features = [

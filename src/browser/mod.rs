@@ -1,7 +1,7 @@
-//! 内置浏览器内核（P20 起，P21 对齐 ZCode 协议，P22 搬进桌面壳）—— 进程内直持 CDP
+//! 内置浏览器内核 —— 进程内直持 CDP
 //! 会话的页面操作能力。
 //!
-//! P20 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs）。P21 起：
+//! 拉起本机 Edge/Chrome（headless），页面级 WebSocket 直连（cdp.rs）。
 //! - **统一命令面**（commands.rs，协议形状移植自 ZCode `browserCommandSchema`，Apache-2.0）：
 //!   一个 `browser` 工具按 `method` 判别覆盖全部动作；结构化错误码不静默兜底。
 //! - **快照双结构**：`elements`（可动作元素，带 ref/selector/rect/inViewport/parentRef/
@@ -16,15 +16,15 @@
 //! - **JS 弹窗**：`Page.javascriptDialogOpening` 捕获进 tab 状态，面板出「确定/取消」条，
 //!   agent 侧 get_dialog / handle_dialog——弹窗不再把页面卡死。
 //!
-//! P22 起浏览器有两种宿主，**上层协议完全不变**：
+//! 浏览器有两种宿主，**上层协议完全不变**：
 //! - **shell 模式**（桌面壳在跑）：标签页是壳窗口里的 child webview（真页面、真交互、
 //!   复用 App 自己的 WebView2 运行时，不再另起无头 Edge 进程）。壳的 WebView2 环境带
 //!   `--remote-debugging-port=9223`（tauri.conf.json），本服务经页面级 CDP 驱动这些
 //!   webview；标签页的开/关/挪/显隐由服务通过控制通道（shell.rs）指挥壳执行。
 //! - **无头模式**（壳不在：start.bat 直跑服务、或用户在普通浏览器里开 5173）：
-//!   沿用 P20 的无头 Edge/Chrome，行为与此前完全一致。
+//!  沿用此前的无头 Edge/Chrome，行为与此前完全一致。
 //!
-//! 设计约定（窄而刚 v1，承 P20）：
+//! 设计约定（窄而刚 v1，承 ）：
 //! - **单浏览器多标签页**：所有会话共用一个浏览器实例；面板与 agent 工具共享进程，
 //!   各标签页独立 CDP 连接互不干扰；agent 工具缺省作用于 agent 专用标签页。
 //! - **DOM 增量 diff**：快照时给元素钉 `data-agent-ref`（已存在的不重打——ref 稳定），
@@ -145,8 +145,8 @@ struct DialogInfo {
     default_prompt: String,
 }
 
-/// 一个标签页 = 一条页面级 CDP 连接（P20.1 网页面板起多标签化；面板与 agent 工具
-/// 共享同一个浏览器进程，各标签页连接互不干扰）。P21 增补驻留/帧/弹窗状态。
+/// 一个标签页 = 一条页面级 CDP 连接（网页面板起多标签化；面板与 agent 工具
+/// 共享同一个浏览器进程，各标签页连接互不干扰）。增补驻留/帧/弹窗状态。
 pub struct WebTab {
     /// CDP target id
     pub id: String,
@@ -223,7 +223,7 @@ impl WebTab {
     }
 }
 
-/// 浏览器宿主模式（P22）。
+/// 浏览器宿主模式。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostMode {
     /// 无头 Edge/Chrome（壳不在时的兜底）
@@ -317,7 +317,7 @@ impl BrowserSession {
     }
     fn set_showing(&self, v: bool) {
         *self.panel_showing.lock().unwrap_or_else(|e| e.into_inner()) = v;
-        // P26：面板收起时作废上次矩形——否则重新打开时壳拿旧矩形立刻显示 webview
+        // 面板收起时作废上次矩形——否则重新打开时壳拿旧矩形立刻显示 webview
         // （侧边栏展开动画还没完，页面先闪在旧位置再被新矩形套进去，用户反馈很突兀）
         if !v {
             *self.last_rect.lock().unwrap_or_else(|e| e.into_inner()) = None;

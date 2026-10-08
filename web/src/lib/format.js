@@ -1,4 +1,4 @@
-// 纯格式化/判定助手（P19 App.svelte 拆分）：无组件状态依赖，App 与各视图组件共用。
+// 纯格式化/判定助手（App.svelte 拆分）：无组件状态依赖，App 与各视图组件共用。
 
 export function fmtBytes(b) {
   // NaN/负数/非数字一律按 0 显示（!b 会吞 NaN 显示 "0B" 但放过 -5 显示 "-5B"，F9）
@@ -37,7 +37,7 @@ export function configLabel(c) {
   return c.name || '未命名';
 }
 
-// P23.1：inferCapabilities（按模型名猜图片/视频/音频能力）已随智能预测机制一并删除——
+// inferCapabilities（按模型名猜图片/视频/音频能力）已随智能预测机制一并删除——
 // 聚合渠道上名字与真实能力对不上；能力一律以设置里手动勾选为准。
 
 export function gitStatusLabel(s) {
@@ -57,7 +57,7 @@ export function webNormalizeUrl(u) {
   if (s === 'about:blank' || /^(https?|file):\/\//.test(s)) return s;
   return 'https://' + s;
 }
-// —— P6 恢复与续命 ——
+// —— 恢复与续命 ——
 export function contentText(c) {
   if (typeof c === 'string') return c;
   if (Array.isArray(c)) return c.map((p) => p.text || '').join('');

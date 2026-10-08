@@ -5,7 +5,7 @@ use tokio::task::spawn_blocking;
 use crate::sandbox::{self, SandboxLimits, SandboxSpec};
 
 /// shell / git 共用：沙箱（或本机直跑）内跑命令行，格式化输出。
-/// P20 沙箱统一：选档交给 SandboxTier 对象（探测链解析出的生效档，含 AC→受限回退），
+/// 沙箱统一：选档交给 SandboxTier 对象（探测链解析出的生效档，含 AC→受限回退），
 /// 调用方不再手工拼 restricted/appcontainer 标志位。
 pub(crate) async fn run_in_sandbox(
     cfg: &ExecConfig,

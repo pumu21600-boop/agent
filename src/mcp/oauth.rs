@@ -1,4 +1,4 @@
-//! MCP OAuth（P24）——远程 MCP 服务登录。架构照 ZCode `adapters/src/mcp/oauth-*` 移植：
+//! MCP OAuth——远程 MCP 服务登录。架构照 ZCode `adapters/src/mcp/oauth-*` 移植：
 //! discovery（protected-resource → authorization-server well-known）→ DCR 动态注册（无 client_id 时）
 //! → PKCE(S256) + loopback 回调 → 授权码换 token → DPAPI 加密落盘 → Bearer 挂载 + 近过期刷新。
 //!

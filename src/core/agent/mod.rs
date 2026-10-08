@@ -34,30 +34,30 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     ToolResult { name: String, ok: bool, preview: String },
     StepLimit(u32),
-    /// 上下文占用（每步模型调用前 + 每次回复落地后各发一次；P5 圆环数据源）。
+    /// 上下文占用（每步模型调用前 + 每次回复落地后各发一次；圆环数据源）。
     /// 口径对齐 DSH token-meter 的 `contextPressure`：三个数语义分开、单一来源——
     /// `pressure`（最近一次渠道实报的 prompt，锚点，未拿到实报时为 None）、
     /// `projected`（**下一次请求**的预估占用 = pressure + 自锚点以来的带符号增量，
     /// 圆环分子，裁剪后会自动回落）、`window`（模型窗口，圆环分母）。
     /// `breakdown` 是**估算**构成（近似值，不参与任何决策）。
     ContextUsage { pressure: Option<u64>, projected: u64, window: u64, breakdown: context::Breakdown },
-    /// 渠道返回的真实用量（P5：缓存命中率累计 + 预算钩子 + 圆环锚点更新）。
+    /// 渠道返回的真实用量（：缓存命中率累计 + 预算钩子 + 圆环锚点更新）。
     ApiUsage { prompt_tokens: u64, cached_tokens: Option<u64> },
-    /// 会话快照（P6）：当前全量消息（不含 system），server 收到即落盘
+    /// 会话快照：当前全量消息（不含 system），server 收到即落盘
     Snapshot { messages: Vec<Value> },
-    /// 提示性通知（P6：自动 HANDOFF 等），前端以系统消息展示
+    /// 提示性通知（：自动 HANDOFF 等），前端以系统消息展示
     Notice(String),
-    /// 本步作废重来（P15/022 降级链）：主渠道流到一半失败、换渠道重试时发出。
+    /// 本步作废重来（/022 降级链）：主渠道流到一半失败、换渠道重试时发出。
     /// 前端应把当前消息尾部各丢掉 `content` / `reasoning` 个 UTF-16 码元
     /// （与 JS String.length 同口径），否则半截回答会与重试后的完整回答叠在一起。
     StepReset { content: usize, reasoning: usize },
-    /// P8 TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
+    /// TITLE 角色：会话标题已生成（server 收到即改会话文件并转前端）
     Title(String),
-    /// 任务改动统计条（P6.1）：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
+    /// 任务改动统计条：相对任务起点基线的文件数/增删行；「撤销」恢复到 id
     Checkpoint { id: String, files_changed: usize, additions: u64, deletions: u64 },
-    /// P7 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
+    /// 滚动摘要更新：server 收到即写进会话文件（跨任务延续）
     Summary(String),
-    /// P9 B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
+    /// B3：Plan 档产出的结构化计划（模型最终回答中的 ```plan 块），前端渲染计划卡
     PlanProposal { goal: String, steps: Vec<String>, files: Vec<String> },
     /// N1/025 运行中追加消息（steering）：这些用户消息已并入本轮对话（模型下一步可见），
     /// server 收到即转前端补气泡 + 落盘。取走点有两个：每步决策前（take_steering）+
@@ -65,7 +65,7 @@ pub enum AgentEvent {
     Steer { messages: Vec<Value> },
 }
 
-/// P9 B3：Plan 档解析出的结构化计划。
+/// B3：Plan 档解析出的结构化计划。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
     pub goal: String,
@@ -73,10 +73,10 @@ pub struct Plan {
     pub files: Vec<String>,
 }
 
-/// P7 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
+/// 滚动摘要消息的前缀标记（注入/剥离/快照过滤都认它）。
 pub const SUMMARY_PREFIX: &str = "【历史摘要】";
 
-/// P9 B3：Plan 档 system prompt 增量。
+/// B3：Plan 档 system prompt 增量。
 /// 红线（坑 13/施工单 013 红线 9）：不注入模型身份/人设——这里是纯任务行为约束与计划格式约定。
 pub const PLAN_PROMPT: &str = "\
 [Plan 模式]\n\
@@ -91,7 +91,7 @@ pub const PLAN_PROMPT: &str = "\
 ```\n\
 用户批准该计划后才会开始实际执行。";
 
-/// P8 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
+/// 角色映射 + 降级链的接线件：主渠道 + 可选专用渠道 + 降级配置（按序）。
 pub struct LoopChannels {
     /// 主对话渠道（base_url/model/key/参数已从 settings+预设组装）
     pub primary: Channel,
@@ -101,12 +101,12 @@ pub struct LoopChannels {
     pub title: Option<Channel>,
     /// 降级链：主渠道当轮失败时按序替换重试
     pub fallbacks: Vec<Channel>,
-    /// P21：任务超 token 预算后的降级渠道（[roles] budget；None=不降级，维持主渠道）
+    /// 任务超 token 预算后的降级渠道（[roles] budget；None=不降级，维持主渠道）
     pub downgrade: Option<Channel>,
-    /// P21：与 server 共享的「本任务已超预算」标志（budget_exceeded 触发时置位，
+    /// 与 server 共享的「本任务已超预算」标志（budget_exceeded 触发时置位，
     /// 本任务剩余步骤改走 downgrade）。未配 downgrade 时只影响 Notice，不换渠道。
     pub budget_hit: Arc<std::sync::atomic::AtomicBool>,
-    /// P22-C 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
+    /// 子代理派发器（None = 本任务不许派发子代理，如测试或无头简单场景）。
     /// 工具调用 subagent_spawn 由核心循环拦截交给它——实现见 server/subagent.rs。
     pub subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>>,
     /// 上一轮结束时的占用锚点 `(实报 pressure, 锚点时的本地估价)`，由 server 从会话用量
@@ -117,15 +117,15 @@ pub struct LoopChannels {
 
 /// 审批判定**单点**：一律走 `ApprovalGate::needs_approval_for`（细粒度，见
 /// `core::rules::evaluate_risk` + `should_ask_approval` 的档位映射）。
-/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在 P9 施工单 013 A2 中删除——
+/// 旧的按工具静态 danger_level 判定的 `needs_approval` 已在施工单 013 A2 中删除——
 /// 两套判定并存会造成语义分裂，此后再无第二处审批判定入口。
 /// （工具静态 danger_level 现仅用于「是否拍影子仓库检查点」，不参与审批判定。）
 ///
 /// 审批门：由 server 层实现（SSE 发审批请求、挂 oneshot 等决定）。
 pub trait ApprovalGate: Send + Sync {
-    /// P9 细粒度审批：结合工具名与具体参数进行风险研判
+    /// 细粒度审批：结合工具名与具体参数进行风险研判
     fn needs_approval_for(&self, tool: &str, args_json: &str) -> bool;
-    /// P9 B2（Plan 档）：返回 Some(理由) = 该工具在 Plan 档被**直接驳回**，
+    /// B2（Plan 档）：返回 Some(理由) = 该工具在 Plan 档被**直接驳回**，
     /// 不进审批弹窗流程（写/执行类操作连「问用户」都不问，直接拦下回喂模型调整计划）。
     /// 默认不拦截（Plan 档之外恒 None）——判定单点原则与 A2 一致。
     fn plan_block_reason(&self, _tool: &str, _args: &str) -> Option<String> {
@@ -144,7 +144,7 @@ pub trait ApprovalGate: Send + Sync {
         ""
     }
 
-    /// P22-C：本会话的**父任务**会话 id（子代理会话专用）——台账按父任务聚合。
+    /// 本会话的**父任务**会话 id（子代理会话专用）——台账按父任务聚合。
     /// 默认 None = 本会话就是主任务（行为与旧版一致）。
     fn usage_parent_session(&self) -> Option<&str> {
         None
@@ -164,7 +164,7 @@ pub enum LoopOutcome {
     Cancelled,
 }
 
-/// 渠道链调用（P27 从 run_task 抽出，续写复用同一套）：主渠道当轮失败按序换 fallback
+/// 渠道链调用（从 run_task 抽出，续写复用同一套）：主渠道当轮失败按序换 fallback
 /// 重试同一步；取消置位立即停（不降级）。流式增量原样转发 on_event；换渠道时先发
 /// StepReset（前端丢半截内容）+ 人话提示。返回 (结果, 提示文本)——提示已实时转发过，
 /// 调用方负责 persist_notice 补进上下文落盘（重启后气泡还在）。
@@ -229,7 +229,7 @@ async fn run_chain(
     (outcome, notices)
 }
 
-/// 通知持久化（P27）：通知以 display_only 消息进上下文——随 Snapshot 落盘，重启/切回
+/// 通知持久化：通知以 display_only 消息进上下文——随 Snapshot 落盘，重启/切回
 /// 会话后气泡还在；发送侧由 gateway replay 净化剥离（模型永远看不到）。
 /// 提示已实时转发过 Notice 事件的调用方用这个（如渠道链降级提示）。
 fn persist_notice(msgs: &mut Vec<Value>, on_event: &(impl Fn(AgentEvent) + Send + Sync), text: &str) {
@@ -314,7 +314,7 @@ pub async fn run_task(
     rec_cfg: &RecoveryConfig,
     mem: &crate::memory::Memory,
     prior_summary: Option<String>,
-    // P9 B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
+    // B1：Plan 档（true=只读+先出计划；由请求级 plan_mode 带入，前端随会话持久化）
     plan_mode: bool,
     gate: &dyn ApprovalGate,
     // 审计 05：本任务固定使用的工作区（无头/定时任务按触发时钉住；前台每轮传当前全局）
@@ -323,7 +323,7 @@ pub async fn run_task(
 ) -> anyhow::Result<LoopOutcome> {
     let primary = &channels.primary;
     let max_output_tokens = primary.params.max_tokens;
-    // P9 B1/B3：Plan 档注入行为约束与 ```plan 计划格式（增量不含身份/人设，坑 13）
+    // B1/B3：Plan 档注入行为约束与 ```plan 计划格式（增量不含身份/人设，坑 13）
     let system_prompt_owned;
     let system_prompt = if plan_mode {
         system_prompt_owned = format!("{system_prompt}\n\n{PLAN_PROMPT}");
@@ -333,16 +333,16 @@ pub async fn run_task(
     };
     let mut msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     msgs.push(json!({ "role": "system", "content": system_prompt }));
-    // P21 用量台账归属：本任务的会话 id（辅助调用与主流程同一归属）
-    // P22-C：子代理会话填父任务 id——台账按父任务聚合（草案第 4 节，无数据迁移）
+    // 用量台账归属：本任务的会话 id（辅助调用与主流程同一归属）
+    // 子代理会话填父任务 id——台账按父任务聚合（草案第 4 节，无数据迁移）
     let sid = gate.session_id().to_string();
     let mut usage_ctx = UsageCtx::main(&sid);
     if let Some(parent) = gate.usage_parent_session() {
         usage_ctx.parent_session = Some(parent.to_string());
     }
-    // P21：任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
+    // 任务超 token 预算后剩余步骤改走降级渠道（与 server 共享标志；未配渠道只通知不换道）
     let mut downgrade_noticed = false;
-    // P10-A：任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
+    // 任务起点边界事件（trace 时间线切分用；State kind 扩展属合法「只增」）
     // session 一并记上：时间线按工作区过滤要把任务归属回聊天会话——日志顶层 session_id
     // 是进程级日志会话（进程重启即换），跟工作区无关，归属只能靠这个字段（真机实锤过）
     observability::event(EventType::State, json!({ "kind": "task.start", "session": gate.session_id() }));
@@ -355,16 +355,16 @@ pub async fn run_task(
         );
     }
     msgs.extend(messages.iter().cloned());
-    // P6 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
+    // 会话落盘：任务一开始就把用户消息存住（崩溃也丢不了这轮请求）
     on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
-    // P7 事件流水：任务开始
+    // 事件流水：任务开始
     mem.record(
         "task.start",
         json!({ "text": messages.iter().rev().find(|m| m.get("role").and_then(Value::as_str) == Some("user")).and_then(|m| m.get("content")).and_then(Value::as_str).map(|s| s.chars().take(200).collect::<String>()).unwrap_or_default() }),
     );
-    // P7 滚动摘要：跨任务延续的当前摘要
+    // 滚动摘要：跨任务延续的当前摘要
     let mut running_summary = prior_summary.filter(|s| !s.trim().is_empty());
-    // P6.1 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
+    // 改动统计条基线：任务起点当场拍一个快照（提交当前工作树状态），
     // 结束时的 diff 就只包含本任务的改动，不会把历史漂移算进来
     let baseline: Option<String> = if rec_cfg.checkpoint_enabled {
         let ws = tools::workspace_root().to_path_buf();
@@ -436,9 +436,9 @@ pub async fn run_task(
             on_event(AgentEvent::Steer { messages: added });
             on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
         }
-        // 上下文预算（P5）：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
+        // 上下文预算：超预算则归档旧工具结果/折叠旧轮次；占用推给前端圆环
         {
-            // P7：摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
+            // 摘要消息每步重新注入，先剥掉上一轮的（不参与裁剪统计）
             msgs.retain(|m| !is_summary_msg(m));
             let (mut compacted, stats) =
                 context::compact_messages(&msgs, ctx_cfg, tools_schema_tokens, count_reasoning);
@@ -456,7 +456,7 @@ pub async fn run_task(
                         "tokens_after": stats.tokens_after,
                     }),
                 );
-                // P7 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
+                // 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
                 if !stats.folded.is_empty() && mem.enabled {
                     match summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid).await {
                         Some(s) => {
@@ -474,7 +474,7 @@ pub async fn run_task(
                     }
                 }
             }
-            // P7：把当前摘要作为 system 消息紧跟主 system 注入（不进快照、不参与折叠）
+            // 把当前摘要作为 system 消息紧跟主 system 注入（不进快照、不参与折叠）
             if let Some(s) = &running_summary {
                 compacted.insert(1, json!({ "role": "system", "content": format!("{SUMMARY_PREFIX}{s}") }));
             }
@@ -491,12 +491,12 @@ pub async fn run_task(
             &on_event,
         );
         let est_total = breakdown.total();
-        // P6 交接文档已按用户要求移除（2026-10-01）：上下文满时的自动 HANDOFF 生成
+        // 交接文档已按用户要求移除（2026-10-01）：上下文满时的自动 HANDOFF 生成
         // 与 composer 手动按钮都不做了——会话落盘+摘要已保障续命，不再另生文档
         observability::debug(&format!("[loop] step {step} 调用模型 {}", primary.model));
 
-        // P8 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）
-        // P21：任务已超 token 预算且有降级渠道时，本步起改走降级渠道（便宜模型跑剩余步骤）
+        // 降级链：主渠道当轮失败 → 按序换 fallback 重试同一步；取消置位立即停（不降级）
+        // 任务已超 token 预算且有降级渠道时，本步起改走降级渠道（便宜模型跑剩余步骤）
         let mut chain: Vec<&Channel> = Vec::with_capacity(1 + channels.fallbacks.len());
         if let (true, Some(cheap)) = (
             channels.budget_hit.load(std::sync::atomic::Ordering::Relaxed),
@@ -556,10 +556,10 @@ pub async fn run_task(
         // 渠道真实用量：锚点更新 + 缓存行累计在回复落地后报（见下面两处 report_api_usage），
         // 这样服务端那一次 usage 落盘就是含本条回复的终态。
 
-        // P7.6 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
-        // P27.3 起思考预算已在网关侧扩容（effective_max_tokens：思考开启时发送
+        // 输出截断检测：finish_reason=length → 提示调大最大输出/拆分写入。
+        // 思考预算已在网关侧扩容（effective_max_tokens：思考开启时发送
         // 配置值+思考余量），思考不再吃掉「最大输出长度」额度——此处截断即正文
-        // 本身超限，提示口径回归真实。P27 的自动续写方案已撤（治标不治本且拖慢
+        // 本身超限，提示口径回归真实。此前的自动续写方案已撤（治标不治本且拖慢
         // 响应：续写要重传全量上下文，用户实锤「还会卡」）。
         if turn.finish_reason.as_deref() == Some("length") {
             observability::event(
@@ -592,7 +592,7 @@ pub async fn run_task(
             } else {
                 turn.content.clone()
             };
-            // P9 B3：Plan 档最终回答解析 ```plan 结构化计划 → 前端计划卡
+            // B3：Plan 档最终回答解析 ```plan 结构化计划 → 前端计划卡
             if plan_mode {
                 match parse_plan(&final_text) {
                     Some(plan) => {
@@ -616,9 +616,9 @@ pub async fn run_task(
                     ),
                 }
             }
-            // P6：最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
+            // 最终回答写入会话并落盘（与前端看到的一致）；带 reasoning_content（思考内容
             // 随消息持久化，前端切回会话时恢复；回放侧由 replay.rs 按渠道契约决定去留）
-            // 顺带落时长：「工作用时」（整轮，用户要的 ZCode 式工作时间）与「思考 · 持续了」
+            // 顺带落时长：「工作用时」（整轮）与「思考 · 持续了」
             // （本步 reasoning 分片首尾差）——刷新/切回会话后这两个数字还在
             let mut final_msg = json!({ "role": "assistant", "content": final_text });
             if !turn.reasoning.is_empty() {
@@ -676,9 +676,9 @@ pub async fn run_task(
                 EventType::State,
                 json!({ "kind": "loop.finish", "step": step, "content_chars": turn.content.chars().count(), "session": gate.session_id() }),
             );
-            // P7 事件流水：任务完成
+            // 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
-            // P8 TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
+            // TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
             if let Some(tch) = &channels.title
                 && let Some(title) = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid).await {
                     observability::event(
@@ -710,7 +710,7 @@ pub async fn run_task(
         if !turn.reasoning.is_empty()
             && primary.params.thinking.as_deref() != Some("off")
         {
-            // P26：思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
+            // 思考=关时不落 reasoning_content——否则刷新/切回会话又从历史里显示出来
             asst_msg["reasoning_content"] = json!(turn.reasoning);
         }
         // 中间步骤也带上时长（思考持续 + 本步耗时）：刷新后每一步的气泡也能显示
@@ -739,7 +739,7 @@ pub async fn run_task(
             &on_event,
         );
 
-        // —— P12 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
+        // —— 018：工具执行两阶段（判定串行 → 只读组并行 / 写类串行独占）——
         // fs_unconfined / unsandboxed 每步现读 gate：运行中切档，从下一步起按新档位执行
         let exec_cfg = ExecConfig {
             sandbox: sandbox_cfg.clone(),
@@ -774,9 +774,9 @@ pub async fn run_task(
             on_event(AgentEvent::ToolCall { name: call.name.clone(), args: call.arguments.clone() });
             observability::debug(&format!("[loop] 工具 {} 参数 {}", call.name, call.arguments));
 
-            // P9 B2：Plan 档拦截优先于审批流；P9 细粒度审批单点不变
+            // B2：Plan 档拦截优先于审批流；细粒度审批单点不变
             let plan_reason = gate.plan_block_reason(&call.name, &call.arguments);
-            // P18 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
+            // 钩子（027）：before_tool 只有否决权——deny 则不执行且不进审批流；
             // 钩子放行 ≠ 免审批，审批门照走（定案 7）。
             let hook_reason = if plan_reason.is_none() {
                 crate::hooks::before_tool(gate.session_id(), &call.name, &call.arguments)
@@ -809,7 +809,7 @@ pub async fn run_task(
             });
         }
 
-        // 写冲突检测（P12 018）：同轮 write_file 同路径 → 仅首个执行，其余跳过回喂
+        // 写冲突检测（018）：同轮 write_file 同路径 → 仅首个执行，其余跳过回喂
         {
             let calls: Vec<(String, String)> = turn
                 .tool_calls
@@ -829,7 +829,7 @@ pub async fn run_task(
         }
 
         // 阶段二「执行」：Safe 只读组并行（无副作用无竞态），写/执行组串行独占。
-        // P22-C：subagent_spawn 也进并行组——子代理各自独立会话，天然无共享竞态，
+        // subagent_spawn 也进并行组——子代理各自独立会话，天然无共享竞态，
         // 一轮里发多个即真并行（受服务层并发度上限约束）。
         let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
         let parallel: Vec<usize> = (0..turn.tool_calls.len())
@@ -857,7 +857,7 @@ pub async fn run_task(
             let parent = parent_sid.clone();
             futs.push(Box::pin(async move {
                 let exec = exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent);
-                // P26：并行组同样可被取消即时中断（串行组同款，见下方 select! 注释）
+                // 并行组同样可被取消即时中断（串行组同款，见下方 select! 注释）
                 (
                     i,
                     tokio::select! {
@@ -911,7 +911,7 @@ pub async fn run_task(
                     true,
                 )
             } else if let Some(reason) = &d.hook_reason {
-                // P18 钩子 deny（027）：未执行，把理由回喂给模型调整做法
+                // 钩子 deny（027）：未执行，把理由回喂给模型调整做法
                 observability::event(
                     EventType::State,
                     json!({ "kind": "hook.blocked", "step": step, "tool": call.name, "reason": reason }),
@@ -934,8 +934,8 @@ pub async fn run_task(
             } else if !d.approved {
                 ("用户拒绝了该操作，工具未执行。请换别的做法或直接回答用户。".to_string(), true)
             } else {
-                // P6：写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断。
-                // P22-C：subagent_spawn 不拍——子代理会话对自己的改动拍自己的检查点
+                // 写类/执行类工具动手前先拍影子仓库检查点；失败只记日志，绝不阻断。
+                // subagent_spawn 不拍——子代理会话对自己的改动拍自己的检查点
                 // （父任务这边拍只会把子代理的改动混进父任务的基线口径）。
                 if rec_cfg.checkpoint_enabled && danger >= 1 && call.name != "subagent_spawn" {
                     let reason = format!("{} {}", call.name, short_args(&call.arguments, 100));
@@ -967,7 +967,7 @@ pub async fn run_task(
                     channels.subagents.as_ref(),
                     gate.session_id(),
                 );
-                // P26：取消即时中断——工具卡在浏览器 CDP 调用里时，select! 到取消当场丢 future
+                // 取消即时中断——工具卡在浏览器 CDP 调用里时，select! 到取消当场丢 future
                 // （以前只靠下个决策点轮询 is_set，用户点了「结束回答」还要干等工具超时，
                 // 期间服务端仍显示在跑，新消息被排进队列——用户实测实锤）
                 let exec = async {
@@ -998,7 +998,7 @@ pub async fn run_task(
             mem.record("tool.call", json!({ "name": call.name, "ok": ok }));
             msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));
         }
-        // P6 会话落盘：本步工具回填完毕，状态常驻磁盘
+        // 会话落盘：本步工具回填完毕，状态常驻磁盘
         on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
     }
 
@@ -1025,8 +1025,8 @@ mod tests {
         assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
     }
 
-    // —— P9 B3：plan 块解析 ——
-    // —— P12 018：写冲突检测 ——
+    // —— B3：plan 块解析 ——
+    // —— 018：写冲突检测 ——
     #[test]
     fn write_conflict_detection() {        let mk = |n: &str, a: &str| (n.to_string(), a.to_string());
         let calls = vec![
@@ -1207,9 +1207,9 @@ mod tests {
     #[test]
     fn parse_plan_tolerant_marks() {
         // 中文冒号 + markdown 加粗 + 「-」列表符 + 反引号包裹路径
-        let text = "```plan\n**目标**：完成 P9\n步骤:\n- 第一步\n- 第二步\n**文件**：`a.rs`、`b.rs`\n```";
+        let text = "```plan\n**目标**：完成 目标\n步骤:\n- 第一步\n- 第二步\n**文件**：`a.rs`、`b.rs`\n```";
         let p = parse_plan(text).expect("容错格式应解析成功");
-        assert_eq!(p.goal, "完成 P9");
+        assert_eq!(p.goal, "完成 目标");
         assert_eq!(p.steps, vec!["第一步", "第二步"]);
         assert_eq!(p.files, vec!["a.rs", "b.rs"]);
     }
@@ -1234,8 +1234,8 @@ mod tests {
         assert!(p.files.is_empty());
     }
 
-    // —— P27.3 思考预算扩容 + 截断提示（2026-09-29 用户实锤「思考内容算进输出长度
-    // 把正文截断」；P27 的自动续写方案已撤——治标不治本且拖慢响应）——
+    // —— 思考预算扩容 + 截断提示（2026-09-29 用户实锤「思考内容算进输出长度
+    // 把正文截断」；此前的自动续写方案已撤——治标不治本且拖慢响应）——
     // mock SSE：一次请求即 finish_reason=length 半截正文。
     // 期望：① 请求体 max_tokens = 配置值+思考余量（4096 → 12288，思考不再吃正文额度）；
     //       ② 不自动续写（只有一次请求，正文就是半截）；③ 截断提示落盘成 display_only 气泡。

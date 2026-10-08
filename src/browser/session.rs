@@ -417,7 +417,7 @@ pub(crate) fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>,
 }
 
 /// 桌面壳没跑时给人的话（不静默、不偷偷拉 Edge）。
-pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。P20.4 起网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
+pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
 
 /// 是否允许无头模式（默认关——没有壳就不起 Edge）。
 pub(crate) fn headless_allowed() -> bool {
@@ -438,7 +438,7 @@ pub(crate) async fn launch() -> Result<Arc<BrowserSession>, String> {
             }
         }
     }
-    // 没有壳：**默认不再自动拉无头 Edge**——用户多次明令不要起 Edge 进程，而 P20.4 起
+    // 没有壳：**默认不再自动拉无头 Edge**——用户多次明令不要起 Edge 进程，而 
     // 浏览器的家就是壳。确需无头（自动化 / CI / 特意不用壳）时设 AGENT_BROWSER_HEADLESS=1。
     if !headless_allowed() {
         return Err(NO_SHELL_HINT.to_string());
@@ -849,7 +849,7 @@ pub(crate) async fn close_internal(reason: &str) {
     }
 }
 
-// —— 标签页事件任务（screencast 帧 / JS 弹窗；P21）——
+// —— 标签页事件任务（screencast 帧 / JS 弹窗）——
 
 /// 每标签页一个事件任务：消费 CDP 事件广播。retired 后退出；actor 退出（WS 断）即退。
 pub(crate) fn spawn_tab_events(tab: Arc<WebTab>) {

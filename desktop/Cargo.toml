@@ -2,13 +2,13 @@
 name = "agent-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "Agent 桌面壳（P13）：窗口 + 托盘 + 服务保活，WebView 加载本机服务"
+description = "Agent 桌面壳：窗口 + 托盘 + 服务保活，WebView 加载本机服务"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# unstable：P22 child webview（add_child）所需；devtools：child webview 开真 DevTools
+# unstable：child webview（add_child）所需；devtools：child webview 开真 DevTools
 tauri = { version = "2", features = ["tray-icon", "unstable", "devtools"] }
 serde_json = "1"
 # ResizeDirection 在 tauri-runtime 里 re-export 不出来（tauri::ResizeDirection 不存在），无边框边缘拉伸要用

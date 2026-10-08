@@ -12,7 +12,7 @@
 
     #[test]
     fn thinking_inflates_max_tokens_budget() {
-        // P27.3：思考开启时上游把 reasoning+正文算进同一个 max_tokens，用户配的
+        // 思考开启时上游把 reasoning+正文算进同一个 max_tokens，用户配的
         // 「最大输出长度」会被思考吃掉——发送值 = 配置值 + max(配置值, 8192)。
         // 思考关闭/未配 → 原值（此时上限本就只约束正文）。
         let mut p = ChatParams { max_tokens: Some(4096), thinking: Some("high".into()), ..Default::default() };
@@ -34,7 +34,7 @@
     fn build_body_vendor_styles() {
         // REGISTRY 是进程级 OnceLock：测试进程里手动加载一次（幂等）
         let _ = crate::gateway::providers::init(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("providers.json"));
-        // P23 预设收敛后旧预设 id 已下架：契约知识保留在端点探测，手工构造探测线索验证
+        // 预设收敛后旧预设 id 已下架：契约知识保留在端点探测，手工构造探测线索验证
         fn legacy(id: &str) -> ChatParams {
             ChatParams { provider_id: Some(id.into()), ..Default::default() }
         }
@@ -108,7 +108,7 @@
         p.thinking = Some("high".into());
         let b = build_body("mystery-model", &msgs, true, &p, None);
         assert_eq!(b["reasoning_effort"], json!("high"));
-        // Anthropic 协议（P23）：build_body 入口直接产出 Messages 形状（system 顶层/max_tokens 必填/无 stream_options）
+        // Anthropic 协议：build_body 入口直接产出 Messages 形状（system 顶层/max_tokens 必填/无 stream_options）
         let mut p = legacy("anthropic");
         p.thinking = Some("on".into());
         p.max_tokens = Some(8192);
@@ -145,7 +145,7 @@
         assert!(b.get("stream_options").is_none());
     }
 
-    // —— P21 用量台账：渠道标识与 usage 解析 ——
+    // —— 用量台账：渠道标识与 usage 解析 ——
 
     #[test]
     fn host_of_strips_scheme_and_path_keeps_port() {

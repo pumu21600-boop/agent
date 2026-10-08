@@ -1035,5 +1035,5 @@ pub(crate) fn virtual_key_code(key: &str) -> i64 {
     }
 }
 
-// —— 网页面板（P20.1 起，P21 帧流/驻留/dialog）——
+// —— 网页面板（自桌面壳落地起，帧流/驻留/dialog）——
 

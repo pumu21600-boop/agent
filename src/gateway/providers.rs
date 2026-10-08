@@ -2,9 +2,9 @@
 //!
 //! 预设清单在仓库根目录 `providers.json`，启动时加载。
 //! 每个预设带默认 base_url 与默认模型（不带模型清单，模型靠渠道 GET /models 实时获取），
-//! 以及可选的 `thinking_format` 覆盖（OpenClaw thinkingFormat 词表）。
+//! 以及可选的 `thinking_format` 覆盖（五态词表见下）。
 //! 思考参数的组装不再按预设字段逐个开关：端点探测（compat::resolve）给出主判定，
-//! 预设的 thinking_format 只在端点域名认不出时兜底——与 OpenClaw「端点归属 + 配置覆盖」一致。
+//! 预设的 thinking_format 只在端点域名认不出时兜底——端点归属探测优先于配置覆盖。
 
 use std::{path::Path, sync::OnceLock};
 
@@ -19,7 +19,7 @@ pub struct ProviderPreset {
     pub name: String,
     pub default_base_url: String,
     pub default_model: String,
-    /// 思考参数形态覆盖（OpenClaw 词表：openai/deepseek/zai/qwen/qwen-chat-template）。
+    /// 思考参数形态覆盖（词表：openai/deepseek/zai/qwen/qwen-chat-template）。
     /// None=完全交给端点探测（官方域名都能认出；custom 中转认不出时按 openai 格式）。
     #[serde(default)]
     pub thinking_format: Option<ThinkingFormat>,
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn presets_parse_with_thinking_format() {
         let ps = load_test();
-        // P23 预设收敛（用户拍板）：OpenAI 兼容 / Anthropic / DeepSeek / StepFun / GLM 五个。
+        // 预设收敛（用户拍板）：OpenAI 兼容 / Anthropic / DeepSeek / StepFun / GLM 五个。
         // 被移除的旧预设 id 的契约知识保留在 compat 端点探测里，老渠道照常工作。
         assert_eq!(ps.len(), 5, "预设收敛后应是五个，实际 {}", ps.len());
         for id in ["openai_compat", "anthropic", "deepseek", "stepfun", "zhipu"] {

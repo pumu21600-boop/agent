@@ -65,15 +65,15 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
-    /// P21 成本台账：全局花费上限（硬闸）等成本红线参数
+    /// 成本台账：全局花费上限（硬闸）等成本红线参数
     #[serde(default)]
     pub cost: CostConfig,
-    /// P22-C 子代理并行度上限
+    /// 子代理并行度上限
     #[serde(default)]
     pub subagent: SubagentConfig,
 }
 
-/// 成本红线参数（施工单 030，P21）。
+/// 成本红线参数（施工单 030）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostConfig {
     /// 全局花费上限（美元，硬闸）：台账累计花费达到即拒绝新的模型请求；0 = 不限（默认）。
@@ -82,7 +82,7 @@ pub struct CostConfig {
     pub spend_cap_usd: f64,
 }
 
-/// P8 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的
+/// 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的
 /// 配置名或配置 id；未配置的角色回落主渠道。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RolesConfig {
@@ -95,17 +95,17 @@ pub struct RolesConfig {
     /// 向量嵌入（EMBEDDING，记忆库语义检索消费；未配置时用本地哈希向量）
     #[serde(default)]
     pub embedding: Option<String>,
-    /// P21 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，本任务剩余步骤改走它
-    /// （未配置 = 维持主渠道 + Notice，行为与 P18 一致）
+    /// 降级渠道：单任务累计 token 超 [hooks] budget_tokens 后，本任务剩余步骤改走它
+    /// （未配置 = 维持主渠道 + Notice，行为与此前一致）
     #[serde(default)]
     pub budget: Option<String>,
-    /// P22-C 子代理专用渠道（未配置 = 回落主渠道，与 B3 一致）；
+    /// 子代理专用渠道（未配置 = 回落主渠道，与 B3 一致）；
     /// 典型用法：主会话用旗舰模型，子代理跑量用便宜模型
     #[serde(default)]
     pub subagent: Option<String>,
 }
 
-/// P22-C 子代理并行度（config.toml `[subagent]`；docs/subagent-draft.md 第 1 节）。
+/// 子代理并行度（config.toml `[subagent]`；docs/subagent-draft.md 第 1 节）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentConfig {
     /// 全局并发子代理上限（0 = 不允许派发子代理）
@@ -176,7 +176,7 @@ pub struct AgentConfig {
     /// 调用是常态；失控由取消标志/相同调用护栏/花费硬闸管，不由步数砍任务）
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
-    /// 工具结果回填模型的截断上限（上下文工程雏形，P5 补全）
+    /// 工具结果回填模型的截断上限（上下文工程雏形，补全）
     #[serde(default = "default_tool_result_max_chars")]
     pub tool_result_max_chars: usize,
     /// 默认审批档位：suggest / auto-edit / full-auto / local（请求级可覆盖）
@@ -190,7 +190,7 @@ pub struct AgentConfig {
     pub unsandboxed_approval: bool,
 }
 
-/// 执行沙箱参数（施工单 004，P4 shell 工具也走这套限额）。
+/// 执行沙箱参数（施工单 004，shell 工具也走这套限额）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// 墙钟超时（ms）：到点整树击杀
@@ -202,13 +202,13 @@ pub struct SandboxConfig {
     /// 进程树内活跃进程数上限
     #[serde(default = "default_sandbox_active_processes")]
     pub active_processes: u32,
-    /// P12 019：隔离模式 "restricted"（默认，受限 token）| "appcontainer"（LowBox + 能力 SID，默认断网；实验特性）
+    /// 019：隔离模式 "restricted"（默认，受限 token）| "appcontainer"（LowBox + 能力 SID，默认断网；实验特性）
     #[serde(default = "default_sandbox_mode")]
     pub mode: String,
-    /// P12 019：启用 AppContainer 模式（mode=appcontainer 时有效）
+    /// 019：启用 AppContainer 模式（mode=appcontainer 时有效）
     #[serde(default)]
     pub appcontainer: bool,
-    /// P12 019：AppContainer 网络出向（仅 appcontainer 模式生效）
+    /// 019：AppContainer 网络出向（仅 appcontainer 模式生效）
     #[serde(default)]
     pub allow_network: bool,
 }
@@ -216,7 +216,7 @@ fn default_sandbox_mode() -> String {
     "restricted".into()
 }
 
-/// 钩子配置（施工单 027，P18）—— 用户不改源码即可在固定挂点插入自定义动作。
+/// 钩子配置（施工单 027）—— 用户不改源码即可在固定挂点插入自定义动作。
 /// 承载形式：本地命令（stdin 收 JSON 事件、stdout 回 JSON 决定）；空串 = 未配置。
 /// 语义四条（定案 7）：4 挂点 / before_tool 仅否决权 / 超时放行 / JSONL 审计。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -271,11 +271,11 @@ pub struct GatewayConfig {
     pub base_url: String,
     #[serde(default = "default_model")]
     pub model: String,
-    /// 本地限流（P8）：每分钟最多发起多少次模型请求；0=不限（默认）。
+    /// 本地限流：每分钟最多发起多少次模型请求；0=不限（默认）。
     /// 全渠道共用一个节流器，超过时排队等待（只影响节奏，不报错）。
     #[serde(default)]
     pub max_rpm: u32,
-    /// 降级链（P8）：主渠道当轮调用失败时按序切换的配置名（settings.configs 的 name）。
+    /// 降级链：主渠道当轮调用失败时按序切换的配置名（settings.configs 的 name）。
     /// 每次切换发 Notice；全部失败才报错。取消标志置位时立即停，不降级。
     #[serde(default)]
     pub fallback_configs: Vec<String>,

@@ -1,4 +1,4 @@
-//! 钩子（施工单 027，P18）—— 用户不改源码即可在固定挂点插入自定义动作。
+//! 钩子（施工单 027）—— 用户不改源码即可在固定挂点插入自定义动作。
 //!
 //! 承载形式：config.toml `[hooks]` 里配本地命令；事件以 JSON 从 stdin 喂给命令，
 //! `before_tool` 读 stdout 的 JSON 决定放行与否，其余挂点只作通知。
@@ -102,7 +102,7 @@ pub async fn session_end(session: &str) {
 }
 
 /// budget_exceeded 通知：单任务累计 token 超过 [hooks] budget_tokens 时由 server 触发
-/// （每次任务最多一次；降级策略本身留 P21 成本台账，这里只做通知挂点）。
+/// （每次任务最多一次；降级策略本身留成本台账，这里只做通知挂点）。
 pub fn notify_budget_exceeded(session: &str, tokens: u64, budget: u64) {
     fire_and_forget(
         "budget_exceeded",

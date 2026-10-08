@@ -1,4 +1,4 @@
-//! 用量台账（施工单 030，P21）—— 每一次模型调用的计量、计价、聚合与花费硬闸。
+//! 用量台账（施工单 030）—— 每一次模型调用的计量、计价、聚合与花费硬闸。
 //!
 //! 定位：**计量收口在网关单点**（`Gateway::stream_chat` / `complete` 是全部模型流量的唯一
 //! 出入口），业务代码零埋点。台账落 `<log_dir>/usage/ledger.jsonl`（追加写 + flush，
@@ -15,7 +15,7 @@
 //! 4. **币种**：单价与花费一律以**美元**为规范存储/计算；人民币只是展示层
 //!    （settings.cost.currency + usd_cny_rate，前端折算），切币种不动任何账。
 //!
-//! P22 衔接：`parent_session` 字段 v1 恒为 None（子代理在 P22）；子会话填父任务 id 后
+//! 衔接：`parent_session` 字段 v1 恒为 None（子代理落地后）；子会话填父任务 id 后
 //! 报表按父任务聚合即可，无需数据迁移（docs/subagent-draft.md 第 4 节）。
 
 use std::{
@@ -50,7 +50,7 @@ pub struct UsageRecord {
     pub ts: String,
     /// 归属会话
     pub session_id: String,
-    /// P22 子代理花销记父任务：子会话填父任务 id；主会话为 None
+    /// 子代理花销记父任务：子会话填父任务 id；主会话为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
     /// 用途：main（主循环）| summary（滚动摘要）| title（标题）| media（媒体旁路）

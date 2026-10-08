@@ -164,7 +164,7 @@ pub const SCHEMA: &[SchemaEntry] = &[
         ],
         default: Some("auto/空串=端点探测"),
         risk: "normal",
-        desc: "各协议 thinking 字段形态覆盖；P8.3 旧词表别名自动映射",
+        desc: "各协议 thinking 字段形态覆盖；旧词表别名自动映射",
     },
     SchemaEntry {
         path: "capabilities",

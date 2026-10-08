@@ -1,7 +1,7 @@
-//! P22-B 定时任务：按 cron 唤醒无头会话跑任务，完成留痕可查
+//! 定时任务：按 cron 唤醒无头会话跑任务，完成留痕可查
 //!
 //! 形态（最薄上层）：settings.json 里存任务清单（`schedules`），服务内一个 2s
-//! 心跳的循环到点唤醒（走 P22-A 无头会话同一条路），结果写回任务状态 + 全局
+//! 心跳的循环到点唤醒（走无头会话同一条路），结果写回任务状态 + 全局
 //! 通知列表（GET /api/schedules 一并带出，设置→定时 页签展示）。
 //!
 //! 语义定死：
@@ -49,7 +49,7 @@ pub struct ScheduleTask {
     /// 到点唤醒无头会话的消息内容（kind=memory 时忽略，内容由记忆检索生成）
     #[serde(default)]
     pub message: String,
-    /// 任务类型："message"（缺省，固定消息）| "memory"（P22-D 主动记忆提醒：
+    /// 任务类型："message"（缺省，固定消息）| "memory"（主动记忆提醒：
     /// 到点先检索最近 memory_days 天的对话记录，生成回顾指令再唤醒）
     #[serde(default)]
     pub kind: String,
@@ -394,7 +394,7 @@ fn fire(state: &AppState, task: ScheduleTask, trigger: &'static str, manual: boo
             }
         }
         let _running_guard = RunningGuard(task.id.clone());
-        // P22-D：记忆提醒类型——到点先同步记忆库（本地索引，零网络）并生成回顾指令；
+        // 记忆提醒类型——到点先同步记忆库（本地索引，零网络）并生成回顾指令；
         // 窗口内没有可回顾的对话就跳过本轮（标记已处理，不每跳重复到点、不白烧模型调用）
         let message = if task.kind() == "memory" {
             // 先同步记忆库（有界增量，配了嵌入渠道走语义向量），再检索回顾窗口内的对话
@@ -554,7 +554,7 @@ pub fn next_run_ts(task: &ScheduleTask) -> Option<i64> {
     spec.next_after(from).map(|d| d.timestamp())
 }
 
-/// P22-D：从记忆库条目生成「主动记忆提醒」的回顾指令（纯函数，可单测）。
+/// 从记忆库条目生成「主动记忆提醒」的回顾指令（纯函数，可单测）。
 /// 口径：最近 `days` 天内有更新、非归档、至少 2 条消息的真对话；按更新时间倒序取 12 条。
 /// 没有可回顾的返回 None（调度器据此跳过本轮，不白烧一次模型调用）。
 pub fn build_memory_message(
@@ -643,7 +643,7 @@ mod tests {
         assert!(t.validate().is_err(), "fixed 模式必须带会话 id");
         let t = task("0 9 * * *", "fixed", "sess-1");
         assert!(t.validate().is_ok());
-        // P22-D：memory 类型不要求 message，但 days 要在 1–90
+        // memory 类型不要求 message，但 days 要在 1–90
         let mut t = task("0 9 * * *", "new", "");
         t.kind = "memory".into();
         t.message = String::new();
@@ -713,7 +713,7 @@ mod tests {
         assert!(t.validate().is_ok());
     }
 
-    /// P22-D：类型与回顾窗口的生效值（缺省 message / days 越界兜底 3）。
+    /// 类型与回顾窗口的生效值（缺省 message / days 越界兜底 3）。
     #[test]
     fn kind_and_days_defaults() {
         let t = task("0 9 * * *", "new", "");
@@ -777,7 +777,7 @@ mod tests {
         assert!(list2.contains(&"k249".to_string()) && !list2.contains(&"k0".to_string()), "留新丢旧");
     }
 
-    /// P22-D：回顾指令生成——窗口过滤 / 归档与空会话排除 / 倒序取 12 / 空窗 None。
+    /// 回顾指令生成——窗口过滤 / 归档与空会话排除 / 倒序取 12 / 空窗 None。
     #[test]
     fn build_memory_message_filters_and_composes() {
         use crate::memory::library::Entry;

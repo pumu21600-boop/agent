@@ -79,7 +79,7 @@ pub(crate) fn should_preserve_replay(model_id: &str, compat: &Compat) -> bool {
 /// 2) OpenRouter 形态 reasoning_details → reasoning 字符串合并后再按契约去留；
 /// 3) developer 角色改写（上游 supportsDeveloperRole：OpenAI 新系）；
 /// 4) 空消息过滤（上游 requiresNonEmptyUserOrAssistantMessage：ModelStudio/Qwen）；
-/// 5) display_only 消息剔除（P27）：通知/错误等前端气泡随会话落盘只为重启后界面还在，
+/// 5) display_only 消息剔除：通知/错误等前端气泡随会话落盘只为重启后界面还在，
 ///    这里统一剥离——两条协议的请求体组装都在本净化之后，一处过滤即全渠道生效。
 pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &Compat) {
     let arr = match messages.as_array_mut() {
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn drops_display_only_notices() {
-        // P27：通知/错误气泡（display_only）只随会话落盘给界面回放，绝不进模型上下文
+        // 通知/错误气泡（display_only）只随会话落盘给界面回放，绝不进模型上下文
         let mut msgs = json!([
             {"role":"system","content":"sys prompt"},
             {"role":"user","content":"hi"},

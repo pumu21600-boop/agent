@@ -1,4 +1,4 @@
-//! 工作区切换与文件面板端点（files/file/changes/shell/picker）（P19 自 server.rs 按域拆出）
+//! 工作区切换与文件面板端点（files/file/changes/shell/picker）（自 server.rs 按域拆出）
 
 use super::*;
 
@@ -325,7 +325,7 @@ pub struct WorkspaceRequest {
     pub path: String,
 }
 
-/// GET /api/workspace —— 当前工作区 + 最近列表（P8.2）。
+/// GET /api/workspace —— 当前工作区 + 最近列表。
 pub(super) async fn get_workspace(State(state): State<AppState>) -> Json<Value> {
     let s = state.settings.read().unwrap_or_else(|e| e.into_inner());
     Json(json!({
@@ -377,9 +377,9 @@ pub(crate) fn apply_workspace(state: &AppState, canon: &std::path::Path) -> Resu
     s.recent_workspaces.truncate(8);
     s.save().map_err(|e| e.to_string())?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
     // 开着的界面即时跟上：工作区/最近列表/项目名全来自 settings（前端 loadSettings 才有），
     // agent 经 settings 工具 action=workspace 切时不推这条，界面要重启才认新工作区。
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["workspace"] }));
@@ -413,7 +413,7 @@ pub(super) async fn set_workspace(
     (StatusCode::OK, Json(json!({ "ok": true, "current": canon.display().to_string(), "recent": recent })))
 }
 
-/// POST /api/workspace/file —— UI 扩展写工作区文件（P17 组件总线写操作；宿主侧已按 manifest
+/// POST /api/workspace/file —— UI 扩展写工作区文件（组件总线写操作；宿主侧已按 manifest
 /// 权限 + 用户确认把关）。边界与工具的 write_file 一致：工作区内、512KB、原子写。
 pub(super) async fn write_workspace_file(Json(req): Json<Value>) -> (StatusCode, Json<Value>) {
     let path = req.get("path").and_then(Value::as_str).unwrap_or("").trim().to_string();
@@ -469,9 +469,9 @@ pub(super) async fn remove_workspace(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
     }
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
     observability::event(EventType::State, json!({ "kind": "workspace.removed", "path": path }));
     (StatusCode::OK, Json(json!({ "ok": true, "recent": s.recent_workspaces })))
 }
@@ -500,9 +500,9 @@ pub(crate) fn set_workspace_alias(state: &AppState, path: &str, name: &str) -> R
     let name = name.trim().to_string();
     s.save().map_err(|e| e.to_string())?;
     *state.settings.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
-    // P18 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
+    // 存储一门/契约（027）：settings 变更即同步停用名单到工具插件（拒新调用）
     crate::plugin::wasm::set_disabled(&s.disabled_plugins);
-    crate::mcp::sync_configs(&s.mcp_servers); // P11：MCP 配置变更即同步管理器（幂等）
+    crate::mcp::sync_configs(&s.mcp_servers); // MCP 配置变更即同步管理器（幂等）
     // 开着的界面即时跟上：侧栏项目名读 settings.workspace_aliases，不推这条事件，
     // agent/命令行改完落盘成功、界面还叫旧名，用户只能重启才看见（2026-10-05 真机实锤）。
     crate::server::ui_events::emit(json!({ "kind": "settings_changed", "keys": ["workspace_aliases"] }));

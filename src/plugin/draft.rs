@@ -1,4 +1,4 @@
-//! 模型自产插件 draft 隔离区（施工单 027，P18）。
+//! 模型自产插件 draft 隔离区（施工单 027）。
 //!
 //! `source=model_generated` 的插件走 draft 隔离区：**只在内存**（不入盘，服务重启即失），
 //! **权限一律清空**（最低权限，连 notify 都没有），工具可编译进 WASM 引擎供当前使用。
@@ -6,7 +6,7 @@
 //!
 //! 与定案的差异（如实记录）：定案说「仅当前会话生效」；v1 的生命周期是「到重启」——
 //! 多会话同见。会话级隔离要给清单/面板/总线全链路加 session 过滤，在还没有真实生产者
-//! （模型生成插件的工具链属 P22）之前是纯成本，故先做重启粒度，语义留口。
+//! （模型生成插件的工具链属 ）之前是纯成本，故先做重启粒度，语义留口。
 //!
 //! 隔离边界：draft 插件能做什么由「权限清空 + WASM 纯计算沙箱（零宿主函数）」物理保证，
 //! 不靠自觉；面板 iframe 不透明源、postMessage 白名单校验权限（全部为空 ⇒ 全拒）。
@@ -168,7 +168,7 @@ pub fn entry_file(name: &str) -> Option<String> {
     })
 }
 
-/// 一键转正：全部文件落 `plugins/<name>/`（P28 目录合并：manifest.json + 面板页 +
+/// 一键转正：全部文件落 `plugins/<name>/`（目录合并：manifest.json + 面板页 +
 /// 工具文件同住一个目录，一次写盘），来源改 `user`；随后重扫 WASM 注册表并移除
 /// draft。返回落盘路径列表。
 pub fn promote(name: &str) -> Result<Vec<String>, String> {
@@ -179,7 +179,7 @@ pub fn promote(name: &str) -> Result<Vec<String>, String> {
     let mut mf = d.manifest.clone();
     mf["source"] = json!(crate::plugin::contract::ORIGIN_USER);
 
-    // P28 目录合并：一个插件一个目录，manifest + 面板页 + 工具文件一次写盘
+    // 目录合并：一个插件一个目录，manifest + 面板页 + 工具文件一次写盘
     let dir = crate::plugin::wasm::plugins_dir()
         .unwrap_or_else(|| app_root.join(crate::plugin::ui::DIR))
         .join(name);

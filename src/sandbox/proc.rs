@@ -3,7 +3,7 @@
 //! 流程：受限 token + Job 就绪 → CreateProcessAsUserW(CREATE_SUSPENDED) → AssignProcessToJobObject
 //! → ResumeThread（挂起期入 Job，竞态窗口为零）→ 匿名管道收 stdout/stderr → 超时整树击杀。
 //! 环境不继承父进程：只注入白名单最小集（SystemRoot/COMSPEC/PATH/TEMP…），密钥永不进子进程。
-//! 同步阻塞实现：P4 工具层接入时用 tokio::task::spawn_blocking 包裹。
+//! 同步阻塞实现：工具层接入时用 tokio::task::spawn_blocking 包裹。
 
 use std::{
     ffi::c_void,
@@ -91,7 +91,7 @@ pub(crate) const SANDBOX_ENV_VARS: &[&str] = &[
     "TEMP", "TMP", "USERPROFILE", "windir",
 ];
 
-/// 单流输出上限：超出部分只丢弃不累积（防一条 `yes` 撑爆内存；上下文截断是 P5 的事）。
+/// 单流输出上限：超出部分只丢弃不累积（防一条 `yes` 撑爆内存；上下文截断是上下文工程的事）。
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Windows 系统目录（一般为 C:\Windows\System32）。
@@ -108,7 +108,7 @@ pub(crate) fn system_dir() -> PathBuf {
 /// restricted=true：受限 token + 白名单环境（权限笼）；false：完整用户 token + 继承父环境（本机直跑）。
 /// 两种模式都保留 Job 生命周期保险丝（kill-on-close、超时整树击杀）。
 pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
-    // P12 019：AppContainer 模式——LowBox token 由 SECURITY_CAPABILITIES 启动属性创建
+    // 019：AppContainer 模式——LowBox token 由 SECURITY_CAPABILITIES 启动属性创建
     if spec.appcontainer {
         return spawn_appcontainer_impl(spec);
     }
@@ -219,7 +219,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
     }
 }
 
-/// AppContainer 模式 spawn（P12 019）：profile/SID/ACE → STARTUPINFOEX(SECURITY_CAPABILITIES)
+/// AppContainer 模式 spawn（019）：profile/SID/ACE → STARTUPINFOEX(SECURITY_CAPABILITIES)
 /// → CreateProcessW（挂起）→ Job → Resume。管道/Job/读取线程与 restricted 模式共用。
 /// 白名单环境照用（AppContainer 不继承父环境）；默认断网（能力 SID 白名单空）。
 fn spawn_appcontainer_impl(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
@@ -512,7 +512,7 @@ fn build_env_block() -> Vec<u16> {
         ("PROMPT".into(), "$P$G".into()),
         (
             "PATH".into(),
-            // P4 起 shell/git 工具要能用用户装的工具链（git/cargo/node…），
+            // shell/git 工具要能用用户装的工具链（git/cargo/node…），
             // PATH 不是密钥，继承父进程；父进程没有再退回系统目录集；
             // 工具层发现的外部工具目录（register_path_dir）追加在最后
             {

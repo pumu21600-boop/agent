@@ -1,6 +1,6 @@
 use super::*;
 
-/// P8/P9/P8.5：从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索/工具开关）。
+/// //从配置项 + 供应商预设组装请求参数（采样/思考/端点探测线索/工具开关）。
 pub(crate) fn build_chat_params(
     c: &crate::config::settings::Config,
     preset: Option<&gateway::providers::ProviderPreset>,
@@ -20,7 +20,7 @@ pub(crate) fn build_chat_params(
     p
 }
 
-/// P9：思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定（设置面板控件）。
+/// 思考参数形态覆盖——中转/自定义渠道端点探测认不出时显式指定（设置面板控件）。
 /// B4 思考形态解析顺序（施工单 012 固化）：`Config.thinking_style` 显式覆盖 >
 /// 端点探测（compat.rs：官方域名→native 供应商规范 / 本地→local / 其余→openai 兜底）>
 /// providers.json 预设 `thinking_format` 兜底（预设值在 compat::resolve 内作为探测输入，
@@ -31,7 +31,7 @@ pub(crate) fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&s
     use gateway::compat::ThinkingFormat as TF;
     match style {
         Some("none") => p.thinking_format = Some(TF::None),
-        // 旧词表别名（P8.3 设置残留）：thinking_object=GLM 式对象 → zai；
+        // 旧词表别名（设置残留）：thinking_object=GLM 式对象 → zai；
         // reasoning_effort=档位 → openai；enable_thinking（_budget）=布尔 → qwen
         Some("thinking_object") => p.thinking_format = Some(TF::Zai),
         Some("reasoning_effort") => p.thinking_format = Some(TF::Openai),
@@ -41,7 +41,7 @@ pub(crate) fn apply_thinking_style(p: &mut gateway::ChatParams, style: Option<&s
     }
 }
 
-/// P8/P8.5：把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
+/// /把配置名（或配置 id）解析成一条可用渠道。解析失败（名字不存在/地址为空）返回 None。
 /// B3 角色解析顺序（施工单 012 固化）：settings.roles.<role> > config.toml [roles] > 回落主渠道；
 /// 角色值按「配置名或配置 id」解析（本函数），解析失败回落主渠道并 Notice。
 pub(crate) fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel> {
@@ -58,7 +58,7 @@ pub(crate) fn find_channel(s: &Settings, name: &str) -> Option<gateway::Channel>
     let params = build_chat_params(c, preset);
     // B2 key 回落链（施工单 012）：DPAPI key > DEEPSEEK_API_KEY 环境变量。
     // 角色/降级渠道与主渠道同一把尺子——没单独存 key 的配置靠环境变量兜底
-    // （P21 补：此前只有主渠道走这条链，budget/summary/title 渠道会「未设置 key」）
+    // （补：此前只有主渠道走这条链，budget/summary/title 渠道会「未设置 key」）
     let key = resolve_key(s, c);
     Some(gateway::Channel::new(&base_url, &model, &key, params))
 }
@@ -70,8 +70,8 @@ pub(crate) fn resolve_key(s: &Settings, c: &crate::config::settings::Config) -> 
         .unwrap_or_default()
 }
 
-/// 审批档位归一化（P19 四档 + 旧档名映射）。返回（生效档, 降级提示）。
-/// /api/chat 与无头会话（P22-A）共用——档位语义只有这一处解释。
+/// 审批档位归一化（四档 + 旧档名映射）。返回（生效档, 降级提示）。
+/// /api/chat 与无头会话共用——档位语义只有这一处解释。
 pub(crate) fn normalize_mode(cfg: &crate::config::AgentConfig, requested: &str) -> (String, Option<String>) {
     let norm = |m: &str| -> String {
         match m.trim() {
@@ -187,7 +187,7 @@ pub(crate) struct TurnChannels {
     pub(crate) summary: Option<gateway::Channel>,
     pub(crate) title: Option<gateway::Channel>,
     pub(crate) fallbacks: Vec<gateway::Channel>,
-    /// P21：预算降级渠道（[roles] budget；超 token 预算后剩余步骤改走它）
+    /// 预算降级渠道（[roles] budget；超 token 预算后剩余步骤改走它）
     pub(crate) downgrade: Option<gateway::Channel>,
     /// 角色渠道解析失败等提示（转发给调用方展示，不静默）
     pub(crate) notices: Vec<String>,
@@ -224,7 +224,7 @@ pub(crate) fn assemble_turn_channels(
     let mut params = build_chat_params(active_cfg, gateway::providers::find(&active_cfg.provider_id));
     params.base_url = Some(base_url.clone());
     let primary = gateway::Channel::new(&base_url, &model, &api_key, params);
-    // P8/P8.5 角色映射：优先 settings.roles，未设回落 config.toml [roles]；
+    // / 角色映射：优先 settings.roles，未设回落 config.toml [roles]；
     // features.roles=false（插件页「功能桥接」关）= 整条路由链跳过，全部走主渠道/默认退化
     let roles = if s.features.roles { s.roles.as_ref() } else { None };
     let cfg_roles = if s.features.roles { Some(&state.roles_cfg) } else { None };
@@ -251,7 +251,7 @@ pub(crate) fn assemble_turn_channels(
             "角色「标题生成」配置的渠道「{n}」解析失败（配置名不存在或地址为空），已回落主渠道代跑"
         ));
     }
-    // P8/P8.5 降级链：优先 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
+    // / 降级链：优先 settings.roles.fallbacks，未设回落 [gateway].fallback_configs
     let fallback_names: Vec<String> = roles
         .map(|r| r.fallbacks.clone())
         .filter(|f| !f.is_empty())
@@ -260,7 +260,7 @@ pub(crate) fn assemble_turn_channels(
         .iter()
         .filter_map(|n| find_channel(s, n))
         .collect();
-    // P21：预算降级渠道
+    // 预算降级渠道
     let budget_name = roles
         .and_then(|r| r.budget.as_deref())
         .or_else(|| cfg_roles.and_then(|c| c.budget.as_deref()));
@@ -272,7 +272,7 @@ pub(crate) fn assemble_turn_channels(
             "角色「预算降级」配置的渠道「{n}」解析失败（配置名不存在或地址为空），超预算后维持主渠道"
         ));
     }
-    // P23 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功），
+    // 思考参数自适应降级登记：该端点此前 400 拒收过思考字段（剥参重试成功），
     // 本轮起明确告知用户，不静默
     if state.gateway.thinking_is_degraded(&base_url, &model) {
         notices.push("该端点此前拒绝了思考参数，已自动关闭思考下发（对话正常进行）".to_string());
@@ -280,7 +280,7 @@ pub(crate) fn assemble_turn_channels(
     TurnChannels { primary, summary, title, fallbacks, downgrade, notices }
 }
 
-/// 检查模型是否具备指定模态的输入能力：P23.1 起只认用户手动勾选的能力标记，
+/// 检查模型是否具备指定模态的输入能力：只认用户手动勾选的能力标记，
 /// 不再按模型名智能推导（聚合渠道上名字与真实能力对不上）。
 /// 此前 accept_modality 的按名推导兜底已删：专家配置解析失败时按「未勾选」处理，
 /// A5（施工单 012）：媒体附件落在 <workspace>/.attachments/，若工作区是 git 仓库且

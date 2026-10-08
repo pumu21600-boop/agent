@@ -1,5 +1,5 @@
 <script>
-  // 大图预览（P19 自 App.svelte 按视图拆出）：src 为空即不渲染，点击遮罩/关闭按钮回传 close
+  // 大图预览（自 App.svelte 按视图拆出）：src 为空即不渲染，点击遮罩/关闭按钮回传 close
   export let src = null;
   import { createEventDispatcher } from 'svelte';
   const dispatch = createEventDispatcher();

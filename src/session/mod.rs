@@ -99,7 +99,7 @@ pub struct SessionFile {
     pub created_at: String,
     pub updated_at: String,
     pub messages: Vec<Value>,
-    /// P7 滚动摘要（跨任务延续；无摘要时缺省）
+    /// 滚动摘要（跨任务延续；无摘要时缺省）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// 创建时所在的工作区（DSH 式侧边栏「按工作区」分组用；旧文件缺省=未分组）
@@ -228,7 +228,7 @@ impl SessionManager {
     }
 
     /// 原子写（临时文件 + rename），save / rename / set_meta / fork 共用。
-    /// P18 存储一门：会话落盘只走 `storage::write_session`（仓内唯一入口 + 审计）。
+    /// 存储一门：会话落盘只走 `storage::write_session`（仓内唯一入口 + 审计）。
     fn write(&self, f: &SessionFile) -> anyhow::Result<()> {
         let text = serde_json::to_string(f).context("会话序列化失败")?;
         crate::storage::write_session(&self.path(&f.id), &text)
@@ -375,7 +375,7 @@ impl SessionManager {
         }
     }
 
-    /// 改会话标题（P8 TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
+    /// 改会话标题（TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
     /// 不动 updated_at：list 与「上次做到哪」都按它排序，改名不该把老会话顶到最前（与 set_flags 口径一致，F7）。
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
         let lock = self.session_lock(id);
@@ -611,7 +611,7 @@ mod tests {
         assert!(list.iter().any(|s| s.id == a && s.title.contains("会话A")));
         assert!(list.iter().any(|s| s.id == b));
 
-        // 更新 A：标题与 created_at 保留，消息数变化；P7 摘要随存
+        // 更新 A：标题与 created_at 保留，消息数变化；摘要随存
         m.save(
             &a,
             &[
@@ -624,7 +624,7 @@ mod tests {
         let fa = m.get(&a).unwrap();
         assert_eq!(fa.messages.len(), 2);
         assert_eq!(fa.title, "帮我修编译错误，这是会话A的开头");
-        assert!(fa.summary.as_deref().unwrap_or("").contains("main.rs"), "P7 摘要应持久化");
+        assert!(fa.summary.as_deref().unwrap_or("").contains("main.rs"), " 摘要应持久化");
         // summary 传 None 时保留旧值
         m.save(&a, &fa.messages, None).unwrap();
         assert!(m.get(&a).unwrap().summary.is_some());

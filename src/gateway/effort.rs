@@ -1,4 +1,5 @@
-//! reasoning_effort 档位解析 —— 移植自 OpenClaw `packages/ai/src/providers/openai-reasoning-effort.ts`（v2026.8.2）。
+//! reasoning_effort 档位解析 —— 移植自 OpenClaw `packages/ai/src/providers/openai-reasoning-effort.ts`
+//! （v2026.8.2，此后按厂商规范与实测多轮修订）。
 //!
 //! 不同 GPT 家族接受的 effort 枚举不同（gpt-5 无 "none"，gpt-5.1+ 有，gpt-5.2+ 有 "xhigh"，
 //! gpt-5.6 还有 "max" 且拒收 temperature），请求前必须按模型 id 解析成该模型支持的最近档位。
@@ -51,7 +52,7 @@ fn model_matches(id: &str, re: fn(&str) -> bool) -> bool {
     re(&normalize_model_id(id))
 }
 
-// 以下三个家族判定（5.4-mini / 5.5 / temperature 支持性）是 OpenClaw 逐行移植保留项，
+// 以下三个家族判定（5.4-mini / 5.5 / temperature 支持性）逐行保留自移植版本，
 // 当前未接线（档位解析只用到 5.6 与 codex 分支）；保留以便跟上游对齐时不产生差异。
 #[allow(dead_code)]
 fn is_gpt_5_4_mini(id: &str) -> bool {

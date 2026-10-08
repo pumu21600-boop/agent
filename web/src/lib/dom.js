@@ -1,4 +1,4 @@
-// DOM/CSS 纯助手(P19 范式 App.svelte 拆分):无组件状态依赖,App 与各视图组件共用。
+// DOM/CSS 纯助手(范式 App.svelte 拆分):无组件状态依赖,App 与各视图组件共用。
 // 给每条顶层规则的选择器加 #app 前缀：压过 Svelte scoped 样式（.composer.s-xxx 两级类名）；
 // @media/@keyframes 等整块原样保留
 // 2026-10-08 修三处 CSS 语法盲区：① 选择器按逗号切分时不识别引号/[]/()——

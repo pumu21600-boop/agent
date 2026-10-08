@@ -9,7 +9,7 @@
   function mcpAction(action, name, server) { dispatch('action', { action, name, server }); }
 
   // 021：transport 二选一。stdio=本地子进程；http=远端 MCP（Streamable HTTP）
-  // P24：http 再加认证方式（无/自定义头、OAuth 授权码、OAuth 客户端凭据）
+  // http 再加认证方式（无/自定义头、OAuth 授权码、OAuth 客户端凭据）
   let mcpForm = {
     name: '',
     transport: 'stdio',
@@ -56,7 +56,7 @@
   function addMcpServer() {
     const isHttp = mcpForm.transport === 'http' || mcpForm.transport === 'sse';
     const args = mcpForm.args.trim() ? mcpForm.args.trim().split(/\s+/) : [];
-    // P24：选了 OAuth 就带 oauth 配置（授权码可留空 client_id 走动态注册）
+    // 选了 OAuth 就带 oauth 配置（授权码可留空 client_id 走动态注册）
     const oauth =
       isHttp && mcpForm.oauth !== 'none'
         ? {

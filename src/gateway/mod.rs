@@ -2,12 +2,12 @@
 //!
 //! base_url / model / api_key 全部由调用方（设置系统）动态传入，不再写死。
 //! api_key 只出现在内存中的 Authorization 头，绝不写日志/文件。
-//! P8：采样参数、本地限流（max_rpm）、embeddings 接口。
-//! P9（OpenClaw 对齐）：思考参数按「端点探测（compat）+ reasoning_effort 档位解析（effort）」
-//! 组装，词表与规则移植自 OpenClaw v2026.8.2 packages/ai；响应端支持
+//! 采样参数、本地限流（max_rpm）、embeddings 接口。
+//! 思考参数按「端点探测（compat）+ reasoning_effort 档位解析（effort）」组装，词表与规则
+//! 移植自 OpenClaw v2026.8.2 packages/ai（此后按厂商规范与实测多轮修订）；响应端支持
 //! reasoning_content/reasoning/reasoning_text/reasoning_details 四字段 + 14 种思考标签剥离；
 //! 发送前按端点契约净化历史（回放字段/developer 角色/空消息过滤）。
-//! P21（施工单 030）：**计量收口在网关单点**——stream_chat / complete 是全部模型流量的
+//! （施工单 030）：**计量收口在网关单点**——stream_chat / complete 是全部模型流量的
 //! 唯一出入口，每次调用记一条用量台账（token 三路分计量 + 状态 + 延迟），
 //! 并在发送前过「全局花费上限」硬闸。
 
@@ -61,9 +61,9 @@ pub struct Gateway {
     /// （注释里写了多年的「ProxyOverride 环回绕代理」其实从未实现），2026-10-08
     /// 补上：base_url 是环回主机时 send() 换这个客户端。
     loopback_client: reqwest::Client,
-    /// 本地限流（P8）：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
+    /// 本地限流：Some=请求间最小间隔（60/max_rpm 秒，向上取整），None=不限。
     throttle: Option<Throttle>,
-    /// P23 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
+    /// 思考参数自适应降级登记：渠道 400 拒收思考字段后剥参重试成功，
     /// 这里记下「base_url|model」，后续请求直接不发思考字段（每轮渠道组装时出人话提示）。
     thinking_degraded: RwLock<std::collections::HashSet<String>>,
 }
@@ -103,7 +103,7 @@ fn request_summary(body: &Value) -> Value {
     })
 }
 
-/// 请求参数（P9）：全部可选，None=不发字段走渠道默认。
+/// 请求参数：全部可选，None=不发字段走渠道默认。
 /// 思考接线不再自带厂商字段——由 compat 按端点探测；用户设置只有开/关 + 档位。
 #[derive(Debug, Clone)]
 pub struct ChatParams {
@@ -149,7 +149,7 @@ impl ChatParams {
     }
 }
 
-/// 本地限流器（P8）：请求间保证最小间隔，排队等待而非拒绝。
+/// 本地限流器：请求间保证最小间隔，排队等待而非拒绝。
 struct Throttle {
     min_interval: std::time::Duration,
     last: tokio::sync::Mutex<Option<Instant>>,
@@ -242,17 +242,17 @@ fn is_loopback_base_url(base_url: &str) -> bool {
     it.next() == Some("127") && it.clone().count() == 3 && it.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// 聚合后的模型回复（P2 核心循环用）：正文 / 思考 / 工具调用。
+/// 聚合后的模型回复（核心循环用）：正文 / 思考 / 工具调用。
 #[derive(Debug, Clone, Default)]
 pub struct AssistantTurn {
     pub content: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
-    /// 渠道返回的用量（P5：缓存命中率展示用；P21：台账分计量）
+    /// 渠道返回的用量（：缓存命中率展示用；台账分计量）
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
-    /// 结束原因（P7.6："length"=输出被 max_tokens 截断，核心循环据此提示用户）
+    /// 结束原因（："length"=输出被 max_tokens 截断，核心循环据此提示用户）
     pub finish_reason: Option<String>,
     /// 思考流的时间跨度：首个 reasoning 分片与最后一个分片的到达时刻（「思考 · 持续了 N 秒」用）
     pub reasoning_first_at: Option<std::time::Instant>,
@@ -319,7 +319,7 @@ impl Gateway {
             .any(|k| body.get(*k).is_some())
     }
 
-    /// 打开本地限流（P8）：max_rpm>0 时生效。启动时由 main 配置一次（Arc 包装前）。
+    /// 打开本地限流：max_rpm>0 时生效。启动时由 main 配置一次（Arc 包装前）。
     pub fn set_max_rpm(&mut self, max_rpm: u32) {
         if max_rpm > 0 && self.throttle.is_none() {
             self.throttle = Some(Throttle::new(max_rpm));
@@ -432,7 +432,7 @@ impl Gateway {
         }
     }
 
-    /// 按协议取对话端点 URL：OpenAI /chat/completions；Anthropic /v1/messages（P23）。
+    /// 按协议取对话端点 URL：OpenAI /chat/completions；Anthropic /v1/messages。
     fn request_url(base_url: &str, protocol: Protocol) -> String {
         match protocol {
             Protocol::OpenAiCompletions => Self::chat_url(base_url),
@@ -440,7 +440,7 @@ impl Gateway {
         }
     }
 
-    /// 按协议挂鉴权：OpenAI Authorization Bearer；Anthropic x-api-key + anthropic-version（P23）。
+    /// 按协议挂鉴权：OpenAI Authorization Bearer；Anthropic x-api-key + anthropic-version。
     fn auth(rb: reqwest::RequestBuilder, api_key: &str, protocol: Protocol) -> reqwest::RequestBuilder {
         match protocol {
             Protocol::OpenAiCompletions => rb.bearer_auth(api_key),
@@ -452,7 +452,7 @@ impl Gateway {
 
     /// GET {base}/models → 模型 id 列表（OpenAI 兼容）。
     pub async fn list_models(&self, base_url: &str, api_key: &str) -> anyhow::Result<Vec<String>> {
-        // Anthropic /v1/models 的 data[].id 与 OpenAI 同形，仅 URL 与鉴权头不同（P23）
+        // Anthropic /v1/models 的 data[].id 与 OpenAI 同形，仅 URL 与鉴权头不同
         let protocol = if anthropic::is_anthropic_endpoint(None, Some(base_url)) {
             Protocol::AnthropicMessages
         } else {
@@ -497,9 +497,9 @@ impl Gateway {
         Ok(ids)
     }
 
-    /// 非流式单轮补全（P7 滚动摘要 / P8 标题生成 / 媒体旁路用）：返回 choices[0].message.content。
+    /// 非流式单轮补全（滚动摘要 /  标题生成 / 媒体旁路用）：返回 choices[0].message.content。
     /// 不查取消标志（摘要失败由调用方降级），超时走客户端全局 600s。
-    /// P21：与流式同一道计量（台账 + 花费硬闸），ctx.purpose 区分用途。
+    /// 与流式同一道计量（台账 + 花费硬闸），ctx.purpose 区分用途。
     pub async fn complete(
         &self,
         ctx: &UsageCtx,
@@ -517,7 +517,7 @@ impl Gateway {
             params.thinking_format,
         );
         let url = Self::request_url(base_url, compat.protocol);
-        // P23 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
         let degraded = self.thinking_is_degraded(base_url, model);
         let eff_params = if degraded {
             let mut p = params.clone();
@@ -535,7 +535,7 @@ impl Gateway {
             EventType::State,
             json!({ "kind": "gateway.request", "url": url, "body": request_summary(&body), "purpose": "aux" }),
         );
-        // 红线1（P21）：花费上限硬闸——辅助调用与主流程同一道闸
+        // 红线1：花费上限硬闸——辅助调用与主流程同一道闸
         if let Some(msg) = crate::usage::cap_block() {
             observability::event(
                 EventType::State,
@@ -553,7 +553,7 @@ impl Gateway {
                 return Err(anyhow!("请求渠道失败: {url}"));
             }
         };
-        // P23 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
         // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
         if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
             let text = response.text().await.unwrap_or_default();
@@ -629,7 +629,7 @@ impl Gateway {
         Ok(clean)
     }
 
-    /// 向量嵌入（P8 EMBEDDING 角色预留，OpenAI 兼容 /embeddings）。
+    /// 向量嵌入（EMBEDDING 角色预留，OpenAI 兼容 /embeddings）。
     /// 记忆 v1 不消费；语义检索需求真实出现后由上层接线。
     pub async fn embed(
         &self,
@@ -676,7 +676,7 @@ impl Gateway {
     }
 }
 
-/// 一轮模型调用的目标渠道（P8 降级链/角色映射的基本单位）。
+/// 一轮模型调用的目标渠道（降级链/角色映射的基本单位）。
 #[derive(Debug, Clone, Default)]
 pub struct Channel {
     pub base_url: String,
@@ -701,7 +701,7 @@ impl Gateway {
     ///
     /// 每个分片：1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
     /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
-    /// P21：ctx 带归属信息（会话/用途/父任务），本方法内完成台账记录与花费硬闸。
+    /// ctx 带归属信息（会话/用途/父任务），本方法内完成台账记录与花费硬闸。
     pub async fn stream_chat(
         self: &Arc<Self>,
         ctx: &UsageCtx,
@@ -715,7 +715,7 @@ impl Gateway {
         let model = &channel.model;
         let started = Instant::now();
         let provider_id = channel.params.provider_id.clone();
-        // 红线1（P21）：花费上限硬闸——降级链每次尝试都过同一道闸
+        // 红线1：花费上限硬闸——降级链每次尝试都过同一道闸
         if let Some(msg) = crate::usage::cap_block() {
             observability::event(
                 EventType::State,
@@ -742,7 +742,7 @@ impl Gateway {
             channel.params.thinking_format,
         );
         let url = Self::request_url(base_url, compat.protocol);
-        // P23 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
+        // 降级登记：该端点已确认拒收思考字段 → 本请求直接不发（人话提示由每轮渠道组装时出）
         let degraded = self.thinking_is_degraded(base_url, model);
         let eff_params = if degraded {
             let mut p = channel.params.clone();
@@ -753,7 +753,7 @@ impl Gateway {
         };
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, &channel.model, &compat);
-        // P27.3 思考预算扩容：思考开启时上游把思考+正文算进同一个 max_tokens，用户配的
+        // 思考预算扩容：思考开启时上游把思考+正文算进同一个 max_tokens，用户配的
         // 「最大输出长度」会被思考吃掉导致正文莫名截断——发送值加思考余量（端点硬上限
         // 拒收时下方回退原值重试）。思考关闭/未配 max_tokens 时等价原值。
         let mut send_params = eff_params.clone();
@@ -797,7 +797,7 @@ impl Gateway {
             }
         };
 
-        // P23 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
+        // 思考参数自适应降级：400 且请求带思考字段 → 剥参重试一次；
         // 成功则登记该渠道（后续请求不再发思考字段），失败则抛出重试的真实错误
         let mut degrade_retried = false;
         if response.status().as_u16() == 400 && !degraded && Self::body_has_thinking_params(&body) {
@@ -832,7 +832,7 @@ impl Gateway {
             }
         }
 
-        // P27.3 扩容回退：扩容后的 max_tokens 超出该模型硬上限被 400 拒收 → 用配置原值
+        // 扩容回退：扩容后的 max_tokens 超出该模型硬上限被 400 拒收 → 用配置原值
         // 重试一次（思考参数不动；剥参重试已跑过则不重复——它本来就用的原值）
         if response.status().as_u16() == 400 && inflated && !degrade_retried {
             let text = response.text().await.unwrap_or_default();
@@ -883,7 +883,7 @@ impl Gateway {
         // 说明关键分片（典型是携带 tool_calls 的那个）被吞了——必须报错而不是
         // 当「模型给了空回答」静默结束（2026-10-08 修）。
         let mut parse_failures = 0usize;
-        // Anthropic 协议（P23）：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
+        // Anthropic 协议：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
         let mut translator = anthropic::SseTranslator::default();
         let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
         loop {
@@ -981,7 +981,7 @@ impl Gateway {
                  可能是中转代理在 data: 行前后注入了文本，或流被截断。请重试或更换渠道。"
             );
         }
-        // P21 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
+        // 台账：成功调用记 usage 三路（渠道不回 usage 时 token 记 0，请求与延迟照记）
         record_usage(
             ctx,
             base_url,

@@ -41,7 +41,7 @@ pub fn run_fast_suite(cfg: &SandboxConfig) -> Vec<ProbeResult> {
     ]
 }
 
-/// P20 档位探测链：把同一套快速探针跑到**指定档位**的 spawn 通道上。
+/// 档位探测链：把同一套快速探针跑到**指定档位**的 spawn 通道上。
 /// privilege_strip 是受限 token 内省，只对受限语义的档位有意义（AppContainer 由
 /// LowBox 派生 token，特权面不同，直跑档无 token 剥离）——其余档位自动跳过该项。
 pub fn run_fast_suite_for_tier(tier: &dyn SandboxTier, limits: SandboxLimits) -> Vec<ProbeResult> {
@@ -503,7 +503,7 @@ pub(crate) fn restricted_host_limitation() -> Option<String> {
         .clone()
 }
 
-// —— P20 档位探测链编排 ——
+// —— 档位探测链编排 ——
 
 /// 档位解析结果（/api/sandbox/info 直出 + 工具层选档依据）。
 pub struct TierReport {
@@ -654,7 +654,7 @@ mod tests {
     use super::*;
     use crate::config::SandboxConfig;
 
-    /// P12 019：AppContainer 真机探针（ignored，手工跑：cargo test appcontainer_smoke -- --ignored --nocapture）
+    /// 019：AppContainer 真机探针（ignored，手工跑：cargo test appcontainer_smoke -- --ignored --nocapture）
     #[test]
     #[ignore]
     fn appcontainer_smoke() {
@@ -777,7 +777,7 @@ mod tests {
         assert!(results.iter().all(|r| r.ok), "fast suite 未全绿: {:?}", results.iter().filter(|r| !r.ok).map(|r| (r.name, r.detail.clone())).collect::<Vec<_>>());
     }
 
-    // —— P20 档位探测链：解析出的生效档位与探测链自洽 ——
+    // —— 档位探测链：解析出的生效档位与探测链自洽 ——
     #[test]
     fn tier_resolution_reports_effective() {
         init_logger();
@@ -803,7 +803,7 @@ mod tests {
         assert!(v.get("probes").and_then(|p| p.as_array()).is_some());
     }
 
-    // —— P20 生效档缓存：同配置第二次解析走缓存（结论幂等）——
+    // —— 生效档缓存：同配置第二次解析走缓存（结论幂等）——
     #[test]
     fn tier_cache_is_stable_per_config() {
         init_logger();

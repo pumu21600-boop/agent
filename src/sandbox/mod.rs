@@ -1,10 +1,10 @@
-//! 执行沙箱 —— 施工单 004（P3）
+//! 执行沙箱 —— 施工单 004
 //!
 //! Job Objects 管进程树生命周期与资源上限（kill-on-close 团灭、内存/进程数/CPU 上限、UI 限制），
 //! 受限 token 管权限面（剥光全部特权 + 受限 SID 白名单）。真实隔离、不依赖管理员权限。
-//! 同步阻塞实现：P4 工具层接入时用 tokio::task::spawn_blocking 包裹调用。
+//! 同步阻塞实现：工具层接入时用 tokio::task::spawn_blocking 包裹调用。
 //!
-//! 留口（不实现）：AppContainer / 网络出向限制 / 完整性降级（P12）；交互式输入（P4 视需要）。
+//! 留口（不实现）：AppContainer / 网络出向限制 / 完整性降级；交互式输入（视需要）。
 
 mod appcontainer;
 pub mod backend;
@@ -34,7 +34,7 @@ pub struct SandboxLimits {
 }
 
 /// 一次受限拉起的完整描述（持有所有权，构造方便）。
-/// P20 起派生 Clone：tier.spawn 内部按档位归一标志位时要基于调用方的 spec 出副本。
+/// 派生 Clone：tier.spawn 内部按档位归一标志位时要基于调用方的 spec 出副本。
 #[derive(Clone)]
 pub struct SandboxSpec {
     /// exe 绝对路径（如 C:\Windows\System32\cmd.exe）
@@ -47,9 +47,9 @@ pub struct SandboxSpec {
     /// true=权限笼（受限 token + 白名单环境 + 资源/UI 上限）；
     /// false=本机直跑（完整用户 token + 继承父环境，仅留超时团灭保险丝）
     pub restricted: bool,
-    /// P12 019：AppContainer 模式（LowBox token + 能力 SID；restricted 被忽略）
+    /// 019：AppContainer 模式（LowBox token + 能力 SID；restricted 被忽略）
     pub appcontainer: bool,
-    /// P12 019：AppContainer 网络出向（false=断网；true=授予 INTERNET_CLIENT 能力）
+    /// 019：AppContainer 网络出向（false=断网；true=授予 INTERNET_CLIENT 能力）
     pub allow_network: bool,
 }
 
@@ -62,20 +62,20 @@ pub struct SandboxOutput {
 }
 
 impl SandboxOutput {
-    /// 正常退出且退出码为 0（P4 工具层判定用）。
+    /// 正常退出且退出码为 0（工具层判定用）。
     #[allow(dead_code)]
     pub fn ok(&self) -> bool {
         !self.timed_out && self.exit_code == Some(0)
     }
 }
 
-/// 系统目录下的 cmd.exe 绝对路径（探针 / P4 shell 工具用）。
+/// 系统目录下的 cmd.exe 绝对路径（探针 /  shell 工具用）。
 pub fn system_cmd() -> std::path::PathBuf {
     proc::system_dir().join("cmd.exe")
 }
 
 /// 拉起受限进程树；返回可 wait 的句柄。Drop 即团灭。
-/// P4 shell 工具接入；探针与测试已在用（bin 构建不链接测试代码故此处告警）。
+/// shell 工具接入；探针与测试已在用（bin 构建不链接测试代码故此处告警）。
 #[allow(dead_code)]
 pub fn spawn(spec: &SandboxSpec) -> anyhow::Result<SandboxChild> {
     proc::spawn(spec)

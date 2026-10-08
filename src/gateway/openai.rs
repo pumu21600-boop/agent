@@ -20,7 +20,7 @@ pub fn build_body(
     build_body_with_compat(model, messages, stream, params, tools, &compat)
 }
 
-/// P27.3 思考预算扩容：思考开启时上游把 reasoning+正文一起算进同一个 max_tokens
+/// 思考预算扩容：思考开启时上游把 reasoning+正文一起算进同一个 max_tokens
 /// （StepFun 官方文档：max_tokens 默认 INF、推理深度只有 reasoning_effort 三档、
 /// 没有单独思考预算参数；GLM/DeepSeek/Qwen 同构——共用一个输出上限）。
 /// 用户配的「最大输出长度」本意是正文额度，被思考吃掉半截正文就莫名截断
@@ -50,7 +50,7 @@ pub fn build_body_with_compat(
     tools: Option<&Value>,
     compat: &Compat,
 ) -> Value {
-    // Anthropic Messages 协议（P23）：请求体形状完全不同，交给专用适配器；
+    // Anthropic Messages 协议：请求体形状完全不同，交给专用适配器；
     // 响应侧同样由适配器合成为 OpenAI 分片，下游零感知
     if compat.protocol == Protocol::AnthropicMessages {
         return anthropic::build_body(model, messages, stream, params, tools);
@@ -78,7 +78,7 @@ pub fn build_body_with_compat(
         body["top_p"] = json!(t);
     }
 
-    // —— 思考参数：按 thinkingFormat 分支（对齐 OpenClaw buildOpenAICompletionsParams）——
+    // —— 思考参数：按 thinkingFormat 分支 ——
     // 关键保底：默认档位（None 或空串）绝不向任何网关发送任何思考字段，坚决尊重渠道自身行为
     let requested = params
         .thinking
@@ -147,7 +147,7 @@ pub fn build_body_with_compat(
     body
 }
 
-/// 流式分片聚合器（P23 从 stream_chat 抽出）：一个 OpenAI 形状分片进，
+/// 流式分片聚合器（从 stream_chat 抽出）：一个 OpenAI 形状分片进，
 /// usage/思考剥离/tool_calls 增量聚合、model_chunk 事件、干净分片出。
 /// Anthropic 协议的合成 OpenAI 分片走同一入口，下游零分叉。
 pub(crate) struct StreamAgg {
@@ -165,7 +165,7 @@ impl StreamAgg {
     /// 处理一个分片：raw/data 原文 + OpenAI 形状 chunk（可变，思考剥离会写回）。
     pub(crate) fn feed(&mut self, chunk: &mut Value, data: &str) {
         // 末尾分片的 usage：OpenAI 风格 prompt_tokens_details.cached_tokens
-        // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示 + P21 台账分计量）
+        // 或 DeepSeek 风格 prompt_cache_hit_tokens（缓存命中率展示 +  台账分计量）
         if let Some(u) = chunk.get("usage")
             && let Some(p) = u.get("prompt_tokens").and_then(Value::as_u64)
         {
@@ -285,8 +285,8 @@ pub struct Delta {
 }
 
 /// 从分片里提取增量内容与思考内容。
-/// 思考字段全量对齐 OpenClaw OPENAI_COMPLETIONS_REASONING_FIELDS +
-/// OpenRouter reasoning_details（type=reasoning.text）：四字段按序取第一个非空。
+/// 思考字段取 reasoning_content / reasoning / reasoning_text / reasoning_details 四路，
+/// 按序取第一个非空（含 OpenRouter reasoning_details 的 type=reasoning.text）。
 pub fn extract_delta(chunk: &Value) -> Delta {
     let choice = chunk.pointer("/choices/0").cloned().unwrap_or(Value::Null);
     let delta = choice.pointer("/delta").cloned().unwrap_or(Value::Null);

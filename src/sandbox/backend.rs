@@ -1,10 +1,10 @@
-//! 沙箱后端统一接口（P20 沙箱统一）—— trait 包住既有三档。
+//! 沙箱后端统一接口（沙箱统一）—— trait 包住既有三档。
 //!
 //! 三档隔离实现早已建成并经探针矩阵真机验证（Job Objects / 受限 token / AppContainer），
 //! 此前由调用方手工拼 SandboxSpec 的 restricted/appcontainer/allow_network 标志位；
 //! 现在统一为 [`SandboxTier`] 对象：工具层选档 = 拿一个 trait 对象，不再关心标志位怎么拼。
 //! 本项目只对准 Windows；Linux/macOS 档（bwrap / Seatbelt）评估过、结论不引入，
-//! 决策记录见 docs/ROADMAP.md P20 行。
+//! 决策记录见 docs/ROADMAP.md 对应行。
 
 use super::{proc, probes::{self, ProbeResult}, SandboxChild, SandboxLimits, SandboxOutput, SandboxSpec};
 

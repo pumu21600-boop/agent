@@ -1,4 +1,4 @@
-//! /api/chat 流式对话 + 请求级参数组装 + 取消（P19 自 server.rs 按域拆出）
+//! /api/chat 流式对话 + 请求级参数组装 + 取消（自 server.rs 按域拆出）
 
 use super::*;
 use super::gate::ChatGate;
@@ -18,10 +18,10 @@ pub struct ChatRequest {
     /// 单轮消息（messages 为空时使用，兼容内置回退页）
     #[serde(default)]
     pub message: String,
-    /// P2：完整消息数组（role: user/assistant/tool），非空则优先
+    /// 完整消息数组（role: user/assistant/tool），非空则优先
     #[serde(default)]
     pub messages: Option<Vec<Value>>,
-    /// P8.5 多模态媒体附件（图片、视频、音频）
+    /// 多模态媒体附件（图片、视频、音频）
     #[serde(default)]
     pub attachments: Option<Vec<MediaAttachment>>,
     /// 请求级覆盖：非空优先于已保存设置（页面当前选择即时生效）
@@ -32,17 +32,17 @@ pub struct ChatRequest {
     /// 可选的请求级 key 覆盖（仅内存）；为空则用已保存设置
     #[serde(default)]
     pub api_key: String,
-    /// 审批档位覆盖（P19 四档）：read-only / sandbox / auto / full-access（旧档名自动映射；缺省用配置默认）
+    /// 审批档位覆盖（四档）：read-only / sandbox / auto / full-access（旧档名自动映射；缺省用配置默认）
     #[serde(default)]
     pub approval_mode: String,
-    /// P6.1 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
+    /// 多会话：消息落进哪条会话；缺省自动新建（前端从 SSE `session` 事件拿回 id）
     #[serde(default)]
     pub session_id: String,
     /// 027：同会话正在跑时这条消息怎么处理——false（缺省）= 排队，等这一轮跑完自动发；
     /// true = 立即（引导）：并进正在跑的那一轮，模型下一个决策点就看到（不打断、不另起一轮）
     #[serde(default)]
     pub steer: bool,
-    /// P9 B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
+    /// B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
     #[serde(default)]
     pub plan_mode: bool,
 }
@@ -143,12 +143,12 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         }
         c
     };
-    // P7 AGENTS.md 双层注入（全局在前、项目在后）；P8.2 记忆层随工作区热重开
+    // AGENTS.md 双层注入（全局在前、项目在后）；记忆层随工作区热重开
     let approvals = state.approvals.clone();
     let session = state.session.clone();
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let rec_cfg = (*state.recovery_cfg).clone();
-    // P6.1 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
+    // 多会话：请求带了合法 id 就用，没带就新建（前端从首个 SSE 事件拿 id）
     let session_id = {
         let sid = req.session_id.trim().to_string();
         let valid = !sid.is_empty()
@@ -274,18 +274,18 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         )
             .into_response();
     };
-    // P7 滚动摘要：从会话文件带出旧摘要继续压
+    // 滚动摘要：从会话文件带出旧摘要继续压
     let prior_summary = session.get(&session_id).and_then(|f| f.summary);
-    // P22-C 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。
+    // 子代理派发器：主对话任务才挂（子代理自己的无头轮不挂——v1 不支持嵌套）。
     // 在 spawn 前构建：dispatcher 持 AppState 克隆，任务里随 LoopChannels 带进核心循环。
     let subagents: Option<Arc<dyn crate::core::subagent::SubagentRunner>> =
         Some(Arc::new(subagent::SubagentDispatcher {
             state: state.clone(),
             limits: (*state.subagent_cfg).clone(),
         }));
-    // P22-C：子代理 token 并入本任务预算的水印（只计自己没计过的增量）
+    // 子代理 token 并入本任务预算的水印（只计自己没计过的增量）
     let subagent_seen = std::sync::atomic::AtomicU64::new(subagent::subagent_tokens(&session_id));
-    // 审批档位归一化（P19 四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
+    // 审批档位归一化（四档）：旧档名映射保留兼容 → 写入共享档位供 gate 活读。
     // full-access 需 config 总开关，没开就降级为 auto 并告知前端（档位与实际权限保持一致）。
     let allow_unsandboxed = cfg.allow_unsandboxed;
     let (mode, mode_notice) = normalize_mode(&cfg, &req.approval_mode);
@@ -357,7 +357,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // M2：run/cancel 可重绑——收尾时会先注销占位、再取队列续跑一轮
         let mut run = CancelRun::from_flag(cancel_registry.clone(), &session_id, run_flag);
         let mut cancel = run.flag.clone();
-        // P7 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
+        // 摘要槽：Summary 事件写入，Snapshot 落盘时随会话持久化
         let summary_slot: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(prior_summary.clone()));
         // 025：本任务最新一次会话快照（消息全量，不含 system）——迟到的追加消息
@@ -368,13 +368,13 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             send(json!({ "error": "消息为空" }));
             return;
         }
-        // P6.1：先把会话 id 告诉前端（新建时它还不知道）
+        // 先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
 
         // 系统约定 + 双层 AGENTS.md + 项目现状摘要 + 技能索引（与无头会话同一组装路径）
         let system_prompt = turn_system_prompt(&state, &session_id).await;
 
-        // P8.5 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
+        // 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
         // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
         let mut prior_summary = prior_summary;
@@ -387,7 +387,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             let mut projections: Vec<String> = Vec::new();
 
             for att in &attachments {
-                // P27+ 文档流水线：Office/PDF 类附件不做多模态内联（视觉模型解析不了
+                // 文档流水线：Office/PDF 类附件不做多模态内联（视觉模型解析不了
                 // 二进制文档），一律落盘工作区 + 文本通知，交给文档处理技能
                 if att.is_document() {
                     doc_attachments.push(att);
@@ -637,7 +637,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
 
                         let mut call_err = None;
                         for prompt_variant in &candidate_prompts {
-                            // P21：媒体旁路调用记台账（purpose=media，归属本会话）
+                            // 媒体旁路调用记台账（purpose=media，归属本会话）
                             let media_ctx = gateway::UsageCtx::aux(&session_id, "media");
                             match gateway.complete(&media_ctx, &vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params).await {
                                 Ok(text) if !text.trim().is_empty() => {
@@ -705,8 +705,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         for n in &ch.notices {
             send(json!({ "notice": n }));
         }
-        // P18 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
-        // P21：同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
+        // 钩子（027）：单任务累计 token（预算通知用；[hooks] 未配置时零开销）
+        // 同一个 Arc 标志同时驱动「剩余步骤改走降级渠道」（核心循环每步读它）
         let task_tokens = std::sync::atomic::AtomicU64::new(0);
         let budget_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // 用量快照槽：种子取会话文件里上次落盘的快照（跨请求/跨重启延续累计）；
@@ -732,10 +732,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     summary: ch.summary.clone(),
                     title: ch.title.clone(),
                     fallbacks: ch.fallbacks.clone(),
-                    // P21：预算降级渠道 + 共享超预算标志（见上方 budget_fired）
+                    // 预算降级渠道 + 共享超预算标志（见上方 budget_fired）
                     downgrade: ch.downgrade.clone(),
                     budget_hit: budget_fired.clone(),
-                    // P22-C：子代理派发（None 的任务不许派发）
+                    // 子代理派发（None 的任务不许派发）
                     subagents: subagents.clone(),
                     prior_anchor,
                 },
@@ -758,7 +758,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     allow_unsandboxed,
                     unsandboxed_approval: cfg.unsandboxed_approval,
                     pending: approvals.clone(),
-                    // P9 A3：会话内同类允许的作用域与记忆存储
+                    // A3：会话内同类允许的作用域与记忆存储
                     session_id: session_id.clone(),
                     meta: state.approval_meta.clone(),
                     approved: state.approved_scopes.clone(),
@@ -770,7 +770,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 crate::tools::workspace_root(),
                 |ev| match ev {
                     AgentEvent::Content(c) => send(json!({ "content": c })),
-                    // P26：思考=关时不上报 reasoning——渠道（如 StepFun 推理模型）无视
+                    // 思考=关时不上报 reasoning——渠道（如 StepFun 推理模型）无视
                     // 「不发思考参数」仍自行思考，用户明确关了就不要再显示思考过程
                     AgentEvent::Reasoning(r) => {
                         if ch.primary.params.thinking.as_deref() != Some("off") {
@@ -811,9 +811,9 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         }))
                     }
                     AgentEvent::ApiUsage { prompt_tokens, cached_tokens } => {
-                        // P18 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
-                        // 触发一次 budget_exceeded 通知挂点（降级策略本身留 P21 成本台账）
-                        // P22-C：子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
+                        // 钩子（027）：单任务累计 token 预算——超 [hooks] budget_tokens
+                        // 触发一次 budget_exceeded 通知挂点（降级策略本身留成本台账）
+                        // 子代理的花销并进本任务预算（水印增量，防拆子代理绕过预算）
                         let sub_total = subagent::subagent_tokens(&session_id);
                         let sub_fresh =
                             sub_total.saturating_sub(subagent_seen.swap(sub_total, std::sync::atomic::Ordering::Relaxed));
@@ -834,7 +834,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         }
                         send(json!({ "api_usage": { "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens } }))
                     }
-                    // P6 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
+                    // 会话落盘：核心循环每关键点推全量消息（不含 system），写盘即续命
                     AgentEvent::Snapshot { messages } => {
                         *last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = messages.clone();
                         let cur_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -849,16 +849,16 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             ),
                         }
                     }
-                    // P7 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
+                    // 滚动摘要：存槽里，下一次 Snapshot 落盘时随会话一起写 summary 字段
                     AgentEvent::Summary(s) => {
                         *summary_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
                         send(json!({ "summary": true }))
                     }
-                    // P6.1 改动统计条：撤销按钮恢复到任务起点基线
+                    // 改动统计条：撤销按钮恢复到任务起点基线
                     AgentEvent::Checkpoint { id, files_changed, additions, deletions } => {
                         send(json!({ "checkpoint": { "id": id, "files": files_changed, "additions": additions, "deletions": deletions } }))
                     }
-                    // P8 TITLE 角色：标题已生成 → 改会话文件并转前端
+                    // TITLE 角色：标题已生成 → 改会话文件并转前端
                     AgentEvent::Title(t) => {
                         match session.rename(&session_id, &t) {
                             Ok(()) => send(json!({ "title": t })),
@@ -868,7 +868,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             ),
                         }
                     }
-                    // P9 B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
+                    // B3：Plan 档结构化计划 → 前端计划卡（SSE 增字段；JSONL 由 agent 层记 plan.proposed）
                     AgentEvent::PlanProposal { goal, steps, files } => {
                         send(json!({ "plan_proposal": { "goal": goal, "steps": steps, "files": files } }))
                     }
@@ -898,7 +898,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                 // 失败被悄悄吞掉（若下一轮同样失败，会再报一次错，语义仍然清楚）
                 observability::event(EventType::Error, json!({ "message": e.to_string() }));
                 send(json!({ "error": e.to_string() }));
-                // P27：错误随会话落盘（重启/切回会话后报错气泡还在）。display_only 消息，
+                // 错误随会话落盘（重启/切回会话后报错气泡还在）。display_only 消息，
                 // 发送侧 replay 剥离，不进模型上下文。
                 {
                     let mut snap = last_snapshot.lock().unwrap_or_else(|e| e.into_inner());
@@ -953,7 +953,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 滚动摘要跟着上一轮走（跑的过程中 Summary 事件更新过槽）
         prior_summary = summary_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         }
-        // P18 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
+        // 钩子（027）：任务结束挂点（Done / Cancelled / 出错都算结束；含续跑轮）
         crate::hooks::session_end(&session_id).await;
     });
 
@@ -962,7 +962,7 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
 
 /// 本轮任务的取消标志守卫（D2）：登记即持标志，Drop 即注销。
 /// 任务正常结束、提前 return 或 panic 都会走到 Drop，注册表不留僵尸登记。
-/// 无头会话（P22-A）复用同一把守卫——「会话在跑」的登记随任务生命周期。
+/// 无头会话复用同一把守卫——「会话在跑」的登记随任务生命周期。
 pub(super) struct CancelRun {
     registry: Arc<CancelRegistry>,
     session: String,
@@ -1091,7 +1091,7 @@ mod tests {
         assert!(!dir2.join(".gitignore").exists(), "非 git 仓库不落 .gitignore");
     }
 
-    /// P21：角色/降级渠道的 key 回落链（B2）——没单独存 key 的配置靠环境变量兜底，
+    /// 角色/降级渠道的 key 回落链（B2）——没单独存 key 的配置靠环境变量兜底，
     /// 否则 budget/summary/title 渠道会一律「API key 未设置」。
     #[test]
     fn resolve_key_falls_back_to_env() {

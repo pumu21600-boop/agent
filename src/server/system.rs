@@ -1,4 +1,4 @@
-//! 技能/版本/trace/沙箱自检等杂项端点（P19 自 server.rs 按域拆出）
+//! 技能/版本/trace/沙箱自检等杂项端点（自 server.rs 按域拆出）
 
 use super::*;
 
@@ -94,7 +94,7 @@ fn default_trace_limit() -> usize {
     5
 }
 
-// —— P10.5 设置面板「记忆」分区 ——
+// —— 设置面板「记忆」分区 ——
 
 /// GET /api/version —— 版本与运行形态（界面「关于」卡片用）。
 /// root 是**运行时认定的应用根**（打包形态=exe 同级，开发形态=源码目录），
@@ -220,7 +220,7 @@ pub struct SandboxInfoQuery {
     pub refresh: u8,
 }
 
-/// GET /api/sandbox/info —— 当前沙箱档位（P20 沙箱统一：档位探测链 + 生效档缓存）。
+/// GET /api/sandbox/info —— 当前沙箱档位（沙箱统一：档位探测链 + 生效档缓存）。
 /// 返回配置档位、生效档位（含 AppContainer→受限 自动回退与原因）、隔离面说明、探测链明细。
 pub(super) async fn sandbox_info(
     State(state): State<AppState>,

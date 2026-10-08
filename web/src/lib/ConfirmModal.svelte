@@ -1,5 +1,5 @@
 <script>
-  // 通用确认弹窗（P27）：桌面壳（Tauri WebView2）不实现 window.confirm/alert——
+  // 通用确认弹窗：桌面壳（Tauri WebView2）不实现 window.confirm/alert——
   // 原生调用静默无操作（wry 0.55 无 ScriptDialogOpening 处理，WebView2 默认
   // AreDefaultDialogDialogsEnabled=false），浏览器里又各有各的样式。全部确认/提示
   // 统一走应用内弹窗：壳内外行为一致，样式随设计系统。

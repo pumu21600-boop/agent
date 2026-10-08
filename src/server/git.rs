@@ -1,4 +1,4 @@
-//! Git 状态/提交/检查点端点（P19 自 server.rs 按域拆出）
+//! Git 状态/提交/检查点端点（自 server.rs 按域拆出）
 
 use super::*;
 
