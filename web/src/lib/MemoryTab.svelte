@@ -8,8 +8,9 @@
   // 「打开记忆库」:关设置 + 开星云(两个状态都在 App 侧)
   const openGalaxy = () => dispatch('openGalaxy');
 
-  // —— 记忆分区（三类约定文件编辑 + 状态）——
-  // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md。
+  // —— 记忆分区（约定文件编辑 + 自动记忆）——
+  // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md、
+  // 自动记忆 <app_root>/.agent/profile.md（agent 也会写，行级增改；用户可自由编辑）。
   // 文本框始终显示文件当前内容：进入分区/切 chips/保存后都回读一次盘。
   let memData = null;
   let memTab = 'system';
@@ -22,6 +23,7 @@
     system: { text: 'system_prompt', path: 'system_path', label: '系统约定' },
     global: { text: 'agents_global', path: 'global_agents_path', label: '全局约定' },
     project: { text: 'agents_project', path: 'project_agents_path', label: '项目约定' },
+    profile: { text: 'agents_profile', path: 'profile_path', label: '自动记忆' },
   };
   function memTextOf(r, tab) {
     const k = (MEM_SCOPES[tab] || MEM_SCOPES.project).text;
@@ -102,7 +104,23 @@
               <button class="chip" class:active={memTab === 'system'} on:click={() => pickMemTab('system')}>系统约定</button>
               <button class="chip" class:active={memTab === 'global'} on:click={() => pickMemTab('global')}>全局约定</button>
               <button class="chip" class:active={memTab === 'project'} on:click={() => pickMemTab('project')}>项目约定</button>
+              <button class="chip" class:active={memTab === 'profile'} on:click={() => pickMemTab('profile')}>自动记忆</button>
             </div>
+            {#if memTab === 'profile'}
+              <div class="mem-contract">这个文件 agent 也会自动往里写：它只会加新条目、或改它认得出的那一条，绝不整段重写；你删掉的条目它不会偷偷加回来。你随时可以改。</div>
+              {#if memData.profile_entries && memData.profile_entries.length}
+                <div class="mem-entries">
+                  {#each memData.profile_entries as e (e.text + e.date)}
+                    <div class="mem-entry">
+                      <div class="mem-entry-text">{e.text}</div>
+                      <div class="mem-entry-meta">命中 {e.hits} 次 · {e.src} · {e.date}{e.status ? ' · ' + e.status : ''}</div>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <div class="mem-entries-empty">还没有任何自动记忆。agent 会把长期偏好和重复踩过的坑记在这里。</div>
+              {/if}
+            {/if}
             <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText} on:input={() => (memDirty = true)}></textarea>
             <div class="sub-row">
               <button class="btn" on:click={saveAgents} disabled={memSaving}>{memSaving ? '保存中…' : '保存'}</button>
@@ -126,6 +144,40 @@
     padding: 9px 12px;
     margin-bottom: 14px;
     word-break: break-all;
+  }
+  .mem-contract {
+    font-size: 12px;
+    color: var(--g6);
+    line-height: 1.6;
+    margin: 2px 0 10px;
+  }
+  .mem-entries {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+    max-height: 216px;
+    overflow-y: auto;
+  }
+  .mem-entry {
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .mem-entry-text {
+    font-size: 12.5px;
+    color: var(--g7);
+    line-height: 1.5;
+  }
+  .mem-entry-meta {
+    font-size: 11px;
+    color: var(--g5);
+    margin-top: 3px;
+  }
+  .mem-entries-empty {
+    font-size: 12px;
+    color: var(--g6);
+    margin-bottom: 10px;
   }
   .mem-stats {
     font-size: 12px;

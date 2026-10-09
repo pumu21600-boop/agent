@@ -383,13 +383,17 @@ impl Memory {
     }
     /// AGENTS.md 原文（编辑器用；缺省返回模板，模板不注入只展示）。
     /// scope: "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
+    /// | "profile"（自动记忆原文，缺文件为空串）
     pub fn agents_raw(&self, scope: &str) -> String {
         let path = match scope {
             "global" => self.dirs.user.join("AGENTS.md"),
+            "profile" => self.dirs.install.join("profile.md"),
             _ => self.ws.join("AGENTS.md"),
         };
         std::fs::read_to_string(path).unwrap_or_else(|_| {
             if scope == "global" {
+                String::new()
+            } else if scope == "profile" {
                 String::new()
             } else {
                 AGENTS_TEMPLATE.to_string()
@@ -398,11 +402,20 @@ impl Memory {
     }
     /// 保存用户编辑的 AGENTS.md（设置面板写入；下次任务注入自动生效）。
     /// global 写用户约定根（~/.agent）——那是用户的地盘，agent 只在这里落用户编辑。
+    /// profile 写自动记忆文件（与 agent 的行级写同一把互斥，防并发丢更新）；用户编辑
+    /// 不过 sanitize——那是用户自己的内容，与 AGENTS.md 同口径。
     pub fn save_agents(&self, scope: &str, content: &str) -> anyhow::Result<PathBuf> {
         let path = match scope {
             "global" => {
                 std::fs::create_dir_all(&self.dirs.user)?;
                 self.dirs.user.join("AGENTS.md")
+            }
+            "profile" => {
+                let _guard = self.profile_write_guard();
+                std::fs::create_dir_all(&self.dirs.install)?;
+                let p = self.dirs.install.join("profile.md");
+                crate::fsx::write_atomic_str(&p, content)?;
+                return Ok(p);
             }
             _ => self.ws.join("AGENTS.md"),
         };

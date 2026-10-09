@@ -22,10 +22,12 @@ pub(super) fn save_system_prompt(state: &AppState, content: &str) -> anyhow::Res
 /// GET /api/memory —— 记忆层状态 + 三类约定文件原文（编辑器数据源，每次调用读盘 = 显示文件实时内容）。
 /// 两个全局根分列（2026-10-09 回滚）：user_global_dir=用户约定根（~/.agent，AGENTS.md），
 /// install_state_dir=安装状态根（app_root/.agent，index.json）。agents_conflict=启动回滚
-/// 发现两份全局约定不一致时的告知（None 不显示）。
+/// 发现两份全局约定不一致时的告知（None 不显示）。profile_* = 自动记忆第四签的数据
+/// （条目按 hits 降序，绝不按 src 分组，§3.6/§6.1）。
 pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let projects_registered = mem.load_index().projects.len();
+    let profile = mem.profile();
     Json(json!({
         "enabled": mem.enabled,
         "user_global_dir": mem.user_global_dir().display().to_string(),
@@ -37,27 +39,58 @@ pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
         "global_agents_path": mem.global_agents_path().display().to_string(),
         "project_agents_path": mem.project_agents_path().display().to_string(),
         "agents_conflict": mem.agents_conflict(),
+        "profile_path": profile.path().display().to_string(),
+        "profile_chars": profile.chars(),
+        "profile_entries": profile_entries(&profile),
         "system_prompt": read_system_prompt(&state),
         "agents_global": mem.agents_raw("global"),
         "agents_project": mem.agents_raw("project"),
+        "agents_profile": mem.agents_raw("profile"),
     }))
+}
+
+/// 自动记忆条目（面板第四签用）：按 hits 降序，稳定排序（同 hits 保持文件顺序）。
+/// **绝不按 src 分组**——分组会诱导用户删掉「在 A 学但全局有效」的教训（§3.6）。
+fn profile_entries(profile: &crate::memory::profile::Profile) -> Vec<Value> {
+    use crate::memory::profile::Section;
+    let mut es = profile.entries();
+    es.sort_by(|a, b| b.1.hits.cmp(&a.1.hits));
+    es.iter()
+        .map(|(s, e)| {
+            json!({
+                "section": match s {
+                    Section::Prefs => "prefs",
+                    Section::Lessons => "lessons",
+                },
+                "text": e.text,
+                "src": e.src,
+                "date": e.date,
+                "hits": e.hits,
+                "status": e.status,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SaveAgentsRequest {
     /// "system"（prompts/system.md）| "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
+    /// | "profile"（<app_root>/.agent/profile.md，自动记忆，用户可自由编辑）
     pub scope: String,
     pub content: String,
 }
 
 /// POST /api/memory/agents —— 保存用户编辑的约定文件（system 走实时读盘，保存即生效；
-/// 两层 AGENTS.md 下次任务注入自动生效）。
+/// 两层 AGENTS.md 下次任务注入自动生效；profile 写自动记忆文件，agent 之后只做行级增改）。
 pub(super) async fn save_memory_agents(
     State(state): State<AppState>,
     Json(req): Json<SaveAgentsRequest>,
 ) -> (StatusCode, Json<Value>) {
-    if !matches!(req.scope.as_str(), "system" | "global" | "project") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "scope 须为 system / global / project" })));
+    if !matches!(req.scope.as_str(), "system" | "global" | "project" | "profile") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "scope 须为 system / global / project / profile" })),
+        );
     }
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let saved = if req.scope == "system" {
