@@ -317,13 +317,24 @@ impl Memory {
         }
     }
 
-    /// 双层 AGENTS.md：全局在前、项目在后（项目优先级更高，靠后覆盖语义）。
-    /// 全局层读用户约定根（~/.agent/AGENTS.md，2026-10-09 回滚后不再读安装根）。
-    pub fn agents_md(&self) -> String {
-        let mut out = String::new();
+    /// 每轮注入的记忆块，顺序即优先级（靠后优先级高，§2/§4）：
+    /// 自动记忆 profile.md（agent 总结的，优先级最低）→ 全局约定（用户手写）
+    /// → 项目约定（用户手写）。冲突时听用户的。
+    pub fn memory_context(&self) -> String {
+        let mut out = self.profile_md();
         out.push_str(&agents_text("全局约定", &self.dirs.user.join("AGENTS.md")));
         out.push_str(&agents_text("项目约定", &self.ws.join("AGENTS.md")));
         out
+    }
+
+    /// 自动记忆注入块（§4）：空分区不注入，一个条目都没有时整块不出现。
+    /// 不看 enabled——与约定层同口径：注入是展示不是记录。
+    pub fn profile_md(&self) -> String {
+        let text = self.profile().injected_text();
+        if text.is_empty() {
+            return String::new();
+        }
+        format!("\n\n【自动记忆】\n{text}")
     }
 
     // —— 设置面板「记忆」分区（只读状态 + AGENTS.md 编辑）——
@@ -728,6 +739,54 @@ mod tests {
         std::fs::remove_dir_all(&utmp).ok();
     }
 
+    /// 注入顺序即优先级（§2/§4）：自动记忆（agent 总结，最低）→ 全局约定（用户手写）
+    /// → 项目约定（用户手写）。空 profile 整块不出现。
+    #[test]
+    fn memory_context_orders_profile_before_conventions() {
+        use crate::memory::profile::Section;
+        init_logger();
+        let tmp = std::env::temp_dir().join(format!("agent-p7-ctx-{}", uuid::Uuid::new_v4().simple()));
+        let gtmp = std::env::temp_dir().join(format!("agent-p7-ctxg-{}", uuid::Uuid::new_v4().simple()));
+        let utmp = std::env::temp_dir().join(format!("agent-p7-ctxu-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&utmp).unwrap();
+        let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
+        let mem = Memory::open_at(&tmp, &MemoryConfig::default(), dirs);
+        mem.profile()
+            .add(
+                Section::Prefs,
+                profile::Entry::new("自动记的偏好", "ws", "2026-10-09", Section::Prefs),
+            )
+            .unwrap();
+        std::fs::write(utmp.join("AGENTS.md"), "全局约定内容").unwrap();
+        std::fs::write(tmp.join("AGENTS.md"), "项目约定内容").unwrap();
+        let ctx = mem.memory_context();
+        let ip = ctx.find("自动记的偏好").expect("自动记忆要注入");
+        let ig = ctx.find("全局约定内容").expect("全局约定要注入");
+        let iproj = ctx.find("项目约定内容").expect("项目约定要注入");
+        assert!(ip < ig && ig < iproj, "顺序必须是 自动记忆→全局→项目: {ctx}");
+        assert!(ctx.contains("【自动记忆】"), "{ctx}");
+
+        // 空 profile（一个条目都没有）：整块不出现，只剩两份约定
+        let gtmp2 = std::env::temp_dir().join(format!("agent-p7-ctxg2-{}", uuid::Uuid::new_v4().simple()));
+        let utmp2 = std::env::temp_dir().join(format!("agent-p7-ctxu2-{}", uuid::Uuid::new_v4().simple()));
+        let mem2 = Memory::open_at(
+            &tmp,
+            &MemoryConfig::default(),
+            GlobalDirs { install: gtmp2.clone(), user: utmp2.clone() },
+        );
+        let ctx2 = mem2.memory_context();
+        assert!(!ctx2.contains("【自动记忆】"), "空 profile 不注入: {ctx2}");
+        assert!(ctx2.contains("项目约定内容"), "项目约定照常注入");
+        assert!(!ctx2.contains("全局约定内容"), "另一个用户根是空的，不许串味");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&gtmp).ok();
+        std::fs::remove_dir_all(&utmp).ok();
+        std::fs::remove_dir_all(&gtmp2).ok();
+        std::fs::remove_dir_all(&utmp2).ok();
+    }
+
     #[test]
     fn agents_template_created() {
         init_logger();
@@ -748,11 +807,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(tmp.join("AGENTS.md")).unwrap(), "我的约定");
         // 未改动的空白模板 = 不注入（含 CRLF 变体）；用户填了才注入
         std::fs::write(tmp.join("AGENTS.md"), AGENTS_TEMPLATE).unwrap();
-        assert!(!mem.agents_md().contains("AGENTS.md"), "空白模板不应注入: {:?}", mem.agents_md());
+        assert!(!mem.memory_context().contains("AGENTS.md"), "空白模板不应注入: {:?}", mem.memory_context());
         std::fs::write(tmp.join("AGENTS.md"), AGENTS_TEMPLATE.replace('\n', "\r\n")).unwrap();
-        assert!(!mem.agents_md().contains("AGENTS.md"), "CRLF 模板同样不应注入");
+        assert!(!mem.memory_context().contains("AGENTS.md"), "CRLF 模板同样不应注入");
         std::fs::write(tmp.join("AGENTS.md"), "构建用 make build").unwrap();
-        assert!(mem.agents_md().contains("make build"), "用户设定应注入");
+        assert!(mem.memory_context().contains("make build"), "用户设定应注入");
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
         std::fs::remove_dir_all(&utmp).ok();

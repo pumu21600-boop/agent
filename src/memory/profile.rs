@@ -215,6 +215,34 @@ impl Profile {
         self.raw.chars().count() + extra
     }
 
+    /// 注入用文本（§4：空分区不注入，不占 token）：只含有条目的分区，条目按标准
+    /// 形态重渲染。分区外的用户自注不进注入——注入契约只覆盖两个分区（面板里看得到
+    /// 全文）。无任何条目时返回空串。
+    pub fn injected_text(&self) -> String {
+        let entries = self.entries();
+        if entries.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for section in [Section::Prefs, Section::Lessons] {
+            let items: Vec<&Entry> = entries
+                .iter()
+                .filter(|(s, _)| *s == section)
+                .map(|(_, e)| e)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            out.push_str(section.header());
+            out.push('\n');
+            for e in items {
+                out.push_str(&render_entry(e));
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// 定位目标行：分区内正文与 match_text 完全相同的条目行号。
     /// 匹配不上（含分区不存在、条目被删/改）一律报错——不硬盖、不偷偷加回来。
     fn locate(&self, section: Section, match_text: &str) -> Result<usize, String> {
@@ -532,6 +560,33 @@ mod tests {
         assert!(!d2.join("profile.md").exists(), "只读不开火");
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&d2).ok();
+    }
+
+    #[test]
+    fn injected_text_skips_empty_sections_and_outside_notes() {
+        let d = tmp("inject");
+        std::fs::write(
+            d.join("profile.md"),
+            "# 用户自己加的标题备注\n\n## 偏好区\n- 偏好甲 <!-- src: ws · 2026-10-09 · hits: 2 -->\n\n## 教训区\n\n## 别的区\n- 不该进注入 <!-- src: ws · 2026-10-09 · hits: 1 -->\n",
+        )
+        .unwrap();
+        let p = Profile::open(&d);
+        let t = p.injected_text();
+        assert!(t.starts_with("## 偏好区"), "{t}");
+        assert!(t.contains("- 偏好甲 <!-- src: ws · 2026-10-09 · hits: 2 -->"), "{t}");
+        assert!(!t.contains("教训区"), "空分区不注入: {t}");
+        assert!(!t.contains("用户自己加的标题备注"), "分区外自注不进注入: {t}");
+        assert!(!t.contains("不该进注入"), "未知分区不进注入: {t}");
+        // 一个条目都没有：整块空
+        let d2 = tmp("inject-empty");
+        std::fs::write(d2.join("profile.md"), "## 偏好区\n\n## 教训区\n").unwrap();
+        assert_eq!(Profile::open(&d2).injected_text(), "");
+        // 文件不存在：同样是空
+        let d3 = tmp("inject-missing");
+        assert_eq!(Profile::open(&d3).injected_text(), "");
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::remove_dir_all(&d2).ok();
+        std::fs::remove_dir_all(&d3).ok();
     }
 
     #[test]

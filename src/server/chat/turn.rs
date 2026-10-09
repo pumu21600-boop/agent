@@ -101,16 +101,17 @@ pub(crate) fn normalize_mode(cfg: &crate::config::AgentConfig, requested: &str) 
     (mode, None)
 }
 
-/// 一轮对话的系统提示：prompts/system.md（每轮实时读盘）+ 双层 AGENTS.md +
-/// 项目现状摘要（新会话开场：上一条同项目会话 + 工作区未提交改动）+ 技能索引。
+/// 一轮对话的系统提示：prompts/system.md（每轮实时读盘）+ 记忆注入块
+/// （自动记忆 profile.md → 全局约定 → 项目约定，靠后优先级高）+ 项目现状摘要
+/// （新会话开场：上一条同项目会话 + 工作区未提交改动）+ 技能索引。
 /// /api/chat 与无头会话共用同一套注入，行为对齐。
 pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> String {
     let prompt = read_system_prompt(state);
-    let agents_md = state
+    let memory_md = state
         .memory
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .agents_md();
+        .memory_context();
     // 工作区目录常驻系统提示：用户说「工作区/项目」都指这里，模型据此拼绝对路径，
     // 不再满磁盘 dir 猜位置（真机踩过：shell 工具描述写「项目根」，模型把用户说的
     // 工作区理解成了应用仓库，白搜 6 轮目录才找对文件）
@@ -146,7 +147,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
         }
     };
     format!(
-        "{prompt}{agents_md}{workspace_hint}{project_brief}{}{}{}",
+        "{prompt}{memory_md}{workspace_hint}{project_brief}{}{}{}",
         crate::skills::index_prompt(),
         crate::plugin::ui::index_prompt(),
         selfop_policy(state),
