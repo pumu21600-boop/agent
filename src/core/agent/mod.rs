@@ -1132,7 +1132,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let mem = Memory::open_at(
             &ws,
-            &MemoryConfig { enabled: false, persist_sensitive: false },
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
             crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         // 收集每次 ContextUsage（pressure, projected）与 ApiUsage 次数
@@ -1302,7 +1302,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let mem = Memory::open_at(
             &ws,
-            &MemoryConfig { enabled: false, persist_sensitive: false },
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
             crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1455,7 +1455,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let mem = Memory::open_at(
             &ws,
-            &MemoryConfig { enabled: false, persist_sensitive: false },
+            &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
             crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         struct G;
