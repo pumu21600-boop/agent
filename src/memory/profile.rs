@@ -42,6 +42,80 @@ pub fn warn_line(max_chars: usize) -> usize {
 /// 已确认的教训不清（能转正说明当时被佐证过，之后不再出现可能只是场景没复发）。
 pub const OBSERVATION_MAX_AGE_DAYS: i64 = 30;
 
+/// 隐私闸（§7）：候选含敏感信息就**直接丢弃不记**——sanitize 只会打码、不会判定
+/// 「该丢」，这里是「先判断再决定记不记」的那一步。命中即返回原因（人话）：
+/// ① sanitize 会打码的形态（sk-/Bearer/密钥字段）；
+/// ② ≥11 位连号（手机号/身份证/卡号/账号类）；
+/// ③ 「密码/账号/token… 是 <值>」形态（值 ≥6 个字符且含 ASCII——纯中文短语不误伤）；
+/// ④ 邮箱形态（账号标识，进每轮注入 = 每次调模型都暴露）。
+/// 口径：宁可漏报（用户还能在面板里手动加），不可把普通教训/偏好误杀。
+pub fn looks_sensitive(text: &str) -> Option<&'static str> {
+    // ① sanitize 打码差异 = 含密钥/令牌形态（与写入时的打码同一把尺子）
+    if sanitize(text) != text {
+        return Some("含密钥或令牌（sk-、Bearer、密钥字段形态）");
+    }
+    // ② 长数字串
+    let mut run = 0usize;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run += 1;
+            if run >= 11 {
+                return Some("含长数字串（手机号/身份证/卡号/账号类）");
+            }
+        } else {
+            run = 0;
+        }
+    }
+    // ④ 邮箱形态：local@domain.tld（local 与 domain 都非空、domain 含点）
+    if let Some(at) = text.find('@') {
+        let (local, rest) = (&text[..at], &text[at + 1..]);
+        let domain = rest.split_whitespace().next().unwrap_or("");
+        if !local.is_empty()
+            && !local.ends_with(char::is_whitespace)
+            && domain.contains('.')
+            && !domain.starts_with('.')
+            && !domain.ends_with('.')
+            && domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Some("含邮箱地址");
+        }
+    }
+    // ③ 密码/账号值是 X：关键词 + 分隔符 + ≥6 字符且含 ASCII 的值
+    const KEYS: &[&str] = &["密码", "账号", "口令", "令牌", "密钥", "token", "secret", "api_key", "apikey"];
+    let lower = text.to_ascii_lowercase();
+    for key in KEYS {
+        let mut from = 0usize;
+        while let Some(p) = lower[from..].find(key) {
+            // to_ascii_lowercase 保字节长度，lower 与 text 的字节下标一一对应；
+            // key.len() 是字节长度（中文关键词 chars().count() 会切出半个字）
+            let i = from + p + key.len();
+            from = i;
+            // 跳过「是/为/:/=/空格/引号」一类分隔符
+            let mut j = i;
+            while let Some(c) = text[j..].chars().next() {
+                if c == '是' || c == '为' || c == ':' || c == '=' || c == '"' || c == '\'' || c.is_whitespace() {
+                    j += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            // 量值：到空白/标点为止
+            let mut k = j;
+            while let Some(c) = text[k..].chars().next() {
+                if c.is_whitespace() || c == '，' || c == '。' || c == '；' || c == '"' {
+                    break;
+                }
+                k += c.len_utf8();
+            }
+            let value = &text[j..k];
+            if value.chars().count() >= 6 && value.chars().any(|c| c.is_ascii_alphanumeric()) {
+                return Some("含密码/账号一类的实体值");
+            }
+        }
+    }
+    None
+}
+
 /// 教训区条目状态（偏好区不带状态：偏好一次就够，无需佐证）
 pub const STATUS_OBSERVING: &str = "观察中";
 pub const STATUS_CONFIRMED: &str = "已确认";
@@ -590,6 +664,35 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&d2).ok();
         std::fs::remove_dir_all(&d3).ok();
+    }
+
+    #[test]
+    fn looks_sensitive_flags_secrets_but_not_normal_entries() {
+        // 命中：密钥/令牌形态（sanitize 打码差异）
+        assert!(looks_sensitive("api_key 是 sk-abc1234567890").is_some());
+        assert!(looks_sensitive("Authorization: Bearer ghp_token123456").is_some());
+        // 命中：长数字串（手机号/身份证/卡号）
+        assert!(looks_sensitive("用户手机号 13812345678 别打").is_some());
+        assert!(looks_sensitive("身份证 11010119900307801X").is_some());
+        // 命中：密码/账号值是 X
+        assert!(looks_sensitive("用户的密码是 hunter2xx").is_some());
+        assert!(looks_sensitive("数据库账号是 admin_user01").is_some());
+        // 命中：邮箱
+        assert!(looks_sensitive("周报发到 zhangsan@company.com").is_some());
+        // 不误伤：普通偏好与教训（数字短、纯中文短语、无密钥形态）
+        for ok in [
+            "以后回答先给结论",
+            "cargo test 失败先看前 50 行，别全量刷屏",
+            "上下文预算 96000 token，超了先裁剪",
+            "版本号 0.32.26 起带这个行为",
+            "日期 2026-10-09 记的这条",
+            "密码要有复杂度要求（没说具体值）",
+            "账号密码都不要写进代码",
+            "别用 root 登录生产机",
+            "端口 5173，日志在 logs 目录",
+        ] {
+            assert_eq!(looks_sensitive(ok), None, "普通条目不该被拦: {ok}");
+        }
     }
 
     #[test]

@@ -248,6 +248,18 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             };
+            // 隐私闸（§7）：含敏感信息的候选直接丢弃不记——先判断再决定记不记。
+            // merge 不动正文（只 hits+1），不过检
+            if matches!(op.as_str(), "add" | "replace") {
+                if let Some(t) = field("text") {
+                    if let Some(why) = crate::memory::profile::looks_sensitive(&t) {
+                        return Err(format!(
+                            "这条像含敏感信息（{why}），没记。把具体值去掉再叫我记；\
+                             确实要留的你自己到 设置→记忆→自动记忆 里手动加。"
+                        ));
+                    }
+                }
+            }
             let result = match op.as_str() {
                 // 加一条：T1 偏好一次就够；T2 首记教训落「观察中」
                 "add" => {
@@ -604,6 +616,18 @@ mod tests {
         let out = call(r#"{"action":"write","op":"add","section":"prefs","text":"预警线探针"}"#).await.unwrap();
         assert!(out.contains("已记入偏好区"), "{out}");
         assert!(out.contains("预警线") && out.contains("压缩旧条目"), "过线要提醒+三选项: {out}");
+
+        // 隐私闸（§7）：含敏感信息的候选直接丢弃不记，文件不变
+        let before = std::fs::read_to_string(dir.join("global").join("profile.md")).unwrap();
+        let err = call(r#"{"action":"write","op":"add","section":"prefs","text":"密钥是 sk-abc1234567890 记下来"}"#).await.unwrap_err();
+        assert!(err.contains("敏感信息") && err.contains("没记"), "{err}");
+        let err = call(r#"{"action":"write","op":"replace","section":"prefs","match":"预警线探针","text":"手机号 13812345678"}"#).await.unwrap_err();
+        assert!(err.contains("敏感信息"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("global").join("profile.md")).unwrap(),
+            before,
+            "隐私闸拒了就不落盘"
+        );
 
         // 闸：关掉「记忆库」插件 → 拒 + 指路（与浏览器插件同一套能力总闸语义；写通道一并收回）
         state.settings.write().unwrap().features.galaxy = false;
