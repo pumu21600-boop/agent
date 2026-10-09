@@ -1133,7 +1133,7 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false },
-            ws.join("global"),
+            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         // 收集每次 ContextUsage（pressure, projected）与 ApiUsage 次数
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(Option<u64>, u64)>::new()));
@@ -1303,7 +1303,7 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false },
-            ws.join("global"),
+            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
@@ -1456,7 +1456,7 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false },
-            ws.join("global"),
+            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
         );
         struct G;
         impl ApprovalGate for G {

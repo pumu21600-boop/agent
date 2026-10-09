@@ -20,18 +20,23 @@ pub(super) fn save_system_prompt(state: &AppState, content: &str) -> anyhow::Res
 }
 
 /// GET /api/memory —— 记忆层状态 + 三类约定文件原文（编辑器数据源，每次调用读盘 = 显示文件实时内容）。
+/// 两个全局根分列（2026-10-09 回滚）：user_global_dir=用户约定根（~/.agent，AGENTS.md），
+/// install_state_dir=安装状态根（app_root/.agent，index.json）。agents_conflict=启动回滚
+/// 发现两份全局约定不一致时的告知（None 不显示）。
 pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let projects_registered = mem.load_index().projects.len();
     Json(json!({
         "enabled": mem.enabled,
-        "global_dir": mem.global_dir().display().to_string(),
+        "user_global_dir": mem.user_global_dir().display().to_string(),
+        "install_state_dir": mem.install_state_dir().display().to_string(),
         "project_dir": mem.project_dir().display().to_string(),
         "events_lines": mem.events_lines(),
         "projects_registered": projects_registered,
         "system_path": state.prompt_path.display().to_string(),
         "global_agents_path": mem.global_agents_path().display().to_string(),
         "project_agents_path": mem.project_agents_path().display().to_string(),
+        "agents_conflict": mem.agents_conflict(),
         "system_prompt": read_system_prompt(&state),
         "agents_global": mem.agents_raw("global"),
         "agents_project": mem.agents_raw("project"),

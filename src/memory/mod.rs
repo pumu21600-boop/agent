@@ -1,12 +1,16 @@
 //! 记忆系统 v1 —— 总架构 §9 / 施工单 009
 //!
-//! 双层存储：全局 `<app_root>/.agent/` + 项目 `<workspace>/.agent/memory/`（与影子仓库同根）。
-//! - index.json（全局层）：项目身份登记（git remote 优先，无则 git 根路径），防串项目。
-//! - events.log（项目层）：任务/工具/交接/检查点的事件流水，跟 git 仓库走沉淀"经验"；
+//! 双全局根（2026-10-09 回滚 v0.32.32 搬根后定案，各管各的文件）：
+//! - 用户约定根 `~/.agent/`（按 Windows 用户，永久生效）：只有用户手写的全局约定
+//!   AGENTS.md，agent 绝不写它；
+//! - 安装状态根 `<app_root>/.agent/`（按安装，一份安装一份）：index.json 项目登记
+//!   + profile.md 自动记忆（读写层见施工单第 1 步）。
+//! 项目层 `<workspace>/.agent/memory/`（与影子仓库同根）：
+//! - events.log：任务/工具/交接/检查点的事件流水，跟 git 仓库走沉淀"经验"；
 //!   默认脱敏（sk-/Bearer/api_key 打码），`persist_sensitive=true` 才存原文。
 //! - AGENTS.md：全局 + 项目双层读取注入 system prompt；项目缺失时生成模板（开箱即用）。
 //!
-//! 语义记忆/向量检索留接口（EMBEDDING 再补），本单只做"流水 + 摘要 + 约定"。
+//! 语义记忆/向量检索在 memory/library.rs（EMBEDDING 角色渠道 + 本地哈希兜底）。
 
 pub mod library;
 
@@ -18,28 +22,34 @@ use serde_json::{Value, json};
 
 use crate::config::MemoryConfig;
 
-/// 全局层目录：应用自己目录下的 `.agent`（2026-10-09 搬根，原在 `~/.agent`）。
+/// 安装状态根：应用自己目录下的 `.agent`（按安装算，一份安装一份）。
 ///
-/// 原根按 Windows 用户算，同一台电脑跑几份 agent 会共享一份 AGENTS.md/index.json，
-/// 而会话索引（log_dir）本就按安装目录各一份——两层口径不一致，A 里记的用户印象
-/// 在 B 里也看得到。技能根（app_root/skills）一直是按安装算的，搬过来才统一。
-pub fn global_dir() -> PathBuf {
+/// 管 index.json（项目登记）与 profile.md（自动记忆）。v0.32.32 曾把全局约定
+/// AGENTS.md 也放这里，导致用户改 `~/.agent/AGENTS.md` 没有任何效果（线上活
+/// bug），2026-10-09 回滚：AGENTS.md 归 user_global_dir()，本根只管 agent
+/// 自己的账。
+pub fn install_state_dir() -> PathBuf {
     crate::config::app_root().join(".agent")
 }
 
-/// 搬根前的旧全局根（`~/.agent`）：只用于迁移与遗留副本查找，不再写入。
-pub fn legacy_global_dir() -> PathBuf {
+/// 用户约定根：`~/.agent`（按 Windows 用户算，永久生效，不随安装走）。
+///
+/// 只管用户手写的全局约定 AGENTS.md——"我这个人在所有项目里通用的设定"本来就
+/// 该按用户算。agent 绝不写这个目录里的 AGENTS.md。
+pub fn user_global_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".agent")
 }
 
-/// 把旧全局根里的记忆文件并到新根（AGENTS.md / index.json 两个，别的一概不碰）。
-/// 只搬「新根没有」的——新根已有的，那是这份安装自己的记忆，绝不覆盖。
+/// 把旧全局根（`~/.agent`，搬根前的位置）里的 index.json 并到安装状态根。
+/// 只搬「新根没有」的——新根已有的，那是这份安装自己的账，绝不覆盖。
 /// 旧根永不删：什么时候清理由用户决定。返回本次搬过来的文件名。
+///
+/// AGENTS.md 不搬：它的语义正主就是旧根（用户手写），回滚后无需迁移。
 pub fn migrate_legacy_global(new_dir: &Path) -> Vec<&'static str> {
-    migrate_legacy_global_at(new_dir, &legacy_global_dir())
+    migrate_legacy_global_at(new_dir, &user_global_dir())
 }
 
 fn migrate_legacy_global_at(new_dir: &Path, old_dir: &Path) -> Vec<&'static str> {
@@ -47,7 +57,7 @@ fn migrate_legacy_global_at(new_dir: &Path, old_dir: &Path) -> Vec<&'static str>
         return Vec::new();
     }
     let mut moved = Vec::new();
-    for name in ["AGENTS.md", "index.json"] {
+    for name in ["index.json"] {
         let src = old_dir.join(name);
         let dst = new_dir.join(name);
         if dst.exists() || !src.is_file() {
@@ -61,6 +71,49 @@ fn migrate_legacy_global_at(new_dir: &Path, old_dir: &Path) -> Vec<&'static str>
         }
     }
     moved
+}
+
+/// 回滚全局约定路径（v0.32.32 活 bug 的收尾，§5）：AGENTS.md 的语义正主回到
+/// `~/.agent`，安装状态根里那份 v0.32.32 遗留副本失效——内容不一致（含一方为空、
+/// 一方非空的不对称情形）时备份为 `AGENTS.md.bak` 不删，一致（含两份都空）时直接
+/// 移除冗余副本。返回告知语（无冲突 None，由启动方转告用户）。
+///
+/// 告知条件不能写成"两份都非空且不同"：那恰好排除了最危险的方向——`~/.agent` 空
+/// 而安装根有内容时，回滚后后者失效进 .bak 却不告知，用户以为约定还在生效，正是
+/// 本方案要消灭的"静默"。
+pub fn rollback_global_agents_at(install_dir: &Path, user_dir: &Path) -> Option<String> {
+    let install_agents = install_dir.join("AGENTS.md");
+    if !install_agents.is_file() {
+        return None;
+    }
+    // 同址（开发形态）时别把用户唯一那份删了
+    if install_dir == user_dir {
+        return None;
+    }
+    let user_agents = user_dir.join("AGENTS.md");
+    // 行尾归一后比较：git checkout / 手动编辑带来的 CRLF 差异不算内容不一致
+    let norm = |p: &Path| -> String {
+        std::fs::read_to_string(p)
+            .map(|t| t.replace("\r\n", "\n").trim().to_string())
+            .unwrap_or_default()
+    };
+    let (a, b) = (norm(&install_agents), norm(&user_agents));
+    if a == b {
+        // 一致（含两份都空）：安装根那份是冗余副本，内容在用户根原样保留
+        let _ = std::fs::remove_file(&install_agents);
+        return None;
+    }
+    // 不一致：以 ~/.agent 为准。已存在旧 .bak 就不覆盖——第一份备份是最早的证据
+    let bak = install_dir.join("AGENTS.md.bak");
+    if !bak.exists() {
+        let _ = std::fs::copy(&install_agents, &bak);
+    }
+    let _ = std::fs::remove_file(&install_agents);
+    Some(format!(
+        "发现两份全局约定内容不一致，已以 {} 为准，另一份备份在 {}，请确认",
+        user_agents.display(),
+        bak.display()
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,31 +146,54 @@ fn agents_text(label: &str, path: &Path) -> String {
     format!("\n\n【{label} AGENTS.md】\n{t}")
 }
 
+/// 两个全局根的落点（open() 生产路径现算，open_at() 测试隔离传入）。
+#[derive(Debug, Clone)]
+pub struct GlobalDirs {
+    /// 安装状态根：index.json（+ profile.md）
+    pub install: PathBuf,
+    /// 用户约定根：AGENTS.md（用户手写）
+    pub user: PathBuf,
+}
+
 /// 打开的记忆层（持有路径与开关，核心循环/server 共享一个实例）。
 pub struct Memory {
     pub enabled: bool,
     persist_sensitive: bool,
-    global_dir: PathBuf,
+    dirs: GlobalDirs,
     project_dir: PathBuf,
     ws: PathBuf,
     pub key: String,
     pub name: String,
     pub remote: Option<String>,
+    /// 启动回滚发现的全局约定冲突告知（None = 无冲突）；面板与日志转告用户
+    agents_conflict: Option<String>,
 }
 
 impl Memory {
     /// 计算项目身份、建目录、登记 index.json（enabled 时）。
     pub fn open(ws: &Path, cfg: &MemoryConfig) -> Self {
-        let dir = global_dir();
+        let dirs = GlobalDirs {
+            install: install_state_dir(),
+            user: user_global_dir(),
+        };
         // 搬根迁移：只在记忆开着时做——关着时不落任何文件（含迁移）
         if cfg.enabled {
-            migrate_legacy_global(&dir);
+            migrate_legacy_global(&dirs.install);
         }
-        Self::open_at(ws, cfg, dir)
+        // 全局约定回滚不论记忆开关：AGENTS.md 注入本就不看 enabled，路径修错时
+        // 用户改 ~/.agent 永远不生效，这个告知不能跟着开关一起哑
+        let agents_conflict = rollback_global_agents_at(&dirs.install, &dirs.user);
+        if let Some(ref notice) = agents_conflict {
+            crate::observability::debug(&format!("[memory] {notice}"));
+            eprintln!("[memory] {notice}");
+        }
+        let mut mem = Self::open_at(ws, cfg, dirs);
+        mem.agents_conflict = agents_conflict;
+        mem
     }
 
-    /// 指定全局层目录（测试隔离用；生产走 open()）。
-    pub fn open_at(ws: &Path, cfg: &MemoryConfig, global_dir: PathBuf) -> Self {
+    /// 指定两个全局根的落点（测试隔离用；生产走 open()）。
+    pub fn open_at(ws: &Path, cfg: &MemoryConfig, dirs: GlobalDirs) -> Self {
         let remote = crate::recovery::remote_url(ws);
         let root = crate::recovery::root_path(ws).unwrap_or_else(|| ws.to_path_buf());
         let key = match &remote {
@@ -131,12 +207,13 @@ impl Memory {
         let mem = Self {
             enabled: cfg.enabled,
             persist_sensitive: cfg.persist_sensitive,
-            global_dir,
+            dirs,
             project_dir: ws.join(".agent").join("memory"),
             ws: ws.to_path_buf(),
             key,
             name,
             remote,
+            agents_conflict: None,
         };
         if mem.enabled {
             if let Err(e) = std::fs::create_dir_all(&mem.project_dir) {
@@ -148,7 +225,7 @@ impl Memory {
     }
 
     fn index_path(&self) -> PathBuf {
-        self.global_dir.join("index.json")
+        self.dirs.install.join("index.json")
     }
 
     /// 登记/更新本项目在 index.json 的条目（按 key 去重，last_used 刷新）。
@@ -171,7 +248,7 @@ impl Memory {
             idx.projects.sort_by(|a, b| b.last_used.cmp(&a.last_used));
             idx.projects.truncate(50);
         }
-        if let Err(e) = std::fs::create_dir_all(&self.global_dir) {
+        if let Err(e) = std::fs::create_dir_all(&self.dirs.install) {
             crate::observability::debug(&format!("[memory] 建全局目录失败: {e}"));
             return;
         }
@@ -224,23 +301,34 @@ impl Memory {
     }
 
     /// 双层 AGENTS.md：全局在前、项目在后（项目优先级更高，靠后覆盖语义）。
+    /// 全局层读用户约定根（~/.agent/AGENTS.md，2026-10-09 回滚后不再读安装根）。
     pub fn agents_md(&self) -> String {
         let mut out = String::new();
-        out.push_str(&agents_text("全局约定", &self.global_dir.join("AGENTS.md")));
+        out.push_str(&agents_text("全局约定", &self.dirs.user.join("AGENTS.md")));
         out.push_str(&agents_text("项目约定", &self.ws.join("AGENTS.md")));
         out
     }
 
     // —— 设置面板「记忆」分区（只读状态 + AGENTS.md 编辑）——
-    pub fn global_dir(&self) -> &Path {
-        &self.global_dir
+    /// 安装状态根（index.json / profile.md 所在，按安装隔离）。
+    pub fn install_state_dir(&self) -> &Path {
+        &self.dirs.install
+    }
+    /// 用户约定根（~/.agent，全局约定 AGENTS.md 所在，按用户）。
+    pub fn user_global_dir(&self) -> &Path {
+        &self.dirs.user
     }
     pub fn project_dir(&self) -> &Path {
         &self.project_dir
     }
-    /// 全局层 AGENTS.md 路径（~/.agent/AGENTS.md）。
+    /// 全局约定 AGENTS.md 路径（用户根 ~/.agent/AGENTS.md；v0.32.32 曾错指安装根，
+    /// 2026-10-09 回滚）。
     pub fn global_agents_path(&self) -> PathBuf {
-        self.global_dir.join("AGENTS.md")
+        self.dirs.user.join("AGENTS.md")
+    }
+    /// 启动回滚的冲突告知语（无冲突 None）。
+    pub fn agents_conflict(&self) -> Option<&str> {
+        self.agents_conflict.as_deref()
     }
     /// 项目层 AGENTS.md 路径（工作区根 AGENTS.md）。
     pub fn project_agents_path(&self) -> PathBuf {
@@ -256,7 +344,7 @@ impl Memory {
     /// scope: "global"（~/.agent/AGENTS.md）| "project"（工作区根 AGENTS.md）
     pub fn agents_raw(&self, scope: &str) -> String {
         let path = match scope {
-            "global" => self.global_dir.join("AGENTS.md"),
+            "global" => self.dirs.user.join("AGENTS.md"),
             _ => self.ws.join("AGENTS.md"),
         };
         std::fs::read_to_string(path).unwrap_or_else(|_| {
@@ -268,11 +356,12 @@ impl Memory {
         })
     }
     /// 保存用户编辑的 AGENTS.md（设置面板写入；下次任务注入自动生效）。
+    /// global 写用户约定根（~/.agent）——那是用户的地盘，agent 只在这里落用户编辑。
     pub fn save_agents(&self, scope: &str, content: &str) -> anyhow::Result<PathBuf> {
         let path = match scope {
             "global" => {
-                std::fs::create_dir_all(&self.global_dir)?;
-                self.global_dir.join("AGENTS.md")
+                std::fs::create_dir_all(&self.dirs.user)?;
+                self.dirs.user.join("AGENTS.md")
             }
             _ => self.ws.join("AGENTS.md"),
         };
@@ -444,13 +533,15 @@ mod tests {
         init_logger();
         let tmp = std::env::temp_dir().join(format!("agent-p7-mem-{}", uuid::Uuid::new_v4().simple()));
         let gtmp = std::env::temp_dir().join(format!("agent-p7-glob-{}", uuid::Uuid::new_v4().simple()));
+        let utmp = std::env::temp_dir().join(format!("agent-p7-user-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&tmp).unwrap();
         let cfg = MemoryConfig { enabled: true, persist_sensitive: false };
-        let mem = Memory::open_at(&tmp, &cfg, gtmp.clone());
+        let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
+        let mem = Memory::open_at(&tmp, &cfg, dirs.clone());
         assert!(mem.enabled);
         // 项目身份 = 路径（临时目录非 git 仓库）
         assert!(mem.key.contains("agent-p7-mem"), "key 应含目录名: {}", mem.key);
-        // index.json 登记在隔离的全局层
+        // index.json 登记在隔离的安装状态根
         let idx = mem.load_index();
         assert_eq!(idx.projects.len(), 1, "应登记本项目");
         assert_eq!(idx.projects[0].key, mem.key);
@@ -466,32 +557,34 @@ mod tests {
 
         // 删掉整个 .agent 后重开 → 自动重建（静默原则）
         std::fs::remove_dir_all(tmp.join(".agent")).unwrap();
-        let mem2 = Memory::open_at(&tmp, &cfg, gtmp.clone());
+        let mem2 = Memory::open_at(&tmp, &cfg, dirs);
         assert!(tmp.join(".agent").join("memory").exists());
         mem2.record("task.finish", json!({"steps": 1}));
         assert!(tmp.join(".agent").join("memory").join("events.log").exists());
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
+        std::fs::remove_dir_all(&utmp).ok();
     }
 
-    /// 2026-10-09 搬根：全局层从 `~/.agent`（按 Windows 用户）搬到 `app_root/.agent`
-    /// （按安装）——同一台电脑跑几份 agent 时，会话索引本就近安装各一份，AGENTS.md
-    /// 却共享一份，两层口径不一致。
+    /// 2026-10-09 回滚：两个全局根分离——AGENTS.md 归用户根（~/.agent，按用户），
+    /// index.json 归安装状态根（app_root/.agent，按安装）。
     #[test]
-    fn global_dir_is_per_install_not_per_user() {
-        assert_eq!(global_dir(), crate::config::app_root().join(".agent"));
+    fn global_roots_split_user_vs_install() {
+        assert_eq!(install_state_dir(), crate::config::app_root().join(".agent"));
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_default();
         if !home.is_empty() {
-            assert_eq!(legacy_global_dir(), std::path::Path::new(&home).join(".agent"));
+            assert_eq!(user_global_dir(), std::path::Path::new(&home).join(".agent"));
         }
-        assert_ne!(global_dir(), legacy_global_dir(), "新根不能再落在用户目录下");
+        assert_ne!(install_state_dir(), user_global_dir(), "两个根不能同址");
     }
 
+    /// 搬根迁移只搬 index.json：AGENTS.md 的语义正主就是用户根（~/.agent），
+    /// 回滚后无需迁移；别的一概不碰。
     #[test]
-    fn migrate_legacy_global_copies_only_what_is_missing() {
+    fn migrate_legacy_global_copies_only_index() {
         let tag = uuid::Uuid::new_v4().simple();
         let old = std::env::temp_dir().join(format!("agent-mig-old-{tag}"));
         let new = std::env::temp_dir().join(format!("agent-mig-new-{tag}"));
@@ -502,15 +595,15 @@ mod tests {
         std::fs::write(old.join("skills").join("keep.txt"), "别碰我").unwrap();
 
         let moved = migrate_legacy_global_at(&new, &old);
-        assert_eq!(moved, vec!["AGENTS.md", "index.json"], "只搬两个记忆文件");
-        assert_eq!(std::fs::read_to_string(new.join("AGENTS.md")).unwrap(), "用户亲手写的约定");
+        assert_eq!(moved, vec!["index.json"], "只搬 index.json");
+        assert!(!new.join("AGENTS.md").exists(), "AGENTS.md 不搬：用户根就是正主");
         assert_eq!(std::fs::read_to_string(new.join("index.json")).unwrap(), r#"{"projects":[]}"#);
         assert!(!new.join("skills").exists(), "记忆文件之外的一概不碰");
 
-        // 幂等 + 绝不覆盖：新根已有 = 这份安装自己的记忆
-        std::fs::write(new.join("AGENTS.md"), "这份安装自己的").unwrap();
+        // 幂等 + 绝不覆盖：新根已有 = 这份安装自己的账
+        std::fs::write(new.join("index.json"), r#"{"projects":["这份安装自己的"]}"#).unwrap();
         assert!(migrate_legacy_global_at(&new, &old).is_empty(), "新根已有就不搬");
-        assert_eq!(std::fs::read_to_string(new.join("AGENTS.md")).unwrap(), "这份安装自己的");
+        assert_eq!(std::fs::read_to_string(new.join("index.json")).unwrap(), r#"{"projects":["这份安装自己的"]}"#);
 
         // 旧根永不删
         assert!(old.join("AGENTS.md").exists() && old.join("index.json").exists());
@@ -521,18 +614,88 @@ mod tests {
         std::fs::remove_dir_all(&new).ok();
     }
 
+    /// 回滚：两份不一致（最危险方向=用户根空、安装根有内容）→ .bak 备份 + 移除副本 + 告知。
+    #[test]
+    fn rollback_global_agents_conflict_backs_up_and_notifies() {
+        let tag = uuid::Uuid::new_v4().simple();
+        let install = std::env::temp_dir().join(format!("agent-rb-inst-{tag}"));
+        let user = std::env::temp_dir().join(format!("agent-rb-user-{tag}"));
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join("AGENTS.md"), "v0.32.32 时写下的约定").unwrap();
+
+        let notice = rollback_global_agents_at(&install, &user).expect("不一致必须告知");
+        assert!(notice.contains("AGENTS.md.bak"), "告知要点明备份去处: {notice}");
+        assert!(!install.join("AGENTS.md").exists(), "安装根副本失效");
+        assert_eq!(
+            std::fs::read_to_string(install.join("AGENTS.md.bak")).unwrap(),
+            "v0.32.32 时写下的约定",
+            "旧内容备份不删"
+        );
+        assert!(!user.join("AGENTS.md").exists(), "不往用户根写内容——只告知");
+
+        // 幂等：副本已不在，再来一遍不响不炸
+        assert!(rollback_global_agents_at(&install, &user).is_none());
+
+        std::fs::remove_dir_all(&install).ok();
+        std::fs::remove_dir_all(&user).ok();
+    }
+
+    /// 回滚：一致或两份都空 → 静默移除冗余副本不告知；安装根没有副本 → 无事发生。
+    #[test]
+    fn rollback_global_agents_silent_when_no_conflict() {
+        let tag = uuid::Uuid::new_v4().simple();
+        let install = std::env::temp_dir().join(format!("agent-rb2-inst-{tag}"));
+        let user = std::env::temp_dir().join(format!("agent-rb2-user-{tag}"));
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+
+        // 安装根没有 AGENTS.md：无事
+        assert!(rollback_global_agents_at(&install, &user).is_none());
+
+        // 两份一致：静默移除副本，用户根原样不动，不留 .bak
+        std::fs::write(user.join("AGENTS.md"), "同一份约定").unwrap();
+        std::fs::write(install.join("AGENTS.md"), "同一份约定").unwrap();
+        assert!(rollback_global_agents_at(&install, &user).is_none(), "一致不告知");
+        assert!(!install.join("AGENTS.md").exists(), "冗余副本移除");
+        assert!(!install.join("AGENTS.md.bak").exists(), "一致不需要备份");
+        assert_eq!(std::fs::read_to_string(user.join("AGENTS.md")).unwrap(), "同一份约定");
+
+        // 两份都空（用户根文件不在读为空白）：静默移除空副本
+        std::fs::remove_file(user.join("AGENTS.md")).unwrap();
+        std::fs::write(install.join("AGENTS.md"), "").unwrap();
+        assert!(rollback_global_agents_at(&install, &user).is_none(), "都空不响");
+        assert!(!install.join("AGENTS.md").exists());
+
+        // CRLF 差异不算内容不一致
+        std::fs::write(user.join("AGENTS.md"), "行尾差异\r\n第二行\r\n").unwrap();
+        std::fs::write(install.join("AGENTS.md"), "行尾差异\n第二行\n").unwrap();
+        assert!(rollback_global_agents_at(&install, &user).is_none(), "CRLF 不算不一致");
+        assert!(!install.join("AGENTS.md").exists());
+
+        // 同址（开发形态）不删用户唯一那份
+        std::fs::write(user.join("AGENTS.md"), "唯一一份").unwrap();
+        assert!(rollback_global_agents_at(&user, &user).is_none(), "同址不响");
+        assert_eq!(std::fs::read_to_string(user.join("AGENTS.md")).unwrap(), "唯一一份");
+
+        std::fs::remove_dir_all(&install).ok();
+        std::fs::remove_dir_all(&user).ok();
+    }
+
     #[test]
     fn disabled_memory_writes_nothing() {
         init_logger();
         let tmp = std::env::temp_dir().join(format!("agent-p7-off-{}", uuid::Uuid::new_v4().simple()));
         let gtmp = std::env::temp_dir().join(format!("agent-p7-offg-{}", uuid::Uuid::new_v4().simple()));
+        let utmp = std::env::temp_dir().join(format!("agent-p7-offu-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let mem = Memory::open_at(&tmp, &MemoryConfig { enabled: false, persist_sensitive: false }, gtmp.clone());
+        let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
+        let mem = Memory::open_at(&tmp, &MemoryConfig { enabled: false, persist_sensitive: false }, dirs);
         mem.record("task.start", json!({"text": "x"}));
         assert!(!tmp.join(".agent").join("memory").join("events.log").exists(), "关闭时不落任何文件");
         assert!(!gtmp.join("index.json").exists(), "关闭时不登记 index");
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
+        std::fs::remove_dir_all(&utmp).ok();
     }
 
     #[test]
@@ -540,8 +703,10 @@ mod tests {
         init_logger();
         let tmp = std::env::temp_dir().join(format!("agent-p7-agents-{}", uuid::Uuid::new_v4().simple()));
         let gtmp = std::env::temp_dir().join(format!("agent-p7-agentsg-{}", uuid::Uuid::new_v4().simple()));
+        let utmp = std::env::temp_dir().join(format!("agent-p7-agentsu-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let mem = Memory::open_at(&tmp, &MemoryConfig::default(), gtmp.clone());
+        let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
+        let mem = Memory::open_at(&tmp, &MemoryConfig::default(), dirs);
         mem.ensure_agents_template(&tmp);
         let text = std::fs::read_to_string(tmp.join("AGENTS.md")).unwrap();
         // 模板必须近乎空白：只有标题与自填提示，不含任何预置项目知识
@@ -560,5 +725,6 @@ mod tests {
         assert!(mem.agents_md().contains("make build"), "用户设定应注入");
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&gtmp).ok();
+        std::fs::remove_dir_all(&utmp).ok();
     }
 }

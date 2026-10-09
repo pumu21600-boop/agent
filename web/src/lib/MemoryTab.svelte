@@ -78,10 +78,13 @@
 
       {#if tab === 'memory'}
         {#if memData}
+          {#if memData.agents_conflict}
+            <div class="mem-conflict">{memData.agents_conflict}</div>
+          {/if}
           <div class="field">
             <label>记忆存储（自动记录）</label>
             <div class="mem-stats">
-              <div>· 全局目录 <code>{memData.global_dir}</code> · {memData.projects_registered} 个项目</div>
+              <div>· 约定目录 <code>{memData.user_global_dir}</code> · 登记目录 <code>{memData.install_state_dir}</code> · {memData.projects_registered} 个项目</div>
               <div>· 项目目录 <code>{memData.project_dir}</code> · events.log {memData.events_lines} 行</div>
             </div>
           </div>
@@ -113,6 +116,17 @@
       {/if}
 
 <style>
+  .mem-conflict {
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--tint-orange-fg);
+    background: var(--tint-orange-bg);
+    border: 1px solid var(--tint-orange-fg);
+    border-radius: 8px;
+    padding: 9px 12px;
+    margin-bottom: 14px;
+    word-break: break-all;
+  }
   .mem-stats {
     font-size: 12px;
     color: var(--g6);

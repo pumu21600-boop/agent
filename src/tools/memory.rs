@@ -302,7 +302,10 @@ mod tests {
             memory: Arc::new(RwLock::new(Arc::new(crate::memory::Memory::open_at(
                 &ws,
                 &MemoryConfig { enabled: false, persist_sensitive: false },
-                log_dir.join("global"),
+                crate::memory::GlobalDirs {
+                    install: log_dir.join("global"),
+                    user: log_dir.join("user"),
+                },
             )))),
             mem_cfg: Arc::new(MemoryConfig { enabled: false, persist_sensitive: false }),
             approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
