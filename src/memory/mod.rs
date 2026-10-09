@@ -1,11 +1,14 @@
 //! 记忆系统 v1 —— 总架构 §9 / 施工单 009
 //!
 //! 双全局根（2026-10-09 回滚 v0.32.32 搬根后定案，各管各的文件）：
+//!
 //! - 用户约定根 `~/.agent/`（按 Windows 用户，永久生效）：只有用户手写的全局约定
 //!   AGENTS.md，agent 绝不写它；
 //! - 安装状态根 `<app_root>/.agent/`（按安装，一份安装一份）：index.json 项目登记
-//!   + profile.md 自动记忆（读写层见施工单第 1 步）。
+//!   + profile.md 自动记忆（读写层见 memory/profile.rs）。
+//!
 //! 项目层 `<workspace>/.agent/memory/`（与影子仓库同根）：
+//!
 //! - events.log：任务/工具/交接/检查点的事件流水，跟 git 仓库走沉淀"经验"；
 //!   默认脱敏（sk-/Bearer/api_key 打码），`persist_sensitive=true` 才存原文。
 //! - AGENTS.md：全局 + 项目双层读取注入 system prompt；项目缺失时生成模板（开箱即用）。
@@ -13,6 +16,7 @@
 //! 语义记忆/向量检索在 memory/library.rs（EMBEDDING 角色渠道 + 本地哈希兜底）。
 
 pub mod library;
+pub mod profile;
 
 use std::path::{Path, PathBuf};
 
@@ -167,6 +171,8 @@ pub struct Memory {
     pub remote: Option<String>,
     /// 启动回滚发现的全局约定冲突告知（None = 无冲突）；面板与日志转告用户
     agents_conflict: Option<String>,
+    /// profile.md 写互斥：memory.write 与启动清除都走它，防并发丢更新
+    profile_write: std::sync::Mutex<()>,
 }
 
 impl Memory {
@@ -188,6 +194,16 @@ impl Memory {
             eprintln!("[memory] {notice}");
         }
         let mut mem = Self::open_at(ws, cfg, dirs);
+        // 观察中清除（§3.6）：启动时扫一遍 profile.md，静默执行、events.log 留痕。
+        // 不另起后台任务——启动与每次 memory.write 是两个同步触发点
+        if mem.enabled {
+            for text in mem.prune_stale_profile() {
+                mem.record(
+                    "memory.prune",
+                    json!({ "section": "lessons", "text": text, "reason": "观察中且首次记录超 30 天" }),
+                );
+            }
+        }
         mem.agents_conflict = agents_conflict;
         mem
     }
@@ -214,6 +230,7 @@ impl Memory {
             name,
             remote,
             agents_conflict: None,
+            profile_write: std::sync::Mutex::new(()),
         };
         if mem.enabled {
             if let Err(e) = std::fs::create_dir_all(&mem.project_dir) {
@@ -329,6 +346,19 @@ impl Memory {
     /// 启动回滚的冲突告知语（无冲突 None）。
     pub fn agents_conflict(&self) -> Option<&str> {
         self.agents_conflict.as_deref()
+    }
+    /// 自动记忆读写层（profile.md，现开现读现写，文件小不持副本）。
+    pub fn profile(&self) -> profile::Profile {
+        profile::Profile::open(&self.dirs.install)
+    }
+    /// profile.md 写互斥哨兵（memory.write 全链路持锁，防两个会话并发写丢更新）。
+    pub fn profile_write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.profile_write.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// 清 profile.md 里超期的「观察中」教训，返回被清掉的正文（调用方写 events.log 留痕）。
+    pub fn prune_stale_profile(&self) -> Vec<String> {
+        let _guard = self.profile_write_guard();
+        profile::Profile::open(&self.dirs.install).prune_stale(Utc::now().date_naive())
     }
     /// 项目层 AGENTS.md 路径（工作区根 AGENTS.md）。
     pub fn project_agents_path(&self) -> PathBuf {
