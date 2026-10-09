@@ -1,4 +1,4 @@
-//! memory 工具：记忆库检索正门（2026-10-08 补 agent 侧通道）。
+//! memory 工具：记忆库检索正门（2026-10-08 补 agent 侧通道）+ 自动记忆写入（2026-10-09）。
 //!
 //! 此前语义记忆只有 UI 一条路：面板（星云视图）调 /api/memory/search，agent 侧
 //! 一个能调的工具都没有——用户说「检索一下之前的对话」，模型只能 ui open_memory
@@ -6,10 +6,18 @@
 //! library.json。本工具把同一条数据面接给 agent：search（关键词+语义混合）/
 //! recent（最近会话）/ similar（相似会话）/ read（读某条原文）。
 //!
+//! action=write（施工单第 2 步）：自动记忆的唯一写入口，落 <app_root>/.agent/
+//! profile.md，**行级操作**（add/replace/remove/merge），匹配不上报错、绝不整段
+//! 重写——用户手改的其它行一概不动（详见 memory/profile.rs 的铁律）。定级「常规
+//! 写」：只读档每次先问、自动档静默记、完全访问档照静默（§3.7）。
+//!
 //! 闸：「记忆库」插件总闸（features.galaxy）——关掉插件则界面入口与 agent 通道
-//! 一起没，与浏览器插件同一套「能力总闸」语义。
+//! （读+写）一起没，与浏览器插件同一套「能力总闸」语义。
 
 use serde_json::Value;
+
+use crate::memory::profile::{Entry, Section, HARD_CAP_CHARS, WARN_CHARS};
+use serde_json::json;
 
 /// 「记忆库」插件总闸：galaxy 关着时界面入口本就没了，agent 通道一并收回。
 /// 读 AppState.settings（生产里与全局 shared_settings 是同一个 Arc，见 main.rs），
@@ -209,8 +217,127 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             }
             Ok(out)
         }
+        // 写入自动记忆（profile.md 行级操作；§3.3 安全设计 + §3.7 通知与审批）
+        "write" => {
+            let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let section = match v.get("section").and_then(|x| x.as_str()).unwrap_or("").trim() {
+                "prefs" => Section::Prefs,
+                "lessons" => Section::Lessons,
+                other => {
+                    return Err(format!(
+                        "section 须为 prefs（偏好区）或 lessons（教训区），收到 {other:?}"
+                    ));
+                }
+            };
+            let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
+            if !mem.enabled {
+                return Err("记忆层没开（设置→记忆里把开关打开），我写不了自动记忆。".into());
+            }
+            // 全程持写互斥：两个会话同时记记忆不许丢更新
+            let _guard = mem.profile_write_guard();
+            let mut profile = mem.profile();
+            let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+            let src = if mem.name.is_empty() { "工作区".to_string() } else { mem.name.clone() };
+            let field = |key: &str| {
+                v.get(key)
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            let result = match op.as_str() {
+                // 加一条：T1 偏好一次就够；T2 首记教训落「观察中」
+                "add" => {
+                    let Some(text) = field("text") else {
+                        return Err("缺少 text（要记的条目，一句话 ≤40 字，别原句照搬）".into());
+                    };
+                    let status_hint = if section.has_status() {
+                        "（观察中，第二次踩坑再转正）"
+                    } else {
+                        ""
+                    };
+                    profile
+                        .add(section, Entry::new(&text, &src, &today, section))
+                        .map(|()| format!("已记入{}{status_hint}：{text}\n（跟用户说一句「记住了：…」就好，别展开。）", section.label()))
+                }
+                // 换一条：只改正文，元数据原样保留
+                "replace" => {
+                    let (Some(m), Some(text)) = (field("match"), field("text")) else {
+                        return Err("replace 要配 match（现有条目原文，一字不差）和 text（新文）".into());
+                    };
+                    profile
+                        .replace(section, &m, &text)
+                        .map(|()| format!("已更新{}条目：{text}\n（跟用户说一句已更新就好，别展开。）", section.label()))
+                }
+                // 删一条：用户说「忘了这条」就走它
+                "remove" => {
+                    let Some(m) = field("match") else {
+                        return Err("remove 要配 match（要删的条目原文，一字不差）".into());
+                    };
+                    profile
+                        .remove(section, &m)
+                        .map(|()| format!("已从{}删掉：{m}\n（跟用户说一句已删掉就好，别展开。）", section.label()))
+                }
+                // 合并：写入前先搜、搜到就合并——hits+1；confirm=true 且教训区观察中时转正
+                "merge" => {
+                    let Some(m) = field("match") else {
+                        return Err("merge 要配 match（搜到的那条原文，一字不差）".into());
+                    };
+                    let confirm = v.get("confirm").and_then(|x| x.as_bool()).unwrap_or(false);
+                    profile.merge_hit(section, &m, confirm).map(|()| {
+                        let turned = section.has_status() && confirm;
+                        format!(
+                            "已合并{}里的重复条目（命中 +1{}）\n（跟用户说一句「记住了：…」就好，别展开。）",
+                            section.label(),
+                            if turned { "，观察中→已确认" } else { "" }
+                        )
+                    })
+                }
+                other => {
+                    return Err(format!(
+                        "未知 op: {other:?}（add 配 section+text；replace/remove/merge 配 section+match；replace 还要 text，merge 可配 confirm）"
+                    ));
+                }
+            };
+            let msg = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    // 匹配不上：把该区现有条目回带给模型按原文重试——不硬盖、不偷偷加回来
+                    let cur: Vec<String> = profile
+                        .entries()
+                        .iter()
+                        .filter(|(s, _)| *s == section)
+                        .map(|(_, e)| format!("- {}", e.text))
+                        .collect();
+                    if cur.is_empty() {
+                        return Err(format!("{e}（当前{}还是空的）", section.label()));
+                    }
+                    return Err(format!(
+                        "{e}\n当前{}有这些条目，match 要跟其中一条一字不差：\n{}",
+                        section.label(),
+                        cur.join("\n")
+                    ));
+                }
+            };
+            // 写后顺带扫一遍观察中过期（§3.6：memory.write 是两个同步触发点之一），
+            // 静默清、events.log 留痕
+            for text in profile.prune_stale(chrono::Local::now().date_naive()) {
+                mem.record(
+                    "memory.prune",
+                    json!({ "section": "lessons", "text": text, "reason": "观察中且首次记录超 30 天" }),
+                );
+            }
+            // 上限一把尺子：超预警线在回包里说明（三选项的正规提醒走第 6 步通知通道）
+            let chars = profile.chars();
+            let mut out = msg;
+            if chars > WARN_CHARS {
+                out.push_str(&format!(
+                    "\n注意：自动记忆已有 {chars} 字符，超过预警线 {WARN_CHARS}（硬顶 {HARD_CAP_CHARS}）。跟用户说一声，问他要不要压缩旧条目 / 归档到文件 / 提高上限。"
+                ));
+            }
+            Ok(out)
+        }
         other => Err(format!(
-            "未知 action: {other:?}（search 配 query / recent 可配 limit+workspace / similar 配 id / read 配 id）"
+            "未知 action: {other:?}（search 配 query / recent 可配 limit+workspace / similar 配 id / read 配 id / write 配 op+section）"
         )),
     }
 }
@@ -280,7 +407,8 @@ mod tests {
 
     // —— 数据面端到端：真会话 → 有界同步 → 混合检索 → recent/similar ——
     // 不装进程级共享句柄，AppState 本地构造，与其它测试无全局状态纠缠。
-    fn isolated_state(log_dir: &std::path::Path) -> crate::server::AppState {
+    // mem_on：记忆层开关（write 用例要开，检索数据面用例无所谓）。
+    fn isolated_state(log_dir: &std::path::Path, mem_on: bool) -> crate::server::AppState {
         use crate::config::{AgentConfig, ContextConfig, GatewayConfig, MemoryConfig, RecoveryConfig, RolesConfig, SandboxConfig, SubagentConfig};
         use std::sync::{Arc, Mutex, RwLock};
         let ws = log_dir.join("ws");
@@ -301,13 +429,13 @@ mod tests {
             log_dir: Arc::new(log_dir.to_path_buf()),
             memory: Arc::new(RwLock::new(Arc::new(crate::memory::Memory::open_at(
                 &ws,
-                &MemoryConfig { enabled: false, persist_sensitive: false },
+                &MemoryConfig { enabled: mem_on, persist_sensitive: false },
                 crate::memory::GlobalDirs {
                     install: log_dir.join("global"),
                     user: log_dir.join("user"),
                 },
             )))),
-            mem_cfg: Arc::new(MemoryConfig { enabled: false, persist_sensitive: false }),
+            mem_cfg: Arc::new(MemoryConfig { enabled: mem_on, persist_sensitive: false }),
             approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             approval_meta: Arc::new(Mutex::new(std::collections::HashMap::new())),
             approved_scopes: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -323,7 +451,7 @@ mod tests {
     async fn data_plane_syncs_then_searches_and_reads() {
         let dir = std::env::temp_dir().join(format!("agent-mem-tool-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = isolated_state(&dir);
+        let state = isolated_state(&dir, false);
         let sm = &state.session;
         let a = sm.new_id();
         sm.save(&a, &[serde_json::json!({"role":"user","content":"插件删除能力要不要做？上次说等拍板"})], Some("任务目标：插件删除缺口")).unwrap();
@@ -373,7 +501,8 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("agent-mem-exec-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state = isolated_state(&dir);
+        // 记忆层开着：write 用例要能落盘（隔离 install 根 = dir/global）
+        let state = isolated_state(&dir, true);
         let a = state.session.new_id();
         state
             .session
@@ -417,10 +546,43 @@ mod tests {
         let err = call(r#"{"action":"fly"}"#).await.unwrap_err();
         assert!(err.contains("未知 action"), "{err}");
 
-        // 闸：关掉「记忆库」插件 → 拒 + 指路（与浏览器插件同一套能力总闸语义）
+        // —— write：自动记忆行级写入全链路（落隔离 install 根的 profile.md）——
+        // add：T1 偏好一次就够；教训区首记默认「观察中」
+        let out = call(r#"{"action":"write","op":"add","section":"prefs","text":"以后回答先给结论"}"#).await.unwrap();
+        assert!(out.contains("已记入偏好区") && out.contains("以后回答先给结论"), "{out}");
+        let out = call(r#"{"action":"write","op":"add","section":"lessons","text":"cargo test 失败先看前 50 行"}"#).await.unwrap();
+        assert!(out.contains("观察中"), "教训区首记默认观察中: {out}");
+        // merge + confirm：第二次踩坑 → 观察中→已确认，hits+1
+        let out = call(r#"{"action":"write","op":"merge","section":"lessons","match":"cargo test 失败先看前 50 行","confirm":true}"#).await.unwrap();
+        assert!(out.contains("已确认"), "{out}");
+        // replace：只改正文，元数据不动
+        let out = call(r#"{"action":"write","op":"replace","section":"prefs","match":"以后回答先给结论","text":"回答先给结论"}"#).await.unwrap();
+        assert!(out.contains("已更新偏好区"), "{out}");
+        // 匹配不上：报错 + 回带该区现有条目，不硬盖
+        let err = call(r#"{"action":"write","op":"remove","section":"prefs","match":"不存在的条目"}"#).await.unwrap_err();
+        assert!(err.contains("这条不在了"), "{err}");
+        assert!(err.contains("回答先给结论"), "要回带现有条目供按原文重试: {err}");
+        // remove
+        let out = call(r#"{"action":"write","op":"remove","section":"prefs","match":"回答先给结论"}"#).await.unwrap();
+        assert!(out.contains("已从偏好区删掉"), "{out}");
+        // 落盘核验：行级内容、hits、状态、src（来源工作区名）
+        let raw = std::fs::read_to_string(dir.join("global").join("profile.md")).unwrap();
+        assert!(raw.contains("## 偏好区"), "{raw}");
+        assert!(!raw.contains("回答先给结论"), "删掉的条目不在文件里: {raw}");
+        assert!(raw.contains("- cargo test 失败先看前 50 行 <!-- src: ws · "), "{raw}");
+        assert!(raw.contains("hits: 2 · 已确认"), "{raw}");
+        // 缺 section / 缺 text：给人话
+        let err = call(r#"{"action":"write","op":"add","text":"x"}"#).await.unwrap_err();
+        assert!(err.contains("section"), "{err}");
+        let err = call(r#"{"action":"write","op":"add","section":"prefs"}"#).await.unwrap_err();
+        assert!(err.contains("text"), "{err}");
+
+        // 闸：关掉「记忆库」插件 → 拒 + 指路（与浏览器插件同一套能力总闸语义；写通道一并收回）
         state.settings.write().unwrap().features.galaxy = false;
         let err = call(r#"{"action":"recent"}"#).await.unwrap_err();
         assert!(err.contains("记忆库") && err.contains("设置→插件"), "{err}");
+        let err = call(r#"{"action":"write","op":"add","section":"prefs","text":"x"}"#).await.unwrap_err();
+        assert!(err.contains("记忆库") && err.contains("设置→插件"), "写通道也归插件总闸: {err}");
         state.settings.write().unwrap().features.galaxy = true;
 
         let _ = std::fs::remove_dir_all(&dir);

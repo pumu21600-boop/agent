@@ -288,13 +288,17 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
         },
 
         // 2026-10-08 记忆库检索：search/recent/similar/read 全是只读（索引同步与
-        // 向量计算在数据面做，不动任何用户文件），恒定 Safe。缺 action/未知 action
-        // 按高危兜底，与 skill/session 同一套路。
+        // 向量计算在数据面做，不动任何用户文件），恒定 Safe。
+        // 2026-10-09 自动记忆写入：write 定「常规写」（§3.7）——只读档每次记记忆
+        // 先问用户、自动档静默记、完全访问档照静默。安全性由行级操作保证（匹配不上
+        // 报错、绝不整段重写、用户改的行一概不动），不是靠审批档位兜底。
+        // 缺 action/未知 action 按高危兜底，与 skill/session 同一套路。
         "memory" => match args.get("action").and_then(|v| v.as_str()).unwrap_or("") {
             "search" | "recent" | "similar" | "read" => {
                 (RiskLevel::Safe, "检索历史记忆（只读）".into())
             }
-            _ => (RiskLevel::Dangerous, "memory 工具缺少合法 action（search/recent/similar/read）".into()),
+            "write" => (RiskLevel::Normal, "写入自动记忆 profile.md（行级增删改，常规写）".into()),
+            _ => (RiskLevel::Dangerous, "memory 工具缺少合法 action（search/recent/similar/read/write）".into()),
         },
 
         // 写文件 / 局部修改：同一套「敏感文件 > 遍历 > 越界 > 常规」判定（参数名同为 path）
@@ -1539,6 +1543,13 @@ mod tests {
         assert_eq!(evaluate_risk("settings", &json!({"action": "mcp", "op": "refresh", "name": "fs"}), &ws()).0, RiskLevel::Normal);
         assert_eq!(evaluate_risk("settings", &json!({"action": "schedule_run", "id": "t"}), &ws()).0, RiskLevel::Dangerous);
         assert_eq!(evaluate_risk("settings", &json!({"action": "memory", "op": "reindex"}), &ws()).0, RiskLevel::Normal);
+        // 2026-10-09 自动记忆：memory 工具 read 四动作为 Safe，write 定常规写
+        //（只读档每次先问/自动档静默）；缺 action/未知 action 高危兜底
+        assert_eq!(evaluate_risk("memory", &json!({"action": "search"}), &ws()).0, RiskLevel::Safe);
+        assert_eq!(evaluate_risk("memory", &json!({"action": "write", "op": "add"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("memory", &json!({"action": "write", "op": "merge"}), &ws()).0, RiskLevel::Normal);
+        assert_eq!(evaluate_risk("memory", &json!({"action": "fly"}), &ws()).0, RiskLevel::Dangerous);
+        assert_eq!(evaluate_risk("memory", &json!({}), &ws()).0, RiskLevel::Dangerous);
         // workspace：Dangerous 按档位问（2026-10-03 并三档轮起不再任何档位强制红线）
         let (r, why) = evaluate_risk("settings", &json!({"action": "workspace", "path": "C:/x"}), &ws());
         assert_eq!(r, RiskLevel::Dangerous, "{why}");
