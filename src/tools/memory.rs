@@ -16,7 +16,7 @@
 
 use serde_json::Value;
 
-use crate::memory::profile::{Entry, Section, HARD_CAP_CHARS, WARN_CHARS};
+use crate::memory::profile::{Entry, Section};
 use serde_json::json;
 
 /// 「记忆库」插件总闸：galaxy 关着时界面入口本就没了，agent 通道一并收回。
@@ -236,6 +236,10 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             // 全程持写互斥：两个会话同时记记忆不许丢更新
             let _guard = mem.profile_write_guard();
             let mut profile = mem.profile();
+            // 硬顶前置闸（§6.2）：到顶就拒绝继续写，三选一交给用户。remove 是收缩，放行
+            if !matches!(op.as_str(), "remove") && profile.chars() >= mem.profile_max_chars() {
+                return Err(mem.profile_cap_notice(profile.chars(), true));
+            }
             let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
             let src = if mem.name.is_empty() { "工作区".to_string() } else { mem.name.clone() };
             let field = |key: &str| {
@@ -326,13 +330,11 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
                     json!({ "section": "lessons", "text": text, "reason": "观察中且首次记录超 30 天" }),
                 );
             }
-            // 上限一把尺子：超预警线在回包里说明（三选项的正规提醒走第 6 步通知通道）
+            // 上限一把尺子（§6.2）：过预警线（80%）就在回包里提醒 + 三选项由用户选
             let chars = profile.chars();
             let mut out = msg;
-            if chars > WARN_CHARS {
-                out.push_str(&format!(
-                    "\n注意：自动记忆已有 {chars} 字符，超过预警线 {WARN_CHARS}（硬顶 {HARD_CAP_CHARS}）。跟用户说一声，问他要不要压缩旧条目 / 归档到文件 / 提高上限。"
-                ));
+            if chars > crate::memory::profile::warn_line(mem.profile_max_chars()) {
+                out.push_str(&format!("\n{}", mem.profile_cap_notice(chars, chars > mem.profile_max_chars())));
             }
             Ok(out)
         }
@@ -429,13 +431,13 @@ mod tests {
             log_dir: Arc::new(log_dir.to_path_buf()),
             memory: Arc::new(RwLock::new(Arc::new(crate::memory::Memory::open_at(
                 &ws,
-                &MemoryConfig { enabled: mem_on, persist_sensitive: false },
+                &MemoryConfig { enabled: mem_on, persist_sensitive: false, profile_max_chars: 2500 },
                 crate::memory::GlobalDirs {
                     install: log_dir.join("global"),
                     user: log_dir.join("user"),
                 },
             )))),
-            mem_cfg: Arc::new(MemoryConfig { enabled: mem_on, persist_sensitive: false }),
+            mem_cfg: Arc::new(MemoryConfig { enabled: mem_on, persist_sensitive: false, profile_max_chars: 2500 }),
             approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             approval_meta: Arc::new(Mutex::new(std::collections::HashMap::new())),
             approved_scopes: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -576,6 +578,32 @@ mod tests {
         assert!(err.contains("section"), "{err}");
         let err = call(r#"{"action":"write","op":"add","section":"prefs"}"#).await.unwrap_err();
         assert!(err.contains("text"), "{err}");
+
+        // —— 上限（§6.2）：硬顶拒绝 + 三选一；预警线只提醒；remove 是收缩永远放行 ——
+        let fat = format!(
+            "## 偏好区\n{}",
+            "- 灌水条目填充填充填充填充填充填充填充填充填充 <!-- src: ws · 2026-10-09 · hits: 1 -->\n"
+                .repeat(60)
+        );
+        std::fs::write(dir.join("global").join("profile.md"), &fat).unwrap();
+        let err = call(r#"{"action":"write","op":"add","section":"prefs","text":"再写一条"}"#).await.unwrap_err();
+        assert!(err.contains("到顶") && err.contains("这次没写"), "{err}");
+        for opt in ["压缩旧条目", "归档到文件", "提高上限"] {
+            assert!(err.contains(opt), "硬顶也要给全三个选项: {err}");
+        }
+        // remove 收缩，到顶也放行
+        let out = call(r#"{"action":"write","op":"remove","section":"prefs","match":"灌水条目填充填充填充填充填充填充填充填充填充"}"#).await.unwrap();
+        assert!(out.contains("已从偏好区删掉"), "{out}");
+        // 预警线（>80% 但没到顶）：写成功 + 回包带三选项提醒
+        let mid = format!(
+            "## 偏好区\n{}",
+            "- 预警探针条目填充填充填充填充填充填充填充填充 <!-- src: ws · 2026-10-09 · hits: 1 -->\n"
+                .repeat(30)
+        );
+        std::fs::write(dir.join("global").join("profile.md"), &mid).unwrap();
+        let out = call(r#"{"action":"write","op":"add","section":"prefs","text":"预警线探针"}"#).await.unwrap();
+        assert!(out.contains("已记入偏好区"), "{out}");
+        assert!(out.contains("预警线") && out.contains("压缩旧条目"), "过线要提醒+三选项: {out}");
 
         // 闸：关掉「记忆库」插件 → 拒 + 指路（与浏览器插件同一套能力总闸语义；写通道一并收回）
         state.settings.write().unwrap().features.galaxy = false;

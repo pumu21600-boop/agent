@@ -41,6 +41,8 @@ pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
         "agents_conflict": mem.agents_conflict(),
         "profile_path": profile.path().display().to_string(),
         "profile_chars": profile.chars(),
+        "profile_max_chars": mem.profile_max_chars(),
+        "profile_ideal_chars": crate::memory::profile::IDEAL_CHARS,
         "profile_entries": profile_entries(&profile),
         "system_prompt": read_system_prompt(&state),
         "agents_global": mem.agents_raw("global"),

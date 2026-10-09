@@ -173,6 +173,8 @@ pub struct Memory {
     agents_conflict: Option<String>,
     /// profile.md 写互斥：memory.write 与启动清除都走它，防并发丢更新
     profile_write: std::sync::Mutex<()>,
+    /// 自动记忆字符硬顶（预警线 = 80%；§6.2）
+    profile_max_chars: usize,
 }
 
 impl Memory {
@@ -231,6 +233,7 @@ impl Memory {
             remote,
             agents_conflict: None,
             profile_write: std::sync::Mutex::new(()),
+            profile_max_chars: cfg.profile_max_chars.max(1),
         };
         if mem.enabled {
             if let Err(e) = std::fs::create_dir_all(&mem.project_dir) {
@@ -370,6 +373,32 @@ impl Memory {
     pub fn prune_stale_profile(&self) -> Vec<String> {
         let _guard = self.profile_write_guard();
         profile::Profile::open(&self.dirs.install).prune_stale(Utc::now().date_naive())
+    }
+    /// 自动记忆字符硬顶（预警线 = 它的 80%；到顶拒绝再写，§6.2）。
+    pub fn profile_max_chars(&self) -> usize {
+        self.profile_max_chars
+    }
+    /// 上限预警的三选一话术（压缩旧条目 / 归档到文件 / 提高上限，由用户选）。
+    pub fn profile_cap_notice(&self, chars: usize, over_hard: bool) -> String {
+        let max = self.profile_max_chars;
+        let warn = profile::warn_line(max);
+        let archive = self.dirs.install.join("profile-archive.md");
+        if over_hard {
+            format!(
+                "自动记忆到顶了（{chars}/{max} 字符），这次没写。请用户三选一：\
+                 ① 压缩旧条目（删掉/合并冗余的，我来做）；\
+                 ② 归档到文件（旧条目挪到 {archive}，我来做）；\
+                 ③ 提高上限（改 config.toml 的 memory.profile_max_chars，重启后生效）。\
+                 用户选哪个就做哪个，别替他决定。",
+                archive = archive.display()
+            )
+        } else {
+            format!(
+                "提醒：自动记忆 {chars}/{max} 字符，已过预警线 {warn}（80%）。\
+                 跟用户说一声，问他要不要压缩旧条目 / 归档到文件（{archive}）/ 提高上限，由他选。",
+                archive = archive.display()
+            )
+        }
     }
     /// 项目层 AGENTS.md 路径（工作区根 AGENTS.md）。
     pub fn project_agents_path(&self) -> PathBuf {
@@ -589,7 +618,7 @@ mod tests {
         let gtmp = std::env::temp_dir().join(format!("agent-p7-glob-{}", uuid::Uuid::new_v4().simple()));
         let utmp = std::env::temp_dir().join(format!("agent-p7-user-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let cfg = MemoryConfig { enabled: true, persist_sensitive: false };
+        let cfg = MemoryConfig { enabled: true, persist_sensitive: false, profile_max_chars: 2500 };
         let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
         let mem = Memory::open_at(&tmp, &cfg, dirs.clone());
         assert!(mem.enabled);
@@ -743,7 +772,7 @@ mod tests {
         let utmp = std::env::temp_dir().join(format!("agent-p7-offu-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&tmp).unwrap();
         let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
-        let mem = Memory::open_at(&tmp, &MemoryConfig { enabled: false, persist_sensitive: false }, dirs);
+        let mem = Memory::open_at(&tmp, &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 }, dirs);
         mem.record("task.start", json!({"text": "x"}));
         assert!(!tmp.join(".agent").join("memory").join("events.log").exists(), "关闭时不落任何文件");
         assert!(!gtmp.join("index.json").exists(), "关闭时不登记 index");
@@ -798,6 +827,39 @@ mod tests {
         std::fs::remove_dir_all(&utmp).ok();
         std::fs::remove_dir_all(&gtmp2).ok();
         std::fs::remove_dir_all(&utmp2).ok();
+    }
+
+    /// 上限预警话术（§6.2）：预警线（80%）提醒 + 三选一；硬顶拒绝 + 三选一。
+    #[test]
+    fn profile_cap_notice_states_three_options() {
+        init_logger();
+        let tmp = std::env::temp_dir().join(format!("agent-p7-cap-{}", uuid::Uuid::new_v4().simple()));
+        let gtmp = std::env::temp_dir().join(format!("agent-p7-capg-{}", uuid::Uuid::new_v4().simple()));
+        let utmp = std::env::temp_dir().join(format!("agent-p7-capu-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dirs = GlobalDirs { install: gtmp.clone(), user: utmp.clone() };
+        let cfg = MemoryConfig { enabled: true, persist_sensitive: false, profile_max_chars: 1000 };
+        let mem = Memory::open_at(&tmp, &cfg, dirs);
+        assert_eq!(mem.profile_max_chars(), 1000);
+
+        // 预警（过 80% 线 = 800）：提醒 + 三选项，不谎称到顶
+        let warn = mem.profile_cap_notice(850, false);
+        assert!(warn.contains("预警线") && warn.contains("850/1000"), "{warn}");
+        for opt in ["压缩旧条目", "归档到文件", "提高上限"] {
+            assert!(warn.contains(opt), "预警也要给全三个选项: {warn}");
+        }
+        assert!(!warn.contains("这次没写"), "预警不是拒绝: {warn}");
+
+        // 硬顶（≥1000）：明说没写 + 三选项 + 归档路径具名
+        let over = mem.profile_cap_notice(1000, true);
+        assert!(over.contains("到顶") && over.contains("这次没写"), "{over}");
+        assert!(over.contains("profile-archive.md"), "归档去处要具名: {over}");
+        assert!(over.contains("config.toml"), "提高上限的路子要说清: {over}");
+        assert!(over.contains("别替他决定"), "由用户选: {over}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&gtmp).ok();
+        std::fs::remove_dir_all(&utmp).ok();
     }
 
     #[test]

@@ -139,15 +139,28 @@ pub struct MemoryConfig {
     /// 敏感落盘：false（默认）时 events.log 里的 key/token 打码后才写
     #[serde(default)]
     pub persist_sensitive: bool,
+    /// 自动记忆 profile.md 的字符硬顶（一把尺子，§6.2；预警线 = 80%）。
+    /// 到顶后 memory.write 拒绝继续写，用户三选一：压缩旧条目 / 归档到文件 /
+    /// 调这个值（改 config.toml 后重启生效）。
+    #[serde(default = "default_profile_max_chars")]
+    pub profile_max_chars: usize,
 }
 
 fn default_memory_enabled() -> bool {
     true
 }
 
+fn default_profile_max_chars() -> usize {
+    crate::memory::profile::HARD_CAP_CHARS
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
-        Self { enabled: default_memory_enabled(), persist_sensitive: false }
+        Self {
+            enabled: default_memory_enabled(),
+            persist_sensitive: false,
+            profile_max_chars: default_profile_max_chars(),
+        }
     }
 }
 

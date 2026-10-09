@@ -30,10 +30,13 @@ pub const LESSONS_HEADER: &str = "## 教训区";
 /// 上限只用字符一把尺子（§6.2）：每条 ≤40 字已被提示词层约束住，行数不再是独立变量，
 /// 双口径必然出现「哪个先到」的死阈值。硬顶 2500 ≈ 2.5k–3.3k token（对应社区共识 4k 上限）。
 pub const HARD_CAP_CHARS: usize = 2500;
-/// 预警线 2000 字符（80%），此时约 25–26 条
-pub const WARN_CHARS: usize = 2000;
 /// 理想区间 1200 字符以内（约 15 条）≈ 1.2k–1.6k token，宁可少而精
 pub const IDEAL_CHARS: usize = 1200;
+
+/// 预警线 = 硬顶的 80%（默认 2500 → 2000，此时约 25–26 条）。
+pub fn warn_line(max_chars: usize) -> usize {
+    max_chars * 4 / 5
+}
 
 /// 观察中清除：首次记录超 30 天的「观察中」教训静默清掉（§3.6）。
 /// 已确认的教训不清（能转正说明当时被佐证过，之后不再出现可能只是场景没复发）。

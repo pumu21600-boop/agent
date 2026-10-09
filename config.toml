@@ -83,3 +83,6 @@ checkpoint_enabled = true
 enabled = true
 # 敏感落盘：false（默认）时 events.log 里的 sk-/Bearer/api_key 打码后才写
 persist_sensitive = false
+# 自动记忆 profile.md 的字符硬顶（一把尺子，约 2.5k-3.3k token）；预警线 = 80%（2000）。
+# 到顶后 agent 拒绝继续写，用户三选一：压缩旧条目 / 归档到文件 / 调这个值（重启生效）
+profile_max_chars = 2500
