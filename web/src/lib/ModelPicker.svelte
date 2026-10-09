@@ -7,10 +7,8 @@
   export let saved = []; // 已加入配置的模型名（checked 判定）
   import { createEventDispatcher } from 'svelte';
   const dispatch = createEventDispatcher();
-
-  function isChecked(m) {
-    return saved.includes(m);
-  }
+  // checked 必须内联 saved.includes(m)：套函数读闭包变量不进 each 的脏值依赖，
+  // saved 变了（全选/全不选）勾选框不重渲染，按钮就像失效
 </script>
 
 {#if open}
@@ -30,7 +28,7 @@
         {/if}
         {#each models as m}
           <label class="model-item">
-            <input type="checkbox" checked={isChecked(m)} on:change={() => dispatch('toggle', m)} />
+            <input type="checkbox" checked={saved.includes(m)} on:change={() => dispatch('toggle', m)} />
             <span class="m-name">{m}</span>
           </label>
         {/each}
