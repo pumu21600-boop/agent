@@ -145,7 +145,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_skill",
-            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。系统提示的「可用技能」索引列出全部自建技能（「可用插件」节标「自带技能」的插件包文档同样按名读取）；用户消息中出现 /技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
+            description: "读取一个技能（Skill）的完整 SKILL.md；带 ref 参数时读该技能的 references/ 下单篇参考资料（大技能的细节文档按需拉，不必一次全读）。自建技能见系统提示「可用技能」索引，「可用插件」节标「自带技能」的插件包文档同样按名读取；用户消息中出现 /技能名 或任务与某技能描述相关时，先调用本工具读全文再按其步骤执行。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -171,7 +171,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "在工作目录内一个文本文件里做局部替换：把 old_string 精确替换为 new_string（改大文件、改几行时优先用它，不要用 write_file 重写全文）。old_string 必须与文件内容逐字一致（含缩进与换行）且在文件中唯一出现；出现 0 次或多次都会失败并说明原因，可读文件后再试。自动/完全访问档下也接受绝对路径改工作区外文件。",
+            description: "在工作目录内一个文本文件里做局部替换：把 old_string 精确替换为 new_string（改大文件、改几行时优先用它，不要用 write_file 重写全文）。old_string 必须与文件内容逐字一致（含缩进与换行）且在文件中唯一出现；出现 0 次或多次都会失败并说明原因，可读文件后再试。自动/完全访问档下也接受绝对路径。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -211,16 +211,16 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent_spawn",
-            description: " 派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
+            description: "派发一个子代理：在一条独立会话里跑完你给的子任务，把它的最终回答作为工具结果返回给你（你看不到它的中间过程，成本记在你这条任务上）。适用：可并行的独立调研/多方案对比/批量同类小任务（一轮里发多个 subagent_spawn 会并行跑）。注意：子代理无人值守、没有用户来回答审批——需要审批的操作一律按拒绝处理并回给它自己调整；审批档位不得高于你当前会话的档位（只能更严）。子代理失败/超时会以错误文本返回，你可重派或换路。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "task": { "type": "string", "description": "子任务描述：要它做什么、产出什么（说清楚边界，它看不到你的对话历史）" },
-                    "model": { "type": "string", "description": "可选：覆盖子代理用的模型（留空 = 功能桥接里的子代理席位，未配则跟主渠道）" },
-                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "可选：子代理的审批档（不得高于你当前会话的档位；缺省跟随父会话）" },
-                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "可选：子代理命中审批时怎么办（仅 deny 生效：无人值守会话没有用户来批准，模型自选放行等于自己批准自己）" },
-                    "timeout_secs": { "type": "integer", "description": "可选：整轮超时秒数（0 = 默认 1800）" },
-                    "label": { "type": "string", "description": "可选：一句话标签，方便你在结果里识别是哪个子代理" }
+                    "task": { "type": "string", "description": "子任务：要它做什么、产出什么（说清边界，它看不到你的对话历史）" },
+                    "model": { "type": "string", "description": "覆盖模型（留空=功能桥接子代理席位，未配跟主渠道）" },
+                    "approval_mode": { "type": "string", "enum": ["read-only", "auto", "full-access"], "description": "子代理审批档（不得高于父会话，缺省跟随）" },
+                    "on_approval": { "type": "string", "enum": ["deny", "approve"], "description": "命中审批时怎么办（仅 deny 生效）" },
+                    "timeout_secs": { "type": "integer", "description": "整轮超时秒数（0=默认 1800）" },
+                    "label": { "type": "string", "description": "一句话标签，方便在结果里识别" }
                 },
                 "required": ["task"]
             }),
@@ -237,37 +237,37 @@ fn builtin_tools() -> Vec<ToolSpec> {
                         "enum": crate::browser::ALL_METHODS.to_vec(),
                         "description": "命令方法（见工具说明）"
                     },
-                    "url": { "type": "string", "description": "navigate：完整 URL（http:// 或 https://）" },
-                    "ref": { "type": "string", "description": "快照里的元素编号，如 e12" },
-                    "text": { "type": "string", "description": "click：元素可见文本；wait_for：要出现的文本" },
-                    "label": { "type": "string", "description": "type：输入框的占位符或名称（语义匹配）" },
-                    "value": { "type": "string", "description": "fill：要填入的文本" },
-                    "key": { "type": "string", "description": "press：按键名，如 Enter / Tab / Escape / ArrowDown" },
-                    "x": { "type": "number", "description": "视口横坐标（坐标定位 / element_info / scroll 锚点）" },
+                    "url": { "type": "string", "description": "navigate：URL" },
+                    "ref": { "type": "string", "description": "快照元素编号，如 e12" },
+                    "text": { "type": "string", "description": "click：可见文本；wait_for：要出现的文本" },
+                    "label": { "type": "string", "description": "type：输入框名/占位符" },
+                    "value": { "type": "string", "description": "fill：填入文本" },
+                    "key": { "type": "string", "description": "press：按键名（Enter/Tab/Escape…）" },
+                    "x": { "type": "number", "description": "视口横坐标" },
                     "y": { "type": "number", "description": "视口纵坐标" },
-                    "delta_x": { "type": "number", "description": "scroll：水平滚轮增量" },
-                    "delta_y": { "type": "number", "description": "scroll：垂直滚轮增量（正数向下）" },
-                    "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "click：鼠标按键（默认 left）" },
+                    "delta_x": { "type": "number", "description": "scroll：水平增量" },
+                    "delta_y": { "type": "number", "description": "scroll：垂直增量（正数向下）" },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "click：按键（默认 left）" },
                     "double_click": { "type": "boolean", "description": "click：是否双击" },
                     "modifiers": {
                         "type": "array",
                         "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
                         "description": "click/press：修饰键"
                     },
-                    "selector": { "type": "string", "description": "wait_for：要出现/消失的 CSS selector" },
+                    "selector": { "type": "string", "description": "wait_for：CSS selector" },
                     "text_gone": { "type": "string", "description": "wait_for：要消失的文本" },
-                    "timeout_ms": { "type": "integer", "description": "wait_for：超时毫秒（默认 5000，上限 30000）" },
-                    "full_page": { "type": "boolean", "description": "screenshot：整页截图（刷新到网页面板）" },
-                    "expression": { "type": "string", "description": "evaluate：在页面隔离世界执行的 JS 表达式" },
-                    "values": { "type": "array", "items": { "type": "string" }, "description": "select：按 value 或可见文本选择一个或多个 option" },
+                    "timeout_ms": { "type": "integer", "description": "wait_for：超时 ms（默认 5000，上限 30000）" },
+                    "full_page": { "type": "boolean", "description": "screenshot：整页截图" },
+                    "expression": { "type": "string", "description": "evaluate：页面 JS 表达式" },
+                    "values": { "type": "array", "items": { "type": "string" }, "description": "select：option 的 value/文本" },
                     "checked": { "type": "boolean", "description": "check：勾选态（默认 true）" },
-                    "from_ref": { "type": "string", "description": "drag：起点元素 ref" },
-                    "to_ref": { "type": "string", "description": "drag：终点元素 ref" },
+                    "from_ref": { "type": "string", "description": "drag：起点 ref" },
+                    "to_ref": { "type": "string", "description": "drag：终点 ref" },
                     "from": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：起点坐标" },
                     "to": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：终点坐标" },
-                    "accept": { "type": "boolean", "description": "handle_dialog：接受（true）/取消（false）" },
-                    "prompt_text": { "type": "string", "description": "handle_dialog：prompt 弹窗的输入内容" },
-                    "tab_id": { "type": "string", "description": "可选：操作指定标签页（缺省 = agent 专用页）" }
+                    "accept": { "type": "boolean", "description": "handle_dialog：接受/取消" },
+                    "prompt_text": { "type": "string", "description": "handle_dialog：prompt 输入内容" },
+                    "tab_id": { "type": "string", "description": "指定标签页（缺省 agent 专用页）" }
                 },
                 "required": ["method"]
             }),
@@ -275,11 +275,11 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "settings",
-            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。自改纪律：除 action=get（只读）与 schema/set_config 外全部动作要求插件页「中枢」开关开着——先 get 看 features.self_mod，没开就在回复里引导用户去 设置→插件 打开「中枢」，别硬试。action=get：全部设置快照（key 只给尾号；available_plugins/available_skills 列合法 id）。action=schema（只读，不受闸）：全部可改路径的自描述清单（每项路径/类型/可选值/默认/风险档/一句话说明）——set 之前先读它，别瞎猜键名。action=set 配 patch（可给顶层键，也可给点号子路径 features.<键>/roles.<字段>，如 features.galaxy=false、roles.summary=主力配置名）：普通键（thinking/thinking_style/temperature/top_p、context_length/max_output_tokens、capabilities、roles、features、mcp_servers 整表、disabled_plugins/disabled_skills 整表用 id、schedules 整表）静默生效；换大脑键（base_url/model/provider_id/active_config_id）2026-10-04 起与普通键同档（Normal，按审批档位走）。action=set_config 配 key（形如 agent.max_steps/cost.spend_cap_usd）+value：改 config.toml（toml_edit 保注释，重启服务后生效）；default_approval（审批档位的持久形态）任何档位必问。action=config 配 op：new=新建渠道配置（复制当前并激活）；delete+id=删配置（删密钥，按档位问）。action=mcp 配 op=refresh+name：重连 MCP server。action=workspace 配 path：切换工作区（按档位问）。action=alias 配 name（path 省略=当前工作区）：给工作区改显示名（侧栏那一行字），只改显示名不动目录，与用户点侧栏项目「重命名项目」完全同一条路（按档位问）；name 留空=恢复文件夹名——用户说「把工作区名改成 X」「这个项目叫 X」就是这个动作，直接用它，别去动目录名、也别翻源码找接口。action=schedule_run 配 id：立即跑一条定时任务（真花钱，按档位问）。action=memory 配 op=reindex：重建记忆库索引。范围外（表外路径直接报错）：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）与 workspace（工作区边界）。审批档位（read-only只读/auto自动/full-access完全访问三档）agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件的信任走 plugin 工具。",
+            description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。get：全部设置快照（key 只给尾号）。schema（只读不受闸）：全部可改路径的自描述（路径/类型/可选值/默认/风险档）——set 之前先读它，别瞎猜键名。set 配 patch（顶层键或点号子路径，如 features.galaxy=false、roles.summary=主力配置名）：普通键静默生效；换大脑键（base_url/model/provider_id/active_config_id）同档按审批走。set_config 配 key+value 改 config.toml（保注释，重启生效）；default_approval 必问。config 配 op：new=新建渠道配置并激活；delete+id=删配置（删密钥，按档位问）。mcp op=refresh+name 重连 MCP；workspace path 切换工作区（按档位问）；alias name 给工作区改显示名（细则见系统提示【工作区】节）；schedule_run id 立即跑定时任务（真花钱，按档位问）；memory op=reindex 重建记忆索引。范围外直接报错：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）。审批档位 agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件信任走 plugin 工具。除 get/schema/set_config 外受「中枢」闸（见系统提示「自我管理与探索纪律」）。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["schema", "get", "set", "set_config", "config", "mcp", "workspace", "alias", "schedule_run", "memory"], "description": "get/set/set_config/config/mcp/workspace/alias/schedule_run/memory；除 get/schema/set_config 外都要「中枢」插件开着" },
+                    "action": { "type": "string", "enum": ["schema", "get", "set", "set_config", "config", "mcp", "workspace", "alias", "schedule_run", "memory"], "description": "设置动作（每个 action 配什么参数见工具说明）" },
                     "patch": { "type": "object", "description": "set 时必填：要改的键与新值。顶层键 + 点号子路径均可（点号如 features.galaxy / roles.summary；合法路径全集见 action=schema）；整表替换的键（mcp_servers/schedules/roles/features）先 get 拿现状" },
                     "key": { "type": "string", "description": "set_config：config.toml 的键路径（形如 agent.max_steps，section.field）" },
                     "value": { "description": "set_config：新值（字符串/数字/布尔/一维数组）" },
@@ -294,18 +294,18 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ui",
-            description: "操作本应用自己的界面。自改纪律：除 list_panels / state（只读）外全部动作要求插件页「中枢」开关开着——没开就在回复里引导用户去 设置→插件 打开「中枢」，别硬试。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏，二者都是状态设置，不是按一下开关的切换语义；指令含糊（没说哪个/没说方向）时先问用户别猜——猜错方向比多问一句严重。面板：open_panel/close_panel 配 name（trace=时间线、board=项目文件、usage=用量价格），list_panels 列三个面板与启用态，插件停用着打不开并指路 settings 工具。边栏：open_sidebar/close_sidebar 配 side（left=左侧会话列表、right=右侧面板栏）。终端：open_terminal/close_terminal（与右侧面板互斥）。标签页：open_tab 配 name（artifacts=产物/git=git（审查+提交）/web=网页）；close_tab 配 key（artifacts/git/web/ext:usage/file:<路径>，先 state 看 tabs_open/active_tab）。设置：open_settings 可配 tab（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）直接跳页签，close_settings 关弹窗。外观：set_theme 配 mode（dark/light/system）。CSS：inject_css 配 css（往界面注入自定义 CSS，与在设置页 CSS 注入框粘贴完全同路：同转义、同落 localStorage、重开也在，且不依赖「css-ui工具」开着；css 必传，空内容会报错——要清空手写规则用 clear=true；append=true 追加在原有手写规则之后，默认覆盖，要保留原规则先 method=state 读 custom_css）。文件：open_file 配 path 开预览标签。记忆库：open_memory 开星云视图（入口关着会拒绝并指路 settings 开 features.galaxy）。状态：state 读最近一次界面状态上报（边栏/终端/主题/标签/手写 CSS，以及 ops 界面动作自报清单：每项 kind/title/risk/args）——投 fire_event 前先读它看界面认哪些 kind。通用通道：fire_event 配 event（整条事件 JSON，kind 必填）——准入 = 白名单 ∪ 当前界面自报的 ops 清单：先 method=state 读上报里的 ops（每项 kind/title/risk/args 参数说明）就知道此刻界面认哪些 kind；白名单（sidebar/terminal/settings/theme/open_tab/close_tab/css_inject/open_file/open_memory/open_panel/close_panel/new_session/open_session/rename_session/fork_session/pin_session/archive_session）之外的新界面能力，只要登记在清单里且 risk 标 safe/normal 就能直接投递，不用等后端逐个收；破坏类（delete_session/undo_checkpoint）永远不收——必须走具名方法（删会话走 session 工具、撤销检查点走 undo_checkpoint），审批分级不为它从通用通道开口子；清单没登记这个 kind、或没有页面在报清单时按未登记拒绝并回带当前可用清单。能用具名方法就用具名方法。撤销：undo_checkpoint 配 id（回滚某次任务的工作区改动，不可逆，任何审批档位都必问；界面会弹二次确认）。会话管理用 session 工具。",
+            description: "操作本应用自己的界面。语义铁律：「打开/展开」=让目标显示，「收起/关闭/隐藏」=让目标隐藏——是状态设置不是切换语义；指令含糊（没说哪个/没说方向）先问用户，猜错方向比多问一句严重。各 method 的参数配套见参数 schema。补充：面板插件停用着打不开（指路 settings 开插件）；终端与右侧面板互斥；inject_css 与设置页 CSS 注入框同路、不依赖「css-ui工具」开关、重开也在（clear=true 清空、append=true 追加、默认覆盖，保留原规则先 state 读 custom_css）；open_memory 入口关着会拒并指路 settings 开 features.galaxy；state/list_panels 读界面状态、面板启用态与界面自报 ops 清单（kind/title/risk/args）；fire_event（event.kind 必填）准入=白名单∪ops 清单 safe/normal 项，投前先 state 读 ops，破坏类永远不收必须走具名方法，未登记 kind 被拒并回带可用清单——能用具名方法就用具名方法；undo_checkpoint 回滚任务改动，不可逆、任何档位必问。除 list_panels/state 外受「中枢」闸（见系统提示「自我管理与探索纪律」）。会话管理用 session 工具。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "method": { "type": "string", "enum": ["open_panel", "close_panel", "list_panels", "open_file", "open_memory", "open_sidebar", "close_sidebar", "open_terminal", "close_terminal", "open_settings", "close_settings", "set_theme", "open_tab", "close_tab", "state", "inject_css", "fire_event", "undo_checkpoint"], "description": "open_panel/close_panel/open_sidebar/close_sidebar 配 name/side；open_tab 配 name；close_tab 配 key；open_settings 可配 tab；set_theme 配 mode；inject_css 配 css；fire_event 配 event；undo_checkpoint 配 id；open_file 配 path；list_panels/state/open_memory 不需要额外参数" },
-                    "name": { "type": "string", "enum": ["trace", "board", "usage", "artifacts", "git", "web"], "description": "面板插件 id（trace/board/usage）或内置标签（artifacts/git/web），按 method 区分" },
+                    "name": { "type": "string", "enum": ["trace", "board", "usage", "artifacts", "git", "web"], "description": "面板插件 id（trace=时间线/board=项目文件/usage=用量价格）或内置标签（artifacts=产物/git/web），按 method 区分" },
                     "side": { "type": "string", "enum": ["left", "right"], "description": "open_sidebar/close_sidebar：left=左侧会话列表边栏，right=右侧面板边栏" },
-                    "tab": { "type": "string", "enum": ["appearance", "model", "roles", "memory", "skills", "mcp", "ext", "schedule"], "description": "open_settings：打开后直接跳到哪个设置页签" },
+                    "tab": { "type": "string", "enum": ["appearance", "model", "roles", "memory", "skills", "mcp", "ext", "schedule"], "description": "open_settings：跳哪个设置页签（appearance=外观/model=模型/roles=功能桥接/memory=记忆/skills=技能/mcp/ext=插件/schedule=定时）" },
                     "mode": { "type": "string", "enum": ["dark", "light", "system"], "description": "set_theme：dark=深色、light=浅色、system=跟随系统" },
                     "key": { "type": "string", "description": "close_tab：标签 key（artifacts/git/web/ext:usage/file:<路径>）" },
                     "path": { "type": "string", "description": "open_file：要预览的文件路径（工作区相对或绝对）" },
-                    "event": { "type": "object", "description": "fire_event：整条事件对象（kind 必填，其余字段按事件类型带，如 {\"kind\":\"theme\",\"mode\":\"light\"}）；kind 准入 = 白名单 ∪ 界面 ops 清单（非破坏类），fire_event 之前先 method=state 读 ops 清单" },
+                    "event": { "type": "object", "description": "fire_event：事件对象（kind 必填，其余字段按事件类型带，如 {\"kind\":\"theme\",\"mode\":\"light\"}）；准入规则见工具说明，投递前先 method=state 读 ops 清单" },
                     "id": { "type": "string", "description": "undo_checkpoint：检查点 id（/api/checkpoints 可列）" }
                 },
                 "required": ["method"]
@@ -314,7 +314,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "session",
-            description: "会话管理：method=list 列出全部会话（id/标题/工作区/置顶归档态，只读不受闸）；new=新建会话并切过去；open+id=切换到某条会话；rename+id+title=改标题；fork+id=分叉；delete+id=删除（不可逆，必问）；pin/archive+id(+on)=置顶/归档。自改纪律：除 list 外全部动作要求插件页「中枢」开关开着——没开就引导用户去 设置→插件 打开「中枢」，别硬试。注意：切换/新建后 agent 自己的回复仍落在原会话，结果里要向用户交代这一点。",
+            description: "会话管理：method=list 列出全部会话（id/标题/工作区/置顶归档态，只读不受闸）；new=新建会话并切过去；open+id=切换到某条会话；rename+id+title=改标题；fork+id=分叉；delete+id=删除（不可逆，必问）；pin/archive+id(+on)=置顶/归档。除 list 外受「中枢」开关闸（见系统提示「自我管理与探索纪律」）。注意：切换/新建后 agent 自己的回复仍落在原会话，结果里要向用户交代这一点。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -329,7 +329,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "plugin",
-            description: "模型自产插件安装与删除（自改纪律：install/remove 要求「中枢」插件开着）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）：落位到插件目录即加载生效。action=remove 配 name 删除插件（连目录带文件一起删，不可恢复，判 Dangerous 必弹审批卡；只删 user 来源，内置拒删并说人话——想停用内置插件就引导用户关它的开关，别删）。删除前把插件名念给用户确认。",
+            description: "模型自产插件安装与删除（受「中枢」开关闸，见系统提示「自我管理与探索纪律」）。action=install 配 name + manifest + files（files 是 {相对路径: 文本内容} 映射，至少要有入口页或工具文件；manifest 按 manifest schema v1：apiVersion=1、title、ui/tools/permissions 声明——模型生成的插件权限一律清空，装完用户可在插件页按需开）：落位到插件目录即加载生效。action=remove 配 name 删除插件（连目录带文件一起删，不可恢复，判 Dangerous 必弹审批卡；只删 user 来源，内置拒删并说人话——想停用内置插件就引导用户关它的开关，别删）。删除前把插件名念给用户确认。",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -359,7 +359,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "memory",
-            description: "记忆两用：检索以前聊过什么 + 往自动记忆 profile.md 写条目。用户说「你记得吗」「上次」「之前是不是」「检索一下记忆」，或任务需要历史上下文（上次的方案/结论/约定/踩过的坑）时：action=search 配 query（语义+关键词混合，跨全部工作区）返回会话标题/工作区/时间/轮数/命中片段/id；action=recent 配 limit（默认 10）与可选 workspace（按项目名或路径片段过滤）；action=similar 配 id 找相近会话；action=read 配 id 读对话原文。别去翻 logs/ 目录、别解析 library.json、别读应用源码考古。action=write 配 op+section 写自动记忆——何时记、记什么、怎么提炼，看系统提示里的「边聊边记（自动记忆）」节；op=add 配 text；op=replace 配 match+text（只改正文，元数据不动）；op=remove 配 match；op=merge 配 match（confirm=true 时教训区观察中→已确认）；section=prefs（偏好区）/lessons（教训区）。match 必须与现有条目一字不差，匹配不上会回带该区现有条目，按回带的重试。含敏感信息（密钥/手机号/身份证/密码值/邮箱）或到字符硬顶会被拒，按回包提示处理，别原样重试。定级常规写：只读档下每次记记忆先问用户。「记忆库」插件关着会被拒并指路 设置→插件。",
+            description: "记忆两用：检索以前聊过什么 + 往自动记忆 profile.md 写条目。检索：search 配 query（语义+关键词混合，跨全部工作区）→ 标题/工作区/时间/命中片段/id；recent 配 limit（默认 10）+可选 workspace（项目名或路径片段）；similar 配 id 找相近会话；read 配 id 读原文。别翻 logs/、别解析 library.json、别读源码考古。写入：write 配 op+section——何时记/记什么/怎么提炼看系统提示「边聊边记（自动记忆）」节；op=add(text)/replace(match+text)/remove(match)/merge(match，confirm=true 表二次踩坑)；section=prefs/lessons；match 必须一字不差，不上会回带该区条目重试；含敏感信息（密钥/手机号/身份证/邮箱等）或到字符硬顶会被拒，别原样重试。只读档下每次记记忆先问用户。「记忆库」插件关着会被拒并指路 设置→插件。",
             parameters: json!({
                 "type": "object",
                 "properties": {
