@@ -359,20 +359,20 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "memory",
-            description: "记忆库检索正门 + 自动记忆写入口。查以前聊过什么、做过什么、说过什么：用户说「你记得吗」「上次」「之前是不是」「检索一下记忆」「看看你记得什么」，或任务需要历史上下文（上次的方案/结论/约定/踩过的坑）时先用它，别去翻 logs/ 目录、别解析 library.json、别读应用源码考古。action=search 配 query（关键词或自然语言；语义+关键词混合，跨全部工作区）：按相关度返回会话标题/工作区/时间/轮数/命中片段/id。action=recent 配 limit（默认 10）与可选 workspace（按项目名或路径片段过滤）：按时间倒序列最近会话。action=similar 配 id：找与某条会话相近的其它会话。action=read 配 id：读某条会话的对话原文（要真答「上次聊到哪」就用它）。action=write 配 op+section：往自动记忆 profile.md 写条目（行级操作，绝不整段重写）。触发器两类：① 用户消息带长期偏好信号（以后/一直/记住/每次/默认/长期…）→ op=add 落 section=prefs，一次就够；② 同一个坑第二次踩（工具失败后先看已注入的自动记忆里有没有相似坑，有=第二次）→ 有相似条目走 op=merge 配 match=那条原文+confirm=true（观察中→已确认），没有走 op=add 落 section=lessons（首记=观察中）。用户再次提同一偏好 → 同样先搜已注入的条目，搜到走 merge（hits+1）别重复 add。提炼铁律：一句话 ≤40 字、禁止原句照搬；临时性要求（「这次先这样」「十个字内回答」）、一次性任务细节、项目专属事实（某项目的技术栈/目录/约定——那些进项目 AGENTS.md）都不记。op=replace 配 section+match+text 只改正文（元数据不动）；op=remove 配 section+match 删一条。match 必须跟现有条目一字不差，匹配不上会报错并回带该区现有条目，按回带的重试，别硬盖、别把用户删掉的条目偷偷加回来。写入前后都会顺带清掉超 30 天的「观察中」条目（静默）。含敏感信息的候选（密钥/令牌、手机号/身份证/卡号等长数字串、密码账号值、邮箱）会被隐私闸直接拒（没记），把具体值去掉再记，别原样重试。到字符硬顶（默认 2500）会被拒并给用户三选一（压缩旧条目/归档到文件/提高上限），过 80% 预警线只在回包里提醒。定级常规写：只读档下每次记记忆会先问用户。「记忆库」插件关着会被拒并指路 设置→插件。",
+            description: "记忆两用：检索以前聊过什么 + 往自动记忆 profile.md 写条目。用户说「你记得吗」「上次」「之前是不是」「检索一下记忆」，或任务需要历史上下文（上次的方案/结论/约定/踩过的坑）时：action=search 配 query（语义+关键词混合，跨全部工作区）返回会话标题/工作区/时间/轮数/命中片段/id；action=recent 配 limit（默认 10）与可选 workspace（按项目名或路径片段过滤）；action=similar 配 id 找相近会话；action=read 配 id 读对话原文。别去翻 logs/ 目录、别解析 library.json、别读应用源码考古。action=write 配 op+section 写自动记忆——何时记、记什么、怎么提炼，看系统提示里的「边聊边记（自动记忆）」节；op=add 配 text；op=replace 配 match+text（只改正文，元数据不动）；op=remove 配 match；op=merge 配 match（confirm=true 时教训区观察中→已确认）；section=prefs（偏好区）/lessons（教训区）。match 必须与现有条目一字不差，匹配不上会回带该区现有条目，按回带的重试。含敏感信息（密钥/手机号/身份证/密码值/邮箱）或到字符硬顶会被拒，按回包提示处理，别原样重试。定级常规写：只读档下每次记记忆先问用户。「记忆库」插件关着会被拒并指路 设置→插件。",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["search", "recent", "similar", "read", "write"], "description": "search 配 query；recent 可配 limit/workspace；similar/read 配 id；write 配 op+section" },
-                    "query": { "type": "string", "description": "search：关键词或自然语言描述（如「插件删除」「上次定的接口风格」）" },
-                    "workspace": { "type": "string", "description": "可选：只搜某个项目（项目名或工作区路径片段，大小写不敏感）" },
+                    "query": { "type": "string", "description": "search：关键词或自然语言描述" },
+                    "workspace": { "type": "string", "description": "recent 可选：只搜某个项目（项目名或路径片段）" },
                     "limit": { "type": "integer", "description": "recent：返回条数（默认 10，上限 50）" },
                     "id": { "type": "string", "description": "similar/read：会话 id（从 search/recent 结果里拿，别自己编）" },
-                    "op": { "type": "string", "enum": ["add", "replace", "remove", "merge"], "description": "write：add 加一条；replace 换一条（match+text）；remove 删一条（match）；merge 合并重复条目（match，confirm=true 时教训区观察中→已确认）" },
-                    "section": { "type": "string", "enum": ["prefs", "lessons"], "description": "write：prefs=偏好区（用户明说的长期偏好）；lessons=教训区（重复踩坑转正的教训）" },
-                    "text": { "type": "string", "description": "write：add/replace 的条目正文（一句话 ≤40 字，禁止原句照搬）" },
-                    "match": { "type": "string", "description": "write：replace/remove/merge 的目标条目原文，必须一字不差" },
-                    "confirm": { "type": "boolean", "description": "write：merge 可选，true=这是第二次踩坑（教训区观察中→已确认）" }
+                    "op": { "type": "string", "enum": ["add", "replace", "remove", "merge"], "description": "write：add 加一条；replace 换一条；remove 删一条；merge 合并重复条目" },
+                    "section": { "type": "string", "enum": ["prefs", "lessons"], "description": "write：prefs=偏好区；lessons=教训区" },
+                    "text": { "type": "string", "description": "write：add/replace 的条目正文（一句话 ≤40 字，别原句照搬）" },
+                    "match": { "type": "string", "description": "write：replace/remove/merge 的目标条目原文，一字不差" },
+                    "confirm": { "type": "boolean", "description": "write：merge 可选，true=第二次踩坑（观察中→已确认）" }
                 },
                 "required": ["action"]
             }),

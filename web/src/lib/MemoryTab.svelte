@@ -107,7 +107,6 @@
               <button class="chip" class:active={memTab === 'profile'} on:click={() => pickMemTab('profile')}>自动记忆</button>
             </div>
             {#if memTab === 'profile'}
-              <div class="mem-contract">这个文件 agent 也会自动往里写：它只会加新条目、或改它认得出的那一条，绝不整段重写；你删掉的条目它不会偷偷加回来。你随时可以改。</div>
               <div class="mem-cap" class:warn={memData.profile_chars > (memData.profile_max_chars || 2500) * 4 / 5}>
                 自动记忆 {memData.profile_chars}/{memData.profile_max_chars || 2500} 字符（理想 ≤{memData.profile_ideal_chars || 1200} · 预警线 {((memData.profile_max_chars || 2500) * 4 / 5)}）
               </div>
@@ -148,16 +147,10 @@
     margin-bottom: 14px;
     word-break: break-all;
   }
-  .mem-contract {
-    font-size: 12px;
-    color: var(--g6);
-    line-height: 1.6;
-    margin: 2px 0 10px;
-  }
   .mem-cap {
     font-size: 11.5px;
     color: var(--g5);
-    margin: -4px 0 10px;
+    margin: 2px 0 10px;
   }
   .mem-cap.warn {
     color: var(--tint-orange-fg);
