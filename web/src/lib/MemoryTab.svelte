@@ -110,18 +110,6 @@
               <div class="mem-cap" class:warn={memData.profile_chars > (memData.profile_max_chars || 2500) * 4 / 5}>
                 自动记忆 {memData.profile_chars}/{memData.profile_max_chars || 2500} 字符（理想 ≤{memData.profile_ideal_chars || 1200} · 预警线 {((memData.profile_max_chars || 2500) * 4 / 5)}）
               </div>
-              {#if memData.profile_entries && memData.profile_entries.length}
-                <div class="mem-entries">
-                  {#each memData.profile_entries as e (e.text + e.date)}
-                    <div class="mem-entry">
-                      <div class="mem-entry-text">{e.text}</div>
-                      <div class="mem-entry-meta">命中 {e.hits} 次 · {e.src} · {e.date}{e.status ? ' · ' + e.status : ''}</div>
-                    </div>
-                  {/each}
-                </div>
-              {:else}
-                <div class="mem-entries-empty">还没有任何自动记忆。agent 会把长期偏好和重复踩过的坑记在这里。</div>
-              {/if}
             {/if}
             <textarea class="agents-editor" rows="12" spellcheck="false" bind:value={memText} on:input={() => (memDirty = true)}></textarea>
             <div class="sub-row">
@@ -154,34 +142,6 @@
   }
   .mem-cap.warn {
     color: var(--tint-orange-fg);
-  }
-  .mem-entries {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 10px;
-    max-height: 216px;
-    overflow-y: auto;
-  }
-  .mem-entry {
-    border: 1px solid var(--g3);
-    border-radius: 8px;
-    padding: 8px 10px;
-  }
-  .mem-entry-text {
-    font-size: 12.5px;
-    color: var(--g7);
-    line-height: 1.5;
-  }
-  .mem-entry-meta {
-    font-size: 11px;
-    color: var(--g5);
-    margin-top: 3px;
-  }
-  .mem-entries-empty {
-    font-size: 12px;
-    color: var(--g6);
-    margin-bottom: 10px;
   }
   .mem-stats {
     font-size: 12px;

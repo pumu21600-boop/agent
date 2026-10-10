@@ -22,8 +22,9 @@ pub(super) fn save_system_prompt(state: &AppState, content: &str) -> anyhow::Res
 /// GET /api/memory —— 记忆层状态 + 三类约定文件原文（编辑器数据源，每次调用读盘 = 显示文件实时内容）。
 /// 两个全局根分列（2026-10-09 回滚）：user_global_dir=用户约定根（~/.agent，AGENTS.md），
 /// install_state_dir=安装状态根（app_root/.agent，index.json）。agents_conflict=启动回滚
-/// 发现两份全局约定不一致时的告知（None 不显示）。profile_* = 自动记忆第四签的数据
-/// （条目按 hits 降序，绝不按 src 分组，§3.6/§6.1）。
+/// 发现两份全局约定不一致时的告知（None 不显示）。profile_* = 自动记忆第四签的状态
+/// （条目原文直接看 agents_profile 编辑器，命中/时间都在文件自己的元数据注释里，
+/// 2026-10-10 用户拍板不再单列卡片）。
 pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
     let mem = state.memory.read().unwrap_or_else(|e| e.into_inner()).clone();
     let projects_registered = mem.load_index().projects.len();
@@ -43,35 +44,11 @@ pub(super) async fn get_memory(State(state): State<AppState>) -> Json<Value> {
         "profile_chars": profile.chars(),
         "profile_max_chars": mem.profile_max_chars(),
         "profile_ideal_chars": crate::memory::profile::IDEAL_CHARS,
-        "profile_entries": profile_entries(&profile),
         "system_prompt": read_system_prompt(&state),
         "agents_global": mem.agents_raw("global"),
         "agents_project": mem.agents_raw("project"),
         "agents_profile": mem.agents_raw("profile"),
     }))
-}
-
-/// 自动记忆条目（面板第四签用）：按 hits 降序，稳定排序（同 hits 保持文件顺序）。
-/// **绝不按 src 分组**——分组会诱导用户删掉「在 A 学但全局有效」的教训（§3.6）。
-fn profile_entries(profile: &crate::memory::profile::Profile) -> Vec<Value> {
-    use crate::memory::profile::Section;
-    let mut es = profile.entries();
-    es.sort_by(|a, b| b.1.hits.cmp(&a.1.hits));
-    es.iter()
-        .map(|(s, e)| {
-            json!({
-                "section": match s {
-                    Section::Prefs => "prefs",
-                    Section::Lessons => "lessons",
-                },
-                "text": e.text,
-                "src": e.src,
-                "date": e.date,
-                "hits": e.hits,
-                "status": e.status,
-            })
-        })
-        .collect()
 }
 
 #[derive(Debug, Deserialize)]

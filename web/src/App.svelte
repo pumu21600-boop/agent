@@ -958,8 +958,9 @@
   let rightPanelOpen = localStorage.getItem('rpOpen') === null ? true : localStorage.getItem('rpOpen') === '1';
   // —— 右侧边栏 = 统一标签页（用户 2026-10-01 拍板）——
   // 产物/网页/插件面板（时间线/项目速览/用量）/文件预览全在这里开标签页；标签可关、
-  // 尾部 + 号加面板、关光了显示「打开标签页」选择页。首启把用户点名的五个面板开好
-  // （插件没启用的话渲染时自然消失）。持久化：rpTabs（开着哪些）+ rpTab（激活 key）。
+  // 尾部 + 号加面板、关光了显示「打开标签页」选择页。
+  // 2026-10-10 用户拍板：**默认零标签页**——不要一上来就开五个，侧栏打开时显示
+  // 「打开标签页」选择页，点卡片才开。持久化：rpTabs（开着哪些）+ rpTab（激活 key）。
   // 「git」= 审查 + 提交合成一个标签（用户 2026-10-07 拍板：git 提交放进侧边栏跟审查一起，
   // 聊天区底部那根常驻条撤掉）。key 从老 'review' 迁过来，见下面 rpTabs 加载处的迁移。
   const RP_BUILTIN = [
@@ -970,33 +971,35 @@
   // 侧栏只收编这三个宿主面板插件（时间线/项目文件/用量）——其余插件哪怕 manifest 声明
   // dock 也不进侧栏，+ 菜单与选择页都不出（用户 2026-10-03：装的插件别全列出来，六个够了）
   const RP_EXT_PANELS = new Set(['trace', 'board', 'usage']);
+  // 2026-10-10 之前的首启默认（用户点名的五个面板）。存档里还是这五个且一字不差 =
+  // 从没自定义过，按新默认（零标签页）迁走。
+  const LEGACY_DEFAULT_KEYS = ['ext:trace', 'ext:board', 'artifacts', 'web', 'ext:usage'];
   function rpDefaultTabs() {
-    return [
-      { key: 'ext:trace', kind: 'ext', name: 'trace', title: '时间线' },
-      { key: 'ext:board', kind: 'ext', name: 'board', title: '项目速览' },
-      { key: 'artifacts', kind: 'artifacts', title: '产物' },
-      { key: 'web', kind: 'web', title: '网页' },
-      { key: 'ext:usage', kind: 'ext', name: 'usage', title: '用量' },
-    ];
+    return [];
   }
   let rpTabs = (() => {
     try {
       const raw = JSON.parse(localStorage.getItem('rpTabs') || 'null');
       if (Array.isArray(raw) && raw.length) {
         // 老存档里的「审查」标签（key=review）迁成 git（同位置不改用户其余标签）
-        return raw
+        const tabs = raw
           .map((t) => (t && t.key === 'review' ? { ...t, key: 'git', kind: 'git', title: 'git' } : t))
           .filter((t) => t && t.key && t.kind && (t.kind !== 'ext' || RP_EXT_PANELS.has(t.name)));
+        if (tabs.map((t) => t.key).join(',') === LEGACY_DEFAULT_KEYS.join(',')) {
+          return rpDefaultTabs(); // 老默认未动过 → 零标签页
+        }
+        return tabs;
       }
     } catch {}
     return rpDefaultTabs();
   })();
   // 老 localStorage（单 rpTab：'preview'/'ext:x'/'web'）迁移：'preview' 已撤（预览改为
   // 按文件开标签），插件 key 不在列表就补一条，实在对不上就用第一个标签。
+  // 零标签页时不要把旧激活 key 的 ext 面板推回来——那会把「默认零标签」破功。
   let rpTab = (() => {
     const want = (localStorage.getItem('rpTab') || '').replace(/^review$/, 'git'); // 老「审查」激活标签跟着迁
     if (rpTabs.some((t) => t.key === want)) return want;
-    if (want.startsWith('ext:') && RP_EXT_PANELS.has(want.slice(4))) {
+    if (rpTabs.length && want.startsWith('ext:') && RP_EXT_PANELS.has(want.slice(4))) {
       const name = want.slice(4);
       rpTabs.push({ key: want, kind: 'ext', name, title: name });
       return want;
