@@ -953,9 +953,12 @@
   let termInput = '';
   let termRunning = false;
   let termOutEl;
-  // 右侧面板开合持久化（跟 rpWidth/侧栏宽一个 pattern）——否则每次重开 App 面板
-  // 都是关着的，内置浏览器得点两级才找得到（用户截图反馈过"浏览器不在侧边栏"）。
-  let rightPanelOpen = localStorage.getItem('rpOpen') === null ? true : localStorage.getItem('rpOpen') === '1';
+  // 右侧面板开合：**打开软件默认关着**（2026-10-10 用户拍板，面板吃屏幕）——
+  // 会话内刷新保持（sessionStorage 跟标签页同生命），重开软件从关着开始。
+  // 旧 localStorage 键清掉：那套是"找不到内置浏览器"时期的默认开+持久化，
+  // 用户已熟悉入口后反转，别留个 rpOpen=1 的误导痕迹。
+  localStorage.removeItem('rpOpen');
+  let rightPanelOpen = sessionStorage.getItem('rpOpen') === '1';
   // —— 右侧边栏 = 统一标签页（用户 2026-10-01 拍板）——
   // 产物/网页/插件面板（时间线/项目速览/用量）/文件预览全在这里开标签页；标签可关、
   // 尾部 + 号加面板、关光了显示「打开标签页」选择页。
@@ -1340,10 +1343,11 @@
   }
 
   $: webActive = webTabs.find((t) => t.id === webActiveId) || null;
-  // 右侧面板开合/标签持久化（换任何路径改这几个状态都会落盘）
+  // 右侧面板开合/标签持久化（换任何路径改这几个状态都会落盘）。
+  // rpOpen 走 sessionStorage：刷新不关、重开软件关（2026-10-10 用户拍板默认关）。
   $: {
     try {
-      localStorage.setItem('rpOpen', rightPanelOpen ? '1' : '0');
+      sessionStorage.setItem('rpOpen', rightPanelOpen ? '1' : '0');
       localStorage.setItem('rpTab', rpTab);
       localStorage.setItem('rpTabs', JSON.stringify(rpTabs));
     } catch {}
