@@ -748,6 +748,56 @@ pub fn changed_files(
     Ok(out)
 }
 
+/// 基线树里的**顶层目录**在当前工作区已整体消失，且其文件在 diff 里呈删除态——
+/// 典型成因是用户在文件管理器里把目录挪走/删掉，不是本任务干的。
+/// 2026-10-13 用户实锤：智云目录从工作区挪走 5 天后，旧基线把它下面 81 个文件
+/// 全 diff 成删除，产物/git 面板报出一堆幽灵删除（-7186 行），看着像别的
+/// 工作区的改动串过来了。返回人话警告；无可疑子树返回 None。
+pub fn stale_subtree_warning(
+    ws: &Path,
+    origin: RepoOrigin,
+    baseline: &str,
+    files: &[ChangedFile],
+) -> Option<String> {
+    // 删除态文件按顶层段归组
+    let mut deleted: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in files {
+        if f.status != 'D' {
+            continue;
+        }
+        if let Some(top) = f.path.split('/').next().filter(|s| !s.is_empty()) {
+            *deleted.entry(top).or_insert(0) += 1;
+        }
+    }
+    if deleted.is_empty() {
+        return None;
+    }
+    // 当前工作区的顶层条目名（文件与目录都在内）
+    let live: std::collections::BTreeSet<String> = std::fs::read_dir(ws)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    // 基线树里的顶层**目录**（-d 只要 tree；根级单文件删除不算「子树消失」）
+    let bin = git_bin().ok()?;
+    let gitdir = origin.gitdir(ws);
+    let trees = git_ok(&bin, gitdir.as_deref(), ws, &["ls-tree", "-d", "--name-only", baseline.trim()]).ok()?;
+    let gone: Vec<(&str, usize)> = trees
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !live.contains(*t))
+        .filter_map(|t| deleted.get(t).map(|n| (t, *n)))
+        .collect();
+    if gone.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = gone.iter().map(|(t, n)| format!("{t}/（{n} 个文件）")).collect();
+    Some(format!(
+        "基线快照里的顶层目录 {} 已不在当前工作区——这些文件的「删除」很可能是目录被移走/删掉造成的，不是本任务改的；撤销或提交前先确认。",
+        names.join("、")
+    ))
+}
+
 /// 测试与排障用：影子仓库当前跟踪的文件清单。
 #[cfg(test)]
 pub fn shadow_files(ws: &Path) -> Vec<String> {
@@ -1035,4 +1085,70 @@ mod tests {
     }
 
 
+
+    /// 2026-10-13 用户实锤场景：基线拍下时智云还是工作区子目录，之后用户把整个目录
+    /// 挪出工作区——diff 把该目录下所有文件报成删除（幽灵删除，看着像别的项目的
+    /// 改动串过来了）。stale_subtree_warning 要把这种情况说成白话说清楚。
+    #[test]
+    fn stale_subtree_warning_flags_moved_away_directory() {
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("stalesubtree");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::create_dir_all(w.join("智云/assets")).unwrap();
+        std::fs::write(w.join("智云/app.js"), "console.log(1)
+").unwrap();
+        std::fs::write(w.join("智云/app.wxss"), "page { color: red }").unwrap();
+        std::fs::write(w.join("智云/assets/logo.png"), "PNGDATA").unwrap();
+        std::fs::write(w.join("keep.txt"), "留下
+").unwrap();
+        ws.git(&["add", "-A"]);
+
+        let cp = checkpoint(w, "任务起点", "sess-test").unwrap().expect("有 tracked 文件应有检查点");
+
+        // 用户把智云整个挪出工作区（文件管理器里的移动，agent 毫不知情）
+        std::fs::rename(w.join("智云"), w.join("智云-moved")).unwrap();
+        // 另有一个根级文件被真删掉（对照：单文件删除不该触发警告）
+        std::fs::remove_file(w.join("keep.txt")).unwrap();
+
+        let files = changed_files(w, RepoOrigin::Shadow, &cp.id).unwrap();
+        let deleted: Vec<&str> = files.iter().filter(|f| f.status == 'D').map(|f| f.path.as_str()).collect();
+        assert_eq!(deleted.len(), 4, "智云 3 个 + keep.txt 1 个全报删除: {deleted:?}");
+
+        let warn = stale_subtree_warning(w, RepoOrigin::Shadow, &cp.id, &files)
+            .expect("顶层目录整体消失必须给出警告");
+        assert!(warn.contains("智云/"), "警告要点名挪走的目录: {warn}");
+        assert!(warn.contains("3 个文件"), "警告要带文件数: {warn}");
+        assert!(!warn.contains("keep.txt"), "根级单文件删除不是子树消失，不该点名: {warn}");
+    }
+
+    /// 反向：顶层目录还在（哪怕里面有文件被删/改）→ 不警告。
+    #[test]
+    fn stale_subtree_warning_silent_when_tree_intact() {
+        if !git_have() {
+            return;
+        }
+        let ws = temp_ws("staletree2");
+        let w = ws.path();
+        ws.git(&["init", "--quiet"]);
+        std::fs::create_dir_all(w.join("src")).unwrap();
+        std::fs::write(w.join("src/a.rs"), "fn a() {}
+").unwrap();
+        std::fs::write(w.join("src/b.rs"), "fn b() {}
+").unwrap();
+        ws.git(&["add", "-A"]);
+
+        let cp = checkpoint(w, "任务起点", "sess-test").unwrap().expect("应有检查点");
+        // 删掉 src 下一个文件（目录还在）——正常任务语义，不是「目录被挪走」
+        std::fs::remove_file(w.join("src/b.rs")).unwrap();
+
+        let files = changed_files(w, RepoOrigin::Shadow, &cp.id).unwrap();
+        assert!(files.iter().any(|f| f.status == 'D' && f.path == "src/b.rs"));
+        assert!(
+            stale_subtree_warning(w, RepoOrigin::Shadow, &cp.id, &files).is_none(),
+            "顶层目录还在就不该警告"
+        );
+    }
 }

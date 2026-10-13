@@ -19,8 +19,16 @@ pub(super) async fn list_changes(
         }
     }
     let ws = crate::tools::workspace_root().to_path_buf();
-    match tokio::task::spawn_blocking(move || crate::recovery::changed_files(&ws, origin, &baseline)).await {
-        Ok(Ok(files)) => Ok(Json(json!({ "ok": true, "files": files }))),
+    match tokio::task::spawn_blocking(move || {
+        let files = crate::recovery::changed_files(&ws, origin, &baseline)?;
+        // 陈旧子树警告：基线里的顶层目录已不在工作区（用户把目录挪走的典型症状），
+        // 不拦清单，只在响应里带一句人话，让产物/git 面板有机会说明白
+        let warning = crate::recovery::stale_subtree_warning(&ws, origin, &baseline, &files);
+        Ok::<_, anyhow::Error>((files, warning))
+    })
+    .await
+    {
+        Ok(Ok((files, warning))) => Ok(Json(json!({ "ok": true, "files": files, "warning": warning }))),
         Ok(Err(e)) => Err(err(e.to_string())),
         Err(e) => Err(err(e.to_string())),
     }

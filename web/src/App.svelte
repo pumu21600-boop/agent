@@ -443,6 +443,20 @@
       // 列表一并收起——侧栏同时只显示当前项目的会话
       expandedFlags = workspace ? { [workspace]: true } : {};
       localStorage.setItem('projExpanded', JSON.stringify(expandedFlags));
+      // git/产物面板跟着换工作区重置并重拉（openSession 同款）。漏了这段=切过去
+      // 面板还挂着上一个工作区的清单，而 git 状态横幅已跟着新工作区更新——
+      // 用户 2026-10-13 实锤「智云的改动串到另一个工作区」就是这个症状
+      rvBaseline = '';
+      rvFiles = [];
+      rvOpen = {};
+      rvDiff = {};
+      rvWarn = '';
+      rpFiles = [];
+      rpArtifactsNote = '';
+      rpWarn = '';
+      rpReviewBaseline = '';
+      if (rpTab === 'git') loadReview();
+      else if (rpTab === 'artifacts') loadArtifacts();
     } catch (e) {
       // wsMsg 只渲染在 WorkspaceModal 里，而那个弹窗没有任何置 true 的入口（死代码）——
       // 切换失败一直是静默的。改应用内提示弹窗，壳内外都可见。
@@ -1024,6 +1038,11 @@
   let rvOpen = {}; // path → 是否展开 diff
   let rvDiff = {}; // path → { loading, text, error }
   let rvMenu = null; // 行右键菜单 { x, y, path }
+  // 基线陈旧警告（后端 stale_subtree_warning）：基线里的顶层目录已不在当前工作区，
+  // 清单里的「删除」很可能是目录被挪走造成的，不是本任务改的
+  let rvWarn = '';
+  // 产物面板同源警告（与 rvWarn 同一句话，两个面板各自展示）
+  let rpWarn = '';
   // 打开 git 面板并把某个文件展开（产物行「审查」按钮用；变更条撤了，入口只剩产物行）。
   // 审查不是另开的 diff 标签，就是面板里那一行展开。
   function openReviewDiff(path, baseline) {
@@ -1051,6 +1070,7 @@
   async function loadReview() {
     rvLoading = true;
     rvError = '';
+    rvWarn = '';
     if (rvSource === 'work') {
       try {
         const r = await fetch('/api/changes?origin=workspace').then((x) => x.json());
@@ -1059,6 +1079,7 @@
           rvError = r.error;
         } else {
           rvFiles = r.files || [];
+          rvWarn = r.warning || '';
           initCommitSel(rvFiles); // 清单换了，勾选态跟着重建（新文件默认按未跟踪不勾）
         }
       } catch (e) {
@@ -1086,6 +1107,7 @@
         rvError = r.error;
       } else {
         rvFiles = r.files || [];
+        rvWarn = r.warning || '';
       }
     } catch (e) {
       rvFiles = [];
@@ -1856,6 +1878,7 @@
 
   async function loadArtifacts() {
     rpLoading = true;
+    rpWarn = '';
     const { id: baseline, note } = await resolveBaseline();
     if (!baseline) {
       rpFiles = [];
@@ -1866,8 +1889,9 @@
     rpArtifactsNote = '';
     rpReviewBaseline = baseline;
     try {
-      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((r) => r.json());
+      const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((x) => x.json());
       rpFiles = r.files || [];
+      rpWarn = r.warning || '';
       if (r.error) rpArtifactsNote = `读取失败: ${r.error}`;
     } catch (e) {
       rpFiles = [];
@@ -3189,14 +3213,18 @@
         await loadSessions();
       }
       refreshDock();
-      // git 面板开着时跟着换会话/换工作区重拉（否则还显示上一个范围的清单）
-      if (rpTab === 'git') {
-        rvBaseline = '';
-        rvFiles = [];
-        rvOpen = {};
-        rvDiff = {};
-        loadReview();
-      }
+      // git/产物面板开着时跟着换会话/换工作区重拉（否则还显示上一个范围的清单）
+      rvBaseline = '';
+      rvFiles = [];
+      rvOpen = {};
+      rvDiff = {};
+      rvWarn = '';
+      rpFiles = [];
+      rpArtifactsNote = '';
+      rpWarn = '';
+      rpReviewBaseline = '';
+      if (rpTab === 'git') loadReview();
+      else if (rpTab === 'artifacts') loadArtifacts();
     } catch (e) {
       // 加载失败不阻塞
     }
@@ -5934,6 +5962,10 @@
           {#each rpVisibleTabs as t (t.key)}
             <div class="rp-pane" class:hidden={t.key !== rpTab}>
               {#if t.kind === 'artifacts'}
+                {#if rpWarn}
+                  <!-- 与 git 面板同源的基线陈旧警告：目录被挪走造成的幽灵删除 -->
+                  <div class="rv-warn">{rpWarn}</div>
+                {/if}
                 {#if rpLoading}
                   <div class="trace-empty">加载中…</div>
                 {:else if !rpFiles.length}
@@ -5997,6 +6029,11 @@
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95" /><path d="M19 3.5V7h-3.5" /></svg>
                     </button>
                   </div>
+                  {#if rvWarn}
+                    <!-- 基线陈旧警告（后端 stale_subtree_warning）：基线里的顶层目录
+                         已不在当前工作区，清单里它的「删除」很可能是目录被挪走造成的 -->
+                    <div class="rv-warn">{rvWarn}</div>
+                  {/if}
                   {#if rvSource === 'work' && gitInfo && gitInfo.is_repo && !gitMissing && rvFiles.length}
                     <!-- 提交盒：跟清单同档出现（未提交改动 = 暂存区），勾选即「这次提交带上它」 -->
                     <div class="commit-box">
@@ -9426,6 +9463,18 @@
     line-height: 1.6;
     color: var(--tint-orange-fg);
     border-bottom: 1px solid var(--g2);
+  }
+  /* 基线陈旧警告（顶层目录被挪走造成的幽灵删除）：与 git-missing-note 同一只警示色，
+     不带底边——它挂在清单上方，不是把横幅顶掉 */
+  .rv-warn {
+    margin: 8px 10px 0;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--tint-orange-fg);
+    background: color-mix(in srgb, var(--tint-orange-fg) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tint-orange-fg) 35%, transparent);
+    border-radius: 6px;
   }
   /* 插件行描述里的警示色（宿主能力行缺 git 提示用，与 plug-chip.warn 同一只色） */
   .plug-desc.warn-text {
