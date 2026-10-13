@@ -769,17 +769,20 @@ fn synth_def(srv: &str, name: &str) -> Value {
 }
 
 /// 已启用 + 已确认 + 在线工具的 OpenAI function 定义（含声明了 resources/prompts 时的合成工具）。
+/// **顺序确定**：manager 是 HashMap，迭代顺序每进程随机——工具定义数组是提示前缀的
+/// 一部分（Anthropic 协议里 tools 排在 system 之后、messages 之前），顺序一变整个
+/// 前缀作废、缓存全丢。按 server 名排序后，重启/重连前后逐字节一致（缓存命中率的地基）。
 pub fn tool_definitions() -> Vec<Value> {
     let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+    let mut servers: Vec<(&String, &ServerState)> = m
+        .iter()
+        .filter(|(_, st)| {
+            st.online && st.cfg.as_ref().map(|c| c.enabled).unwrap_or(false)
+        })
+        .collect();
+    servers.sort_by(|a, b| a.0.cmp(b.0));
     let mut out = Vec::new();
-    for (srv, st) in m.iter() {
-        if !st.online {
-            continue;
-        }
-        let Some(cfg) = st.cfg.as_ref() else { continue };
-        if !cfg.enabled {
-            continue;
-        }
+    for (srv, st) in servers {
         for (name, desc, schema) in &st.tools {
             out.push(json!({
                 "type": "function",
@@ -1515,5 +1518,42 @@ data: \"result\":{\"n\":7}}";
         assert!(e.starts_with("initialize 失败"), "错误串应指明握手失败: {e}");
         let m = mgr().lock().unwrap_or_else(|e| e.into_inner());
         assert!(!m.get("deadhttp").unwrap().online, "失败后不得留在「在线」态");
+    }
+
+    /// 工具定义顺序必须确定：manager 是 HashMap（迭代顺序每进程随机），而 tools 数组
+    /// 是提示前缀的一部分（Anthropic 协议里排在 system 之后、messages 之前）。
+    /// 插入顺序打乱也必须是名字序——否则重启/重连一次缓存全丢。
+    #[test]
+    fn tool_definitions_sorted_by_server_name() {
+        let _g = test_lock();
+        {
+            let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+            let srv_state = |name: &str, online: bool, enabled: bool| ServerState {
+                online,
+                cfg: Some(
+                    serde_json::from_value(json!({ "name": name, "enabled": enabled }))
+                        .expect("McpServerCfg 全字段有默认值，最小 JSON 可反序列化"),
+                ),
+                tools: vec![(format!("{name}_tool"), "d".into(), json!({"type":"object"}))],
+                ..Default::default()
+            };
+            for srv in ["zeta", "alpha", "mid"] {
+                m.insert(srv.to_string(), srv_state(srv, true, true));
+            }
+            // 停用/离线的必须仍然被过滤（排序不能把过滤规则绕掉）
+            m.insert("aaa_offline".to_string(), srv_state("off", false, true));
+            m.insert("bbb_disabled".to_string(), srv_state("dis", true, false));
+        }
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .map(|d| d.pointer("/function/name").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["mcp__alpha__alpha_tool", "mcp__mid__mid_tool", "mcp__zeta__zeta_tool"], "按 server 名字序，离线/停用被过滤");
+        {
+            let mut m = mgr().lock().unwrap_or_else(|e| e.into_inner());
+            m.clear();
+        }
     }
 }

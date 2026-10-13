@@ -386,3 +386,40 @@ Content-Length: 2
         assert_eq!(s["per_message"][0]["chars"], 20000);
         assert_eq!(s["per_message"][1]["role"], "user");
     }
+
+    /// prompt_cache_key：仅官方 OpenAI 端点发，且随会话 id 走（同会话前缀命中同一
+    /// 缓存条目）；中转/国产端点一个都不发（普遍 400）；none 档连键也不发。
+    #[test]
+    fn prompt_cache_key_gating() {
+        let msgs = json!([{"role":"user","content":"hi"}]);
+        let compat = compat::resolve(Some("openai"), Some("https://api.openai.com/v1"), "gpt-5", None);
+        let p = ChatParams::default();
+        let b = build_body_with_compat("gpt-5", &msgs, true, &p, None, &compat, "sess_abc");
+        assert_eq!(b["prompt_cache_key"], json!("sess_abc"), "官方端点 + short 档：带会话级缓存键");
+        // 会话 id 缺省（辅助调用没归属）→ 不发键，不留 undefined 字段
+        let b = build_body_with_compat("gpt-5", &msgs, true, &p, None, &compat, "  ");
+        assert!(b.get("prompt_cache_key").is_none());
+        // 中转端点：即便 retention=long 也不发（无 supports 标志）
+        let relay = compat::resolve(Some("custom"), Some("https://relay.example.com/v1"), "gpt-5", None);
+        let pl = ChatParams { cache_retention: CacheRetention::Long, ..Default::default() };
+        let b = build_body_with_compat("gpt-5", &msgs, true, &pl, None, &relay, "sess_abc");
+        assert!(b.get("prompt_cache_key").is_none(), "中转不发 prompt_cache_key");
+        assert!(b.get("prompt_cache_retention").is_none(), "中转也不发 24h 保留");
+        // none 档：官方也不发
+        let pn = ChatParams { cache_retention: CacheRetention::None, ..Default::default() };
+        let b = build_body_with_compat("gpt-5", &msgs, true, &pn, None, &compat, "sess_abc");
+        assert!(b.get("prompt_cache_key").is_none(), "用户关缓存 → 键也不发");
+        // long 档 + 官方：24h 保留 + 键
+        let b = build_body_with_compat("gpt-5", &msgs, true, &pl, None, &compat, "sess_abc");
+        assert_eq!(b["prompt_cache_retention"], json!("24h"));
+        assert_eq!(b["prompt_cache_key"], json!("sess_abc"));
+    }
+
+    /// prompt_cache_key 截断到 64 字符（官方规范）；同会话内稳定即可，不求全局唯一。
+    #[test]
+    fn prompt_cache_key_clamped_to_64_chars() {
+        let long = "s".repeat(100);
+        assert_eq!(clamp_prompt_cache_key(&long).len(), 64);
+        assert_eq!(clamp_prompt_cache_key("sess_abc"), "sess_abc");
+        assert_eq!(clamp_prompt_cache_key("  sess_abc  "), "sess_abc", "trim 空白");
+    }

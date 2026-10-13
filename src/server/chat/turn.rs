@@ -16,6 +16,9 @@ pub(crate) fn build_chat_params(
     p.base_url = Some(c.effective_base_url());
     // A3：能力标记「工具调用」闭环（施工单 012）
     p.tools_enabled = c.capabilities.tools;
+    // 提示缓存保留档（[cost] cache_retention，进程级单值）：决定 cache_control 断点 /
+    // prompt_cache_key / 长保留 TTL 发不发。角色/降级/摘要渠道与主渠道同一档
+    p.cache_retention = gateway::cache_retention();
     apply_thinking_style(&mut p, c.thinking_style.as_deref());
     p
 }
@@ -146,12 +149,14 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
             String::new()
         }
     };
-    format!(
-        "{prompt}{memory_md}{workspace_hint}{project_brief}{}{}{}",
-        crate::skills::index_prompt(),
-        crate::plugin::ui::index_prompt(),
-        selfop_policy(state),
-    )
+    // 顺序即缓存前缀：project_brief **只在新会话第一轮出现**（is_new），且内容带
+    // 工作区 git diff stat（每轮可能变）——放在系统提示最末尾，第一轮之后整个
+    // system 逐字节稳定，提示缓存前缀不会被打断（对齐 ZCode「动态内容沉尾」）。
+    // 若放在中段，它一出现/消失就把后面的技能索引、UI 索引、自律纪律全移位。
+    let skills_index = crate::skills::index_prompt();
+    let ui_index = crate::plugin::ui::index_prompt();
+    let selfop = selfop_policy(state);
+    format!("{prompt}{memory_md}{workspace_hint}{skills_index}{ui_index}{selfop}{project_brief}")
 }
 
 /// 自我管理与探索纪律（2026-10-03 用户拍板，与 core/rules 的红线/闸门同一套语义）：

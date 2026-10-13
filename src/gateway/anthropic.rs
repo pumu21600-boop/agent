@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use super::ChatParams;
+use super::{CacheRetention, ChatParams, Compat};
 
 /// Anthropic API 版本头（官方要求必带）。
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -159,7 +159,43 @@ fn image_block(url: &str) -> Option<Value> {
     None
 }
 
-pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatParams, tools: Option<&Value>) -> Value {
+/// 本次请求的缓存断点标记（对齐 pi-ai anthropic-messages）：
+/// retention=none → 不发任何断点；short → `{type:ephemeral}`（官方默认 5 分钟）；
+/// long → 追加 `ttl:"1h"`，但仅官方端点认（compat.supports_long_cache_retention），
+/// 其余端点静默降级短保留——长保留档绝不会把请求打挂。
+fn cache_control(params: &ChatParams, compat: &Compat) -> Option<Value> {
+    match params.cache_retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(json!({ "type": "ephemeral" })),
+        CacheRetention::Long if compat.supports_long_cache_retention => {
+            Some(json!({ "type": "ephemeral", "ttl": "1h" }))
+        }
+        CacheRetention::Long => Some(json!({ "type": "ephemeral" })),
+    }
+}
+
+/// 给内容块数组的最后一个块打缓存断点（仅限可缓存块型：text/image/tool_result）。
+/// 返回是否打上——调用方据此决定是否还要给消息级兜底。
+fn mark_last_block(blocks: &mut [Value], cc: &Value) -> bool {
+    let Some(last) = blocks.last_mut() else { return false };
+    let cacheable = matches!(
+        last.get("type").and_then(Value::as_str),
+        Some("text") | Some("image") | Some("tool_result")
+    );
+    if cacheable {
+        last["cache_control"] = cc.clone();
+    }
+    cacheable
+}
+
+pub fn build_body(
+    model: &str,
+    messages: &Value,
+    stream: bool,
+    params: &ChatParams,
+    tools: Option<&Value>,
+    compat: &Compat,
+) -> Value {
     let arr = messages.as_array().cloned().unwrap_or_default();
 
     // system / developer 消息提为顶层 system 参数（按序拼接）
@@ -231,17 +267,49 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
         }
     }
 
+    // 提示缓存：本请求的三个断点标记（system / 工具尾 / 末消息），None=用户关缓存
+    let cache_cc = cache_control(params, compat);
+
+    // 提示缓存断点三：最后一条 user 消息的最后一个内容块（对话增量）。
+    // 下一轮请求的前半段与本次逐字节相同 → 整段前缀从缓存读，只为新内容付费。
+    // 字符串内容先包成 text 块数组（Anthropic 的 cache_control 只认块级挂载）。
+    // 注意必须在 body 组装前改 out——json! 对 out 是克隆快照，事后再改不进门。
+    if let Some(cc) = &cache_cc
+        && let Some(last) = out.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+    {
+        match last.get_mut("content") {
+            Some(Value::Array(blocks)) => {
+                mark_last_block(blocks, cc);
+            }
+            Some(Value::String(s)) if !s.is_empty() => {
+                let text = std::mem::take(s);
+                last["content"] = json!([{ "type": "text", "text": text, "cache_control": cc }]);
+            }
+            _ => {}
+        }
+    }
+
     let mut body = json!({
         "model": model,
         "max_tokens": params.max_tokens.unwrap_or(8192),
         "messages": out,
         "stream": stream,
     });
+    // 提示缓存断点一：system（最稳的区域——整段会话不变）。
+    // 单字符串要升级成块数组才能挂 cache_control（对齐 pi-ai/ZCode 形状）。
     if !system_parts.is_empty() {
-        body["system"] = json!(system_parts.join("\n\n"));
+        let mut blocks: Vec<Value> = system_parts
+            .into_iter()
+            .map(|t| json!({ "type": "text", "text": t }))
+            .collect();
+        if let Some(cc) = &cache_cc {
+            mark_last_block(&mut blocks, cc);
+        }
+        body["system"] = json!(blocks);
     }
     if let Some(t) = tools {
-        let defs: Vec<Value> = t
+        let mut defs: Vec<Value> = t
             .as_array()
             .map(|a| {
                 a.iter()
@@ -259,6 +327,13 @@ pub fn build_body(model: &str, messages: &Value, stream: bool, params: &ChatPara
                     .collect()
             })
             .unwrap_or_default();
+        // 提示缓存断点二：工具定义最后一个（system→tools→messages 的前缀序，
+        // 打在工具尾=「稳定区」全部进缓存；对话增量每次只付新增部分）。
+        if let Some(cc) = &cache_cc
+            && let Some(last) = defs.last_mut()
+        {
+            last["cache_control"] = cc.clone();
+        }
         body["tools"] = json!(defs);
     }
     // 思考：开（非 off）且本请求不带工具结果才发 thinking 对象；默认档不发。
@@ -438,6 +513,10 @@ mod tests {
         ChatParams { provider_id: Some("anthropic".into()), ..Default::default() }
     }
 
+    fn compat() -> super::super::compat::Compat {
+        super::super::compat::resolve(Some("anthropic"), Some("https://api.anthropic.com"), "claude-sonnet-4-5", None)
+    }
+
     #[test]
     fn multimodal_image_url_converted_for_anthropic() {
         // 审计 04：Anthropic Messages API 不认 image_url，必须转成原生 image 块
@@ -448,7 +527,7 @@ mod tests {
                 {"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}},
             ]},
         ]);
-        let body = build_body("claude-x", &msgs, false, &params(), None);
+        let body = build_body("claude-x", &msgs, false, &params(), None, &compat());
         let content = &body["messages"][0]["content"];
         assert_eq!(content[0], json!({"type":"text","text":"这是什么"}), "text 块原样保留");
         assert_eq!(
@@ -457,17 +536,17 @@ mod tests {
             "data URL → base64 source"
         );
         assert_eq!(
-            content[2],
-            json!({"type":"image","source":{"type":"url","url":"https://example.com/cat.jpg"}}),
-            "http 图片链接 → url source"
+            content[2]["source"],
+            json!({"type":"url","url":"https://example.com/cat.jpg"}),
+            "http 图片链接 → url source（末块另带缓存断点，见 cache_breakpoint_tests）"
         );
         // 非 image 的 data URL 与空 url 不硬转（原样保留，让渠道报明确的错）
         let weird = json!([{"type":"image_url","image_url":{"url":"data:application/pdf;base64,AAAA"}}]);
-        let body = build_body("claude-x", &json!([{"role":"user","content":weird}]), false, &params(), None);
+        let body = build_body("claude-x", &json!([{"role":"user","content":weird}]), false, &params(), None, &compat());
         assert_eq!(body["messages"][0]["content"][0]["type"], "image_url", "非图片 data URL 原样保留");
-        // 纯文本消息不受影响
-        let body = build_body("claude-x", &json!([{"role":"user","content":"hi"}]), false, &params(), None);
-        assert_eq!(body["messages"][0]["content"], json!("hi"));
+        // 纯文本消息：末条 user 的字符串内容会被包成带缓存断点的 text 块（见 cache_breakpoint_tests）
+        let body = build_body("claude-x", &json!([{"role":"user","content":"hi"}]), false, &params(), None, &compat());
+        assert_eq!(body["messages"][0]["content"][0]["text"], json!("hi"));
     }
 
     #[test]
@@ -497,11 +576,14 @@ mod tests {
             {"role":"assistant","content":"hello"},
             {"role":"user","content":"more"}
         ]);
-        let b = build_body("claude-sonnet", &msgs, true, &params(), None);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
         assert_eq!(b["model"], json!("claude-sonnet"));
         assert_eq!(b["max_tokens"], json!(8192), "max_tokens 必填，缺省 8192");
         assert_eq!(b["stream"], json!(true));
-        assert_eq!(b["system"], json!("你是助手\n\n规则B"));
+        // system 提顶层为块数组（多段 system/developer 各一块，末块带缓存断点）
+        assert_eq!(b["system"][0], json!({"type":"text","text":"你是助手"}));
+        assert_eq!(b["system"][1]["text"], json!("规则B"));
+        assert_eq!(b["system"][1]["cache_control"], json!({"type":"ephemeral"}));
         assert!(b.get("temperature").is_none() && b.get("top_p").is_none());
         assert_eq!(b["messages"].as_array().unwrap().len(), 3, "system 消息不进 messages");
         assert_eq!(b["messages"][0]["role"], json!("user"));
@@ -524,7 +606,7 @@ mod tests {
             {"type":"function","function":{"name":"read_file","description":"读","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}
         ]);
         let p = params();
-        let b = build_body("claude-sonnet", &msgs, true, &p, Some(&tools));
+        let b = build_body("claude-sonnet", &msgs, true, &p, Some(&tools), &compat());
         // assistant → tool_use 块；坏 JSON 参数兜底空对象
         let asst = &b["messages"][1];
         assert_eq!(asst["role"], json!("assistant"));
@@ -552,32 +634,32 @@ mod tests {
         let mut p = params();
         p.thinking = Some("on".into());
         p.max_tokens = Some(8192);
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert_eq!(b["thinking"], json!({"type":"enabled","budget_tokens":4096}), "on=预算取 max_tokens 一半");
         // 档位比例：低=20%、高=80%
         p.thinking = Some("low".into());
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert_eq!(b["thinking"]["budget_tokens"], json!(1638), "低=20%");
         p.thinking = Some("high".into());
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert_eq!(b["thinking"]["budget_tokens"], json!(6553), "高=80%");
         // max_tokens 太小放不下预算：不开思考
         p.thinking = Some("on".into());
         p.max_tokens = Some(1024);
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert!(b.get("thinking").is_none(), "budget 必须严格小于 max_tokens，放不下就不发");
         // off 不发
         p.max_tokens = Some(8192);
         p.thinking = Some("off".into());
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert!(b.get("thinking").is_none());
         // 默认档不发
         p.thinking = None;
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert!(b.get("thinking").is_none());
         // 温度夹取 0..1
         p.temperature = Some(1.7);
-        let b = build_body("claude-sonnet", &msgs, true, &p, None);
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
         assert_eq!(b["temperature"], json!(1.0));
     }
 
@@ -639,12 +721,163 @@ mod tests {
     }
 }
 
+/// 提示缓存断点（对齐 pi-ai anthropic-messages：system / 工具尾 / 末消息三处）。
+/// 命中率的地基是「下一轮请求的前半段与本轮逐字节相同」——断点把稳定区钉进缓存，
+/// 每轮只为对话增量付费；保留档决定 TTL，none 档一个标记都不发。
+#[cfg(test)]
+mod cache_breakpoint_tests {
+    use super::*;
+
+    fn params() -> ChatParams {
+        ChatParams { provider_id: Some("anthropic".into()), ..Default::default() }
+    }
+
+    fn compat() -> super::super::compat::Compat {
+        super::super::compat::resolve(Some("anthropic"), Some("https://api.anthropic.com"), "claude-sonnet-4-5", None)
+    }
+
+    #[test]
+    fn system_tools_last_message_all_get_breakpoints() {
+        let msgs = json!([
+            {"role":"system","content":"系统提示"},
+            {"role":"user","content":"第一问"},
+            {"role":"assistant","content":"第一答"},
+            {"role":"user","content":"第二问"}
+        ]);
+        let tools = json!([
+            {"type":"function","function":{"name":"read_file","description":"读","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"shell","description":"跑","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), Some(&tools), &compat());
+        // 断点一：system 升级为块数组，末块带断点（单字符串挂不了 cache_control）
+        let sys = b["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["type"], json!("text"));
+        assert_eq!(sys[0]["cache_control"], json!({"type":"ephemeral"}), "short 档=裸 ephemeral（5 分钟）");
+        // 断点二：只有最后一个工具带（Anthropic 上限 4 个，system+tools+末消息正好 3）
+        assert!(b["tools"][0].get("cache_control").is_none(), "非末工具不打");
+        assert_eq!(b["tools"][1]["cache_control"], json!({"type":"ephemeral"}));
+        // 断点三：末条 user 的字符串内容包成 text 块并挂断点
+        let last = b["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], json!("user"));
+        let blocks = last["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!("第二问"));
+        assert_eq!(blocks[0]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn tool_result_and_array_content_last_blocks_marked() {
+        // 末消息是工具结果（user + tool_result 块数组）→ 断点打在最后一个 tool_result 上
+        let msgs = json!([
+            {"role":"user","content":"干活"},
+            {"role":"assistant","content":null,"tool_calls":[
+                {"id":"tc_1","type":"function","function":{"name":"read_file","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"tc_1","content":"文件内容"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let blocks = b["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], json!("tool_result"));
+        assert_eq!(blocks[0]["cache_control"], json!({"type":"ephemeral"}), "tool_result 块可缓存");
+        // 内容数组（text+image）→ 末块（image）带断点
+        let msgs = json!([{"role":"user","content":[
+            {"type":"text","text":"看图"},
+            {"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}}
+        ]}]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let blocks = b["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(blocks[1]["type"], json!("image"));
+        assert_eq!(blocks[1]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn retention_none_sends_no_markers() {
+        let msgs = json!([{"role":"system","content":"系统提示"},{"role":"user","content":"问"}]);
+        let tools = json!([{"type":"function","function":{"name":"read_file","description":"读","parameters":{"type":"object","properties":{}}}}]);
+        let mut p = params();
+        p.cache_retention = CacheRetention::None;
+        let b = build_body("claude-sonnet", &msgs, true, &p, Some(&tools), &compat());
+        // system 仍是块数组（形状不变），但不带任何 cache_control
+        assert!(b["system"][0].get("cache_control").is_none());
+        assert!(b["tools"][0].get("cache_control").is_none());
+        // 末消息保持纯字符串（不白包一层 text 块）
+        assert_eq!(b["messages"].as_array().unwrap().last().unwrap()["content"], json!("问"));
+    }
+
+    #[test]
+    fn long_retention_adds_ttl_only_on_official() {
+        let msgs = json!([{"role":"system","content":"系统提示"},{"role":"user","content":"问"}]);
+        let mut p = params();
+        p.cache_retention = CacheRetention::Long;
+        // 官方端点：ttl 1h
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &compat());
+        assert_eq!(b["system"][0]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+        assert_eq!(
+            b["messages"].as_array().unwrap().last().unwrap()["content"][0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        // 非官方（中转说 Anthropic 协议但长保留没谱）：静默降级裸 ephemeral，绝不打挂请求
+        let mut relay = compat();
+        relay.supports_long_cache_retention = false;
+        let b = build_body("claude-sonnet", &msgs, true, &p, None, &relay);
+        assert_eq!(b["system"][0]["cache_control"], json!({"type":"ephemeral"}), "不支持的端点降级短保留");
+    }
+
+    #[test]
+    fn no_user_tail_no_message_breakpoint() {
+        // 空消息：不崩、消息侧无从打起（system 也无——没有 system 消息就不造 system 参数）
+        let b = build_body("claude-sonnet", &json!([]), true, &params(), None, &compat());
+        assert!(b["messages"].as_array().unwrap().is_empty());
+        assert!(b.get("system").is_none());
+        // 末条是 assistant：消息侧不打点，system 断点照打（稳定区不受尾部形态影响）
+        let msgs = json!([
+            {"role":"system","content":"系统提示"},
+            {"role":"user","content":"问"},
+            {"role":"assistant","content":"答"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let last = b["messages"].as_array().unwrap().last().unwrap();
+        assert!(last["content"][0].get("cache_control").is_none(), "assistant 尾部不打消息断点");
+        assert_eq!(b["system"][0]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn consecutive_requests_share_byte_identical_prefix() {
+        // 命中率的本质：第 N+1 轮的前半段与第 N 轮逐字节相同。构造「同一会话追加一轮」
+        // 的两次请求，除末条消息外一切一致——下一轮整个稳定区应从缓存读。
+        let base = json!([
+            {"role":"system","content":"系统提示"},
+            {"role":"user","content":"第一问"},
+            {"role":"assistant","content":"第一答"}
+        ]);
+        let mut turn2 = base.as_array().unwrap().clone();
+        turn2.push(json!({"role":"user","content":"第二问"}));
+        let b1 = build_body("claude-sonnet", &json!(base), true, &params(), None, &compat());
+        let b2 = build_body("claude-sonnet", &json!(turn2), true, &params(), None, &compat());
+        assert_eq!(b1["system"], b2["system"], "system 逐字节稳定");
+        assert_eq!(b2["messages"][0], b1["messages"][0]);
+        assert_eq!(b2["messages"][1], b1["messages"][1], "历史前半段不动");
+        // 第 2 轮末条带断点——钉住的前缀比第 1 轮更长，增量只有新增的那条 user
+        let last2 = b2["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last2["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        // 第 1 轮末条是 assistant：不打消息断点（打了也无意义，前缀在它之前已经钉过）
+        let last1 = b1["messages"].as_array().unwrap().last().unwrap();
+        assert!(last1["content"][0].get("cache_control").is_none());
+    }
+}
+
 #[cfg(test)]
 mod b20261008_tests {
     use super::*;
 
     fn params() -> ChatParams {
         ChatParams { provider_id: Some("anthropic".into()), ..Default::default() }
+    }
+
+    fn compat() -> super::super::compat::Compat {
+        super::super::compat::resolve(Some("anthropic"), Some("https://api.anthropic.com"), "claude-sonnet-4-5", None)
     }
 
     /// 2026-10-08 修：思考开启时 Anthropic 要求 temperature 不设或恰为 1——
@@ -657,17 +890,17 @@ mod b20261008_tests {
         p.thinking = Some("high".into());
         p.temperature = Some(0.5);
         p.max_tokens = Some(8192);
-        let body = build_body("claude-x", &msgs, false, &p, None);
+        let body = build_body("claude-x", &msgs, false, &p, None, &compat());
         assert!(body.get("thinking").is_some(), "思考应开启");
         assert!(body.get("temperature").is_none(), "思考开启时不得发 temperature: {}", body);
         // 温度恰为 1 时保留（官方允许）
         p.temperature = Some(1.0);
-        let body = build_body("claude-x", &msgs, false, &p, None);
+        let body = build_body("claude-x", &msgs, false, &p, None, &compat());
         assert_eq!(body["temperature"], json!(1.0), "temperature=1 可随思考同发");
         // 思考关时温度照发
         p.thinking = Some("off".into());
         p.temperature = Some(0.3);
-        let body = build_body("claude-x", &msgs, false, &p, None);
+        let body = build_body("claude-x", &msgs, false, &p, None, &compat());
         assert!(body.get("thinking").is_none(), "off 不发 thinking");
         assert_eq!(body["temperature"], json!(0.3), "思考关闭时 temperature 照发");
     }

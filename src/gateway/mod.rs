@@ -36,7 +36,7 @@ pub use openai::*;
 
 #[cfg(test)]
 mod tests;
-use compat::{Compat, Protocol, ThinkingFormat};
+use compat::{CacheRetention, Compat, Protocol, ThinkingFormat};
 use providers::ProviderPreset;
 use tags::TagSplit;
 
@@ -121,6 +121,9 @@ pub struct ChatParams {
     /// A3 能力标记「工具调用」闭环（施工单 012）：false 时核心循环不携带 tools 参数，
     /// 模型无法发起新工具调用；历史消息里的 tool_calls 回放不受影响。默认 true。
     pub tools_enabled: bool,
+    /// 提示缓存保留档（[cost] cache_retention）：决定是否发 cache_control 断点 /
+    /// prompt_cache_key / 长保留 TTL。默认 Short（对齐 pi-ai 的 cacheRetention 默认档）。
+    pub cache_retention: CacheRetention,
 }
 
 impl Default for ChatParams {
@@ -134,8 +137,24 @@ impl Default for ChatParams {
             provider_id: None,
             base_url: None,
             tools_enabled: true,
+            cache_retention: CacheRetention::Short,
         }
     }
+}
+
+/// 提示缓存保留档（config.toml [cost] cache_retention）：进程级单值，启动时装载，
+/// 与 `usage::set_cap` 同款生命周期（config.toml 本就重启生效）。
+/// 各处组装 ChatParams 时读它——渠道级无单独档位，缓存是账号级前缀属性。
+static CACHE_RETENTION: std::sync::RwLock<CacheRetention> = std::sync::RwLock::new(CacheRetention::Short);
+
+pub fn set_cache_retention(r: CacheRetention) {
+    if let Ok(mut g) = CACHE_RETENTION.write() {
+        *g = r;
+    }
+}
+
+pub fn cache_retention() -> CacheRetention {
+    CACHE_RETENTION.read().map(|g| *g).unwrap_or(CacheRetention::Short)
 }
 
 impl ChatParams {
@@ -528,7 +547,7 @@ impl Gateway {
         };
         let mut outgoing = messages.clone();
         replay::apply_outgoing_transforms(&mut outgoing, model, &compat);
-        let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat);
+        let body = build_body_with_compat(model, &outgoing, false, &eff_params, None, &compat, &ctx.session_id);
         // 同主渠道：JSONL 只留摘要。aux 体量本就小（摘要/标题），但滚雪球时（prior_summary
         // 越带越大）一样能把日志顶爆，规则统一不搞双标
         observability::event(
@@ -566,7 +585,7 @@ impl Gateway {
                 p.thinking = None;
                 p
             };
-            let retry_body = build_body_with_compat(model, &outgoing, false, &retry_params, None, &compat);
+            let retry_body = build_body_with_compat(model, &outgoing, false, &retry_params, None, &compat, &ctx.session_id);
             response = match self
                 .send(base_url, |c| Self::auth(c.post(&url), api_key, compat.protocol).json(&retry_body))
                 .await
@@ -768,7 +787,7 @@ impl Gateway {
             }
             _ => false,
         };
-        let body = build_body_with_compat(model, &outgoing, true, &send_params, tools, &compat);
+        let body = build_body_with_compat(model, &outgoing, true, &send_params, tools, &compat, &ctx.session_id);
 
         // 硬约束：debug 日志输出实际请求体（body 不含 key）
         // JSONL 里只留摘要：完整请求体（messages 历史 + tools）单条就能到 2MB+，
@@ -812,7 +831,7 @@ impl Gateway {
                 p.thinking = None;
                 p
             };
-            let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat);
+            let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat, &ctx.session_id);
             response = match self
                 .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
                 .await
@@ -840,7 +859,7 @@ impl Gateway {
                 EventType::State,
                 json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": url, "model": model, "error_body": text.chars().take(300).collect::<String>() }),
             );
-            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat);
+            let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
             response = match self
                 .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
                 .await

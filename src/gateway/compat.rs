@@ -86,6 +86,44 @@ pub struct Compat {
     pub supports_temperature: bool,
     /// 历史回放：assistant 消息是否保留 reasoning_content（DeepSeek/zai 契约）
     pub requires_reasoning_content_replay: bool,
+    /// 是否支持 OpenAI 的 prompt_cache_key（会话级缓存路由键）。
+    /// 仅官方 api.openai.com 认这个字段——中转/国产端点普遍 400，绝不外发。
+    pub supports_prompt_cache_key: bool,
+    /// 是否支持长保留（Anthropic ttl:"1h" / OpenAI prompt_cache_retention:"24h"）。
+    /// 同样只对官方端点开；long 档在其余端点静默降级为短保留。
+    pub supports_long_cache_retention: bool,
+}
+
+/// 提示缓存保留档（对齐 pi-ai 的 cacheRetention 词表）。
+/// 命中率的两个旋钮之一：断点标记由本档决定是否发出，见 anthropic.rs / openai.rs。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheRetention {
+    /// 不发任何缓存标记：断点/TTL/cache_key 全部不出现（渠道自动缓存仍可能生效）
+    None,
+    /// 短保留（默认）：Anthropic ephemeral（5 分钟）/ OpenAI 默认保留
+    #[default]
+    Short,
+    /// 长保留：Anthropic ttl:"1h" / OpenAI prompt_cache_retention:"24h"；
+    /// 端点不支持时静默降级为 Short（supports_long_cache_retention=false）
+    Long,
+}
+
+impl CacheRetention {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheRetention::None => "none",
+            CacheRetention::Short => "short",
+            CacheRetention::Long => "long",
+        }
+    }
+    /// 词表解析（config.toml / 设置面板写入值）；无法识别按 Short（默认档）。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "none" | "off" | "关" => CacheRetention::None,
+            "long" | "1h" | "24h" => CacheRetention::Long,
+            _ => CacheRetention::Short,
+        }
+    }
 }
 
 /// 提取 base_url 的 host 部分（小写）。
@@ -102,6 +140,22 @@ fn host_of(base_url: &str) -> String {
 
 fn host_has(base_url: &str, needle: &str) -> bool {
     host_of(base_url).contains(needle)
+}
+
+/// 是否官方 OpenAI 端点（api.openai.com；地址空缺时按预设 id 认）。
+/// prompt_cache_key / prompt_cache_retention 只发给它——中转与国产端点普遍 400。
+fn is_openai_official(provider_id: Option<&str>, base_url: Option<&str>) -> bool {
+    match base_url.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => host_of(b) == "api.openai.com",
+        None => provider_id == Some("openai"),
+    }
+}
+
+/// 缓存能力两件套：prompt_cache_key（OpenAI 官方）与长保留（OpenAI 官方 / Anthropic）。
+fn cache_capabilities(provider_id: Option<&str>, base_url: Option<&str>, protocol: Protocol) -> (bool, bool) {
+    let openai_official = is_openai_official(provider_id, base_url);
+    let anthropic = protocol == Protocol::AnthropicMessages;
+    (openai_official, openai_official || anthropic)
 }
 
 /// 按域名归类端点：native=官方网关，local=本地推理服务，default=中转/未识别。
@@ -175,9 +229,11 @@ pub fn resolve(
     } else {
         Protocol::OpenAiCompletions
     };
+    let openai_official = is_openai_official(provider_id, base_url);
 
     // 显式覆盖优先（providers.json 预设或渠道配置）
     if let Some(f) = format_override {
+        let (cache_key, long_retention) = cache_capabilities(provider_id, base_url, protocol);
         return Compat {
             protocol,
             thinking_format: f,
@@ -185,6 +241,8 @@ pub fn resolve(
             supports_usage_in_streaming: true,
             supports_temperature: !effort::is_gpt_5_6_model(model_id),
             requires_reasoning_content_replay: matches!(f, ThinkingFormat::Deepseek | ThinkingFormat::Zai),
+            supports_prompt_cache_key: cache_key,
+            supports_long_cache_retention: long_retention,
         };
     }
 
@@ -197,6 +255,8 @@ pub fn resolve(
             supports_usage_in_streaming: true,
             supports_temperature: true,
             requires_reasoning_content_replay: false,
+            supports_prompt_cache_key: false,
+            supports_long_cache_retention: false,
         };
     }
 
@@ -227,6 +287,8 @@ pub fn resolve(
             thinking_format,
             ThinkingFormat::Deepseek | ThinkingFormat::Zai
         ),
+        supports_prompt_cache_key: openai_official,
+        supports_long_cache_retention: openai_official || protocol == Protocol::AnthropicMessages,
     }
 }
 
@@ -338,5 +400,42 @@ mod tests {
         // 国产官方域不受影响
         let c = resolve(Some("zhipu"), Some("https://open.bigmodel.cn/api/paas/v4"), "glm-4.6", None);
         assert_eq!(c.protocol, Protocol::OpenAiCompletions);
+    }
+
+    #[test]
+    fn cache_capabilities_only_on_official_endpoints() {
+        // prompt_cache_key 与长保留都只对官方端点开——中转/国产端点发这些字段=400
+        let c = resolve(Some("openai"), Some("https://api.openai.com/v1"), "gpt-5", None);
+        assert!(c.supports_prompt_cache_key, "官方 OpenAI 认 prompt_cache_key");
+        assert!(c.supports_long_cache_retention, "官方 OpenAI 认 24h 保留");
+        // Anthropic 协议：断点/TTL 是协议原生，长保留也开
+        let c = resolve(Some("anthropic"), Some("https://api.anthropic.com"), "claude-sonnet-4-5", None);
+        assert!(!c.supports_prompt_cache_key, "Anthropic 协议没有 prompt_cache_key 这个字段");
+        assert!(c.supports_long_cache_retention, "Anthropic 官方认 ttl 1h");
+        // 中转与国产官方：两个都不开（命中率靠前缀稳定 + 渠道自动缓存）
+        for (pid, url) in [("custom", "https://relay.example.com/v1"), ("zhipu", "https://open.bigmodel.cn/api/paas/v4"), ("deepseek", "https://api.deepseek.com")] {
+            let c = resolve(Some(pid), Some(url), "m", None);
+            assert!(!c.supports_prompt_cache_key, "{url} 不发 prompt_cache_key");
+            assert!(!c.supports_long_cache_retention, "{url} 不发长保留");
+        }
+        // 本地推理服务：缓存是它自己的事，我们一个字段都不加
+        let c = resolve(Some("ollama"), Some("http://127.0.0.1:11434/v1"), "qwen3:8b", None);
+        assert!(!c.supports_prompt_cache_key && !c.supports_long_cache_retention);
+        // 显式 thinking_format 覆盖不影响缓存两件套
+        let c = resolve(Some("openai"), Some("https://api.openai.com/v1"), "gpt-5", Some(ThinkingFormat::None));
+        assert!(c.supports_prompt_cache_key && c.supports_long_cache_retention);
+    }
+
+    #[test]
+    fn cache_retention_word_list() {
+        assert_eq!(CacheRetention::parse("short"), CacheRetention::Short);
+        assert_eq!(CacheRetention::parse("SHORT"), CacheRetention::Short, "大小写不敏感");
+        assert_eq!(CacheRetention::parse("long"), CacheRetention::Long);
+        assert_eq!(CacheRetention::parse("none"), CacheRetention::None);
+        assert_eq!(CacheRetention::parse("off"), CacheRetention::None);
+        assert_eq!(CacheRetention::parse("关"), CacheRetention::None);
+        assert_eq!(CacheRetention::parse(""), CacheRetention::Short, "空值按默认档");
+        assert_eq!(CacheRetention::parse("胡说"), CacheRetention::Short, "无法识别按默认档");
+        assert_eq!(CacheRetention::default(), CacheRetention::Short);
     }
 }

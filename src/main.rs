@@ -89,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
     usage::install_prices(&user_settings.cost.prices);
     usage::init(&log_dir.join("usage"));
     usage::set_cap(config.cost.spend_cap_usd);
+    // 提示缓存保留档（[cost] cache_retention）：进程级单值，渠道组装时读
+    gateway::set_cache_retention(gateway::compat::CacheRetention::parse(&config.cost.cache_retention));
+    observability::debug(&format!(
+        "[cost] 提示缓存保留档: {}（决定 cache_control 断点 / prompt_cache_key / 长保留 TTL）",
+        gateway::cache_retention().as_str()
+    ));
     if config.cost.spend_cap_usd > 0.0 {
         observability::debug(&format!(
             "[cost] 全局花费上限已开启: ${:.2}（累计达到即拒绝新模型请求）",

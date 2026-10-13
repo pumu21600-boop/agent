@@ -80,6 +80,15 @@ pub struct CostConfig {
     /// 单价来自 app_root/prices.json（美元 / 1M tokens，带生效时间）。
     #[serde(default)]
     pub spend_cap_usd: f64,
+    /// 提示缓存保留档（缓存命中率旋钮）：short（默认）= Anthropic ephemeral 5 分钟 /
+    /// OpenAI 默认保留；long = Anthropic ttl 1h / OpenAI 24h（仅官方端点，其余静默降级）；
+    /// none = 不发任何缓存标记。读 `cache_retention` 词表见 gateway::compat::CacheRetention。
+    #[serde(default = "default_cache_retention")]
+    pub cache_retention: String,
+}
+
+fn default_cache_retention() -> String {
+    "short".to_string()
 }
 
 /// 角色映射（总架构 §8 功能模型映射，数据驱动）：值为 settings.configs 里的

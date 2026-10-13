@@ -39,6 +39,14 @@ per_parent = 2
 # 单价表在同级 prices.json（美元 / 1M tokens，带生效时间；缺省全部记录未计价）。
 spend_cap_usd = 0.0
 
+# 提示缓存保留档（缓存命中率旋钮，默认 short）：
+#   short = 标准保留（Anthropic ephemeral 5 分钟 / OpenAI 默认 5-10 分钟）
+#   long  = 长保留（Anthropic ttl 1h / OpenAI 24h）——仅官方端点认，其余静默降级 short
+#   none  = 不发任何缓存标记（断点 / prompt_cache_key / TTL 全不出现）
+# 命中率的大头在前缀稳定（system 提示与工具定义逐字节不变），保留档只决定缓存条目
+# 活多久：暂停超过保留时长后的第一轮会重新写一次缓存，之后又全命中。
+cache_retention = "short"
+
 [logging]
 dir = "logs"
 file = "agent.jsonl"

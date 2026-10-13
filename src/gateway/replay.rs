@@ -182,6 +182,8 @@ mod tests {
             supports_usage_in_streaming: true,
             supports_temperature: true,
             requires_reasoning_content_replay: false,
+            supports_prompt_cache_key: false,
+            supports_long_cache_retention: false,
         }
     }
 

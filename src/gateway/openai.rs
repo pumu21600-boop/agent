@@ -17,7 +17,16 @@ pub fn build_body(
         model,
         params.thinking_format,
     );
-    build_body_with_compat(model, messages, stream, params, tools, &compat)
+    build_body_with_compat(model, messages, stream, params, tools, &compat, "")
+}
+
+/// OpenAI prompt_cache_key 长度上限（官方规范：64 字符）。
+/// 会话 id 超长时截断——同会话内键稳定即可，不需要全局唯一。
+pub const PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
+
+/// 会话 id → prompt_cache_key（对齐 pi-ai clampOpenAIPromptCacheKey）。
+pub fn clamp_prompt_cache_key(session_id: &str) -> String {
+    session_id.trim().chars().take(PROMPT_CACHE_KEY_MAX_LENGTH).collect()
 }
 
 /// 思考预算扩容：思考开启时上游把 reasoning+正文一起算进同一个 max_tokens
@@ -42,6 +51,8 @@ pub fn effective_max_tokens(params: &ChatParams) -> Option<u64> {
 }
 
 /// 带 compat 的组装（供网关在发送前先做历史净化时复用同一次探测）。
+/// `session_id`：本次调用归属的会话 id——OpenAI 官方的 prompt_cache_key 用它做
+/// 会话级缓存路由（同会话的前缀命中同一份缓存条目，跨会话不互相挤掉）。
 pub fn build_body_with_compat(
     model: &str,
     messages: &Value,
@@ -49,11 +60,12 @@ pub fn build_body_with_compat(
     params: &ChatParams,
     tools: Option<&Value>,
     compat: &Compat,
+    session_id: &str,
 ) -> Value {
     // Anthropic Messages 协议：请求体形状完全不同，交给专用适配器；
     // 响应侧同样由适配器合成为 OpenAI 分片，下游零感知
     if compat.protocol == Protocol::AnthropicMessages {
-        return anthropic::build_body(model, messages, stream, params, tools);
+        return anthropic::build_body(model, messages, stream, params, tools, compat);
     }
     let mut body = json!({
         "model": model,
@@ -76,6 +88,20 @@ pub fn build_body_with_compat(
         }
     if let Some(t) = params.top_p {
         body["top_p"] = json!(t);
+    }
+    // —— 提示缓存（对齐 pi-ai openai-completions）——
+    // prompt_cache_key：官方 OpenAI 的会话级缓存路由键，同键请求优先命中同一缓存条目。
+    // 只对 api.openai.com 发（中转/国产端点普遍 400，compat 已把开关关掉）；
+    // retention=none 时连键也不发（用户显式关缓存）。
+    if compat.supports_prompt_cache_key
+        && params.cache_retention != CacheRetention::None
+        && !session_id.trim().is_empty()
+    {
+        body["prompt_cache_key"] = json!(clamp_prompt_cache_key(session_id));
+    }
+    // prompt_cache_retention="24h"：长保留档，仅官方端点认；其余端点 long 静默降级短保留
+    if params.cache_retention == CacheRetention::Long && compat.supports_long_cache_retention {
+        body["prompt_cache_retention"] = json!("24h");
     }
 
     // —— 思考参数：按 thinkingFormat 分支 ——
