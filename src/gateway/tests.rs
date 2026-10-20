@@ -423,3 +423,35 @@ Content-Length: 2
         assert_eq!(clamp_prompt_cache_key("sess_abc"), "sess_abc");
         assert_eq!(clamp_prompt_cache_key("  sess_abc  "), "sess_abc", "trim 空白");
     }
+
+    /// computer 工具截图回填的多模态 tool 消息在 OpenAI 兼容层压平成字符串
+    /// （OpenAI 的 tool content 只收字符串；Anthropic 才吃 tool_result 图片块）。
+    /// 图片降级成一句人话，文本照拼——不硬发 400，也不假装模型看得见。
+    #[test]
+    fn tool_multimodal_flattened_for_openai() {
+        let msgs = json!([
+            { "role": "user", "content": "操作电脑" },
+            { "role": "assistant", "content": null, "tool_calls": [
+                { "id": "t1", "type": "function", "function": { "name": "computer", "arguments": "{}" } }
+            ] },
+            { "role": "tool", "tool_call_id": "t1", "content": [
+                { "type": "text", "text": "已截图 1920×1080" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgo" } }
+            ] }
+        ]);
+        let compat = compat::resolve(Some("custom"), Some("https://relay.example.com/v1"), "m", None);
+        let b = build_body_with_compat("m", &msgs, true, &ChatParams::default(), None, &compat, "s");
+        let tool_msg = b["messages"].as_array().unwrap().iter().find(|m| m["role"] == json!("tool")).unwrap();
+        let content = tool_msg["content"].as_str().expect("压平成字符串");
+        assert!(content.contains("已截图 1920×1080"), "文本照拼: {content}");
+        assert!(content.contains("不支持图片"), "图片降级成人话: {content}");
+        assert!(content.contains("screenshots/"), "指路落盘目录: {content}");
+        assert!(!content.contains("iVBORw0KGgo"), "base64 绝不上链路");
+        // 非 tool 消息与纯字符串 tool 消息不受影响
+        let plain = json!([
+            { "role": "user", "content": "hi" },
+            { "role": "tool", "tool_call_id": "t0", "content": "纯文本结果" }
+        ]);
+        let b2 = build_body_with_compat("m", &plain, true, &ChatParams::default(), None, &compat, "s");
+        assert_eq!(b2["messages"][1]["content"], json!("纯文本结果"));
+    }

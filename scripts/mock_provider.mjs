@@ -162,7 +162,7 @@ http
         const hasToolsParam = Array.isArray(parsed.tools) && parsed.tools.length > 0;
         // 死循环剧本：最后一条 user 消息含「死循环」时，每轮都返回工具调用（验证步数上限）
         const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
-        const lastText = lastUser?.content || '';
+        const lastText = (lastUser?.content || '').split('【项目现状')[0];
         const loopForever = /死循环/.test(lastText);
         // 慢循环：同死循环，但每步先等 1.5s——留出「运行中插话」的窗口（验证 steering）
         const slowLoop = /慢循环/.test(lastText);
@@ -393,7 +393,10 @@ http
             ? m.content.filter((b) => b.type === 'text').map((b) => b.text).join('')
             : m.content || '';
         const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
-        const lastText = blockText(lastUser || {});
+        // 当前用户消息（剥掉「项目现状」brief——它引用上一条会话首句，会把上一轮
+        // 的触发词（抓取/派两个…）带进来让剧本误匹配；brief 是产品正确行为，
+        // mock 只认本轮真正说的话）
+        const lastText = blockText(lastUser || {}).split('【项目现状')[0];
         // 网关翻译正确性回声：tool_result 块（挂在 user 消息上）与 system 顶层参数
         const toolResults = [];
         for (const m of msgs) {
@@ -420,9 +423,13 @@ http
         const fetchUrl = (lastText.match(/抓取\s*(https?:\/\/\S+)/) || [])[1];
         const fetchNoRender = /只要静态/.test(lastText);
         const spawnFetch = hasToolsParam && !isChildRound && toolResults.length === 0 && !!fetchUrl;
+        // 操作电脑剧本（第 4 轮）：「操作电脑」→ computer screenshot（只读安全）；
+        // 带「再截一次」→ 已回填过还要再截（验图片标记在下一轮请求里真的在场）
+        const wantComputer = hasToolsParam && !isChildRound && /操作电脑/.test(lastText);
+        const computerTwice = /再截一次/.test(lastText);
         const slowLoop = isChildRound && /慢循环/.test(JSON.stringify(msgs));
         const wantsTool =
-          hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && !spawnFetch && (/读/.test(lastText) || slowLoop);
+          hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && !spawnFetch && !wantComputer && (/读/.test(lastText) || slowLoop);
         // 思考块：无论如何都吐一段（验证 thinking_delta → reasoning_content 通道）
         const ti = startBlock({ type: 'thinking', thinking: '' });
         ev('content_block_delta', {
@@ -457,6 +464,12 @@ http
           // 抓取剧本：web_fetch 打 SPA 页——静态只能拿到空壳，auto 档应回落浏览器渲染；
           // 带「只要静态」走 render=never（只给壳、不起浏览器）
           emitToolUse('toolu_fetch_1', 'web_fetch', fetchNoRender ? { url: fetchUrl, render: 'never' } : { url: fetchUrl });
+          endWithToolUse();
+        } else if (wantComputer) {
+          // 操作电脑：screenshot（GDI 真截屏 + 手写 PNG + 内联标记）。
+          // 「再截一次」= 上一轮已回填过截图，这轮再截——验证图片真的进了上下文
+          // （mock 在下一轮请求里应看到 image_url part）
+          emitToolUse('toolu_pc_1', 'computer', { method: 'screenshot' });
           endWithToolUse();
         } else if (spawnTwo) {
           // 一轮两个派发：甲读文件秒完，乙慢循环（1.5s/步）——并行组 + 取消窗口

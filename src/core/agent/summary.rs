@@ -5,8 +5,27 @@ pub(crate) fn is_summary_msg(m: &Value) -> bool {
 }
 
 /// 快照用：去掉 system 头与摘要消息（摘要由会话文件 summary 字段单独持久化）。
+/// tool 消息里的多模态图片一并剥掉——截图 base64 只活在请求上下文（computer 工具
+/// 回填那一刻），落盘会话文件会被撑爆（一张 1080p PNG 的 base64 上百 KB）。
 pub(crate) fn snapshot_msgs(msgs: &[Value]) -> Vec<Value> {
-    msgs.iter().skip(1).filter(|m| !is_summary_msg(m)).cloned().collect()
+    msgs.iter()
+        .skip(1)
+        .filter(|m| !is_summary_msg(m))
+        .map(|m| {
+            if m.get("role").and_then(Value::as_str) != Some("tool") || !m.get("content").is_some_and(Value::is_array) {
+                return m.clone();
+            }
+            let text: String = m["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            json!({ "role": "tool", "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")), "content": text })
+        })
+        .collect()
 }
 
 /// 滚动摘要：折叠内容 + 旧摘要 → 模型压成 ≤300 字要点。失败返回 None（调用方降级）。

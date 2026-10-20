@@ -215,10 +215,45 @@ pub fn build_body(
                 }
             }
             "tool" => {
+                // tool_result 的 content：纯字符串原样；多模态数组（computer 工具截图
+                // 回填的 text+image_url）转成官方 content 块（image 块见 image_block，
+                // data: URL 直接内联 base64）
+                let content = match m.get("content") {
+                    Some(Value::Array(parts)) => {
+                        let mut blocks: Vec<Value> = Vec::new();
+                        for p in parts {
+                            match p.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(t) = p.get("text").and_then(Value::as_str)
+                                        && !t.is_empty()
+                                    {
+                                        blocks.push(json!({ "type": "text", "text": t }));
+                                    }
+                                }
+                                Some("image_url") => {
+                                    if let Some(u) = p.pointer("/image_url/url").and_then(Value::as_str)
+                                        && let Some(b) = image_block(u)
+                                    {
+                                        blocks.push(b);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if blocks.is_empty() {
+                            json!("")
+                        } else if blocks.len() == 1 && blocks[0]["type"] == json!("text") {
+                            json!(blocks[0]["text"])
+                        } else {
+                            json!(blocks)
+                        }
+                    }
+                    _ => json!(string_content(m).unwrap_or_default()),
+                };
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": m.get("tool_call_id").and_then(Value::as_str).unwrap_or(""),
-                    "content": string_content(m).unwrap_or_default(),
+                    "content": content,
                 });
                 // 连续 tool 消息合并进同一条 user 消息（官方要求 tool_result 挂在 user 上）
                 let appendable = matches!(&out.last(), Some(last)

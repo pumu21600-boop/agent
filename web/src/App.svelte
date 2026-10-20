@@ -4617,10 +4617,25 @@
       args: 'dispatch/parent/child',
       run(m) { subagentUpsert(m, 'cancelled'); },
     },
+
+    // —— 操作电脑实时动作（2026-10-20 第 4 轮；server computer 模块 ui_push）——
+    // 每步键鼠/截图都推一条：聊天区实时条显示当前动作，点「查看屏幕」开主区面板
+    // （最新截图 + 动作流水）。用户拍板：UI 不落侧边栏。
+    'computer.action': {
+      kind: 'computer.action', title: '（内部）电脑操作动作', risk: 'safe', internal: true,
+      args: 'action/screenshot',
+      run(m) {
+        computerLive = {
+          action: m.action || '',
+          screenshot: m.screenshot || computerLive.screenshot,
+          at: Date.now(),
+        };
+        computerMark();
+      },
+    },
   };
 
-  // —— 子代理 UI（2026-10-20 免打扰模式第 2 轮）——
-  // 落点纪律：**不落侧边栏**（左侧会话栏/右侧 aside 都不进）——实时条贴在聊天区
+  // —— 子代理 UI（2026-10-20 免打扰模式第 2 轮）——  // 落点纪律：**不落侧边栏**（左侧会话栏/右侧 aside 都不进）——实时条贴在聊天区
   // 输入框上方（主区），回看面板是居中小弹窗（插件制作器同款形态）。
   // liveMap：本页生命周期内收到的派发事件（dispatch id → 记录）；跑完的回看从
   // GET /api/subagents 补（SSE 只推当时开着的页面，刷新/重开就丢）。
@@ -4679,6 +4694,32 @@
     return { queued: '排队中', running: '执行中', done: '完成', cancelled: '已取消', timeout: '超时', error: '失败' }[s] || s || '未知';
   }
 
+  // —— 操作电脑 UI（第 4 轮；同子代理套路：实时条 + 居中小弹窗，不落侧边栏）——
+  let computerLive = { action: '', screenshot: null, at: 0 };
+  let computerPanelOpen = false;
+  let computerState = { last_screenshot: null, last_size: null, actions: [] };
+  // 实时条只在本页生命周期内有效（事件流断线就断）；5 秒无新动作自动收起，
+  // 之后留一颗 chip 开面板回看（别常驻占输入框上方的位）
+  let computerFresh = false;
+  let computerTimer = null;
+  function computerMark() {
+    computerFresh = true;
+    clearTimeout(computerTimer);
+    computerTimer = setTimeout(() => (computerFresh = false), 5000);
+  }
+
+  async function openComputerPanel() {
+    computerPanelOpen = true;
+    const r = await fetch('/api/computer/state').then((r2) => r2.json()).catch(() => null);
+    if (r) computerState = r;
+  }
+
+  // 启动/重连时拉一次（刷新后「电脑操作」chip 入口也能出现；没有操作记录就不占位）
+  async function loadComputerState() {
+    const r = await fetch('/api/computer/state').then((r2) => r2.json()).catch(() => null);
+    if (r && (r.last_screenshot || (r.actions || []).length)) computerState = r;
+  }
+
   // 可序列化的 ops 清单（剥掉 run 函数）——随 /api/ui/state 上报给后端读。
   // 这就是「界面自报家门」：模型问「你能干什么」有清单可查，不用开发者替界面写死。
   // 桥条目（bridge: true）是插件私货不在此列——agent 的 ui 通道与插件通道各走各的。
@@ -4719,7 +4760,7 @@
     // 连上/重连即重拉一次设置与插件清单（2026-10-05）：服务重启（换二进制/崩溃恢复）
     // 后事件流会断线自动重连，但断连期间推的事件全丢了——页面会一直显示重启前的旧态，
     // 用户以为「又没刷新」。onopen 在首次连接也会触发，多一次 GET 无害。
-    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); };
+    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadComputerState(); };
     uiEventsSrc.onmessage = async (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
@@ -5590,6 +5631,19 @@
         <!-- 本会话派发过子代理（都跑完了）：留一颗不占地的小 chip，想回看就点 -->
         <div class="subagent-chiprow">
           <button class="subagent-chip" on:click={openSubagentPanel}>子代理 ×{subagentPanelRows.length}</button>
+        </div>
+      {/if}
+      <!-- 操作电脑实时条（第 4 轮；同子代理纪律：主区、输入框上方、不落侧边栏）。
+           只在新动作后 5 秒内占位；之后撤成 chip（有历史截图/动作就能开面板回看） -->
+      {#if computerFresh && computerLive.action}
+        <div class="computer-strip">
+          <span class="computer-badge">操作电脑</span>
+          <span class="computer-action" title={computerLive.action}>{computerLive.action}</span>
+          <button class="computer-strip-more" on:click={openComputerPanel}>查看屏幕</button>
+        </div>
+      {:else if computerLive.action || computerState.last_screenshot}
+        <div class="subagent-chiprow">
+          <button class="subagent-chip" on:click={openComputerPanel}>电脑操作 ×{computerState.actions.length || 1} · 查看屏幕</button>
         </div>
       {/if}
       <div class="composer">
@@ -7220,6 +7274,40 @@
         {/each}
       </div>
       <div class="subagent-foot">子代理无人值守：需要审批的操作按拒绝处理；取消只停这一个，父任务停止键会级联停全部。</div>
+    </div>
+  </div>
+{/if}
+{#if computerPanelOpen}
+  <!-- 操作电脑面板（第 4 轮）：居中小弹窗。左=最近截图（全尺寸落盘那份，经
+       /api/workspace/raw 直出），右=动作流水。刷新/断线后的回看数据来自
+       GET /api/computer/state；实时的那张来自 SSE 事件 -->
+  <div class="modal-backdrop" on:click={() => (computerPanelOpen = false)}>
+    <div class="modal computer-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>操作电脑</b>
+        <span class="subagent-modal-count">{computerState.actions.length || (computerLive.action ? 1 : 0)} 个动作</span>
+      </div>
+      <div class="computer-body">
+        <div class="computer-shot">
+          {#if computerLive.screenshot || computerState.last_screenshot}
+            <img
+              src={`/api/workspace/raw?path=${encodeURIComponent(computerLive.screenshot || computerState.last_screenshot)}`}
+              alt="最近屏幕截图"
+              on:error={(e) => (e.currentTarget.style.display = 'none')}
+            />
+          {:else}
+            <div class="computer-empty">还没有截图。模型调 computer 工具截图后，这里显示它看到的屏幕。</div>
+          {/if}
+        </div>
+        <div class="computer-log">
+          {#each computerState.actions as a}
+            <div class="computer-log-row">{a}</div>
+          {:else}
+            {#if computerLive.action}<div class="computer-log-row">{computerLive.action}</div>{/if}
+          {/each}
+        </div>
+      </div>
+      <div class="subagent-foot">截图全尺寸存工作区 screenshots/ 目录；键鼠动作按会话审批档走闸。「结束回答」键只停对话，不动已经发出去的键鼠。</div>
     </div>
   </div>
 {/if}
@@ -10274,6 +10362,96 @@
     font-size: 11px;
     color: var(--g5);
     line-height: 1.6;
+  }
+  /* —— 操作电脑（2026-10-20 第 4 轮；同子代理纪律：主区、不落侧边栏）—— */
+  .computer-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    padding: 7px 10px;
+    background: var(--g2);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+  }
+  .computer-badge {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    background: var(--g3);
+    color: var(--tint-blue-fg);
+  }
+  .computer-action {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--g6);
+  }
+  .computer-strip-more {
+    margin-left: auto;
+    flex: none;
+    background: none;
+    border: none;
+    color: var(--tint-blue-fg);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .computer-strip-more:hover {
+    text-decoration: underline;
+  }
+  .computer-modal {
+    min-width: 640px;
+    max-width: 860px;
+  }
+  .computer-body {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+    min-height: 240px;
+  }
+  .computer-shot {
+    flex: 1.4;
+    min-width: 0;
+    background: var(--g1);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    max-height: 55vh;
+  }
+  .computer-shot img {
+    max-width: 100%;
+    max-height: 55vh;
+    display: block;
+  }
+  .computer-empty {
+    color: var(--g5);
+    font-size: 12px;
+    padding: 24px;
+    text-align: center;
+    line-height: 1.7;
+  }
+  .computer-log {
+    flex: 1;
+    min-width: 0;
+    max-height: 55vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .computer-log-row {
+    font-size: 11px;
+    color: var(--g6);
+    font-family: Consolas, monospace;
+    padding: 4px 6px;
+    background: var(--g2);
+    border-radius: 5px;
+    word-break: break-all;
   }
   .cursor {
     animation: blink 1s step-start infinite;

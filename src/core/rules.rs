@@ -68,6 +68,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "plugin",
     // 2026-10-08 记忆库检索（search/recent/similar/read 全只读；分级见 evaluate_risk 的 memory 臂）
     "memory",
+    // 2026-10-20 操作电脑（截图/键鼠/窗口；按 method 分级，见 evaluate_risk 的 computer 臂）
+    "computer",
 ];
 
 /// 高危程序名（按第一条子命令的程序名 token 精确匹配，小写）。
@@ -196,6 +198,20 @@ pub fn evaluate_risk(tool_name: &str, args: &Value, workspace_root: &Path) -> (R
                 (
                     RiskLevel::Normal,
                     "浏览器页面操作（点击/输入/求值，可能改变页面状态）".into(),
+                )
+            }
+        }
+
+        // 操作电脑（2026-10-20 第 4 轮）：同 browser 按 method 分级——截图/坐标/
+        // 窗口清单只读；键鼠动作真的动用户的桌面，按常规改动审批
+        "computer" => {
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::computer::method_is_read_only(method) {
+                (RiskLevel::Safe, "电脑只读操作（截图/光标/屏幕/窗口清单）".into())
+            } else {
+                (
+                    RiskLevel::Normal,
+                    "电脑操作（键鼠/聚焦，真的在动你的桌面）".into(),
                 )
             }
         }

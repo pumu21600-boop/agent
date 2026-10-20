@@ -831,6 +831,9 @@ pub async fn run_task(
         // 阶段二「执行」：Safe 只读组并行（无副作用无竞态），写/执行组串行独占。
         // subagent_spawn 也进并行组——子代理各自独立会话，天然无共享竞态，
         // 一轮里发多个即真并行（受服务层并发度上限约束）。
+        // tool_images：本步工具结果里剥出的截图（computer 工具）——按 tool_calls
+        // 下标存，回填时升级成多模态 tool 消息；只活在本次任务的请求上下文里。
+        let mut tool_images: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
         let mut results: Vec<(String, bool)> = vec![(String::new(), true); turn.tool_calls.len()];
         let parallel: Vec<usize> = (0..turn.tool_calls.len())
             .filter(|&i| {
@@ -870,10 +873,15 @@ pub async fn run_task(
         // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
         while let Some((i, r)) = futs.next().await {
             let call = &turn.tool_calls[i];
-            let (content, ok) = match r {
+            let (mut content, ok) = match r {
                 Ok(s) => (s, true),
                 Err(e) => (format!("工具执行失败: {e}"), false),
             };
+            // 截图标记：剥出 base64 单放（文本留干净的一句话），消息回填时升级成
+            // 多模态 tool 消息——没有这一步 computer 工具的截图模型看不见
+            if let Some(img) = crate::computer::take_image(&mut content) {
+                tool_images.insert(i, img);
+            }
             let preview: String = content.chars().take(300).collect();
             observability::event(
                 EventType::ToolResult,
@@ -977,7 +985,13 @@ pub async fn run_task(
                     }
                 };
                 match exec.await {
-                    Ok(s) => (s, true),
+                    Ok(mut s) => {
+                        // 截图标记同并行路径：剥出单放，回填时升级多模态
+                        if let Some(img) = crate::computer::take_image(&mut s) {
+                            tool_images.insert(i, img);
+                        }
+                        (s, true)
+                    }
                     Err(e) => (format!("工具执行失败: {e}"), false),
                 }
             };
@@ -996,7 +1010,17 @@ pub async fn run_task(
         for (i, call) in turn.tool_calls.iter().enumerate() {
             let (content, ok) = &results[i];
             mem.record("tool.call", json!({ "name": call.name, "ok": ok }));
-            msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content }));
+            // 本步有截图 → tool 消息升级成多模态（text + image_url part）。
+            // 只活在 msgs（请求上下文）；落盘快照由 snapshot_msgs 剥掉图片，
+            // session 文件不会被 base64 撑爆。
+            let content_value = match tool_images.get(&i) {
+                Some(img) => json!([
+                    { "type": "text", "text": content },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{img}") } }
+                ]),
+                None => json!(content),
+            };
+            msgs.push(json!({ "role": "tool", "tool_call_id": call.id, "content": content_value }));
         }
         // 会话落盘：本步工具回填完毕，状态常驻磁盘
         on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
@@ -1504,5 +1528,34 @@ mod tests {
             3,
             "三轮都被请求到：重复步没有触发终止"
         );
+    }
+
+
+    /// 快照剥离截图：多模态 tool 消息落盘时只留文本（base64 不上会话文件）。
+    /// 请求上下文里是数组（模型看得见），落盘是字符串（文件不爆炸）——两套形状。
+    #[test]
+    fn snapshot_strips_tool_images() {
+        let msgs = vec![
+            json!({ "role": "system", "content": "系统" }),
+            json!({ "role": "user", "content": "操作电脑" }),
+            json!({ "role": "assistant", "content": null, "tool_calls": [
+                { "id": "t1", "type": "function", "function": { "name": "computer", "arguments": "{}" } }
+            ] }),
+            json!({ "role": "tool", "tool_call_id": "t1", "content": [
+                { "type": "text", "text": "已截图 1920×1080" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAAN" } }
+            ] }),
+        ];
+        let snap = snapshot_msgs(&msgs);
+        assert_eq!(snap.len(), 3, "system 头被 skip，其余三条在");
+        let tool = snap.iter().find(|m| m["role"] == json!("tool")).unwrap();
+        assert_eq!(tool["content"], json!("已截图 1920×1080"), "落盘只剩文本");
+        assert!(!serde_json::to_string(&snap).unwrap().contains("iVBORw0KGgo"), "base64 绝不落盘");
+        // 纯字符串 tool 消息原样过（不受影响）
+        let plain = vec![
+            json!({ "role": "system", "content": "s" }),
+            json!({ "role": "tool", "tool_call_id": "t0", "content": "文本" }),
+        ];
+        assert_eq!(snapshot_msgs(&plain)[0]["content"], json!("文本"));
     }
 }

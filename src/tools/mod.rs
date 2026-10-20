@@ -275,6 +275,34 @@ fn builtin_tools() -> Vec<ToolSpec> {
             danger_level: 1,
         },
         ToolSpec {
+            name: "computer",
+            description: "操作电脑：截屏看屏幕 + 键鼠控制（SendInput）+ 窗口聚焦。一个工具按 method 覆盖：screenshot 截虚拟屏 PNG（结果里内联图片，你直接能看见屏幕；全尺寸存工作区 screenshots/ 供用户看）；cursor/screen_size/windows 坐标与窗口清单（只读）；focus 按标题或句柄把窗口带到前台；click/move/scroll/drag 鼠标；type 灌文本（Unicode 直输，中文没问题）；key 组合键（\"ctrl+c\"、\"alt+f4\"、\"enter\"）。坐标用屏幕绝对坐标（截图上的像素位置即坐标）。工作流：先 screenshot 看当前屏幕 → 对目标元素 click/type → 再 screenshot 验证效果；键盘没反应时先看返回里的焦点窗口诊断。键鼠动作按会话审批档走闸（只读档每次问）。",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "enum": crate::computer::ALL_METHODS.to_vec(),
+                        "description": "命令方法（见工具说明）"
+                    },
+                    "x": { "type": "number", "description": "click/move/scroll：屏幕 x 坐标" },
+                    "y": { "type": "number", "description": "click/move/scroll：屏幕 y 坐标" },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "click/drag：鼠标键（缺省 left）" },
+                    "clicks": { "type": "integer", "description": "click：连击次数（1-3，缺省 1）" },
+                    "dx": { "type": "number", "description": "scroll：横向滚动格数（正=右）" },
+                    "dy": { "type": "number", "description": "scroll：纵向滚动格数（正=上）" },
+                    "from": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：起点" },
+                    "to": { "type": "object", "properties": { "x": { "type": "number" }, "y": { "type": "number" } }, "description": "drag：终点" },
+                    "text": { "type": "string", "description": "type：要输入的文本" },
+                    "combo": { "type": "string", "description": "key：组合键，如 \"ctrl+c\"、\"ctrl+shift+t\"、\"enter\"" },
+                    "title": { "type": "string", "description": "focus：窗口标题子串（大小写不敏感）" },
+                    "hwnd": { "type": "integer", "description": "focus：窗口句柄（windows 方法清单里给）" }
+                },
+                "required": ["method"]
+            }),
+            danger_level: 1,
+        },
+        ToolSpec {
             name: "settings",
             description: "读取或修改本应用自身的运行时设置（settings.json）与 config.toml。get：全部设置快照（key 只给尾号）。schema（只读不受闸）：全部可改路径的自描述（路径/类型/可选值/默认/风险档）——set 之前先读它，别瞎猜键名。set 配 patch（顶层键或点号子路径，如 features.galaxy=false、roles.summary=主力配置名）：普通键静默生效；换大脑键（base_url/model/provider_id/active_config_id）同档按审批走。set_config 配 key+value 改 config.toml（保注释，重启生效）；default_approval 必问。config 配 op：new=新建渠道配置并激活；delete+id=删配置（删密钥，按档位问）。mcp op=refresh+name 重连 MCP；workspace path 切换工作区（按档位问）；alias name 给工作区改显示名（细则见系统提示【工作区】节）；schedule_run id 立即跑定时任务（真花钱，按档位问）；memory op=reindex 重建记忆索引。范围外直接报错：api_key/clear_key（key 永不经模型之手，换 key 请用户到设置页）。审批档位 agent 没有任何通道可改，用户要切档请他去输入框上方的档位菜单手动切。第三方插件信任走 plugin 工具。除 get/schema/set_config 外受「中枢」闸（见系统提示「自我管理与探索纪律」）。",
             parameters: json!({
@@ -448,6 +476,8 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
         // Chromium 自带站点隔离即边界，不进 Windows 沙箱；审批门按 method 分级
         // （只读 Safe / 页面操作 Normal，见 core/rules.rs）。
         "browser" => crate::browser::command(args, cfg.max_chars).await,
+        // 操作电脑（截图/键鼠/窗口；2026-10-20 第 4 轮）
+        "computer" => crate::computer::execute(args, cfg.max_chars).await,
         // 2026-10-03 agent 自改设置：读/改 settings.json（分级与红线见 core/rules.rs）
         "settings" => settings::run(args).await,
         // 2026-10-04 放开权限轮：第三方插件信任交给 agent（先审后装，force 必问）

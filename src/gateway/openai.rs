@@ -24,6 +24,51 @@ pub fn build_body(
 /// 会话 id 超长时截断——同会话内键稳定即可，不需要全局唯一。
 pub const PROMPT_CACHE_KEY_MAX_LENGTH: usize = 64;
 
+/// tool 消息多模态压平（OpenAI 兼容层的适配层）：content 数组 → 字符串。
+/// text part 照拼；image part 换成一句「截图已存工作区 screenshots/」——
+/// 本渠道的 tool_result 吃不下图片，说清楚比硬发 400 强。返回新 Value
+/// （没有 tool 数组消息时原样返回，零拷贝）。
+fn flatten_tool_multimodal(messages: &Value) -> Value {
+    let Some(arr) = messages.as_array() else { return messages.clone() };
+    if !arr
+        .iter()
+        .any(|m| m.get("role").and_then(Value::as_str) == Some("tool") && m.get("content").is_some_and(Value::is_array))
+    {
+        return messages.clone();
+    }
+    Value::Array(
+        arr.iter()
+            .map(|m| {
+                if m.get("role").and_then(Value::as_str) != Some("tool") || !m.get("content").is_some_and(Value::is_array) {
+                    return m.clone();
+                }
+                let mut text = String::new();
+                let mut shots = 0usize;
+                for p in m["content"].as_array().into_iter().flatten() {
+                    match p.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = p.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                        Some("image_url") => shots += 1,
+                        _ => {}
+                    }
+                }
+                if shots > 0 {
+                    text.push_str(&format!(
+                        "\n（另有 {shots} 张截图已存工作区 screenshots/ 目录；本渠道的 tool 结果不支持图片，你看不到图——可重新用 computer 工具截图并描述，或让用户看面板）"
+                    ));
+                }
+                json!({ "role": "tool", "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(json!("")), "content": text })
+            })
+            .collect(),
+    )
+}
+
 /// 会话 id → prompt_cache_key（对齐 pi-ai clampOpenAIPromptCacheKey）。
 pub fn clamp_prompt_cache_key(session_id: &str) -> String {
     session_id.trim().chars().take(PROMPT_CACHE_KEY_MAX_LENGTH).collect()
@@ -67,6 +112,11 @@ pub fn build_body_with_compat(
     if compat.protocol == Protocol::AnthropicMessages {
         return anthropic::build_body(model, messages, stream, params, tools, compat);
     }
+    // OpenAI 系的 tool 消息 content 只收字符串——computer 工具截图回填的是
+    // text+image_url 数组（Anthropic 才认多模态 tool_result）。这里压平：
+    // 文本照发，图片降级成一句人话（截图已存工作区 screenshots/，模型可读路径，
+    // 本渠道看不到图）。非 tool 消息（user/assistant）原样过。
+    let messages = flatten_tool_multimodal(messages);
     let mut body = json!({
         "model": model,
         "messages": messages,

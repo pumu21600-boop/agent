@@ -60,6 +60,17 @@ mod usage;
 pub(crate) mod workspace; // settings 工具的 workspace 动作复用 canon_workspace/apply_workspace
 mod webpanel;
 
+/// GET /api/computer/state —— 操作电脑状态（最近截图 + 动作流水；UI 面板用）。
+/// 截图内联图只走 SSE 实时事件，这里给的是「重开页面后也能回看」的落盘面。
+pub(super) async fn computer_state() -> Json<Value> {
+    let s = crate::computer::state();
+    Json(json!({
+        "last_screenshot": s.last_screenshot,
+        "last_size": s.last_size.map(|(w, h)| json!([w, h])),
+        "actions": s.actions,
+    }))
+}
+
 use chat::*;
 use plugins::*;
 use gate::*;
@@ -205,6 +216,8 @@ pub fn router(state: AppState, dist_dir: PathBuf) -> Router {
         // 子代理（2026-10-20 免打扰模式第 2 轮）：派发历史（UI 面板数据源）+ 手动取消
         .route("/api/subagents", get(crate::server::subagent::list_subagents))
         .route("/api/subagents/cancel", post(crate::server::subagent::cancel_subagent))
+        // 操作电脑（第 4 轮）：最近截图路径 + 动作流水（UI 面板数据源；重开也能回看）
+        .route("/api/computer/state", get(computer_state))
         // 反向：前端上报界面状态（ui 工具 state 方法读它；open/close 识别 no-op）
         .route("/api/ui/state", post(crate::server::ui_events::ui_state_post))
         // 契约 v1（027）：模型自产插件 draft 隔离区 + 一键转正 + 丢弃
