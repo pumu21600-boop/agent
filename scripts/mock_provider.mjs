@@ -379,7 +379,22 @@ http
           }
         }
         const hasToolsParam = Array.isArray(parsed.tools) && parsed.tools.length > 0;
-        const wantsTool = hasToolsParam && toolResults.length === 0 && /读/.test(lastText);
+        // 子代理那轮的消息带派发包裹（【子代理任务】），且 brief 会把父任务首句
+        // （如「派两个」）带进上下文——剧本匹配必须排除子代理轮，否则子代理会
+        // 尝试再派（嵌套，生产由深度闸拦，这里让 mock 别添乱）
+        const isChildRound = /【子代理任务/.test(lastText);
+        // 子代理剧本（与 OpenAI 分支对齐）
+        const spawnTwo = hasToolsParam && !isChildRound && toolResults.length === 0 && /派两个/.test(lastText);
+        const spawnThree = hasToolsParam && !isChildRound && toolResults.length === 0 && /派三个/.test(lastText);
+        const spawnOne = hasToolsParam && !isChildRound && toolResults.length === 0 && /派子代理/.test(lastText);
+        // 慢循环：**每轮**都睡 1.5s 再吐工具调用。注意 Anthropic 协议里工具结果
+        // 会并进 user 消息（tool_result 块），lastText 之后恒为空——所以这里搜
+        // 全历史而不是末条（OpenAI 协议的 tool 消息不顶掉 user 消息，没这问题）。
+        // 只让**子代理轮**慢循环：父任务历史里也会出现乙的任务描述（工具结果回声），
+        // 不设 isChildRound 守卫会把父任务也拖进循环（本轮实测踩过）。
+        const slowLoop = isChildRound && /慢循环/.test(JSON.stringify(msgs));
+        const wantsTool =
+          hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && (/读/.test(lastText) || slowLoop);
         // 思考块：无论如何都吐一段（验证 thinking_delta → reasoning_content 通道）
         const ti = startBlock({ type: 'thinking', thinking: '' });
         ev('content_block_delta', {
@@ -388,9 +403,10 @@ http
           delta: { type: 'thinking_delta', thinking: '模拟思考：请求形状是 Messages 协议。' },
         });
         stopBlock();
-        if (wantsTool) {
-          const s = startBlock({ type: 'tool_use', id: 'toolu_mock_1', name: 'read_file', input: {} });
-          const args = JSON.stringify({ path: 'prompts/system.md' });
+        // 流式吐一个 tool_use 块（官方形状：start → input_json_delta 分片 → stop）
+        const emitToolUse = (id, name, input) => {
+          const s = startBlock({ type: 'tool_use', id, name, input: {} });
+          const args = JSON.stringify(input);
           for (let i = 0; i < args.length; i += 8) {
             ev('content_block_delta', {
               type: 'content_block_delta',
@@ -399,7 +415,37 @@ http
             });
           }
           stopBlock();
+          return s;
+        };
+        const endWithToolUse = () =>
           ev('message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 33 } });
+        if (spawnThree) {
+          // 一轮三个派发：per_parent=2 → 第三个必排队（验 queued 态上屏 + 出队即跑）
+          emitToolUse('toolu_mock_a', 'subagent_spawn', { task: '读 prompts/system.md', label: '子代理甲' });
+          emitToolUse('toolu_mock_b', 'subagent_spawn', { task: '慢循环读 config.toml', label: '子代理乙' });
+          emitToolUse('toolu_mock_c', 'subagent_spawn', { task: '读 prompts/system.md', label: '子代理丙' });
+          endWithToolUse();
+        } else if (spawnTwo) {
+          // 一轮两个派发：甲读文件秒完，乙慢循环（1.5s/步）——并行组 + 取消窗口
+          emitToolUse('toolu_mock_a', 'subagent_spawn', { task: '读 prompts/system.md', label: '子代理甲' });
+          emitToolUse('toolu_mock_b', 'subagent_spawn', { task: '慢循环读 config.toml', label: '子代理乙' });
+          endWithToolUse();
+        } else if (spawnOne) {
+          emitToolUse('toolu_mock_1', 'subagent_spawn', { task: '读 prompts/system.md', label: 'mock 子代理' });
+          endWithToolUse();
+        } else if (wantsTool) {
+          if (slowLoop) {
+            // 睡 1.5s 再吐调用：子代理进程还活着，取消才落得下
+            setTimeout(() => {
+              emitToolUse('toolu_slow_1', 'read_file', { path: 'prompts/system.md' });
+              endWithToolUse();
+              ev('message_stop', { type: 'message_stop' });
+              res.end();
+            }, 1500);
+            return;
+          }
+          emitToolUse('toolu_mock_1', 'read_file', { path: 'prompts/system.md' });
+          endWithToolUse();
         } else {
           const echo = toolResults.length
             ? `收到 ${toolResults.length} 条工具结果，第一条开头：${String(toolResults[0]?.content || '').slice(0, 30)}；系统提示 ${String(parsed.system || '').length} 字。`

@@ -4593,13 +4593,96 @@
         reply(true, { ok: true });
       },
     },
+
+    // —— 子代理生命周期（2026-10-20 免打扰模式第 2 轮；server/subagent.rs ui_push）——
+    // 实时条按 dispatch id 聚合：queued → spawned(running) → done/cancelled。
+    // 只推给当时开着的页面，跑完的回看走 GET /api/subagents（面板打开时拉）。
+    'subagent.queued': {
+      kind: 'subagent.queued', title: '（内部）子代理排队', risk: 'safe', internal: true,
+      args: 'dispatch/parent/label/task',
+      run(m) { subagentUpsert(m, 'queued'); },
+    },
+    'subagent.spawned': {
+      kind: 'subagent.spawned', title: '（内部）子代理派发', risk: 'safe', internal: true,
+      args: 'dispatch/parent/child/label/model/task',
+      run(m) { subagentUpsert(m, 'running'); },
+    },
+    'subagent.done': {
+      kind: 'subagent.done', title: '（内部）子代理完成', risk: 'safe', internal: true,
+      args: 'dispatch/parent/child/label/status/tokens/duration_ms',
+      run(m) { subagentUpsert(m, m.status || 'done'); },
+    },
+    'subagent.cancelled': {
+      kind: 'subagent.cancelled', title: '（内部）子代理取消', risk: 'safe', internal: true,
+      args: 'dispatch/parent/child',
+      run(m) { subagentUpsert(m, 'cancelled'); },
+    },
   };
+
+  // —— 子代理 UI（2026-10-20 免打扰模式第 2 轮）——
+  // 落点纪律：**不落侧边栏**（左侧会话栏/右侧 aside 都不进）——实时条贴在聊天区
+  // 输入框上方（主区），回看面板是居中小弹窗（插件制作器同款形态）。
+  // liveMap：本页生命周期内收到的派发事件（dispatch id → 记录）；跑完的回看从
+  // GET /api/subagents 补（SSE 只推当时开着的页面，刷新/重开就丢）。
+  let subagentLive = {};
+  let subagentPanelOpen = false;
+  let subagentHistory = [];
+
+  function subagentUpsert(m, status) {
+    const prev = subagentLive[m.dispatch] || {};
+    // 整键替换（Svelte4 赋值才触发响应式；改属性不保险）
+    subagentLive = {
+      ...subagentLive,
+      [m.dispatch]: {
+        dispatch: m.dispatch,
+        parent: m.parent || prev.parent || '',
+        child: m.child || prev.child || '',
+        label: m.label || prev.label || '子代理',
+        model: m.model || prev.model || '',
+        task: m.task || prev.task || '',
+        status,
+        tokens: m.tokens ?? prev.tokens ?? 0,
+        duration_ms: m.duration_ms ?? prev.duration_ms ?? 0,
+      },
+    };
+  }
+
+  // 本会话的派发：实时（liveMap 里 parent 对得上的）+ 历史（面板打开时拉的全量）
+  $: subagentSessionLive = Object.values(subagentLive).filter((d) => d.parent && d.parent === currentSessionId);
+  $: subagentPanelRows = (() => {
+    const liveIds = new Set(subagentSessionLive.map((d) => d.dispatch));
+    const hist = (subagentHistory || []).filter((d) => d.parent === currentSessionId && !liveIds.has(d.dispatch));
+    return [...subagentSessionLive, ...hist];
+  })();
+  // 实时条只露排队中/执行中；终态不占常驻位（要回看走面板）
+  $: subagentActive = subagentSessionLive.filter((d) => d.status === 'queued' || d.status === 'running');
+
+  async function openSubagentPanel() {
+    subagentPanelOpen = true;
+    const r = await fetch('/api/subagents').then((r2) => r2.json()).catch(() => null);
+    subagentHistory = (r && r.dispatches) || [];
+  }
+
+  async function cancelSubagent(dispatch) {
+    const r = await fetch('/api/subagents/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dispatch }),
+    }).then((r2) => r2.json()).catch(() => null);
+    // 本地即时翻态（UI 事件也会到，双保险；失败就等事件来纠）
+    if (r && r.ok && subagentLive[dispatch]) {
+      subagentLive = { ...subagentLive, [dispatch]: { ...subagentLive[dispatch], status: 'cancelled' } };
+    }
+  }
+
+  function subagentStatusText(s) {
+    return { queued: '排队中', running: '执行中', done: '完成', cancelled: '已取消', timeout: '超时', error: '失败' }[s] || s || '未知';
+  }
 
   // 可序列化的 ops 清单（剥掉 run 函数）——随 /api/ui/state 上报给后端读。
   // 这就是「界面自报家门」：模型问「你能干什么」有清单可查，不用开发者替界面写死。
   // 桥条目（bridge: true）是插件私货不在此列——agent 的 ui 通道与插件通道各走各的。
-  function uiOpsManifest() {
-    return Object.values(UI_OPS)
+  function uiOpsManifest() {    return Object.values(UI_OPS)
       .filter((o) => !o.internal && !o.bridge)
       .map((o) => ({ kind: o.kind, title: o.title, risk: o.risk, args: o.args }));
   }
@@ -5485,6 +5568,30 @@
     {/if}
 
     <footer class="chat-input">
+      <!-- 子代理实时条（主区、输入框上方；用户拍板不落侧边栏）。必须放在 footer 里：
+           输入框是 position:absolute 浮层，放它外面（普通流）会被整个盖住（实测 y 重叠
+           82px，命中测试全落到 composer 上）。footer 子元素自带 pointer-events:auto。
+           只在有排队/执行中的派发时占位，终态即撤——回看走「查看全部」小弹窗 -->
+      {#if subagentActive.length}
+        <div class="subagent-strip">
+          <div class="subagent-strip-head">
+            <span class="subagent-strip-title">子代理 · {subagentActive.length} 个在跑</span>
+            <button class="subagent-strip-more" on:click={openSubagentPanel}>查看全部</button>
+          </div>
+          {#each subagentActive as d (d.dispatch)}
+            <div class="subagent-row">
+              <span class="subagent-badge {d.status}">{d.status === 'queued' ? '排队中' : '执行中'}</span>
+              <span class="subagent-label" title={d.task}>{d.label}</span>
+              <button class="subagent-row-cancel" title="取消这个子代理" on:click={() => cancelSubagent(d.dispatch)}>×</button>
+            </div>
+          {/each}
+        </div>
+      {:else if subagentPanelRows.length}
+        <!-- 本会话派发过子代理（都跑完了）：留一颗不占地的小 chip，想回看就点 -->
+        <div class="subagent-chiprow">
+          <button class="subagent-chip" on:click={openSubagentPanel}>子代理 ×{subagentPanelRows.length}</button>
+        </div>
+      {/if}
       <div class="composer">
         {#if pendingAttachments.length > 0}
           <div class="composer-attachments">
@@ -7076,6 +7183,46 @@
     on:close={() => (wsModalOpen = false)}
   />
 <RenameModal modal={renameModal} on:close={() => (renameModal = null)} on:submit={submitRename} />
+{#if subagentPanelOpen}
+  <!-- 子代理回看面板：居中小弹窗（与插件制作器同款形态，不落侧边栏）。
+       行内信息 = 实时事件（本页）+ GET /api/subagents 历史（跑完的/刷新前的） -->
+  <div class="modal-backdrop" on:click={() => (subagentPanelOpen = false)}>
+    <div class="modal subagent-modal" on:click|stopPropagation>
+      <div class="modal-head">
+        <b>子代理</b>
+        <span class="subagent-modal-count">{subagentPanelRows.length} 次派发</span>
+      </div>
+      <div class="subagent-list">
+        {#if !subagentPanelRows.length}
+          <div class="subagent-empty">
+            本会话还没有派发过子代理。模型遇到可并行的独立调研、多方案对比、批量同类小任务时会自动派发——
+            子代理跑在独立会话里，最终结论作为工具结果回到主对话，成本记在本任务上。
+          </div>
+        {/if}
+        {#each subagentPanelRows as d (d.dispatch)}
+          <div class="subagent-item">
+            <div class="subagent-item-head">
+              <span class="subagent-badge {d.status}">{subagentStatusText(d.status)}</span>
+              <span class="subagent-label">{d.label}</span>
+              {#if d.model}<span class="subagent-model" title={d.model}>{d.model}</span>{/if}
+            </div>
+            <div class="subagent-item-meta">
+              {#if d.tokens}<span class="subagent-meta">token {d.tokens}</span>{/if}
+              {#if d.duration_ms}<span class="subagent-meta">{(d.duration_ms / 1000).toFixed(1)}s</span>{/if}
+              <span class="subagent-meta dim">{d.child ? d.child.slice(0, 8) : ''}</span>
+              {#if d.status === 'queued' || d.status === 'running'}
+                <button class="subagent-item-cancel" on:click={() => cancelSubagent(d.dispatch)}>取消</button>
+              {:else if d.child}
+                <button class="subagent-item-open" on:click={() => { subagentPanelOpen = false; loadSession(d.child); }}>打开子会话</button>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+      <div class="subagent-foot">子代理无人值守：需要审批的操作按拒绝处理；取消只停这一个，父任务停止键会级联停全部。</div>
+    </div>
+  </div>
+{/if}
 <ConfirmModal
   modal={confirmModal}
   on:answer={(e) => {
@@ -9942,6 +10089,191 @@
     white-space: pre-wrap;
     max-height: 160px;
     overflow-y: auto;
+  }
+  /* —— 子代理（2026-10-20 第 2 轮；主区实时条 + 居中小弹窗，不落侧边栏）—— */
+  .subagent-strip {
+    margin: 0 16px 8px;
+    padding: 8px 10px;
+    background: var(--g2);
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .subagent-strip-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--g6);
+  }
+  .subagent-strip-title {
+    font-weight: 600;
+  }
+  .subagent-strip-more {
+    background: none;
+    border: none;
+    color: var(--tint-blue-fg);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 4px;
+  }
+  .subagent-strip-more:hover {
+    text-decoration: underline;
+  }
+  .subagent-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .subagent-row-cancel {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: var(--g5);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .subagent-row-cancel:hover {
+    color: var(--tint-red-fg);
+  }
+  .subagent-chiprow {
+    display: flex;
+    justify-content: center;
+    padding: 0 16px 6px;
+  }
+  .subagent-chip {
+    background: var(--g2);
+    border: 1px solid var(--g3);
+    border-radius: 999px;
+    color: var(--g6);
+    font-size: 11px;
+    padding: 2px 10px;
+    cursor: pointer;
+  }
+  .subagent-chip:hover {
+    color: var(--tint-blue-fg);
+    border-color: var(--tint-blue-fg);
+  }
+  .subagent-badge {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
+  .subagent-badge.queued {
+    background: var(--g3);
+    color: var(--tint-amber-fg, #d4a017);
+  }
+  .subagent-badge.running {
+    background: var(--g3);
+    color: var(--tint-blue-fg);
+  }
+  .subagent-badge.done {
+    background: var(--tint-green-bg);
+    color: var(--tint-green-fg);
+  }
+  .subagent-badge.cancelled {
+    background: var(--g3);
+    color: var(--g5);
+  }
+  .subagent-badge.timeout,
+  .subagent-badge.error {
+    background: var(--tint-red-bg);
+    color: var(--tint-red-fg);
+  }
+  .subagent-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--g6);
+  }
+  .subagent-modal {
+    min-width: 460px;
+    max-width: 640px;
+  }
+  .subagent-modal-count {
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--g5);
+  }
+  .subagent-list {
+    max-height: 55vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .subagent-empty {
+    color: var(--g5);
+    font-size: 12px;
+    line-height: 1.7;
+    padding: 8px 2px;
+  }
+  .subagent-item {
+    border: 1px solid var(--g3);
+    border-radius: 8px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .subagent-item-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .subagent-model {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--g5);
+    font-family: Consolas, monospace;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .subagent-item-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    color: var(--g5);
+  }
+  .subagent-meta.dim {
+    font-family: Consolas, monospace;
+    opacity: 0.7;
+  }
+  .subagent-item-cancel,
+  .subagent-item-open {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--g4);
+    border-radius: 5px;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+    color: var(--g6);
+  }
+  .subagent-item-cancel:hover {
+    color: var(--tint-red-fg);
+    border-color: var(--tint-red-fg);
+  }
+  .subagent-item-open:hover {
+    color: var(--tint-blue-fg);
+    border-color: var(--tint-blue-fg);
+  }
+  .subagent-foot {
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--g5);
+    line-height: 1.6;
   }
   .cursor {
     animation: blink 1s step-start infinite;

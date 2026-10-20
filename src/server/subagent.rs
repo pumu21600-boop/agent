@@ -11,7 +11,7 @@
 //!   （默认拒绝，派发时可显式放行）。
 //! - v1 不支持嵌套派发（子代理不能再派子代理）——防递归烧额度。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 use super::*;
@@ -34,6 +34,83 @@ fn depth_slot() -> &'static Mutex<HashMap<String, u32>> {
 fn tokens_slot() -> &'static Mutex<HashMap<String, u64>> {
     static TOKENS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
     TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 派发历史（UI「子代理」面板的数据源；有界环形，新→旧）。
+/// 为什么不在前端攒：SSE 事件只推给当时开着的页面，重开/刷新就没了；
+/// 跑完的派发要能回看（状态/耗时/token/跳子会话），必须服务端着账。
+fn history_slot() -> &'static Mutex<VecDeque<SubagentRecord>> {
+    static HISTORY: OnceLock<Mutex<VecDeque<SubagentRecord>>> = OnceLock::new();
+    HISTORY.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// 历史容量（条）。子代理是高频操作（一轮可以派好几个），200 条够回看最近若干轮。
+const HISTORY_CAP: usize = 200;
+
+/// 一条派发记录（status: queued / running / done / cancelled / timeout / error）。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SubagentRecord {
+    pub dispatch: String,
+    pub parent: String,
+    pub child: String,
+    pub label: String,
+    pub model: String,
+    pub task_chars: usize,
+    pub status: String,
+    pub tokens: u64,
+    pub duration_ms: u128,
+    /// 派发时刻（Unix ms）；finished_at 同理，未结束为 None
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 推一条 UI 事件（子代理生命周期 → 前端实时条；无人订阅即丢弃，等历史接口兜底）。
+/// 审计事件（observability）照旧另发，两路各司其职。
+fn ui_push(v: Value) {
+    crate::server::ui_events::emit(v);
+}
+
+/// 近期派发历史（新→旧；UI 面板拉全量自己按 parent 过滤）。
+pub(crate) fn recent_dispatches() -> Vec<SubagentRecord> {
+    history_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// 按 dispatch id 取消一个活跃子代理（UI「取消」按钮）。返回是否找到并取消。
+pub(crate) fn cancel_dispatch(dispatch_id: &str) -> bool {
+    let hit = {
+        let mut running = running_slot().lock().unwrap_or_else(|e| e.into_inner());
+        let removed = running.remove(dispatch_id);
+        // 同步历史状态：排队/执行中的记录翻成 cancelled
+        if removed.is_some() {
+            let mut hist = history_slot().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(rec) = hist.iter_mut().find(|r| r.dispatch == dispatch_id) {
+                rec.status = "cancelled".into();
+                rec.finished_at = Some(now_ms());
+            }
+        }
+        removed
+    };
+    let Some(d) = hit else { return false };
+    d.registry.cancel(&d.child);
+    ui_push(json!({
+        "kind": "subagent.cancelled",
+        "dispatch": dispatch_id,
+        "parent": d.parent,
+        "child": d.child,
+    }));
+    true
 }
 
 struct Dispatch {
@@ -142,6 +219,23 @@ fn add_tokens(parent: &str, n: u64) {
     *t.entry(parent.to_string()).or_insert(0) += n;
 }
 
+/// 历史入队（新→旧，超容 pop_back）。
+fn history_push(rec: SubagentRecord) {
+    let mut h = history_slot().lock().unwrap_or_else(|e| e.into_inner());
+    h.push_front(rec);
+    while h.len() > HISTORY_CAP {
+        h.pop_back();
+    }
+}
+
+/// 按 dispatch id 更新历史记录（queued→running→终态 全生命周期同一段）。
+fn history_update(dispatch: &str, f: impl FnOnce(&mut SubagentRecord)) {
+    let mut h = history_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rec) = h.iter_mut().find(|r| r.dispatch == dispatch) {
+        f(rec);
+    }
+}
+
 impl SubagentRunner for SubagentDispatcher {
     fn run(
         &self,
@@ -175,10 +269,27 @@ impl SubagentDispatcher {
         if self.limits.max_concurrent == 0 {
             return "派发失败：子代理并行未启用（config.toml [subagent] max_concurrent = 0）。".to_string();
         }
+        // 派发 id 提前发号：排队/spawned/done/取消全生命周期共用（前端实时条按它聚合）
+        let dispatch_id = uuid::Uuid::new_v4().simple().to_string();
+        let label = if args.label.trim().is_empty() {
+            task.chars().take(20).collect::<String>()
+        } else {
+            args.label.trim().to_string()
+        };
+        let task_preview = task.chars().take(80).collect::<String>();
         // 并发度：全局上限 + 单父任务上限，满员等待（轮询式 FIFO 近似，200ms 粒度）。
         // 等待期间父任务被取消 → 直接返回，不派发。
+        // 排队即上屏：历史记 queued + UI 推一条——用户看得到「在排队」，不是干等。
+        let mut queued_pushed = false;
         loop {
             if self.state.cancel.is_set(parent) {
+                if queued_pushed {
+                    history_update(&dispatch_id, |r| {
+                        r.status = "cancelled".into();
+                        r.finished_at = Some(now_ms());
+                    });
+                    ui_push(json!({ "kind": "subagent.cancelled", "dispatch": dispatch_id, "parent": parent }));
+                }
                 return "派发失败：父任务已取消，未派发。".to_string();
             }
             if running_total() < self.limits.max_concurrent
@@ -186,11 +297,51 @@ impl SubagentDispatcher {
             {
                 break;
             }
+            if !queued_pushed {
+                queued_pushed = true;
+                history_push(SubagentRecord {
+                    dispatch: dispatch_id.clone(),
+                    parent: parent.to_string(),
+                    child: String::new(),
+                    label: label.clone(),
+                    model: String::new(),
+                    task_chars: task.chars().count(),
+                    status: "queued".into(),
+                    tokens: 0,
+                    duration_ms: 0,
+                    started_at: now_ms(),
+                    finished_at: None,
+                });
+                ui_push(json!({
+                    "kind": "subagent.queued",
+                    "dispatch": dispatch_id,
+                    "parent": parent,
+                    "label": label,
+                    "task": task_preview,
+                }));
+            }
             observability::event(
                 EventType::State,
                 json!({ "kind": "subagent.queued", "parent": parent, "running": running_total(), "per_parent": running_for(parent) }),
             );
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        // 没排过队（容量当即就绪）：记录还没入队，这里补一条（queued 态），
+        // 下面的 spawned 更新会把它翻成 running——两条路径汇到同一段记录
+        if !queued_pushed {
+            history_push(SubagentRecord {
+                dispatch: dispatch_id.clone(),
+                parent: parent.to_string(),
+                child: String::new(),
+                label: label.clone(),
+                model: String::new(),
+                task_chars: task.chars().count(),
+                status: "queued".into(),
+                tokens: 0,
+                duration_ms: 0,
+                started_at: now_ms(),
+                finished_at: None,
+            });
         }
 
         // 子会话：独立会话文件（工作区继承——全局 workspace_root 本来就是共享的）
@@ -201,7 +352,6 @@ impl SubagentDispatcher {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(child.clone(), child_depth);
-        let dispatch_id = uuid::Uuid::new_v4().simple().to_string();
         running_slot().lock().unwrap_or_else(|e| e.into_inner()).insert(
             dispatch_id.clone(),
             Dispatch { parent: parent.to_string(), child: child.clone(), registry: self.state.cancel.clone() },
@@ -233,11 +383,21 @@ impl SubagentDispatcher {
             // 未配置席位：三项留空 → 无头会话用激活配置（主渠道）
         }
 
-        let label = if args.label.trim().is_empty() {
-            task.chars().take(20).collect::<String>()
-        } else {
-            args.label.trim().to_string()
-        };
+        // 历史：queued → running（补上 child/model）；UI：spawned（实时条出「执行中」行）
+        history_update(&dispatch_id, |r| {
+            r.child = child.clone();
+            r.model = model.clone();
+            r.status = "running".into();
+        });
+        ui_push(json!({
+            "kind": "subagent.spawned",
+            "dispatch": dispatch_id,
+            "parent": parent,
+            "child": child,
+            "model": model,
+            "label": label,
+            "task": task_preview,
+        }));
         observability::event(
             EventType::State,
             json!({
@@ -314,7 +474,7 @@ impl SubagentDispatcher {
         )
         .await;
 
-        // 收尾：注销派发 + 成本并入父任务 + 审计
+        // 收尾：注销派发 + 成本并入父任务 + 历史终结态 + UI/审计事件
         running_slot()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -324,6 +484,22 @@ impl SubagentDispatcher {
             Err(_) => ("error".to_string(), 0, 0),
         };
         add_tokens(parent, tokens);
+        history_update(&dispatch_id, |r| {
+            r.status = status_kind.clone();
+            r.tokens = tokens;
+            r.duration_ms = ms;
+            r.finished_at = Some(now_ms());
+        });
+        ui_push(json!({
+            "kind": "subagent.done",
+            "dispatch": dispatch_id,
+            "parent": parent,
+            "child": child,
+            "label": label,
+            "status": status_kind,
+            "tokens": tokens,
+            "duration_ms": ms,
+        }));
         observability::event(
             EventType::State,
             json!({
@@ -349,15 +525,48 @@ impl SubagentDispatcher {
     }
 }
 
+/// GET /api/subagents — 近期派发历史（新→旧；UI 面板按 parent 会话过滤自己那份）。
+pub(super) async fn list_subagents() -> Json<Value> {
+    Json(json!({ "dispatches": recent_dispatches() }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct CancelSubagentReq {
+    dispatch: String,
+}
+
+/// POST /api/subagents/cancel — 取消一个活跃子代理（UI「取消」按钮；
+/// 级联取消整组的场景走父任务停止键，这里是单发精确取消）。
+pub(super) async fn cancel_subagent(Json(req): Json<CancelSubagentReq>) -> Json<Value> {
+    let ok = cancel_dispatch(req.dispatch.trim());
+    Json(json!({ "ok": ok }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 沾共享静态（running/history/tokens/depth 都是进程级）的测试全部串行——
+    /// 并行会互相清场/插队，断言时灵时不灵（本轮实锤：容量测试被并行测试的
+    /// clear() 打出一个偏差）。范式同 plugin::REGISTRY_TEST_LOCK。
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 清场（本文件静态跨用例共享）。
+    fn clear_all() {
+        running_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        history_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        tokens_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        depth_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
     /// 并发度核算：全局上限 + 单父任务上限都是硬闸；0 = 不许派发。
     #[test]
     fn concurrency_accounting() {
+        let _g = lock();
         // 清场（本文件静态跨用例共享）
-        running_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_all();
         let reg = Arc::new(crate::core::cancel::CancelRegistry::new());
         // 三个会话都「在跑」：注册表里有标志，取消才落得下（try_begin 即登记）
         for sid in ["c1", "c2", "c3"] {
@@ -378,26 +587,28 @@ mod tests {
         assert_eq!(running_for("p1"), 0);
         assert_eq!(running_for("p2"), 1, "别的父任务的子代理不受影响");
         assert!(reg.is_set("c1") && reg.is_set("c2") && !reg.is_set("c3"));
-        running_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_all();
     }
 
     /// token 并入：水印式增量（调用方只认自己没计过的那部分）。
     #[test]
     fn token_attribution_accumulates() {
-        tokens_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let _g = lock();
+        clear_all();
         assert_eq!(subagent_tokens("p"), 0);
         add_tokens("p", 100);
         add_tokens("p", 0); // 0 不入账
         add_tokens("p", 50);
         assert_eq!(subagent_tokens("p"), 150);
         assert_eq!(subagent_tokens("q"), 0, "父任务之间互不串");
-        tokens_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_all();
     }
 
     /// 嵌套深度：根=0，子代理=1；深度表决定「子代理不能再派」。
     #[test]
     fn depth_guard() {
-        depth_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let _g = lock();
+        clear_all();
         assert_eq!(depth_of("root"), 0);
         // 先算再锁：depth_of 也要锁同一把锁，持锁调用会自锁死
         let child_depth = depth_of("root") + 1;
@@ -406,7 +617,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert("child".into(), child_depth);
         assert_eq!(depth_of("child"), 1);
-        depth_slot().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_all();
     }
 
     /// 参数解析：task 必填，其余全缺省。
@@ -418,5 +629,118 @@ mod tests {
         assert!(a.on_approval.is_empty());
         assert_eq!(a.timeout_secs, 0);
         assert!(serde_json::from_str::<SubagentArgs>(r#"{"label":"x"}"#).is_err(), "缺 task 必须报错");
+    }
+
+    /// 历史生命周期：queued → running → 终态，同一段记录就地更新（不堆多条）。
+    #[test]
+    fn history_lifecycle_updates_in_place() {
+        let _g = lock();
+        clear_all();
+        history_push(SubagentRecord {
+            dispatch: "d1".into(),
+            parent: "p1".into(),
+            child: String::new(),
+            label: "调研".into(),
+            model: String::new(),
+            task_chars: 10,
+            status: "queued".into(),
+            tokens: 0,
+            duration_ms: 0,
+            started_at: 1000,
+            finished_at: None,
+        });
+        history_update("d1", |r| {
+            r.child = "c1".into();
+            r.model = "m1".into();
+            r.status = "running".into();
+        });
+        history_update("d1", |r| {
+            r.status = "done".into();
+            r.tokens = 4321;
+            r.duration_ms = 1500;
+            r.finished_at = Some(2500);
+        });
+        // 更新不存在的 dispatch：静默无操作（不 panic、不插队）
+        history_update("nope", |r| r.status = "x".into());
+        let all = recent_dispatches();
+        assert_eq!(all.len(), 1, "全生命周期只应有一段记录");
+        let r = &all[0];
+        assert_eq!(r.child, "c1");
+        assert_eq!(r.model, "m1");
+        assert_eq!(r.status, "done");
+        assert_eq!(r.tokens, 4321);
+        assert_eq!(r.duration_ms, 1500);
+        assert_eq!(r.finished_at, Some(2500));
+        clear_all();
+    }
+
+    /// 容量边界：超容丢最旧，新的永远在队首。
+    #[test]
+    fn history_cap_drops_oldest() {
+        let _g = lock();
+        clear_all();
+        for i in 0..HISTORY_CAP + 5 {
+            history_push(SubagentRecord {
+                dispatch: format!("d{i}"),
+                parent: "p".into(),
+                child: format!("c{i}"),
+                label: format!("L{i}"),
+                model: String::new(),
+                task_chars: 0,
+                status: "done".into(),
+                tokens: 0,
+                duration_ms: 0,
+                started_at: i as u64,
+                finished_at: Some(i as u64),
+            });
+        }
+        let all = recent_dispatches();
+        assert_eq!(all.len(), HISTORY_CAP, "超容必须截到容量");
+        assert_eq!(all[0].dispatch, format!("d{}", HISTORY_CAP + 4), "队首是最新");
+        assert_eq!(all[HISTORY_CAP - 1].dispatch, "d5", "队尾是第 6 新（前 5 条被丢）");
+        clear_all();
+    }
+
+    /// 取消：命中活跃派发（子会话取消标志置位 + 历史翻 cancelled + UI 推一条）；
+    /// 未命中（不存在/已结束）返回 false，不误伤。
+    #[test]
+    fn cancel_dispatch_precise() {
+        let _g = lock();
+        clear_all();
+        clear_all();
+        let reg = Arc::new(crate::core::cancel::CancelRegistry::new());
+        let _f = reg.try_begin("child-1").expect("占位");
+        running_slot().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            "disp-1".into(),
+            Dispatch { parent: "p1".into(), child: "child-1".into(), registry: reg.clone() },
+        );
+        history_push(SubagentRecord {
+            dispatch: "disp-1".into(),
+            parent: "p1".into(),
+            child: "child-1".into(),
+            label: "L".into(),
+            model: String::new(),
+            task_chars: 0,
+            status: "running".into(),
+            tokens: 0,
+            duration_ms: 0,
+            started_at: 1,
+            finished_at: None,
+        });
+        // UI 总线：取消要推得到（无人订阅时丢弃，这里订一条验真推了）
+        let mut rx = crate::server::ui_events::test_subscribe();
+        assert!(cancel_dispatch("disp-1"), "活跃派发应取消成功");
+        assert!(reg.is_set("child-1"), "子会话取消标志必须置位");
+        let rec = recent_dispatches().into_iter().find(|r| r.dispatch == "disp-1").expect("历史在");
+        assert_eq!(rec.status, "cancelled");
+        assert!(rec.finished_at.is_some(), "取消也要落终态时刻");
+        let ev = rx.try_recv().expect("UI 事件应推得到");
+        assert_eq!(ev["kind"], "subagent.cancelled");
+        assert_eq!(ev["dispatch"], "disp-1");
+        assert!(!cancel_dispatch("disp-1"), "重复取消返回 false");
+        assert!(!cancel_dispatch("disp-404"), "不存在的 dispatch 返回 false");
+        assert!(!reg.is_set("other"), "不相干的会话不许被误伤");
+        clear_all();
+        clear_all();
     }
 }
