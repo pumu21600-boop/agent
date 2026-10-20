@@ -223,11 +223,48 @@ async fn ensure_public_target(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 静态抓取取到的正文少到这个数（且是 HTML）→ 判定 JS 渲染骨架页，回落浏览器。
+/// 不是「页面就一定坏」——真这么小的页面浏览器也只会取回同样小的正文，多走一趟
+/// 内核的代价换「SPA 页不再直接报错」，值。
+const RENDER_FALLBACK_MIN_CHARS: usize = 200;
+
+/// 静态抓取的结果要不要回落浏览器渲染（纯函数，便于单测）：
+/// HTML 且正文薄（空或少于 RENDER_FALLBACK_MIN_CHARS）= JS 渲染骨架页。
+/// 非 HTML（JSON/纯文本/XML）再薄也不回落——那不是渲染问题。
+pub(crate) fn needs_render_fallback(is_html: bool, text_chars: usize) -> bool {
+    is_html && text_chars < RENDER_FALLBACK_MIN_CHARS
+}
+
+/// JS 渲染回退：浏览器 navigate + page_text（整页 innerText）。
+/// 浏览器插件停用/内核没起时错误原样带回——browser::command 自带能力闸人话。
+/// SSRF 闸与静态抓取同一道：浏览器本身没有内外网判别，回落前自己检。
+async fn web_fetch_rendered(url: &str, max_chars: usize) -> Result<String, String> {
+    ensure_public_target(url).await?;
+    let nav = json!({ "method": "navigate", "url": url }).to_string();
+    // navigate 自己等 Page.loadEventFired；SPA 的 load 只是骨架，再给一小段水合时间
+    crate::browser::command(&nav, 2000).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    crate::browser::command(r#"{"method":"page_text"}"#, max_chars).await
+}
+
 pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, String> {
     let v: Value = serde_json::from_str(args).map_err(|e| format!("参数解析失败: {e}"))?;
     let url = v.get("url").and_then(Value::as_str).ok_or("缺少 url 参数")?;
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("url 必须以 http:// 或 https:// 开头".to_string());
+    }
+    // render 档（2026-10-20 免打扰模式第 3 轮）：
+    //   auto（默认）= 静态抓，取不到正文（空/极少，JS 渲染骨架页）就回落浏览器渲染；
+    //   always      = 直接浏览器渲染（已知是 SPA/要登录后渲染的页面）；
+    //   never       = 只要静态抓取（旧行为；浏览器插件停用时的显式选择）。
+    let render = v
+        .get("render")
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .trim()
+        .to_lowercase();
+    if render == "always" {
+        return web_fetch_rendered(url, max_chars).await;
     }
     let client = web_client()?;
     let resp = send_with_ssrf_guard(&client, url).await?;
@@ -238,8 +275,24 @@ pub(crate) async fn web_fetch(args: &str, max_chars: usize) -> Result<String, St
     let body = read_body_capped(resp).await?;
     let is_html = body.trim_start().starts_with('<') || body.contains("<html");
     let text = if is_html { html_to_text(&body) } else { body };
+    let too_thin = needs_render_fallback(is_html, text.chars().count());
+    if render != "never" && (text.trim().is_empty() || too_thin) {
+        // 纯 JS 渲染页（SPA 骨架）：回落浏览器。回退也失败就说两句实话——
+        // 别让模型以为抓取功能坏了，指引它换路（browser 工具/让用户开插件）。
+        match web_fetch_rendered(url, max_chars).await {
+            Ok(rendered) if !rendered.trim().is_empty() => {
+                return Ok(format!("（这是 JS 渲染页面，静态抓取只拿到空骨架；以下为浏览器渲染后的正文）\n{rendered}"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(format!(
+                    "页面内容为空（纯 JS 渲染页），浏览器渲染回退失败：{e}。可换 browser 工具手动 navigate + snapshot，或让用户在 设置→插件 确认「浏览器」已开"
+                ));
+            }
+        }
+    }
     if text.trim().is_empty() {
-        return Err("页面内容为空（可能是纯 JS 渲染页，本工具不做 JS 渲染）".to_string());
+        return Err("页面内容为空（可能是纯 JS 渲染页。可传 render=auto 让浏览器渲染，或直接用 browser 工具）".to_string());
     }
     Ok(cap(&text, max_chars))
 }
@@ -628,8 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn redirect_target_joins_relative_locations() {
-        // 审计 12：Location 相对路径按当前响应 URL 绝对化；非法 Location 明确报错
+    fn redirect_target_joins_relative_locations() {        // 审计 12：Location 相对路径按当前响应 URL 绝对化；非法 Location 明确报错
         let base: reqwest::Url = "https://example.com/a/b".parse().unwrap();
         assert_eq!(redirect_target(&base, "https://elsewhere.com/x").unwrap(), "https://elsewhere.com/x");
         assert_eq!(redirect_target(&base, "c").unwrap(), "https://example.com/a/c");
@@ -663,5 +715,36 @@ mod tests {
             let a: std::net::IpAddr = ip.parse().unwrap();
             assert!(!is_private_ip(a), "{ip} 是公网地址，不该误拦");
         }
+    }
+
+    /// 渲染回退判定（2026-10-20 第 3 轮）：HTML 骨架页（空/薄）才回落浏览器；
+    /// 非 HTML 再薄也不回落（JSON/纯文本不是渲染问题）。
+    #[test]
+    fn render_fallback_decision() {
+        assert!(needs_render_fallback(true, 0), "空 HTML = 纯 JS 骨架，必回落");
+        assert!(needs_render_fallback(true, 50), "薄 HTML（< 200 字）判骨架");
+        assert!(needs_render_fallback(true, 199), "199 字仍算薄");
+        assert!(!needs_render_fallback(true, 200), "200 字整不算薄");
+        assert!(!needs_render_fallback(true, 5000), "正常页面不回落");
+        assert!(!needs_render_fallback(false, 0), "空 JSON/纯文本不回落（不是渲染问题）");
+        assert!(!needs_render_fallback(false, 10), "薄 API 响应不回落");
+    }
+
+    /// render 档位解析：auto/always/never/缺省/大小写/空白都归位；
+    /// 非法值按 auto（缺省）走——最稳的默认。
+    #[test]
+    fn render_mode_parsing() {
+        let mode = |args: &str| -> String {
+            let v: Value = serde_json::from_str(args).unwrap();
+            v.get("render")
+                .and_then(Value::as_str)
+                .unwrap_or("auto")
+                .trim()
+                .to_lowercase()
+        };
+        assert_eq!(mode(r#"{"url":"x"}"#), "auto", "缺省 auto");
+        assert_eq!(mode(r#"{"url":"x","render":"always"}"#), "always");
+        assert_eq!(mode(r#"{"url":"x","render":" NEVER "}"#), "never", "大小写与空白都要容");
+        assert_eq!(mode(r#"{"url":"x","render":"Auto"}"#), "auto");
     }
 }

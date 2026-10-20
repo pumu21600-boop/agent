@@ -708,6 +708,20 @@ pub(crate) async fn dispatch(cmd: BrowserCommand, max_chars: usize) -> Result<St
             let s = serde_json::to_string(&val).unwrap_or_else(|_| val.to_string());
             Ok(format!("求值结果: {}", truncate_str(&s, 2000)))
         }
+        BrowserCommand::PageText { .. } => {
+            // 整页正文：innerText（可见文本，不含 script/style）。与 evaluate 的区别只在
+            // 上限——走 max_chars 而不是钉死 2000（抓整篇文章/长页面用）。
+            let val = tab
+                .cdp
+                .evaluate_in_isolated_world(ISOLATED_WORLD, "document.body ? document.body.innerText : ''")
+                .await
+                .map_err(|e| BrowserError::new(ErrorCode::ExecutionError, e))?;
+            let text = val.as_str().unwrap_or("");
+            if text.trim().is_empty() {
+                return Err(BrowserError::new(ErrorCode::ExecutionError, "页面正文为空（可能还在加载或要求登录）"));
+            }
+            Ok(truncate_str(text, max_chars))
+        }
         BrowserCommand::WaitFor { .. } => wait_for(&tab, &cmd).await,
         BrowserCommand::GetDialog { .. } => {
             let dialog = tab.dialog.lock().await.clone();

@@ -106,11 +106,12 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_fetch",
-            description: "抓取一个 http/https 网页并返回去除 HTML 标签后的正文文本（不做 JS 渲染）。",
+            description: "抓取一个 http/https 网页并返回正文文本。默认 auto 档：先静态抓取（快），取不到正文（空/极少，JS 渲染的 SPA 骨架页）时自动回落浏览器渲染后再取。已知是 JS 渲染页可传 render=always 直接走浏览器；浏览器插件被停用时传 render=never 只要静态结果。",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "完整 URL，必须以 http:// 或 https:// 开头" }
+                    "url": { "type": "string", "description": "完整 URL，必须以 http:// 或 https:// 开头" },
+                    "render": { "type": "string", "enum": ["auto", "always", "never"], "description": "JS 渲染策略：auto（默认）=静态优先、空骨架回落浏览器；always=直接浏览器渲染；never=只要静态抓取" }
                 },
                 "required": ["url"]
             }),
@@ -228,7 +229,7 @@ fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "browser",
-            description: "内置浏览器（无头 Edge/Chrome，本进程直连控制）——一个工具按 method 覆盖全部动作：navigate/back/forward/reload/snapshot/click/fill/type/press/scroll/hover/select/check/drag/screenshot/get_state/element_info/evaluate/wait_for/get_dialog/handle_dialog/new_tab/close/close_browser/list/activate_tab/capabilities。定位优先级：ref（快照编号）→ text/label（语义）→ x/y（坐标）。工作流：navigate 后直接读返回的快照；点击/输入前先 snapshot 拿最新 ref；每个观察周期只做一个状态变更动作，做完再 snapshot 验证效果；ref 失效时用 text/label 或坐标兜底，别重试同一个 ref。用户可在右侧「网页」面板看到同一个浏览器（agent 页带徽章），list 查全部标签页，tab_id 可操作面板页。完整纪律：read_skill(\"browser-use\")。",
+            description: "内置浏览器（无头 Edge/Chrome，本进程直连控制）——一个工具按 method 覆盖全部动作：navigate/back/forward/reload/snapshot/click/fill/type/press/scroll/hover/select/check/drag/screenshot/get_state/element_info/evaluate/page_text/wait_for/get_dialog/handle_dialog/new_tab/close/close_browser/list/activate_tab/capabilities。定位优先级：ref（快照编号）→ text/label（语义）→ x/y（坐标）。工作流：navigate 后直接读返回的快照；点击/输入前先 snapshot 拿最新 ref；每个观察周期只做一个状态变更动作，做完再 snapshot 验证效果；ref 失效时用 text/label 或坐标兜底，别重试同一个 ref。只要整页正文（不交互）用 page_text（比 evaluate 上限宽，走 max_chars）。用户可在右侧「网页」面板看到同一个浏览器（agent 页带徽章），list 查全部标签页，tab_id 可操作面板页。完整纪律：read_skill(\"browser-use\")。",
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -25,6 +25,18 @@ function sendSSE(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
 }
 
+/** SPA 测试页（web_fetch 渲染回退 e2e 用）：静态只有空骨架，正文靠客户端 JS 水合——
+  静态抓取只能拿到 < 200 字的壳，必须回落浏览器渲染才看得到正文。 */
+const SPA_HTML = `<!doctype html><html><head><title>SPA 演示页</title></head>
+<body><div id="app">加载中…</div>
+<script>
+setTimeout(function () {
+  var app = document.getElementById('app');
+  app.textContent = '这是 JS 渲染后才出现的正文：据传 2026 年的缓存命中率已经卷到 99.6%，' +
+    '而静态抓取只能看到一个空壳。页面水合完成，innerText 可以读了。';
+}, 300);
+</script></body></html>`;
+
 /** 收尾块带 usage（真实渠道都有）：网关取 prompt_tokens 做圆环真实占用/台账。
  *  大小按请求体 JSON 长度 /3 拟真（含 tools 定义，量级与真渠道一致）。 */
 let curParsed = null; // 当前请求体（emitToolCall 拟真 usage 用；并发子代理场景下允许串扰，假数字无碍）
@@ -327,6 +339,17 @@ http
           }, 120);
         }
       });
+    } else if (req.method === 'GET' && req.url.startsWith('/spa')) {
+      // SPA 演示页：web_fetch 渲染回退的靶子（静态=空壳，JS 水合后才出正文）
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(SPA_HTML);
+    } else if (req.method === 'GET' && req.url.startsWith('/static')) {
+      // 静态演示页：正文直接在后端 HTML 里（静态抓取就该拿到，不许起浏览器）
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(
+        '<!doctype html><html><head><title>静态演示页</title></head><body><h1>静态正文标题</h1>' +
+          '<p>这是服务端直接渲染的长正文，静态抓取一次拿到，不需要浏览器。'.repeat(20) + '</p></body></html>'
+      );
     } else if (req.method === 'POST' && req.url.includes('/messages')) {
       // Anthropic Messages 协议 mock：请求按 Messages 形状解析（system 顶层 / content 块 /
       // tool_use·tool_result / input_schema），响应按官方 SSE 事件流吐出
@@ -392,9 +415,14 @@ http
         // 全历史而不是末条（OpenAI 协议的 tool 消息不顶掉 user 消息，没这问题）。
         // 只让**子代理轮**慢循环：父任务历史里也会出现乙的任务描述（工具结果回声），
         // 不设 isChildRound 守卫会把父任务也拖进循环（本轮实测踩过）。
+        // 抓取剧本：「抓取 <url>」→ web_fetch 工具调用（验静态抓取 + JS 渲染回退）。
+        // 带「只要静态」→ render=never（SPA 页也只给静态壳，不许起浏览器）
+        const fetchUrl = (lastText.match(/抓取\s*(https?:\/\/\S+)/) || [])[1];
+        const fetchNoRender = /只要静态/.test(lastText);
+        const spawnFetch = hasToolsParam && !isChildRound && toolResults.length === 0 && !!fetchUrl;
         const slowLoop = isChildRound && /慢循环/.test(JSON.stringify(msgs));
         const wantsTool =
-          hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && (/读/.test(lastText) || slowLoop);
+          hasToolsParam && !spawnTwo && !spawnThree && !spawnOne && !spawnFetch && (/读/.test(lastText) || slowLoop);
         // 思考块：无论如何都吐一段（验证 thinking_delta → reasoning_content 通道）
         const ti = startBlock({ type: 'thinking', thinking: '' });
         ev('content_block_delta', {
@@ -424,6 +452,11 @@ http
           emitToolUse('toolu_mock_a', 'subagent_spawn', { task: '读 prompts/system.md', label: '子代理甲' });
           emitToolUse('toolu_mock_b', 'subagent_spawn', { task: '慢循环读 config.toml', label: '子代理乙' });
           emitToolUse('toolu_mock_c', 'subagent_spawn', { task: '读 prompts/system.md', label: '子代理丙' });
+          endWithToolUse();
+        } else if (spawnFetch) {
+          // 抓取剧本：web_fetch 打 SPA 页——静态只能拿到空壳，auto 档应回落浏览器渲染；
+          // 带「只要静态」走 render=never（只给壳、不起浏览器）
+          emitToolUse('toolu_fetch_1', 'web_fetch', fetchNoRender ? { url: fetchUrl, render: 'never' } : { url: fetchUrl });
           endWithToolUse();
         } else if (spawnTwo) {
           // 一轮两个派发：甲读文件秒完，乙慢循环（1.5s/步）——并行组 + 取消窗口

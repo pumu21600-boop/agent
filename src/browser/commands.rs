@@ -84,6 +84,7 @@ pub const ALL_METHODS: &[&str] = &[
     "get_state",
     "element_info",
     "evaluate",
+    "page_text",
     "wait_for",
     "get_dialog",
     "handle_dialog",
@@ -117,6 +118,7 @@ pub fn method_is_read_only(method: &str) -> bool {
             | "list"
             | "activate_tab"
             | "capabilities"
+            | "page_text"
     )
 }
 
@@ -273,6 +275,11 @@ pub enum BrowserCommand {    #[serde(rename = "navigate")]
     ElementInfo { x: f64, y: f64, tab_id: Option<String> },
     #[serde(rename = "evaluate")]
     Evaluate { expression: String, tab_id: Option<String> },
+    /// 整页正文（document.body.innerText，走 max_chars 上限——evaluate 的输出
+    /// 钉死 2000 字符，抓整页不够用）。web_fetch 的 JS 渲染回退与「把这个页面
+    /// 正文读出来」都走它；read-only。
+    #[serde(rename = "page_text")]
+    PageText { tab_id: Option<String> },
     #[serde(rename = "wait_for")]
     WaitFor {
         selector: Option<String>,
@@ -327,6 +334,7 @@ impl BrowserCommand {
             | BrowserCommand::GetState { tab_id }
             | BrowserCommand::ElementInfo { tab_id, .. }
             | BrowserCommand::Evaluate { tab_id, .. }
+            | BrowserCommand::PageText { tab_id }
             | BrowserCommand::WaitFor { tab_id, .. }
             | BrowserCommand::GetDialog { tab_id }
             | BrowserCommand::HandleDialog { tab_id, .. }
@@ -487,12 +495,22 @@ mod tests {
         assert!(method_is_read_only("snapshot"));
         assert!(method_is_read_only("navigate"));
         assert!(method_is_read_only("list"));
+        assert!(method_is_read_only("page_text"), "page_text 只读 innerText，不动页面");
         assert!(!method_is_read_only("click"));
         assert!(!method_is_read_only("evaluate"));
         // 表里每个方法都必须有分级（不许漏网）
         for m in ALL_METHODS {
             let _ = method_is_read_only(m);
         }
+        assert!(ALL_METHODS.contains(&"page_text"), "page_text 必须登记进 ALL_METHODS（工具 schema enum 用它）");
+    }
+
+    #[test]
+    fn parse_page_text_command() {
+        let cmd = parse(r#"{"method":"page_text"}"#).unwrap();
+        assert!(matches!(cmd, BrowserCommand::PageText { tab_id: None }));
+        let cmd = parse(r#"{"method":"page_text","tab_id":"T3"}"#).unwrap();
+        assert!(matches!(cmd, BrowserCommand::PageText { tab_id: Some(_) }));
     }
 
     #[test]
