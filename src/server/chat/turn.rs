@@ -105,10 +105,17 @@ pub(crate) fn normalize_mode(cfg: &crate::config::AgentConfig, requested: &str) 
 }
 
 /// 一轮对话的系统提示：prompts/system.md（每轮实时读盘）+ 记忆注入块
-/// （自动记忆 profile.md → 全局约定 → 项目约定，靠后优先级高）+ 项目现状摘要
-/// （新会话开场：上一条同项目会话 + 工作区未提交改动）+ 技能索引。
+/// （自动记忆 profile.md → 全局约定 → 项目约定，靠后优先级高）+ 技能索引。
 /// /api/chat 与无头会话共用同一套注入，行为对齐。
-pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> String {
+///
+/// **缓存前缀纪律**：这里出去的每个字节都必须跨轮稳定——system 是 Anthropic
+/// 三个缓存断点的第一个（system→tools→messages），system 一变，后面的 tools、
+/// messages 稳定区全部作废（断点前缀miss 是整段的，不是部分的）。「项目现状」
+/// brief 曾经放在这里末尾，结果新会话第 2 轮 system 比第 1 轮短一截 →
+/// system+tools 全段重写（e2e 实测第 2 轮命中 21%，第 3 轮起才回 99%）——
+/// 2026-10-20 起 brief 改并进首条 user 消息（见 `inject_brief_into_first_user`），
+/// 它只属于 messages 区（区小、且本就带尾部断点）。
+pub(crate) async fn turn_system_prompt(state: &AppState) -> String {
     let prompt = read_system_prompt(state);
     let memory_md = state
         .memory
@@ -119,7 +126,7 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
     // 不再满磁盘 dir 猜位置（真机踩过：shell 工具描述写「项目根」，模型把用户说的
     // 工作区理解成了应用仓库，白搜 6 轮目录才找对文件）
     //
-    // 2026-10-05 再补一句「改名 = 改建显示名」：用户说「把工作区名改成 X」时，模型
+    // 2026-10-05 再补一句「改名 = 改建显示名」：用户说「把工作区/项目的名字改成 X」时，模型
     // 因为没有现成入口，去 dir 桌面、翻 .agent、读应用源码找接口，白花十几步（真机
     // 实锤）。入口本来就在 settings 工具里，这里点名，别让模型再当侦探。
     let workspace_hint = format!(
@@ -129,34 +136,58 @@ pub(crate) async fn turn_system_prompt(state: &AppState, session_id: &str) -> St
          别去动目录名，也别翻应用源码找接口。\n",
         crate::tools::workspace_root().display()
     );
-    let project_brief = {
-        let is_new = state
-            .session
-            .get(session_id)
-            .map(|f| f.messages.is_empty())
-            .unwrap_or(true);
-        if is_new {
-            let ws = crate::tools::workspace_root().to_path_buf();
-            let stats = tokio::task::spawn_blocking(move || {
-                let head = crate::recovery::head_id(&ws).ok().flatten()?;
-                crate::recovery::diff_stat(&ws, &head).ok()
-            })
-            .await
-            .ok()
-            .flatten();
-            state.session.project_brief(session_id, stats).unwrap_or_default()
-        } else {
-            String::new()
-        }
-    };
-    // 顺序即缓存前缀：project_brief **只在新会话第一轮出现**（is_new），且内容带
-    // 工作区 git diff stat（每轮可能变）——放在系统提示最末尾，第一轮之后整个
-    // system 逐字节稳定，提示缓存前缀不会被打断（对齐 ZCode「动态内容沉尾」）。
-    // 若放在中段，它一出现/消失就把后面的技能索引、UI 索引、自律纪律全移位。
     let skills_index = crate::skills::index_prompt();
     let ui_index = crate::plugin::ui::index_prompt();
     let selfop = selfop_policy(state);
-    format!("{prompt}{memory_md}{workspace_hint}{skills_index}{ui_index}{selfop}{project_brief}")
+    format!("{prompt}{memory_md}{workspace_hint}{skills_index}{ui_index}{selfop}")
+}
+
+/// 新会话第一轮的「项目现状」brief（上一条同项目会话 + 工作区未提交改动）。
+/// 非新会话返回空串。**不并进系统提示**（会打破 system 缓存前缀，见
+/// `turn_system_prompt` 的纪律注释），由调用方并进首条 user 消息。
+pub(crate) async fn first_turn_brief(state: &AppState, session_id: &str) -> String {
+    let is_new = state
+        .session
+        .get(session_id)
+        .map(|f| f.messages.is_empty())
+        .unwrap_or(true);
+    if !is_new {
+        return String::new();
+    }
+    let ws = crate::tools::workspace_root().to_path_buf();
+    let stats = tokio::task::spawn_blocking(move || {
+        let head = crate::recovery::head_id(&ws).ok().flatten()?;
+        crate::recovery::diff_stat(&ws, &head).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    state.session.project_brief(session_id, stats).unwrap_or_default()
+}
+
+/// 把 brief 并进**首条 user 消息**（纯函数，单测覆盖）。
+/// 为什么在 messages 而不是 system：brief 只出现在新会话第一轮，放进系统提示
+/// 会让第一轮之后 system 逐字节变短——system+tools 整段稳定区第 2 轮全失效
+/// （e2e 实测：第 2 轮命中 21% vs 第 3 轮起 99%；真实 Anthropic 语义下更狠，
+/// 三个断点全部 miss、整单重写）。并进首条 user 消息后 system 从第一轮起就
+/// 逐字节稳定，brief 随 messages 区走（区小，且本就带尾部断点）。
+pub(crate) fn inject_brief_into_first_user(messages: &mut [Value], brief: &str) {
+    if brief.trim().is_empty() {
+        return;
+    }
+    let Some(first) = messages
+        .iter_mut()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return;
+    };
+    match &mut first["content"] {
+        Value::String(s) => *s = format!("{s}\n\n{brief}"),
+        // 数组形态（多模态）：追加一个 text part（不动图片/音频等原生 part）；
+        // 它成为末块也无妨——text 块可缓存，断点照打
+        Value::Array(parts) => parts.push(json!({ "type": "text", "text": brief })),
+        _ => {}
+    }
 }
 
 /// 自我管理与探索纪律（2026-10-03 用户拍板，与 core/rules 的红线/闸门同一套语义）：
@@ -319,6 +350,71 @@ pub(crate) fn ensure_attachments_ignored(ws: &std::path::Path) {
             EventType::State,
             json!({ "kind": "attachments.gitignored", "path": gi.display().to_string() }),
         );
+    }
+}
+
+#[cfg(test)]
+mod brief_injection_tests {
+    use super::*;
+
+    #[test]
+    fn empty_brief_is_noop() {
+        let mut msgs = json!([{"role":"user","content":"问"}]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "");
+        inject_brief_into_first_user(&mut msgs, "   \n  ");
+        assert_eq!(msgs[0]["content"], json!("问"), "空 brief 不许碰消息");
+    }
+
+    #[test]
+    fn string_content_appends_brief() {
+        let mut msgs = json!([{"role":"user","content":"问"}]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "【项目现状】git 干净");
+        assert_eq!(msgs[0]["content"], json!("问\n\n【项目现状】git 干净"));
+    }
+
+    #[test]
+    fn array_content_appends_text_part() {
+        // 多模态数组形态：追加 text part，图片/音频等原生 part 一个不动
+        let mut msgs = json!([{"role":"user","content":[
+            {"type":"text","text":"看图"},
+            {"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}}
+        ]}]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "【项目现状】有改动");
+        let parts = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1]["type"], json!("image_url"), "原生 part 不许被动");
+        assert_eq!(parts[2], json!({"type":"text","text":"【项目现状】有改动"}));
+    }
+
+    #[test]
+    fn only_first_user_message_touched() {
+        // 只并进**首条** user：后面的历史消息一个字不许改
+        let mut msgs = json!([
+            {"role":"system","content":"系统"},
+            {"role":"user","content":"第一问"},
+            {"role":"assistant","content":"第一答"},
+            {"role":"user","content":"第二问"}
+        ]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "B");
+        assert_eq!(msgs[1]["content"], json!("第一问\n\nB"));
+        assert_eq!(msgs[2]["content"], json!("第一答"));
+        assert_eq!(msgs[3]["content"], json!("第二问"), "后续 user 消息不沾");
+    }
+
+    #[test]
+    fn no_user_message_is_noop() {
+        // 全是 assistant/system（异常历史）：不崩、不动
+        let mut msgs = json!([{"role":"assistant","content":"答"}]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "B");
+        assert_eq!(msgs[0]["content"], json!("答"));
+    }
+
+    #[test]
+    fn null_content_message_is_skipped_gracefully() {
+        // content 是 null（异常形态）：不该 panic，落到 _ 分支原样不动
+        let mut msgs = json!([{"role":"user","content":null}]).as_array().cloned().unwrap();
+        inject_brief_into_first_user(&mut msgs, "B");
+        assert_eq!(msgs[0]["content"], json!(null));
     }
 }
 

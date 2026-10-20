@@ -31,6 +31,51 @@ let curParsed = null; // 当前请求体（emitToolCall 拟真 usage 用；并�
 function usageOf(parsed) {
   return { prompt_tokens: Math.max(1, Math.round(JSON.stringify(parsed || curParsed || {}).length / 3)), completion_tokens: 41 };
 }
+
+// —— Anthropic 提示缓存拟真（2026-10-20 缓存命中率 e2e 冒烟用）——
+// 真 Anthropic 语义 = 「最长已缓存前缀命中」：新请求与某条历史请求归一化后
+// 逐字符相同的前缀算 cache_read，只对新增尾部计新鲜 input。归一化规则对齐
+// 真渠道：string content ≡ [{type:text,text}]（网关只给末条消息挂断点，上一轮
+// 末条到下轮会解包回字符串，两种形态是同一内容）；cache_control 是缓存元数据，
+// 不计入内容比较。前缀被打断（工具顺序变/动态内容前移）→ 命中率当场掉。
+const anthropicCacheHistory = [];
+function normalizeForCache(parsed) {
+  const c = JSON.parse(JSON.stringify(parsed));
+  const strip = (blocks) => {
+    if (Array.isArray(blocks)) for (const b of blocks) delete b.cache_control;
+  };
+  strip(c.system);
+  strip(c.tools);
+  for (const m of c.messages || []) {
+    if (typeof m.content === 'string') m.content = [{ type: 'text', text: m.content }];
+    strip(m.content);
+  }
+  // 按 Anthropic 的**前缀顺序**重组再比：system → tools → messages。
+  // 请求 JSON 的键序把易变的 messages 排在最前（max_tokens/messages/model/stream/
+  // system/tools），字符级 LCP 会在对话追加点提前断掉——必须按语义前缀序比。
+  // model/max_tokens/stream 不参与前缀比较（不是被缓存的前缀内容）。
+  return JSON.stringify({ system: c.system ?? null, tools: c.tools ?? null, messages: c.messages ?? [] });
+}
+function longestCachedPrefix(cur) {
+  let best = 0;
+  for (const prev of anthropicCacheHistory) {
+    const max = Math.min(prev.length, cur.length);
+    let i = 0;
+    while (i < max && prev[i] === cur[i]) i++;
+    if (i > best) best = i;
+  }
+  return best;
+}
+/** Anthropic 口径 usage：input_tokens 不含 cache_read；cached = 命中前缀。 */
+function anthropicCacheUsage(parsed) {
+  const norm = normalizeForCache(parsed);
+  const lcp = longestCachedPrefix(norm);
+  anthropicCacheHistory.push(norm);
+  if (anthropicCacheHistory.length > 64) anthropicCacheHistory.shift();
+  const total = Math.max(1, Math.round(norm.length / 3));
+  const cached = Math.min(total, Math.round(lcp / 3));
+  return { input_tokens: total - cached, cache_read_input_tokens: cached };
+}
 function finishWithUsage(res, parsed) {
   sendSSE(res, {
     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
@@ -293,6 +338,13 @@ http
       req.on('end', () => {
         console.log('[mock-anthropic] request body:', body);
         const parsed = JSON.parse(body);
+        // 提示缓存拟真：按最长已缓存前缀报 cache_read（首轮无历史=全新鲜）
+        const cacheUsage = anthropicCacheUsage(parsed);
+        const bpCount = JSON.stringify(parsed).match(/"cache_control"/g)?.length || 0;
+        console.log(
+          `[mock-anthropic] cache: breakpoints=${bpCount} total=${cacheUsage.input_tokens + cacheUsage.cache_read_input_tokens} ` +
+            `read=${cacheUsage.cache_read_input_tokens} fresh=${cacheUsage.input_tokens}`
+        );
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
         const ev = (name, obj) => res.write(`event: ${name}\ndata: ${JSON.stringify(obj)}\n\n`);
         let blockIdx = -1;
@@ -304,7 +356,13 @@ http
         const stopBlock = () => ev('content_block_stop', { type: 'content_block_stop', index: blockIdx });
         ev('message_start', {
           type: 'message_start',
-          message: { usage: { input_tokens: 42, cache_read_input_tokens: 8 } },
+          message: {
+            usage: {
+              input_tokens: cacheUsage.input_tokens,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: cacheUsage.cache_read_input_tokens,
+            },
+          },
         });
         const msgs = parsed.messages || [];
         const blockText = (m) =>

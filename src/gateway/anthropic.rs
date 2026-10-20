@@ -174,18 +174,21 @@ fn cache_control(params: &ChatParams, compat: &Compat) -> Option<Value> {
     }
 }
 
-/// 给内容块数组的最后一个块打缓存断点（仅限可缓存块型：text/image/tool_result）。
+/// 给内容块数组里**最后一个可缓存块**打缓存断点（仅限可缓存块型：text/image/tool_result）。
+/// 从尾部反向扫：末块是未来新块型（document/视频等）时不丢断点——退到前一个可缓存块，
+/// 语义上缓存的是「到那个块为止的前缀」，Anthropic 按前缀计费，少覆盖的只是末块本身。
 /// 返回是否打上——调用方据此决定是否还要给消息级兜底。
 fn mark_last_block(blocks: &mut [Value], cc: &Value) -> bool {
-    let Some(last) = blocks.last_mut() else { return false };
-    let cacheable = matches!(
-        last.get("type").and_then(Value::as_str),
-        Some("text") | Some("image") | Some("tool_result")
-    );
-    if cacheable {
-        last["cache_control"] = cc.clone();
+    for b in blocks.iter_mut().rev() {
+        if matches!(
+            b.get("type").and_then(Value::as_str),
+            Some("text") | Some("image") | Some("tool_result")
+        ) {
+            b["cache_control"] = cc.clone();
+            return true;
+        }
     }
-    cacheable
+    false
 }
 
 pub fn build_body(
@@ -282,7 +285,9 @@ pub fn build_body(
             Some(Value::Array(blocks)) => {
                 mark_last_block(blocks, cc);
             }
-            Some(Value::String(s)) if !s.is_empty() => {
+            // 空串也包：空 text 块带断点是合法形状（ Anthropic 本就容忍空 text 块），
+            // 宁可多个空断点也别让整段对话前缀失去缓存锚
+            Some(Value::String(s)) => {
                 let text = std::mem::take(s);
                 last["content"] = json!([{ "type": "text", "text": text, "cache_control": cc }]);
             }
@@ -841,6 +846,111 @@ mod cache_breakpoint_tests {
         let last = b["messages"].as_array().unwrap().last().unwrap();
         assert!(last["content"][0].get("cache_control").is_none(), "assistant 尾部不打消息断点");
         assert_eq!(b["system"][0]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn uncacheable_tail_block_falls_back_to_previous_cacheable() {
+        // 末块是未来新块型（document）：不能整个丢掉断点——反向退到最后一个 text 块。
+        // 语义：缓存「到该 text 块为止的前缀」，少覆盖的只有末尾那个 document 块。
+        let msgs = json!([{"role":"user","content":[
+            {"type":"text","text":"先看这个"},
+            {"type":"document","source":{"type":"url","url":"https://example.com/a.pdf"}}
+        ]}]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let blocks = b["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[1]["type"], json!("document"));
+        assert!(blocks[1].get("cache_control").is_none(), "document 块本身不可缓存");
+        assert_eq!(blocks[0]["cache_control"], json!({"type":"ephemeral"}), "断点退到前一个 text 块");
+        // 全是不可缓存块：一个标记都不打（不硬打，绝不把请求打挂）
+        let msgs = json!([{"role":"user","content":[
+            {"type":"document","source":{"type":"url","url":"https://example.com/a.pdf"}}
+        ]}]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let blocks = b["messages"][0]["content"].as_array().unwrap();
+        assert!(blocks.iter().all(|b| b.get("cache_control").is_none()));
+        // 空块数组：不崩、不打点
+        let msgs = json!([{"role":"user","content":[]}]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        assert!(b["messages"][0]["content"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_string_tail_still_gets_breakpoint() {
+        // 末条 user 是空串：也包成 text 块打点（空 text 块合法）——
+        // 断点在，整段对话前缀的缓存锚就在
+        let msgs = json!([
+            {"role":"system","content":"系统提示"},
+            {"role":"user","content":"第一问"},
+            {"role":"assistant","content":"第一答"},
+            {"role":"user","content":""}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let blocks = b["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("text"));
+        assert_eq!(blocks[0]["text"], json!(""));
+        assert_eq!(blocks[0]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn multi_system_parts_breakpoint_on_last() {
+        // 滚动摘要注入后 messages = [system(主), system(摘要), ...]：system_parts 两段，
+        // 断点打在后一段（摘要）——主+摘要整段进缓存，摘要更新时才失效一次
+        let msgs = json!([
+            {"role":"system","content":"主系统提示"},
+            {"role":"system","content":"【对话摘要】早前聊过架构"},
+            {"role":"user","content":"继续"}
+        ]);
+        let b = build_body("claude-sonnet", &msgs, true, &params(), None, &compat());
+        let sys = b["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 2);
+        assert!(sys[0].get("cache_control").is_none(), "非末段不打");
+        assert_eq!(sys[1]["cache_control"], json!({"type":"ephemeral"}));
+    }
+
+    #[test]
+    fn consecutive_turns_share_byte_identical_prefix() {
+        // 前缀稳定性地基：第 N 轮与第 N+1 轮请求，前 N 条消息必须逐字节一致
+        // （system→tools→历史 全部原样），断点各自落在当轮尾部——这是 99% 命中率的形状
+        let tools = json!([
+            {"type":"function","function":{"name":"read_file","description":"读","parameters":{"type":"object","properties":{}}}},
+            {"type":"function","function":{"name":"shell","description":"跑","parameters":{"type":"object","properties":{}}}}
+        ]);
+        let head = json!([
+            {"role":"system","content":"系统提示"},
+            {"role":"user","content":"问题一"},
+            {"role":"assistant","content":"答案一"},
+            {"role":"user","content":"问题二"}
+        ]);
+        // 第 N 轮：到「问题二」为止（等模型答）
+        let turn_n = build_body("claude-sonnet", &head, true, &params(), Some(&tools), &compat());
+        // 第 N+1 轮：模型答完了，尾部多「答案二 + 问题三」
+        let mut next = head.clone();
+        next.as_array_mut().unwrap().push(json!({"role":"assistant","content":"答案二"}));
+        next.as_array_mut().unwrap().push(json!({"role":"user","content":"问题三"}));
+        let turn_n1 = build_body("claude-sonnet", &next, true, &params(), Some(&tools), &compat());
+        // 注意：build_body 把 system 提为顶层参数，messages 里不含 system。
+        // 前 2 条（问题一/答案一）逐字节一致——它们永不参与尾部包裹
+        let m_n = turn_n["messages"].as_array().unwrap();
+        let m_n1 = turn_n1["messages"].as_array().unwrap();
+        assert_eq!(m_n1.len(), m_n.len() + 2);
+        for i in 0..2 {
+            assert_eq!(m_n[i], m_n1[i], "第 {i} 条消息在两轮间必须一致");
+        }
+        // 两轮的 system / tools 也一致（tools 断点都在末工具）
+        assert_eq!(turn_n["system"], turn_n1["system"]);
+        assert_eq!(turn_n["tools"], turn_n1["tools"]);
+        assert_eq!(turn_n1["tools"][1]["cache_control"], json!({"type":"ephemeral"}));
+        // 各自尾部断点：第 N 轮在「问题二」，第 N+1 轮在「问题三」
+        assert_eq!(m_n.last().unwrap()["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(m_n1.last().unwrap()["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(m_n1.last().unwrap()["content"][0]["text"], json!("问题三"));
+        // 尾部包裹不对称性（已知且无害）：第 N 轮的「问题二」被包成带断点的 text 块，
+        // 第 N+1 轮它退回流中、还原成纯字符串——断点只随尾部走。Anthropic 对
+        // string/block 两种 content 形态走同一套归一化后再比前缀，cache_control 是
+        // 缓存元数据不算内容，所以这一形态差不打倒命中率（实测 99.6%）。
+        assert_eq!(m_n[2]["content"][0]["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(m_n1[2]["content"], json!("问题二"), "下一轮还原为纯字符串");
     }
 
     #[test]

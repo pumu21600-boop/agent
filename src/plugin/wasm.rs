@@ -340,6 +340,9 @@ pub fn load_inline(stem: &str, bytes: &[u8]) -> Result<(), String> {
     // 调用方已查重；这里再 retain 一次保证幂等
     reg.retain(|e| e.stem != stem);
     reg.push(entry);
+    // 保持注册表 stem 名字序（tool_definitions 也排，这里双保险）——
+    // 乱序会让 tools 定义数组变形，打翻 Anthropic 的 system→tools 缓存前缀
+    reg.sort_by(|a, b| a.stem.cmp(&b.stem));
     Ok(())
 }
 
@@ -521,11 +524,16 @@ pub fn risk_for(full_name: &str) -> Option<u8> {
 }
 
 /// 已加载插件的 OpenAI function 定义（停用的不下发 = 拒新调用的第一道）。
+/// **顺序确定**（缓存前缀地基，同 MCP 侧）：注册表顺序可能被 load_inline 追加 /
+/// rescan 局部替换打乱，而 tools 数组是 Anthropic 协议里 system 之后、messages
+/// 之前的稳定区——顺序一变整个前缀作废、缓存全丢。下发前按 stem 名字序排一遍。
 pub fn tool_definitions() -> Vec<Value> {
     let reg = registry().read().unwrap_or_else(|e| e.into_inner());
     let dis = disabled();
+    let mut entries: Vec<&PluginEntry> = reg.iter().collect();
+    entries.sort_by(|a, b| a.stem.cmp(&b.stem));
     let mut out = Vec::new();
-    for e in reg.iter() {
+    for e in entries {
         if e.load_error.is_some() || dis.iter().any(|d| d == &e.stem) {
             continue;
         }
@@ -747,7 +755,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 2026-10-08 修：StoreLimits 内存闸。插件 grow 超过 64MB 时按 spec 返回 -1
+    /// 工具定义顺序必须确定（缓存前缀地基，与 MCP 侧同规）：注册表被直接塞进
+    /// 乱序条目（真实路径 scan_and_load 虽排序，但 inline/draft 装载与 rescan
+    /// 都可能打乱），下发的定义仍必须按 stem 名字序——顺序一变，Anthropic 协议里
+    /// system→tools 的整个稳定区前缀作废、缓存全丢。
+    #[test]
+    fn tool_definitions_sorted_by_stem() {
+        let _g = lock();
+        set_disabled(&[]);
+        let mk = |stem: &str| {
+            PluginEntry::new(
+                stem,
+                std::env::temp_dir().join(format!("{stem}.wasm")),
+                vec![("echo".to_string(), "d".to_string(), json!({"type":"object"}))],
+                None,
+            )
+        };
+        {
+            let mut reg = registry().write().unwrap_or_else(|e| e.into_inner());
+            reg.clear();
+            // 故意乱序 + 一个加载失败的（必须被过滤，排序不能把过滤规则绕掉）
+            reg.push(mk("zeta"));
+            reg.push(mk("alpha"));
+            reg.push(mk("mid"));
+            let mut broken = mk("broken");
+            broken.load_error = Some("炸了".into());
+            reg.push(broken);
+        }
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .map(|d| d.pointer("/function/name").and_then(Value::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["wasm__alpha__echo", "wasm__mid__echo", "wasm__zeta__echo"],
+            "按插件名序下发，加载失败的被过滤"
+        );
+        {
+            let mut reg = registry().write().unwrap_or_else(|e| e.into_inner());
+            reg.clear();
+        }
+    }
     /// （不 trap 不崩——实测；燃料/epoch 在本平台会炸进程，见常量区注释故不设）。
     /// 直接走 with_instance 验证限额接线，不经插件注册表。
     #[test]

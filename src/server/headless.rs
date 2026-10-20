@@ -10,7 +10,7 @@
 //! 只有 ask() 按无人值守策略自动决定（默认拒绝，显式 approve 才放行）。
 
 use super::*;
-use super::chat::{CancelRun, assemble_turn_channels, normalize_mode, turn_system_prompt};
+use super::chat::{CancelRun, assemble_turn_channels, first_turn_brief, inject_brief_into_first_user, normalize_mode, turn_system_prompt};
 use super::gate::ChatGate;
 use super::subagent;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -276,7 +276,11 @@ pub(crate) async fn run_headless_inner(
         .unwrap_or_default();
     history.push(json!({ "role": "user", "content": message }));
     let mut prior_summary = state.session.get(&session_id).and_then(|f| f.summary);
-    let system_prompt = turn_system_prompt(&state, &session_id).await;
+    let system_prompt = turn_system_prompt(&state).await;
+    // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀，
+    // 与 /api/chat 同一路径——见 turn.rs 的 inject_brief_into_first_user 纪律注释）
+    let brief = first_turn_brief(&state, &session_id).await;
+    inject_brief_into_first_user(&mut history, &brief);
     let ch = assemble_turn_channels(&state, &s, &active_cfg, &req.model, &req.base_url, &req.api_key);
 
     let mut notices = ch.notices.clone();

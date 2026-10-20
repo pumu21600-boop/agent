@@ -371,13 +371,19 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 先把会话 id 告诉前端（新建时它还不知道）
         send(json!({ "session": session_id }));
 
-        // 系统约定 + 双层 AGENTS.md + 项目现状摘要 + 技能索引（与无头会话同一组装路径）
-        let system_prompt = turn_system_prompt(&state, &session_id).await;
+        // 系统约定 + 双层 AGENTS.md + 技能索引（与无头会话同一组装路径）。
+        // **不含**「项目现状」brief——它只在新会话第一轮出现，放进系统提示会让
+        // 第 2 轮 system 变短、system+tools 稳定区缓存全失效（e2e 实测第 2 轮
+        // 命中 21%）；改并进首条 user 消息，随 messages 区走（turn.rs 有完整纪律注释）。
+        let system_prompt = turn_system_prompt(&state).await;
 
         // 多模态媒体理解流水线：感知媒体附件与视觉/视频/音频解析能力
         let mut history = history;
         // 025：续跑一轮时摘要可能被上一轮更新（见收尾处的重新赋值）
         let mut prior_summary = prior_summary;
+        // 新会话第一轮：项目现状 brief 并进首条 user 消息（不进系统提示，保缓存前缀）
+        let brief = first_turn_brief(&state, &session_id).await;
+        inject_brief_into_first_user(&mut history, &brief);
         if !attachments.is_empty() {
             // features.roles=false（「功能桥接」关）= 不走专家渠道，媒体附件统一占位文本
             let roles = if s.features.roles { s.roles.as_ref() } else { None };
