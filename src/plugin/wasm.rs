@@ -828,25 +828,48 @@ mod tests {
 
     /// 并发闸不泄滞：超过 WASM_MAX_CONCURRENT 的并发调用应全部正常完成
     /// （许可 acquire/释放配对；漏释放会在这里挂死）。
+    ///
+    /// 注册表是进程级静态，并发段期间必须不被别的测试清场，否则 `call_tool` 会
+    /// 「未知插件: echo」。锁不能跨 await（`MutexGuard` 不是 Send），所以这里
+    /// 把 guard 交给一个常驻同步任务持有，await 全程不碰它。
     #[tokio::test]
     async fn concurrent_calls_all_complete_without_deadlock() {
-        let _g = lock();
         let dir = std::env::temp_dir().join(format!("agent-wasm-conc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
-        assert_eq!(scan_and_load(&dir), 1);
+
+        // 同步段：持锁装插件（guard 在此作用域结束即 drop）
+        {
+            let _g = lock();
+            assert_eq!(scan_and_load(&dir), 1);
+        }
+
+        // 并发段：锁由同步任务持有到本测试结束（await 不碰 guard，满足 Send）
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _g = crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = hold_rx.recv();
+        });
+
         let mut handles = Vec::new();
         for _ in 0..WASM_MAX_CONCURRENT * 3 {
             handles.push(tokio::spawn(async {
                 tokio::time::timeout(std::time::Duration::from_secs(20), call_tool("wasm__echo__echo", r#"{"x":1}"#)).await
             }));
         }
+        let mut all_ok = true;
         for h in handles {
             let r = h.await.unwrap().expect("并发调用超时（许可泄漏？）");
-            assert!(r.is_ok(), "并发调用应成功: {:?}", r.err());
+            if r.is_err() {
+                all_ok = false;
+                eprintln!("并发调用失败: {:?}", r.err());
+            }
         }
+        let _ = hold_tx.send(());
+        holder.join().expect("持锁线程异常");
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(all_ok, "并发调用应全部成功");
     }
 }
 

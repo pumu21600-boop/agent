@@ -450,7 +450,7 @@ pub fn set_config_key_at(path: &std::path::Path, key: &str, value: &serde_json::
     let item = match &value {
         serde_json::Value::Null => toml_edit::Item::None,
         serde_json::Value::String(s) => toml_edit::value(s.clone()),
-        serde_json::Value::Bool(b) => toml_edit::value(b.clone()),
+        serde_json::Value::Bool(b) => toml_edit::value(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 toml_edit::value(i)
@@ -511,7 +511,7 @@ fn coerce_to_existing(
     let mut cur: &toml_edit::Table = doc.as_table();
     let segs: Vec<&str> = key.split('.').collect();
     for (i, seg) in segs.iter().enumerate() {
-        let Some(item) = cur.get(*seg) else {
+        let Some(item) = cur.get(seg) else {
             return Ok(value.clone());
         };
         if i + 1 == segs.len() {

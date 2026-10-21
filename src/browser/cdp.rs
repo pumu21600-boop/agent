@@ -45,6 +45,11 @@ pub struct Cdp {
     alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// CDP 回包等待表（call id → 回包投递口；actor 专用）。
+type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
+/// CDP 事件等待器（token → 方法名 + 投递口；注册序即触发序）。
+type WaiterList = Vec<(u64, String, oneshot::Sender<Result<Value, String>>)>;
+
 impl Cdp {
     /// 连接页面级 CDP 端点并起 actor。
     pub async fn connect(ws_url: &str) -> Result<Self, String> {
@@ -60,17 +65,12 @@ impl Cdp {
 
         tokio::spawn(async move {
             let mut next_id: u64 = 1;
-            let mut pending: std::collections::HashMap<u64, oneshot::Sender<Result<Value, String>>> =
-                std::collections::HashMap::new();
+            let mut pending: PendingMap = PendingMap::new();
             // 事件等待器：注册顺序即触发顺序（同页面同方法极少并发等待）。
             // token 用于精确摘除（UnwaitEvent），避免误摘别人的等待器。
-            let mut waiters: Vec<(u64, String, oneshot::Sender<Result<Value, String>>)> = Vec::new();
+            let mut waiters: WaiterList = Vec::new();
 
-            let die = |pending: &mut std::collections::HashMap<
-                u64,
-                oneshot::Sender<Result<Value, String>>,
-            >,
-                      waiters: &mut Vec<(u64, String, oneshot::Sender<Result<Value, String>>)>| {
+            let die = |pending: &mut PendingMap, waiters: &mut WaiterList| {
                 alive_in_actor.store(false, std::sync::atomic::Ordering::Relaxed);
                 for (_, slot) in pending.drain() {
                     let _ = slot.send(Err("CDP 连接已断开（浏览器退出或标签页崩溃）".to_string()));

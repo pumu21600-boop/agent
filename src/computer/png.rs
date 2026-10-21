@@ -141,7 +141,7 @@ mod tests {
     fn downscale_halves_dimensions() {
         // 4×2 BGRA → 上限 2 宽 → 2×1，取最近邻（左上角像素）
         let mut bgra = vec![0u8; 16];
-        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.copy_from_slice(&[i as u8, 100, 200, 255]);
         }
         let (w, h, out) = downscale_bgra(&bgra, 4, 2, 16, 2).expect("该降");

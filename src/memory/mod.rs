@@ -420,9 +420,7 @@ impl Memory {
             _ => self.ws.join("AGENTS.md"),
         };
         std::fs::read_to_string(path).unwrap_or_else(|_| {
-            if scope == "global" {
-                String::new()
-            } else if scope == "profile" {
+            if matches!(scope, "global" | "profile") {
                 String::new()
             } else {
                 AGENTS_TEMPLATE.to_string()
@@ -493,7 +491,7 @@ pub fn sanitize(text: &str) -> String {
             && chars[i..i + p.len()]
                 .iter()
                 .zip(p.iter())
-                .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
     };
     let mut i = 0usize;
     while i < n {

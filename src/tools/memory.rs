@@ -250,15 +250,14 @@ pub(crate) async fn run(args: &str) -> Result<String, String> {
             };
             // 隐私闸（§7）：含敏感信息的候选直接丢弃不记——先判断再决定记不记。
             // merge 不动正文（只 hits+1），不过检
-            if matches!(op.as_str(), "add" | "replace") {
-                if let Some(t) = field("text") {
-                    if let Some(why) = crate::memory::profile::looks_sensitive(&t) {
-                        return Err(format!(
-                            "这条像含敏感信息（{why}），没记。把具体值去掉再叫我记；\
-                             确实要留的你自己到 设置→记忆→自动记忆 里手动加。"
-                        ));
-                    }
-                }
+            if matches!(op.as_str(), "add" | "replace")
+                && let Some(t) = field("text")
+                && let Some(why) = crate::memory::profile::looks_sensitive(&t)
+            {
+                return Err(format!(
+                    "这条像含敏感信息（{why}），没记。把具体值去掉再叫我记；\
+                     确实要留的你自己到 设置→记忆→自动记忆 里手动加。"
+                ));
             }
             let result = match op.as_str() {
                 // 加一条：T1 偏好一次就够；T2 首记教训落「观察中」

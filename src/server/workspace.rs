@@ -628,7 +628,7 @@ mod tests {
             Some("nosniff")
         );
         // 非 SVG：nosniff 照带（禁 MIME 嗅探），但不加 CSP（不影响 PDF/音视频内嵌渲染）
-        std::fs::write(dir.join("y.png"), &[0x89, 0x50, 0x4e, 0x47]).ok();
+        std::fs::write(dir.join("y.png"), [0x89, 0x50, 0x4e, 0x47]).ok();
         let mut p2 = std::collections::HashMap::new();
         p2.insert("path".to_string(), ".p8-test-raw/y.png".to_string());
         let resp2 = read_workspace_raw(Query(p2)).await.unwrap();

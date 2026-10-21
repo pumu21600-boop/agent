@@ -275,10 +275,10 @@ impl Profile {
                 cur = None;
                 continue;
             }
-            if let Some(s) = cur {
-                if let Some(e) = parse_entry_line(line) {
-                    out.push((s, e));
-                }
+            if let Some(s) = cur
+                && let Some(e) = parse_entry_line(line)
+            {
+                out.push((s, e));
             }
         }
         out
@@ -333,10 +333,10 @@ impl Profile {
         };
         let end = block_end(&lines, start);
         for (offset, line) in lines[start + 1..end].iter().enumerate() {
-            if let Some(e) = parse_entry_line(line) {
-                if e.text == want {
-                    return Ok(start + 1 + offset);
-                }
+            if let Some(e) = parse_entry_line(line)
+                && e.text == want
+            {
+                return Ok(start + 1 + offset);
             }
         }
         Err(format!("这条不在了，可能你删了或改了：{want}"))

@@ -1038,7 +1038,7 @@ pub fn approval_scope(tool_name: &str, args: &Value, risk: RiskLevel) -> String 
 /// - "auto" (原 auto-edit / full-auto)：Safe(0) 与 Normal(1) 静默放行，仅 Dangerous(2) 需审批；
 ///   工作区外写入判 Dangerous（见 `risk_write_file`），因此在 auto 档「能动电脑但高危先问」；
 /// - "full-access" (原 local)：全免审（除非配置显式强制了 unsandboxed_approval）。
-/// 唯一「任何档位必问」是撤销检查点（见 `red_line_hold`）——档位即用户意愿，其余不强制。
+///   唯一「任何档位必问」是撤销检查点（见 `red_line_hold`）——档位即用户意愿，其余不强制。
 pub fn should_ask_approval(mode: &str, risk: RiskLevel) -> bool {
     match mode {
         "full-access" | "local" => false,
