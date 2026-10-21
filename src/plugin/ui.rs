@@ -795,14 +795,12 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["docplug", "soloplug"], "工作区覆盖内置 + 未停用者贡献");
         let ws_docplug = roots.iter().find(|(_, n)| n == "docplug").unwrap();
-        // skills_dir_of 出口刻意剥掉了 canonicalize 的 `\\?\` 前缀（给模型当脚本路径
-        // 用），所以比较时两边都剥——不然一边带前缀一边不带，永远对不上。
-        let strip = |p: &Path| -> PathBuf {
-            let s = p.as_os_str().to_string_lossy();
-            PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-        };
-        let ws_stripped = strip(&ws);
-        assert!(strip(&ws_docplug.0).starts_with(&ws_stripped), "覆盖后用工作区那份的技能目录");
+        // 「工作区那份遮蔽内置」要验的是来源目录，不是路径字符串形态：CI runner 与
+        // 本机的盘符/长短名/`\\?\` 前缀都不一样，直接比字符串必假阴性。两边都
+        // canonicalize 后比较（这才是目录同一性的判据）。
+        let norm = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let ws_norm = norm(&ws);
+        assert!(norm(&ws_docplug.0).starts_with(&ws_norm), "覆盖后用工作区那份的技能目录");
         assert!(roots.iter().all(|(p, _)| p.ends_with("skills")));
         // 停用的始终不贡献
         assert!(!roots.iter().any(|(_, n)| n == "offplug"));
