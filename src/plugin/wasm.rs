@@ -829,9 +829,10 @@ mod tests {
     /// 并发闸不泄滞：超过 WASM_MAX_CONCURRENT 的并发调用应全部正常完成
     /// （许可 acquire/释放配对；漏释放会在这里挂死）。
     ///
-    /// 注册表是进程级静态，并发段期间必须不被别的测试清场，否则 `call_tool` 会
-    /// 「未知插件: echo」。锁不能跨 await（`MutexGuard` 不是 Send），所以这里
-    /// 把 guard 交给一个常驻同步任务持有，await 全程不碰它。
+    /// 注册表是进程级静态：`scan_and_load` 整表替换，别的测试跑一次就把 echo 清掉，
+    /// 于是「未知插件: echo」。所以本测试全程持锁（装载 → 并发调用 → 收尾），
+    /// `MutexGuard` 不是 Send 不能跨 await，锁交给常驻同步线程持着，主线程只在
+    /// await 里等它发话。
     #[tokio::test]
     async fn concurrent_calls_all_complete_without_deadlock() {
         let dir = std::env::temp_dir().join(format!("agent-wasm-conc-{}", std::process::id()));
@@ -839,18 +840,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
 
-        // 并发段：装载与调用全程由持锁线程担保。`MutexGuard` 不是 Send，锁不能跨
-        // await，所以把锁交给一个常驻同步线程；必须在**它持锁期间**完成装载，并且
-        // 等它确认持锁成功后才起并发调用——否则别的测试能在这个窗口里
-        // scan_and_load 清场，run 起来就报「未知插件: echo」（2026-10-21 实锤：
-        // 单独跑必过、全量并行必红）。
+        // 持锁线程：拿锁 → 装载 → 等收尾信号。装载结果经 channel 回报给主线程。
         let dir2 = dir.clone();
         let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>();
         let holder = std::thread::spawn(move || {
             let _g = crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // 装载本身也在这个持锁线程里做：主线程先放手再重拿会留出清场窗口
-            let _ = ready_tx.send(scan_and_load(&dir2));
+            let n = scan_and_load(&dir2);
+            let _ = ready_tx.send(n);
             let _ = hold_rx.recv();
         });
         assert_eq!(ready_rx.recv().expect("持锁线程应回报装载结果"), 1, "应装载 1 个插件");

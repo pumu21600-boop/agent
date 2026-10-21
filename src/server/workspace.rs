@@ -578,15 +578,16 @@ mod tests {
         let a = tmp("a");
         let b = tmp("b");
         let mut s = Settings::default();
-        alias_into(&mut s, &a.0.display().to_string(), "甲");
-        alias_into(&mut s, &b.0.display().to_string(), "乙");
+        let ka = alias_into(&mut s, &a.0.display().to_string(), "甲");
+        let kb = alias_into(&mut s, &b.0.display().to_string(), "乙");
 
-        let key = alias_into(&mut s, &a.0.display().to_string(), "");
+        alias_into(&mut s, &a.0.display().to_string(), "");
 
-        assert!(!s.workspace_aliases.contains_key(&key), "空名应清掉该项目的别名");
+        assert!(!s.workspace_aliases.contains_key(&ka), "空名应清掉该项目的别名");
         assert_eq!(s.workspace_aliases.len(), 1, "只清目标那一条");
-        let other = b.0.display().to_string();
-        assert_eq!(s.workspace_aliases.get(&other).map(String::as_str), Some("乙"));
+        // 按 alias_into 返回的规范化键查，不拿原始路径比（CI 的 runner 路径
+        // canonicalize 前后不一致，原始字符串当键会查空）
+        assert_eq!(s.workspace_aliases.get(&kb).map(String::as_str), Some("乙"));
     }
 
     /// 目录已不在（移走/删了）也能起别名：规范化失败时原样用输入的路径当键，

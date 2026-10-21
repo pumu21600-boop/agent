@@ -795,7 +795,14 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["docplug", "soloplug"], "工作区覆盖内置 + 未停用者贡献");
         let ws_docplug = roots.iter().find(|(_, n)| n == "docplug").unwrap();
-        assert!(ws_docplug.0.starts_with(&ws), "覆盖后用工作区那份的技能目录");
+        // skills_dir_of 出口刻意剥掉了 canonicalize 的 `\\?\` 前缀（给模型当脚本路径
+        // 用），所以比较时两边都剥——不然一边带前缀一边不带，永远对不上。
+        let strip = |p: &Path| -> PathBuf {
+            let s = p.as_os_str().to_string_lossy();
+            PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
+        };
+        let ws_stripped = strip(&ws);
+        assert!(strip(&ws_docplug.0).starts_with(&ws_stripped), "覆盖后用工作区那份的技能目录");
         assert!(roots.iter().all(|(p, _)| p.ends_with("skills")));
         // 停用的始终不贡献
         assert!(!roots.iter().any(|(_, n)| n == "offplug"));
