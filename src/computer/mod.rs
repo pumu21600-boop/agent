@@ -318,11 +318,17 @@ mod real_input_tests {
         let png = png::encode_png_from_bgra(&bgra, sw, sh, stride).expect("PNG 编码成功");
         assert!(png.starts_with(&[0x89u8, b'P', b'N', b'G']), "PNG 签名");
         assert!(png.len() > 10_000, "截图应有实际内容（{} 字节）", png.len());
-        // 5) 收拾：关窗不保存（alt+f4 → 对话框按 N）；句柄 kill 兜底
-        let _ = input::key_combo("alt+f4");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let _ = input::key_combo("n");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // 5) 收拾：关窗不保存（alt+f4 → 对话框按 N）；句柄 kill 兜底。
+        // 发键前先确认前台仍是我们拉起的记事本——否则 alt+f4 会打到桌面/别的窗口
+        // （桌面上无焦点窗口时 Windows 会弹「关闭 Windows」确认框，2026-10-21 实锤）。
+        let still_ours = window::foreground_title()
+            .is_some_and(|t| t.contains("记事本") || t.contains("Notepad"));
+        if still_ours {
+            let _ = input::key_combo("alt+f4");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = input::key_combo("n");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
         child.kill().ok();
         child.wait().ok();
     }

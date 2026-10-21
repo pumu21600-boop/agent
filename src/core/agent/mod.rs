@@ -457,8 +457,14 @@ pub async fn run_task(
                     }),
                 );
                 // 滚动摘要：有折叠 → 调模型把折叠内容压进摘要（失败保留占位符降级）
+                // 用户点了停止就别再为了摘要干等渠道（辅助调用走非流式 complete，
+                // 本身不看取消标志）——取消即按「摘要失败」降级，下面立刻收尾。
                 if !stats.folded.is_empty() && mem.enabled {
-                    match summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid).await {
+                    let summarized = tokio::select! {
+                        s = summarize_folded(gateway, primary, channels.summary.as_ref(), &running_summary, &stats.folded, &sid) => s,
+                        () = cancel.cancelled() => None,
+                    };
+                    match summarized {
                         Some(s) => {
                             running_summary = Some(s.clone());
                             observability::event(
@@ -678,15 +684,21 @@ pub async fn run_task(
             );
             // 事件流水：任务完成
             mem.record("task.finish", json!({ "steps": step + 1, "chars": final_text.chars().count() }));
-            // TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）
-            if let Some(tch) = &channels.title
-                && let Some(title) = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid).await {
+            // TITLE 角色：任务结束用专用渠道生成会话标题（失败静默保留机械标题）。
+            // 同样接取消：回答已落地，用户点了停止就不该再为标题多等一次渠道往返。
+            if let Some(tch) = &channels.title {
+                let titled = tokio::select! {
+                    t = generate_title(gateway, tch, title_source.as_deref().unwrap_or(&final_text), &sid) => t,
+                    () = cancel.cancelled() => None,
+                };
+                if let Some(title) = titled {
                     observability::event(
                         EventType::State,
                         json!({ "kind": "session.titled", "title": title }),
                     );
                     on_event(AgentEvent::Title(title));
                 }
+            }
             return Ok(LoopOutcome::Done);
         }
 
@@ -1187,7 +1199,7 @@ mod tests {
             &SandboxConfig::default(),
             0,
             &ContextConfig::default(),
-            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &RecoveryConfig { checkpoint_enabled: false },
             &mem,
             None,
             false,
@@ -1356,7 +1368,7 @@ mod tests {
             &SandboxConfig::default(),
             0,
             &ContextConfig::default(),
-            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &RecoveryConfig { checkpoint_enabled: false },
             &mem,
             None,
             false,
@@ -1505,7 +1517,7 @@ mod tests {
             &SandboxConfig::default(),
             0,
             &ContextConfig::default(),
-            &RecoveryConfig { checkpoint_enabled: false, ..Default::default() },
+            &RecoveryConfig { checkpoint_enabled: false },
             &mem,
             None,
             false,

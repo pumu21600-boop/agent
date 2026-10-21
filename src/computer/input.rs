@@ -267,9 +267,9 @@ pub fn vk_from_name(name: &str) -> Option<VIRTUAL_KEY> {
     })
 }
 
-/// 组合键："ctrl+c" / "ctrl+shift+t" / "alt+f4"。按住修饰 → 敲末键 → 逆序抬起。
-/// 单个键（无 +）也走这里。
-pub fn key_combo(combo: &str) -> Result<(), String> {
+/// 解析组合键为虚拟键码序列（纯函数，不发任何键）。
+/// 单测只测它——**绝不**在单测里调 key_combo：那会真的向系统发全局按键。
+pub fn parse_combo(combo: &str) -> Result<Vec<VIRTUAL_KEY>, String> {
     let parts: Vec<&str> = combo.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
     if parts.is_empty() {
         return Err("组合键为空".into());
@@ -279,6 +279,18 @@ pub fn key_combo(combo: &str) -> Result<(), String> {
         let vk = vk_from_name(p).ok_or_else(|| format!("不认识的键「{p}」"))?;
         vks.push(vk);
     }
+    Ok(vks)
+}
+
+/// 组合键："ctrl+c" / "ctrl+shift+t" / "alt+f4"。按住修饰 → 敲末键 → 逆序抬起。
+/// 单个键（无 +）也走这里。
+///
+/// **真的会向系统发全局按键**（作用在当时的焦点窗口上）。生产路径只有
+/// computer 工具；单测一律用 [parse_combo]，别调它——2026-10-21 实锤：
+/// 单测里 `key_combo("alt+f4")` 在桌面无焦点窗口时直接弹出了系统的
+/// 「关闭 Windows」对话框（用户屏幕上突然出现关机确认窗）。
+pub fn key_combo(combo: &str) -> Result<(), String> {
+    let vks = parse_combo(combo)?;
     for &vk in &vks {
         let _ = send(&[key_input(vk, 0)]);
     }
@@ -320,12 +332,19 @@ mod tests {
         assert_eq!(vk_from_name("不认识的键"), None);
     }
 
+    /// 组合键解析覆盖生产入口用到的写法。**只测解析，不发键**——
+    /// 真发键的单测会打到用户当前桌面（alt+f4 在无焦点窗口时弹「关闭 Windows」，
+    /// 2026-10-21 实锤）。真正发键的通路由 AGENT_COMPUTER_E2E 那条记事本 e2e 覆盖。
     #[test]
     fn combo_requires_known_keys() {
-        assert!(key_combo("ctrl+c").is_ok());
-        assert!(key_combo("alt+f4").is_ok());
-        assert!(key_combo("ctrl+不懂").is_err());
-        assert!(key_combo("").is_err() || key_combo("   ").is_err());
+        assert_eq!(parse_combo("ctrl+c").unwrap(), vec![VK_CONTROL, 0x43]);
+        assert_eq!(parse_combo("alt+f4").unwrap(), vec![VK_MENU, VK_F4]);
+        assert_eq!(parse_combo("end").unwrap(), vec![VK_END]);
+        assert_eq!(parse_combo("ctrl+shift+t").unwrap(), vec![VK_CONTROL, VK_SHIFT, 0x54]);
+        assert_eq!(parse_combo(" ctrl + c ").unwrap(), vec![VK_CONTROL, 0x43], "空白宽容");
+        assert!(parse_combo("ctrl+不懂").is_err());
+        assert!(parse_combo("").is_err());
+        assert!(parse_combo("   ").is_err());
     }
 
     #[test]

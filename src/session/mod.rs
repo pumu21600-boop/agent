@@ -431,12 +431,19 @@ impl SessionManager {
         }
     }
 
-    /// 改会话标题（TITLE 角色 / 侧边栏重命名）；会话不存在时静默成功（标题晚于首落盘的竞态下无能为力）。
+    /// 改会话标题（TITLE 角色 / 侧边栏重命名）。
+    /// 会话不存在时**报错**（2026-10-20 修）：早先静默 Ok，`POST /api/sessions/meta`
+    /// 传空 id/写错 id 也回 `{"ok":true}`，前端以为改名成功。口径对齐 set_flags。
     /// 不动 updated_at：list 与「上次做到哪」都按它排序，改名不该把老会话顶到最前（与 set_flags 口径一致，F7）。
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        if !safe_id(id) {
+            anyhow::bail!("非法 session id: {id}");
+        }
         let lock = self.session_lock(id);
         let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mut f) = self.get(id) else { return Ok(()) };
+        let Some(mut f) = self.get(id) else {
+            anyhow::bail!("会话不存在: {id}");
+        };
         f.title = title.chars().take(60).collect();
         self.write(&f)
     }
@@ -734,6 +741,11 @@ mod tests {
         assert!(m.get("../evil").is_none());
         assert!(m.delete("../evil").is_err());
         assert!(m.get("不存在的会话").is_none());
+        // 改名/标记不存在的会话必须报错，不许静默成功（2026-10-20 修：
+        // POST /api/sessions/meta 传空 id 曾回 {"ok":true}）
+        assert!(m.rename("", "标题").is_err(), "空 id 改名必须报错");
+        assert!(m.rename("ghost", "标题").is_err(), "不存在的会话改名必须报错");
+        assert!(m.rename("../evil", "标题").is_err(), "非法 id 改名必须报错");
     }
 
     #[test]

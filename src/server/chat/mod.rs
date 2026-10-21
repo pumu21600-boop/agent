@@ -631,6 +631,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                     let mut desc_result = None;
                     let mut last_route = (first_provider.to_string(), first_model.clone());
                     let mut last_error_msg = String::new();
+                    // 用户停止 → 不再试下一个候选渠道，也不为后面的附件继续转写
+                    let mut cancelled = false;
 
                     for vch in &candidates {
                         let provider = vch.params.provider_id.as_deref().unwrap_or("openai_compat");
@@ -645,7 +647,13 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                         for prompt_variant in &candidate_prompts {
                             // 媒体旁路调用记台账（purpose=media，归属本会话）
                             let media_ctx = gateway::UsageCtx::aux(&session_id, "media");
-                            match gateway.complete(&media_ctx, &vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params).await {
+                            // 旁路走非流式 complete，本身不看取消标志：用户点了停止
+                            // 就别再为转写/识图干等渠道（2026-10-20 修，同 bug 1/2 一类）
+                            let done = tokio::select! {
+                                r = gateway.complete(&media_ctx, &vch.base_url, &vch.model, &vch.api_key, prompt_variant, &params) => r,
+                                () = cancel.cancelled() => { cancelled = true; break; }
+                            };
+                            match done {
                                 Ok(text) if !text.trim().is_empty() => {
                                     let is_refusal = text.contains("没有能力听音频")
                                         || text.contains("无法听音频")
@@ -682,12 +690,17 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
                             }
                         }
 
-                        if desc_result.is_some() {
+                        if desc_result.is_some() || cancelled {
                             break;
                         }
                         if let Some(err) = call_err {
                             last_error_msg = err;
                         }
+                    }
+                    // 取消已置位：不再为剩余附件做转写/识图，交给下游的取消收尾
+                    if cancelled {
+                        projections.push(format!("[{success_label}: 已取消]"));
+                        break;
                     }
 
                     // 4) 投影格式化（DSH 规范）

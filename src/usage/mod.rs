@@ -279,6 +279,21 @@ pub fn spend_total() -> f64 {
     f64::from_bits(SPEND.load(Ordering::Relaxed))
 }
 
+/// 金额的人话展示：按量级自适应精度（至少 2 位，至多 6 位，去尾零）。
+///
+/// 固定 `{:.2}` 会把小额上限显示成 `$0.00`——用户设 0.000001 的上限时提示
+/// 「已达到上限 $0.00」，看着像程序算错了（2026-10-20 修）。
+pub fn fmt_usd(v: f64) -> String {
+    let mut s = format!("{v:.6}");
+    if let Some(dot) = s.find('.') {
+        // 小数点后保留 2~6 位：多的尾零去掉，但不许少到看不出量级
+        while s.len() - dot - 1 > 2 && s.ends_with('0') {
+            s.pop();
+        }
+    }
+    s
+}
+
 /// 硬闸：超限返回人话原因（未超 / 未启用返回 None）。
 pub fn cap_block() -> Option<String> {
     let cap = cap_value();
@@ -288,7 +303,9 @@ pub fn cap_block() -> Option<String> {
     let total = spend_total();
     if total >= cap {
         return Some(format!(
-            "已触发全局花费上限：累计花费 ${total:.4} 已达到上限 ${cap:.2}（config.toml [cost] spend_cap_usd）。调高上限后才能继续调用模型。"
+            "已触发全局花费上限：累计花费 ${} 已达到上限 ${}（config.toml [cost] spend_cap_usd）。调高上限后才能继续调用模型。",
+            fmt_usd(total),
+            fmt_usd(cap)
         ));
     }
     None
@@ -597,6 +614,29 @@ mod tests {
         set_cap(1_000_000.0);
         assert!(cap_block().is_none());
         set_cap(0.0);
+    }
+
+    /// 小额上限不许显示成 $0.00（2026-10-20 实锤：上限设 0.000001 时提示
+    /// 「已达到上限 $0.00」，看着像算错了）。
+    #[test]
+    fn cap_message_keeps_small_amounts_readable() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ledger();
+        prices_star();
+        // 造一笔花费，再把上限设到远小于它
+        let before = spend_total();
+        record(rec("api.tiny.com", "m", 1_000_000, 0, 0, "ok", 1));
+        assert!(spend_total() > before);
+        set_cap(0.000001);
+        let msg = cap_block().expect("已达上限");
+        assert!(msg.contains("上限 $0.000001（"), "小额要留得出量级、不许显示成 $0.00: {msg}");
+        set_cap(0.0);
+        // 格式化本身：大额去尾零、小额留精度、整数给两位
+        assert_eq!(fmt_usd(12.0), "12.00");
+        assert_eq!(fmt_usd(12.345), "12.345");
+        assert_eq!(fmt_usd(0.000001), "0.000001");
+        assert_eq!(fmt_usd(0.25), "0.25");
+        assert_eq!(fmt_usd(1234.5678), "1234.5678");
     }
 
     #[test]

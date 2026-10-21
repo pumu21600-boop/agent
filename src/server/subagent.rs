@@ -140,6 +140,34 @@ struct SubagentArgs {
     timeout_secs: u64,
 }
 
+/// 子代理审批档钳制：只准更严，不许借子代理升权（返回 生效档, 降级原因）。
+///
+/// 白名单式档位排序——认不出的名字返回 `None` 按「非法」处理（跟随父档 + 事件）。
+/// 早先这里 `_ => 1` 把任何拼错/编造的档位（如 "yolo"）当成 auto 放行，模型传错
+/// 字得不到任何反馈（2026-10-20 修，与 on_approval 的处理方式对齐）。
+fn clamp_child_mode(parent_mode: &str, requested: &str) -> (String, Option<&'static str>) {
+    let rank = |m: &str| -> Option<u8> {
+        match m {
+            // 0 = 只读侧（sandbox/suggest 是 2026-10-03 并三档前的旧名）
+            "read-only" | "sandbox" | "suggest" => Some(0),
+            "auto" | "auto-edit" | "full-auto" => Some(1),
+            "full-access" | "local" => Some(2),
+            _ => None,
+        }
+    };
+    // 父档为空/认不出时按 auto 计——config 默认档即 auto
+    let parent_rank = rank(parent_mode).unwrap_or(1);
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return (parent_mode.to_string(), None);
+    }
+    match rank(requested) {
+        Some(r) if r > parent_rank => (parent_mode.to_string(), Some("above_parent")),
+        Some(_) => (requested.to_string(), None),
+        None => (parent_mode.to_string(), Some("unknown_mode")),
+    }
+}
+
 /// 某父任务当前活跃的子代理数。
 fn running_for(parent: &str) -> usize {
     running_slot()
@@ -429,23 +457,18 @@ impl SubagentDispatcher {
             .and_then(|m| m.get(parent).cloned())
             .or_else(|| self.state.approval_mode.read().ok().map(|m| m.clone()))
             .unwrap_or_default();
-        let mode_rank = |m: &str| match m {
-            "read-only" | "suggest" | "sandbox" => 0,
-            "full-access" | "local" | "full-auto" => 2,
-            _ => 1, // auto / auto-edit / 空（走 config 默认档）
-        };
+        // 白名单式档位排序：认不出的名字返回 None，调用方按「非法」处理。
+        // 早先这里 `_ => 1` 把任何拼错/编造的档位（如 "yolo"）当成 auto 放行，
+        // 模型传错字得不到任何反馈（2026-10-20 修，与下方 on_approval 的行为对齐）。
         let requested_mode = args.approval_mode.trim();
-        let child_mode = if requested_mode.is_empty() || mode_rank(requested_mode) > mode_rank(&parent_mode) {
-            parent_mode.clone()
-        } else {
-            requested_mode.to_string()
-        };
-        if !args.on_approval.trim().is_empty() && !args.on_approval.eq_ignore_ascii_case("deny") {
+        let (child_mode, mode_clamp) = clamp_child_mode(&parent_mode, requested_mode);
+        if mode_clamp.is_some() || (!args.on_approval.trim().is_empty() && !args.on_approval.eq_ignore_ascii_case("deny")) {
             observability::event(
                 EventType::State,
                 json!({
                     "kind": "subagent.approval_clamped",
                     "parent": parent,
+                    "reason": mode_clamp,
                     "requested_on_approval": args.on_approval,
                     "requested_mode": requested_mode,
                     "effective_mode": child_mode,
@@ -588,6 +611,29 @@ mod tests {
         assert_eq!(running_for("p2"), 1, "别的父任务的子代理不受影响");
         assert!(reg.is_set("c1") && reg.is_set("c2") && !reg.is_set("c3"));
         clear_all();
+    }
+
+    /// 审批档钳制：只准更严；非法档位跟随父档并给出原因（不再静默当 auto）。
+    #[test]
+    fn approval_mode_clamped_or_rejected() {
+        // 缺省 → 跟随父档，无降级
+        assert_eq!(clamp_child_mode("auto", ""), ("auto".into(), None));
+        assert_eq!(clamp_child_mode("read-only", "  "), ("read-only".into(), None));
+        // 合法且不高于父档 → 原样生效
+        assert_eq!(clamp_child_mode("auto", "read-only"), ("read-only".into(), None));
+        assert_eq!(clamp_child_mode("full-access", "auto"), ("auto".into(), None));
+        assert_eq!(clamp_child_mode("auto", "auto"), ("auto".into(), None));
+        // 旧名照旧认（2026-10-03 并三档前的值）
+        assert_eq!(clamp_child_mode("auto", "suggest"), ("suggest".into(), None));
+        // 高于父档 → 压回父档，原因 above_parent
+        assert_eq!(clamp_child_mode("auto", "full-access"), ("auto".into(), Some("above_parent")));
+        assert_eq!(clamp_child_mode("read-only", "auto"), ("read-only".into(), Some("above_parent")));
+        // 非法档位：不猜、不放行，跟随父档，原因 unknown_mode（旧实现静默当 auto）
+        assert_eq!(clamp_child_mode("read-only", "yolo"), ("read-only".into(), Some("unknown_mode")));
+        assert_eq!(clamp_child_mode("auto", "Auto"), ("auto".into(), Some("unknown_mode")), "大小写不对也是非法，不猜");
+        // 父档为空（config 默认 auto）→ 按 auto 计
+        assert_eq!(clamp_child_mode("", "read-only"), ("read-only".into(), None));
+        assert_eq!(clamp_child_mode("", "full-access"), ("".into(), Some("above_parent")));
     }
 
     /// token 并入：水印式增量（调用方只认自己没计过的那部分）。

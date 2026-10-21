@@ -371,10 +371,21 @@ impl Gateway {
         fresh
     }
 
+    /// 等一个 future，同时监听取消标志：取消先到返回 None（调用方据此收尾）。
+    /// 网关里所有「可能长时间不返回」的等待（发请求/等响应头/等分片）都要过它——
+    /// 否则渠道静默时点「停止」只能干等到超时（2026-10-20 修）。
+    async fn or_cancel<T>(cancel: &CancelFlag, fut: impl std::future::Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            () = cancel.cancelled() => None,
+            v = fut => Some(v),
+        }
+    }
+
     /// 发请求；两类自愈：
-    /// 1) 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
-    /// 2) 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
+    /// 1. 网络层失败（连接/超时类）→ 重建客户端重试一次（Clash 开关热恢复）；
+    /// 2. 渠道 429 → 指数退避重试最多 3 次（尊重 Retry-After 头，缺省 1s/2s/4s），
     ///    仍 429 才把错误抛给上层。用户不该看见瞬时限流。
+    ///
     /// `base_url` 决定用哪个客户端：环回主机（本地模型服务）永不走代理。
     async fn send(
         &self,
@@ -805,10 +816,22 @@ impl Gateway {
         observability::debug(&format!("[gateway] POST {url}"));
         observability::debug(&format!("[gateway] request body: {body}"));
 
-        let mut response = match self
-            .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body))
-            .await
-        {
+        // 等响应头同样要能被「停止」打断：渠道完全无响应时这里会一直等客户端
+        // 总超时（600s），期间 cancel 标志无从检查（2026-10-20 修）。
+        let sent = Self::or_cancel(
+            cancel,
+            self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&body)),
+        )
+        .await;
+        let Some(sent) = sent else {
+            observability::event(
+                EventType::State,
+                json!({ "kind": "cancel", "phase": "awaiting_response", "url": url }),
+            );
+            record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+            return Ok(ChatOutcome::Cancelled);
+        };
+        let mut response = match sent {
             Ok(r) => r,
             Err(e) => {
                 record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
@@ -832,10 +855,16 @@ impl Gateway {
                 p
             };
             let retry_body = build_body_with_compat(model, &outgoing, true, &retry_params, tools, &compat, &ctx.session_id);
-            response = match self
-                .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
-                .await
-            {
+            let sent = Self::or_cancel(
+                cancel,
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+            )
+            .await;
+            let Some(sent) = sent else {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                return Ok(ChatOutcome::Cancelled);
+            };
+            response = match sent {
                 Ok(r) => r,
                 Err(e) => {
                     record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
@@ -860,10 +889,16 @@ impl Gateway {
                 json!({ "kind": "gateway.max_tokens_inflate_retry", "status": 400, "url": url, "model": model, "error_body": text.chars().take(300).collect::<String>() }),
             );
             let retry_body = build_body_with_compat(model, &outgoing, true, &eff_params, tools, &compat, &ctx.session_id);
-            response = match self
-                .send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body))
-                .await
-            {
+            let sent = Self::or_cancel(
+                cancel,
+                self.send(base_url, |c| Self::auth(c.post(&url), &channel.api_key, compat.protocol).json(&retry_body)),
+            )
+            .await;
+            let Some(sent) = sent else {
+                record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                return Ok(ChatOutcome::Cancelled);
+            };
+            response = match sent {
                 Ok(r) => r,
                 Err(e) => {
                     record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
@@ -906,9 +941,22 @@ impl Gateway {
         let mut translator = anthropic::SseTranslator::default();
         let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
         loop {
-            let item = match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
-                Ok(item) => item,
-                Err(_) => anyhow::bail!("模型流超时：120 秒无新数据（渠道或代理可能断流，可重试）"),
+            // 等下一个分片：空闲超时与「停止」同时监听——渠道静默不回分片时，
+            // 原先只在拿到分片后才查 cancel，停止按钮要干等到 120s 空闲超时
+            // 才生效（2026-10-20 修，对照工具侧的 select! 写法）。
+            let item = tokio::select! {
+                () = cancel.cancelled() => {
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "cancel", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
+                    return Ok(ChatOutcome::Cancelled);
+                }
+                item = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => match item {
+                    Ok(item) => item,
+                    Err(_) => anyhow::bail!("模型流超时：120 秒无新数据（渠道或代理可能断流，可重试）"),
+                },
             };
             let Some(item) = item else { break };
             let bytes = item.context("读流失败")?;

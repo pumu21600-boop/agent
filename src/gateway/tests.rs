@@ -455,3 +455,92 @@ Content-Length: 2
         let b2 = build_body_with_compat("m", &plain, true, &ChatParams::default(), None, &compat, "s");
         assert_eq!(b2["messages"][1]["content"], json!("纯文本结果"));
     }
+
+    /// 拟真渠道的两种「僵住」形态（2026-10-20 实锤 bug 1/2 的靶子）：
+    /// - `HeadersOnly`：回了响应头但一个分片都不吐（渠道静默）；
+    /// - `NeverRespond`：连响应头都不回（渠道僵死）。
+    ///
+    /// 都保持连接不关，模拟真实渠道卡住而不是断开。
+    #[derive(Clone, Copy)]
+    enum MockMode {
+        HeadersOnly,
+        NeverRespond,
+    }
+
+    fn mock_stalled_provider(mode: MockMode) -> (String, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        // 监听器非阻塞，接受的 socket 会继承该标志（同 loopback 测试的坑）
+                        let _ = s.set_nonblocking(false);
+                        // 先把请求读掉再僵住：不读就挂会让对端写阻塞，测的就不是超时路径了
+                        let mut buf = [0u8; 8192];
+                        let _ = std::io::Read::read(&mut s, &mut buf);
+                        if let MockMode::HeadersOnly = mode {
+                            use std::io::Write;
+                            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+                            let _ = s.flush();
+                        }
+                        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), stop, handle)
+    }
+
+    /// 跑一次会被「停止」打断的对话：400ms 后置取消标志，断言 5s 内返回 Cancelled。
+    async fn assert_cancel_interrupts(mode: MockMode) {
+        init_logger();
+        let (base, stop, handle) = mock_stalled_provider(mode);
+        let gw = Arc::new(Gateway::new());
+        let ch = Channel::new(&base, "m", "sk-test", ChatParams::default());
+        let cancel = Arc::new(CancelFlag::new());
+        let cancel2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            cancel2.set();
+        });
+        let started = Instant::now();
+        let out = gw
+            .stream_chat(
+                &UsageCtx::main("sess-cancel"),
+                &ch,
+                &json!([{"role":"user","content":"hi"}]),
+                None,
+                &cancel,
+                |_| {},
+            )
+            .await;
+        let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
+        match out {
+            Ok(ChatOutcome::Cancelled) => {}
+            Ok(ChatOutcome::Done(_)) => panic!("应返回 Cancelled，实际拿到完整回答"),
+            Err(e) => panic!("应返回 Cancelled，实际报错: {e:#}"),
+        }
+        // 旧实现要干等到 120s 空闲超时（静默）或 600s 客户端超时（无响应）
+        assert!(elapsed < std::time::Duration::from_secs(5), "停止必须在秒级生效，实际 {elapsed:?}");
+    }
+
+    /// bug 1 回归：渠道回了响应头却一直不吐分片时，点「停止」必须当场生效。
+    #[tokio::test]
+    async fn cancel_interrupts_silent_stream() {
+        assert_cancel_interrupts(MockMode::HeadersOnly).await;
+    }
+
+    /// bug 2 回归：渠道连响应头都不回（僵死）时，点「停止」同样必须当场生效。
+    #[tokio::test]
+    async fn cancel_interrupts_hung_request() {
+        assert_cancel_interrupts(MockMode::NeverRespond).await;
+    }
