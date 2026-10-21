@@ -4674,8 +4674,15 @@
 
   async function openSubagentPanel() {
     subagentPanelOpen = true;
+    await loadSubagentHistory();
+  }
+
+  // 启动/重连时拉一次派发历史：**chip 入口靠它出现**——原来只在打开面板时拉，
+  // 而 chip 是开面板的唯一入口（实时条跑完就撤），刷新/重开页面后 chip 永远不出现，
+  // 历史彻底看不到（死结，2026-10-21 实修）。
+  async function loadSubagentHistory() {
     const r = await fetch('/api/subagents').then((r2) => r2.json()).catch(() => null);
-    subagentHistory = (r && r.dispatches) || [];
+    if (r) subagentHistory = r.dispatches || [];
   }
 
   async function cancelSubagent(dispatch) {
@@ -4760,7 +4767,7 @@
     // 连上/重连即重拉一次设置与插件清单（2026-10-05）：服务重启（换二进制/崩溃恢复）
     // 后事件流会断线自动重连，但断连期间推的事件全丢了——页面会一直显示重启前的旧态，
     // 用户以为「又没刷新」。onopen 在首次连接也会触发，多一次 GET 无害。
-    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadComputerState(); };
+    uiEventsSrc.onopen = () => { loadExt(); loadSettings(); loadComputerState(); loadSubagentHistory(); };
     uiEventsSrc.onmessage = async (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
