@@ -5169,7 +5169,7 @@
     <div class="side-head">
       <div class="brand-row">
         <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5 20 7.5v5c0 4.5-3.2 7.6-8 9-4.8-1.4-8-4.5-8-9v-5Z"/><path d="m9 11.5 2.2 2.2L15.5 9.5"/></svg></span>
-        <span class="brand-name">Agent</span>
+        <span class="brand-name">Pawch Agent</span>
         <button class="icon-btn" title={theme === 'dark' ? '切到浅色主题' : '切到深色主题'} on:click={toggleTheme}>
           {#if theme === 'dark'}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.2"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6"/></svg>

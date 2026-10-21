@@ -1,6 +1,6 @@
 # 接口一览
 
-agent 服务的全部 HTTP / SSE 端点。服务只接受本机来源的请求（`Host` 必须是
+Pawch Agent 服务的全部 HTTP / SSE 端点。服务只接受本机来源的请求（`Host` 必须是
 `localhost` / `127.x` / `[::1]`；带 `Origin` 时必须同源同端口）——绑定 127.0.0.1 挡不住
 DNS rebinding，这层校验补的就是它。不带 `Origin` 的命令行客户端（curl、eval 驱动器、
 服务自管理）照常可用。

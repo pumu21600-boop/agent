@@ -83,8 +83,10 @@ pub unsafe fn recreate_profile(allow_network: bool) -> Result<SidGuard, String> 
         .map(|sid| SID_AND_ATTRIBUTES { Sid: *sid, Attributes: 0 })
         .collect();
 
-    let display = wide("Agent Local Sandbox");
-    let desc = wide("agent 项目沙箱（LowBox，默认断网）");
+    // 显示名/描述会出现在 Windows 的 AppContainer 列表里；PROFILE_NAME 是删除/重建用的
+    // 标识符，改它等于丢掉已建 profile，故只改这两个给人看的字段。
+    let display = wide("Pawch Agent Sandbox");
+    let desc = wide("Pawch Agent 项目沙箱（LowBox，默认断网）");
     let mut sid: PSID = ptr::null_mut();
     let hr = unsafe {
         CreateAppContainerProfile(

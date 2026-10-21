@@ -448,7 +448,7 @@ const EMBEDDED_INDEX: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agent</title>
+<title>Pawch Agent</title>
 </head>
 <body>
 <h3>模型设置</h3>

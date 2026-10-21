@@ -1,4 +1,4 @@
-//! Agent 桌面壳—— 窗口 + 托盘 + 服务保活 + **child webview 宿主**
+//! Pawch Agent 桌面壳—— 窗口 + 托盘 + 服务保活 + **child webview 宿主**
 //!
 //! 设计（窄而刚 v1）：
 //! - WebView 直接加载 http://127.0.0.1:5173（前端零改动，agent.exe 是唯一真源）；
@@ -254,8 +254,8 @@ fn instance_guard() -> Option<TcpListener> {
         return Some(l);
     }
     if other_pid.map(pid_alive).unwrap_or(false) {
-        slog("另一个 Agent 壳已在运行，本实例退出");
-        println!("[desktop] 另一个 Agent 壳已在运行");
+        slog("另一个 Pawch Agent 壳已在运行，本实例退出");
+        println!("[desktop] 另一个 Pawch Agent 壳已在运行");
         std::process::exit(0);
     }
     slog(&format!("单实例端口 {GUARD_PORT} 被非本程序占用，放弃守卫继续启动"));
@@ -537,7 +537,7 @@ fn main() {
 
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().expect("缺窗口图标").clone())
-                .tooltip("Agent（127.0.0.1:5173）")
+                .tooltip("Pawch Agent（127.0.0.1:5173）")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, ev| match ev.id.as_ref() {
@@ -598,5 +598,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("Agent 桌面壳启动失败");
+        .expect("Pawch Agent 桌面壳启动失败");
 }

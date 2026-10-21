@@ -1,6 +1,7 @@
-# agent —— Windows 原生自主编码 Agent
+# Pawch Agent —— Windows 原生自主办事 Agent
 
 Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。版本号以 `Cargo.toml` 为准（当前 0.32.x）。
+源码 crate 与二进制的技术标识符仍叫 `agent`（`agent.exe` / `agent-desktop.exe`、数据目录 `.agent/`），产品显示名是 **Pawch Agent**。
 逐阶段施工记录与踩坑见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)，全部 HTTP/SSE 接口见 [docs/api.md](docs/api.md)。
 
 ## 功能总览

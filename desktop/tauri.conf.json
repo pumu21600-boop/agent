@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agent",
+  "productName": "Pawch Agent",
   "version": "0.1.0",
   "identifier": "com.agent.local.desktop",
   "build": {
@@ -9,7 +9,7 @@
   "app": {
     "windows": [
       {
-        "title": "Agent",
+        "title": "Pawch Agent",
         "url": "http://127.0.0.1:5173",
         "width": 1280,
         "height": 860,

@@ -417,7 +417,7 @@ pub(crate) fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>,
 }
 
 /// 桌面壳没跑时给人的话（不静默、不偷偷拉 Edge）。
-pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
+pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Pawch Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
 
 /// 是否允许无头模式（默认关——没有壳就不起 Edge）。
 pub(crate) fn headless_allowed() -> bool {
