@@ -155,7 +155,7 @@ cargo run                                # 终端 2：127.0.0.1:5173
 - **用量台账**：价格表靠手填（不抓取、不同步、不多币种）；未命中价格计入「未计价」不计费；花费上限是全累计口径，调到 0 即关闭。
 - **钩子**：四挂点（before_tool 仅否决权 / after_tool / session_end / budget_exceeded），超时与失败一律放行。
 - **eval**：12 个任务；2026-09-23 已在真实渠道（StepFun `step-5-preview`，隔离临时实例）跑过 **53/53 断言全过**；复跑流程与两个本机坑见 ROADMAP「eval 真模型验证」行。
-- **CI**：只在 GitHub Actions 上跑（本机没有 hook 强制）。**远端备份**：GitHub 私有仓库 `pumu21600-boop/agent`（origin：`dev` 为主线 + 全部标签）。
+- **CI**：只在 GitHub Actions 上跑（本机没有 hook 强制）。**远端备份**：GitHub 公开仓库 `pumu21600-boop/pawch-agent`（origin：`dev` 为主线 + 全部标签；2026-10-21 由 `agent` 改名，旧地址 GitHub 自动跳转）。
 
 ## 分发：内置 git（用户不用装任何东西）
 
