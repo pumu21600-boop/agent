@@ -839,18 +839,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("echo.wat"), ECHO_WAT).unwrap();
 
-        // 同步段：持锁装插件（guard 在此作用域结束即 drop）
-        {
-            let _g = lock();
-            assert_eq!(scan_and_load(&dir), 1);
-        }
-
-        // 并发段：锁由同步任务持有到本测试结束（await 不碰 guard，满足 Send）
+        // 并发段：装载与调用全程由持锁线程担保。`MutexGuard` 不是 Send，锁不能跨
+        // await，所以把锁交给一个常驻同步线程；必须在**它持锁期间**完成装载，并且
+        // 等它确认持锁成功后才起并发调用——否则别的测试能在这个窗口里
+        // scan_and_load 清场，run 起来就报「未知插件: echo」（2026-10-21 实锤：
+        // 单独跑必过、全量并行必红）。
+        let dir2 = dir.clone();
         let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>();
         let holder = std::thread::spawn(move || {
             let _g = crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // 装载本身也在这个持锁线程里做：主线程先放手再重拿会留出清场窗口
+            let _ = ready_tx.send(scan_and_load(&dir2));
             let _ = hold_rx.recv();
         });
+        assert_eq!(ready_rx.recv().expect("持锁线程应回报装载结果"), 1, "应装载 1 个插件");
 
         let mut handles = Vec::new();
         for _ in 0..WASM_MAX_CONCURRENT * 3 {
