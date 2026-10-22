@@ -179,12 +179,11 @@
 
 **小项 / 验证欠账（可插空做）**：
 
-2. ** 厂商思考参数真 key 冒烟**：MiniMax/Claude/豆包/混元官方端点的 thinking 形态（坑 14 B4：新形态入词表必须附真实渠道冒烟记录）；需对应用户的厂商 key，StepFun 渠道覆盖不到。
-3. **browser 工具真模型全流程**：navigate/跨站点新页/面板同步已用 step-5-preview 实测（补丁五）；snapshot/click/fill/select/wait_for/scroll/get_state 等仍只有 mock 剧本 + CDP 直驱冒烟（028）——可让真模型跑一轮补实（少量额度，用户已给渠道）。
-4. **E1 拆分**（tools/mod.rs 单文件拆分）：纯机械、无行为收益，低优先级。（✅ 2026-09-29 随上一轮件 6 完成：tools 工具族五国拆分，mod.rs 1808→760）
-5. **MCP OAuth / WASM 宿主函数**：分别需对照服务端 / ABI 变更，继续留口。
-6. **settings.json 旧格式迁移垫片**：版本兼容问题，留待大版本。
-7. ~~**prices.json 补全**~~：prices.json 已于退役删除——价格表搬进 settings.json `cost` 节（设置 → 用量价格面板内维护），本待办作废。
+2. **browser 工具真模型全流程**：navigate/跨站点新页/面板同步已用 step-5-preview 实测（补丁五）；snapshot/click/fill/select/wait_for/scroll/get_state 等仍只有 mock 剧本 + CDP 直驱冒烟（028）——可让真模型跑一轮补实（少量额度，需用户提供渠道）。
+3. **E1 拆分**（tools/mod.rs 单文件拆分）：纯机械、无行为收益，低优先级。（✅ 2026-09-29 随上一轮件 6 完成：tools 工具族五国拆分，mod.rs 1808→760）
+4. **WASM 宿主函数**：需 ABI 变更，继续留口。（2026-10-22 核实修正：MCP OAuth 已于 2026-09-28 交付——施工单 P24 bb7f351，mock OAuth MCP 全链路真机验证过，原「留口」系 09-23 梳理后未更新；同日用户拍板移除「厂商思考参数真 key 冒烟」一项。）
+5. **settings.json 旧格式迁移垫片**：版本兼容问题，留待大版本。
+6. ~~**prices.json 补全**~~：prices.json 已于退役删除——价格表搬进 settings.json `cost` 节（设置 → 用量价格面板内维护），本待办作废。
 
 **状态更正（本次梳理）**：桌面壳**已启用**（自启用起 = 内置浏览器宿主，非搁置）；此前的“桌面壳待定”已定（保留壳），两行状态已改。
 
