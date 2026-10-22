@@ -42,6 +42,13 @@ impl CancelFlag {
         self.flag.load(Ordering::SeqCst)
     }
 
+    /// 复位。**取消信号从不调用它**（一轮的生命周期内停止不可撤销）；只有
+    /// core::steer 的打断信号（「立即发送」，复用本类型）在决策点取走打断
+    /// 消息后复位——指令已并入本轮，让位使命完成。
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
     /// 异步等到取消置位（已置位则立即返回）。供 select! 中断阻塞中的工具执行。
     ///
     /// 2026-10-08 修丢唤醒竞态：`notified()` 在**首次被 poll 时**才注册等待者，而

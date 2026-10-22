@@ -4,6 +4,7 @@ use super::*;
 use super::gate::ChatGate;
 use super::memory::read_system_prompt;
 use super::subagent;
+use crate::core::steer::SteerMode;
 mod cancel;
 mod media;
 mod turn;
@@ -39,9 +40,13 @@ pub struct ChatRequest {
     #[serde(default)]
     pub session_id: String,
     /// 027：同会话正在跑时这条消息怎么处理——false（缺省）= 排队，等这一轮跑完自动发；
-    /// true = 立即（引导）：并进正在跑的那一轮，模型下一个决策点就看到（不打断、不另起一轮）
+    /// true = 引导：并进正在跑的那一轮，模型下一个决策点就看到（不打断、不另起一轮）
     #[serde(default)]
     pub steer: bool,
+    /// 2026-10-22「立即发送」分家：true = 打断——置位打断信号（审批/工具/流式让位），
+    /// 消息并入本轮继续。与 steer 的区别就是「打断 vs 不打断」；都不带 = 排队。
+    #[serde(default)]
+    pub interrupt: bool,
     /// B1：Plan 档（true=只读+先出计划；请求级字段，前端随会话持久化到 localStorage）
     #[serde(default)]
     pub plan_mode: bool,
@@ -218,24 +223,40 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             )
                 .into_response();
         }
-        // 027：缺省 = 排队（这一轮跑完自动接着发）；steer=true = 立即（引导当前这一轮）
-        let immediate = req.steer;
-        let pending = state.steer.push(&session_id, text, immediate);
+        // 027 + 2026-10-22 三级分家：缺省 = 排队（这一轮跑完自动接着发）；
+        // steer=true = 引导（并入本轮，不打断，模型下一个决策点看到）；
+        // interrupt=true = 立即发送（打断信号置位：审批/工具/流式三个等待点让位，
+        // 消息并入本轮继续——打断不是停，是「放下手里的、马上听我的」）。
+        let mode = if req.interrupt {
+            SteerMode::Interrupt
+        } else if req.steer {
+            SteerMode::Steer
+        } else {
+            SteerMode::Queued
+        };
+        let immediate = mode != SteerMode::Queued;
+        let pending = state.steer.push(&session_id, text, mode);
         observability::event(
             EventType::State,
             json!({
                 "kind": "chat.steered",
                 "session": session_id,
-                "mode": if immediate { "immediate" } else { "queue" },
+                "mode": match mode { SteerMode::Interrupt => "interrupt", SteerMode::Steer => "immediate", SteerMode::Queued => "queue" },
                 "pending": pending,
             }),
         );
         let (stx, srx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
-        let notice = if immediate {
-            "已并入正在运行的一轮：模型下一个决策点就会看到（引导当前回答，不打断）".to_string()
-        } else {
-            "已排队：当前这一轮结束后自动发送（想马上引导当前回答，点这条消息上的「立即发送」）"
-                .to_string()
+        let notice = match mode {
+            SteerMode::Interrupt => {
+                "已中断当前操作并并入本轮：新指令立即生效".to_string()
+            }
+            SteerMode::Steer => {
+                "已引导：不打断当前操作，跑完这步就并入（本条不进对话气泡，静默生效）".to_string()
+            }
+            SteerMode::Queued => {
+                "已排队：当前这一轮结束后自动发送（想马上生效，点这条消息上的「立即发送」或「引导」）"
+                    .to_string()
+            }
         };
         let flag = if immediate { "steered" } else { "queued" };
         // M2 收口：入队的这一刻，上一轮可能刚好收尾（它的收尾 drain 已经跑过）——
@@ -245,8 +266,11 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             let extra = state.steer.drain_all(&session_id);
             let snap = session.get(&session_id).map(|s| s.messages).unwrap_or_default();
             let mut merged = if snap.is_empty() { history.clone() } else { snap };
-            for t in &extra {
-                merged.push(json!({ "role": "user", "content": t }));
+            for s in &extra {
+                merged.push(match s.mode {
+                    SteerMode::Interrupt => json!({ "role": "user", "content": s.text, "interrupted": true }),
+                    _ => json!({ "role": "user", "content": s.text, "steered": true }),
+                });
             }
             observability::event(
                 EventType::State,
@@ -936,8 +960,10 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 就会出现（消息在收尾 drain 之后到达 → 队列里没人消费）。先注销后，这一瞬之后
         // 到达的消息会走正常路径自己起一轮（而不是排队等人取）。
         drop(run);
-        // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的）→
-        // 用最后一轮快照当上下文，紧接着再跑一轮（同一个 SSE 流）：「进了队列的消息一定被处理」。
+        // 025/027：一轮跑完后还剩的排队消息（缺省模式，或最后一个决策点之后才到的——
+        // 含错过补取窗口的引导/打断）→ 用最后一轮快照当上下文，紧接着再跑一轮
+        // （同一个 SSE 流）：「进了队列的消息一定被处理」。带 mode：followup 的
+        // 消息也按 引导=steered 静默 / 打断=interrupted 气泡 打标记，与决策点并入同款。
         let extra = steer_queue.drain_all(&session_id);
         if extra.is_empty() {
             send(json!({ "done": true }));
@@ -946,8 +972,8 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
         // 还有排队的消息 → 抢回占位自己续跑；抢不到说明已有别的请求起来了，
         // 把它们放回队列（那一轮的收尾会取走——入队与收尾的顺序保证不会悬空）。
         let Some(f) = cancel_registry.try_begin(&session_id) else {
-            for t in extra {
-                steer_queue.push(&session_id, t, false);
+            for s in extra {
+                steer_queue.push(&session_id, s.text, s.mode);
             }
             send(json!({ "done": true }));
             break;
@@ -963,8 +989,13 @@ pub(super) async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequ
             EventType::State,
             json!({ "kind": "steer", "phase": "followup", "session": session_id, "count": extra.len() }),
         );
-        let turn_msgs: Vec<Value> =
-            extra.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+        let turn_msgs: Vec<Value> = extra
+            .iter()
+            .map(|s| match s.mode {
+                SteerMode::Interrupt => json!({ "role": "user", "content": s.text, "interrupted": true }),
+                _ => json!({ "role": "user", "content": s.text, "steered": true }),
+            })
+            .collect();
         // 通知前端：这些排队消息现在开始跑了（气泡从「排队中」转成正式消息、开新回答气泡）
         send(json!({ "turn": { "messages": turn_msgs } }));
         next.extend(turn_msgs);

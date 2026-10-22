@@ -153,7 +153,7 @@ impl agent::ApprovalGate for HeadlessGate {
     }
     /// 无头不吃「立即发送」引导消息：UI 给这条会话发的追加消息进排队队列，
     /// 由本轮收尾处的有界续跑处理（见 run_headless 尾部）。
-    fn take_steering(&self) -> Vec<String> {
+    fn take_steering(&self) -> Vec<crate::core::steer::SteerMsg> {
         Vec::new()
     }
     /// 无人值守：没有 UI 来回答审批。按 on_approval 策略决定并留审计。
@@ -507,8 +507,8 @@ pub(crate) async fn run_headless_inner(
                 // 旧代码在这里直接 break，第 4 个非空批次被取出即弃——用户发了却
                 // 静默消失，只有一条内部事件，与「不丢消息」的注释正相反）。
                 // 口径同聊天路径抢不到占位时 push 回去：留给下一轮/下一次唤醒跑。
-                for text in extra {
-                    steer_queue.push(&sid, text, false);
+                for msg in extra {
+                    steer_queue.push(&sid, msg.text, msg.mode);
                 }
                 observability::event(
                     EventType::State,
@@ -524,8 +524,13 @@ pub(crate) async fn run_headless_inner(
             if next.is_empty() {
                 next = history.clone();
             }
-            let turn_msgs: Vec<Value> =
-                extra.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+            let turn_msgs: Vec<Value> = extra
+                .iter()
+                .map(|s| match s.mode {
+                    crate::core::steer::SteerMode::Interrupt => json!({ "role": "user", "content": s.text, "interrupted": true }),
+                    _ => json!({ "role": "user", "content": s.text, "steered": true }),
+                })
+                .collect();
             next.extend(turn_msgs);
             history = next;
             prior_summary = col_task.summary.lock().unwrap_or_else(|e| e.into_inner()).clone();

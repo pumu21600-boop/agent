@@ -300,6 +300,11 @@ pub struct ToolCall {
 
 pub enum ChatOutcome {
     Done(AssistantTurn),
+    /// 2026-10-22「立即发送」打断：流式输出被用户插话中断，已收到的半截内容
+    /// 落在这里（tool_calls 已清空——半截的工具调用不可靠，丢弃）；调用方把
+    /// 半截落地后**继续本轮**（下一个决策点取走打断指令），与 Cancelled（终止
+    /// 整轮）的本质区别。
+    Interrupted(AssistantTurn),
     Cancelled,
 }
 
@@ -732,6 +737,7 @@ impl Gateway {
     /// 每个分片：1) 写 model_chunk 到 JSONL；2) 回调 on_chunk 转发给前端。
     /// 开始前与每个分片前都查取消标志（核心循环同款检查点）。
     /// ctx 带归属信息（会话/用途/父任务），本方法内完成台账记录与花费硬闸。
+    #[allow(clippy::too_many_arguments)] // 中断臂参数是打断分家的必要面（run_chain 同款豁免）
     pub async fn stream_chat(
         self: &Arc<Self>,
         ctx: &UsageCtx,
@@ -739,6 +745,7 @@ impl Gateway {
         messages: &Value,
         tools: Option<&Value>,
         cancel: &CancelFlag,
+        interrupt: Option<&CancelFlag>,
         on_chunk: impl Fn(&Value),
     ) -> anyhow::Result<ChatOutcome> {
         let base_url = &channel.base_url;
@@ -940,10 +947,14 @@ impl Gateway {
         // Anthropic 协议：事件流经 SseTranslator 合成回 OpenAI delta 分片再进同一聚合器
         let mut translator = anthropic::SseTranslator::default();
         let is_anthropic = compat.protocol == Protocol::AnthropicMessages;
+        // 打断信号（「立即发送」）：None = 该调用不支持打断（摘要/标题等辅助调用）。
+        // 用一个进程级永不置位的信号兜底，select! 不用分叉两套写法。
+        static NEVER_INTERRUPT: std::sync::OnceLock<CancelFlag> = std::sync::OnceLock::new();
+        let interrupt = interrupt.unwrap_or_else(|| NEVER_INTERRUPT.get_or_init(CancelFlag::new));
         loop {
-            // 等下一个分片：空闲超时与「停止」同时监听——渠道静默不回分片时，
-            // 原先只在拿到分片后才查 cancel，停止按钮要干等到 120s 空闲超时
-            // 才生效（2026-10-20 修，对照工具侧的 select! 写法）。
+            // 等下一个分片：空闲超时、「停止」与「立即发送打断」同时监听——渠道静默
+            // 不回分片时，原先只在拿到分片后才查 cancel，停止按钮要干等到 120s 空闲
+            // 超时才生效（2026-10-20 修，对照工具侧的 select! 写法）。
             let item = tokio::select! {
                 () = cancel.cancelled() => {
                     observability::event(
@@ -952,6 +963,19 @@ impl Gateway {
                     );
                     record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("cancelled", "用户取消".into()));
                     return Ok(ChatOutcome::Cancelled);
+                }
+                () = interrupt.cancelled() => {
+                    // 「立即发送」：流式让位——半截内容带出（tool_calls 丢弃），调用方
+                    // 落地半截后继续本轮（下一个决策点取走打断指令）
+                    observability::event(
+                        EventType::State,
+                        json!({ "kind": "interrupt", "phase": "streaming", "chunks": agg.chunk_count }),
+                    );
+                    record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::ok((0, 0, 0)));
+                    agg.finish();
+                    let mut turn = agg.turn;
+                    turn.tool_calls.clear();
+                    return Ok(ChatOutcome::Interrupted(turn));
                 }
                 item = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => match item {
                     Ok(item) => item,

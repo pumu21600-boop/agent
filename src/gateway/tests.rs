@@ -518,6 +518,7 @@ Content-Length: 2
                 &json!([{"role":"user","content":"hi"}]),
                 None,
                 &cancel,
+                None,
                 |_| {},
             )
             .await;
@@ -527,6 +528,7 @@ Content-Length: 2
         match out {
             Ok(ChatOutcome::Cancelled) => {}
             Ok(ChatOutcome::Done(_)) => panic!("应返回 Cancelled，实际拿到完整回答"),
+            Ok(ChatOutcome::Interrupted(_)) => panic!("应返回 Cancelled，实际拿到打断"),
             Err(e) => panic!("应返回 Cancelled，实际报错: {e:#}"),
         }
         // 旧实现要干等到 120s 空闲超时（静默）或 600s 客户端超时（无响应）

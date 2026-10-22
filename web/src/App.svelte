@@ -120,8 +120,11 @@
   let input = '';
   let seq = 0;
   let chatBody;
-  // 本页发过的「立即发送」内容：服务端 steer 事件按序配对，避免自己发的那条被重复补气泡
+  // 本页发过的「立即发送/引导」内容：服务端 steer 事件按序配对，避免自己发的那条被重复处理
   let localSteers = [];
+  // 「已引导」静默标记（2026-10-22 用户定案：引导不打断、不发用户气泡——显示
+  // 「已引导」轻提示，本轮结束清除；发完输入框立即可继续干别的）
+  let guided = {}; // key → [{ text }]
 
   const curKey = () => currentSessionId || '@new';
   // 刷新「当前会话」的三个镜像变量（切会话、流开始/结束时调用）
@@ -2755,18 +2758,27 @@
       .map((m) => ({ role: m.role, content: m.content }));
     history.push({ role: 'user', content: effectiveMsg });
     const asstId = nextId();
-    // 出队 / 立即发送的那条：原地把「排队中」气泡转正（保持顺序），不新增用户气泡
+    // 出队 / 立即发送的那条：原地把「排队中」气泡转正（保持顺序），不新增用户气泡。
+    // 引导（steer + silentSteer，2026-10-22 用户定案）反过来：**撤掉**排队气泡——
+    // 引导是静默的，不占对话气泡位，只显示「已引导」标记。
     const hasBubble = opts.bubbleId && (sessionMsgs[key] || []).some((m) => m.id === opts.bubbleId);
-    updMsgs(key, (a) => [
-      ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer } : m)),
-      ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: text, attachments: atts, convs }]),
-      { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() },
-    ]);
+    if (opts.silentSteer) {
+      updMsgs(key, (a) => [
+        ...a.filter((m) => m.id !== opts.bubbleId),
+        { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() },
+      ]);
+    } else {
+      updMsgs(key, (a) => [
+        ...a.map((m) => (opts.bubbleId && m.id === opts.bubbleId ? { ...m, queued: false, steered: !!opts.steer, interrupted: !!opts.interrupt } : m)),
+        ...(hasBubble ? [] : [{ id: nextId(), role: 'user', content: text, attachments: atts, convs }]),
+        { id: asstId, role: 'assistant', content: '', thinking: '', tools: [], streaming: true, workStartedAt: Date.now() },
+      ]);
+    }
     const ac = new AbortController();
-    // 引导（立即发送）不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
+    // 引导/打断不是一轮对话：**不登记 streams**——登记会顶掉运行中那轮的
     // 流条目，引导响应一结束 finally 又把它删掉，原轮还在跑本页却以为空闲了
     // （再发消息走错分支、出队逻辑乱序）。引导的 SSE 只回执不产出，用不上这些。
-    const ownsTurn = opts.steer !== true;
+    const ownsTurn = opts.steer !== true && opts.interrupt !== true;
     if (ownsTurn) streams = { ...streams, [key]: { asstId, controller: ac } };
     syncCur();
     const stream = { asstId, controller: ac };
@@ -2786,6 +2798,7 @@
           approval_mode: approvalBySession[key] || approvalMode,
           session_id: skey === '@new' ? '' : skey,
           steer: opts.steer === true,
+          interrupt: opts.interrupt === true,
         }),
         signal: ac.signal,
       });
@@ -2864,11 +2877,14 @@
                   thinking: (m.thinking || '').slice(0, Math.max(0, (m.thinking || '').length - (d.reset.reasoning || 0))),
                 }));
               else if (d.steer) {
-                // 「立即发送（引导）」的消息并入了本轮：别的窗口发的在这里补气泡；本页自己发过的已补过
+                // 引导/打断的消息并入了本轮。本页自己发过的（localSteers 按序配对）跳过——
+                // 引导的已在发送时显示「已引导」标记（不发气泡），打断的气泡已转正。
+                // 别的窗口发的在这里补：打断=正常用户气泡，引导=「已引导」静默标记（不占气泡位）。
                 const add = [];
                 for (const m of d.steer.messages || []) {
                   if (localSteers.length > 0 && localSteers[0] === m.content) localSteers.shift();
-                  else add.push({ id: nextId(), role: 'user', content: m.content });
+                  else if (m.interrupted) add.push({ id: nextId(), role: 'user', content: m.content, interrupted: true });
+                  else guided = { ...guided, [skey]: [...(guided[skey] || []), { text: m.content }] };
                 }
                 if (add.length) updMsgs(skey, (a) => [...a, ...add]);
               } else if (d.tool_call)
@@ -2984,6 +3000,10 @@
         delete nextStreams[skey];
         streams = nextStreams;
         localSteers = [];
+        // 本轮结束：「已引导」标记完成使命（指令都已并入并被处理）
+        const nextGuided = { ...guided };
+        delete nextGuided[skey];
+        guided = nextGuided;
         syncCur();
         // 流死了没产出任何内容（网络断/服务重启等）：撤掉空回答气泡，别留一个空壳。
         // 缓冲已被清掉的会话（切工作区 abort）不复活条目——否则空数组是 truthy，
@@ -3009,14 +3029,18 @@
     return ok;
   }
 
-  // 「立即发送」（027）：把排队的这条马上并进正在跑的那一轮——不打断对话，
-  // 模型下一个决策点就看到（引导当前回答）。跑完了/没送进去会自动退回队列。
-  async function sendNow(itemId) {
+  // 「立即发送 / 引导」（027 + 2026-10-22 分家）：把排队的这条马上并进正在跑的那一轮。
+  // mode='interrupt'（立即发送）= 打断：审批/工具/流式让位，新指令立即生效（消息正常上气泡）；
+  // mode='steer'（引导）= 不打断：跑完当前这步就并入，**静默**——撤掉排队气泡，
+  // 只显示「已引导」标记，输入框立即可继续干别的。
+  // 跑完了/没送进去会自动退回队列。
+  async function sendNow(itemId, mode = 'interrupt') {
     const key = curKey();
     const item = (outbox[key] || []).find((x) => x.id === itemId);
     if (!item) return;
+    const label = mode === 'steer' ? '引导' : '立即发送';
     if (item.atts && item.atts.length > 0) {
-      pushMsg(key, { id: nextId(), role: 'error', content: '「立即发送」暂不支持带附件的消息：这一轮结束后会自动发出去。' });
+      pushMsg(key, { id: nextId(), role: 'error', content: `「${label}」暂不支持带附件的消息：这一轮结束后会自动发出去。` });
       return;
     }
     // 先出队（免得本轮结束时又自动发一遍）
@@ -3027,16 +3051,32 @@
       return;
     }
     if (item.convs && item.convs.length) {
-      pushMsg(key, { id: nextId(), role: 'error', content: '「立即发送」暂不支持带引用对话的消息：这一轮结束后会自动发出去。' });
+      pushMsg(key, { id: nextId(), role: 'error', content: `「${label}」暂不支持带引用对话的消息：这一轮结束后会自动发出去。` });
       return;
     }
     localSteers.push(item.text);
-    const ok = await deliver(key, item.text, [], { bubbleId: item.id, steer: true });
+    if (mode === 'steer') {
+      // 引导：静默——撤气泡 + 「已引导」标记
+      guided = { ...guided, [key]: [...(guided[key] || []), { text: item.text }] };
+    }
+    const ok = await deliver(key, item.text, [], {
+      bubbleId: item.id,
+      steer: mode === 'steer',
+      silentSteer: mode === 'steer',
+      interrupt: mode === 'interrupt',
+    });
     if (!ok) {
       // 没送进服务端：退回队列，等这一轮结束自动发
       localSteers = localSteers.filter((t) => t !== item.text);
+      if (mode === 'steer') {
+        guided = { ...guided, [key]: (guided[key] || []).filter((g) => g.text !== item.text) };
+        // 静默撤掉的气泡补回来（恢复排队中状态）
+        updMsgs(key, (a) => [...a, { id: item.id, role: 'user', content: item.text, queued: true }]);
+      }
       outbox = { ...outbox, [key]: [item, ...(outbox[key] || [])] };
-      updMsgs(key, (a) => a.map((m) => (m.id === item.id ? { ...m, queued: true, steered: false } : m)));
+      if (mode === 'interrupt') {
+        updMsgs(key, (a) => a.map((m) => (m.id === item.id ? { ...m, queued: true, steered: false, interrupted: false } : m)));
+      }
     }
   }
 
@@ -3642,7 +3682,8 @@
     const out = [];
     for (const m of msgs) {
       if (m.role === 'user') {
-        out.push({ id: nextId(), role: 'user', content: contentText(m.content) });
+        // steered=引导消息（2026-10-22）：渲染成「已引导」轻量行，不占气泡位
+        out.push({ id: nextId(), role: 'user', content: contentText(m.content), steered: !!m.steered, interrupted: !!m.interrupted });
       } else if (m.role === 'assistant') {
         const asst = {
           id: nextId(),
@@ -5438,6 +5479,13 @@
         <div class="cv-chunk" style:contain-intrinsic-size={`auto ${c.n * 140}px`}>
           {#each c.msgs as m (m.id)}
         {#if m.role === 'user'}
+          {#if m.steered}
+            <!-- 引导消息：静默轻量行（2026-10-22 用户定案——引导不打断、不占对话气泡位） -->
+            <div class="steer-line" title="引导消息：不打断当时的对话，静默并入了那一轮">
+              <span class="steer-line-badge">已引导</span>
+              <span class="steer-line-text">{m.content}</span>
+            </div>
+          {:else}
           <div class="msg user">
             <div class="bubble user-bubble">
               {#if m.attachments && m.attachments.length > 0}
@@ -5477,13 +5525,17 @@
               {#if m.queued}
                 <div class="queued-row">
                   <span class="queued-badge">排队中 · 这一轮结束后自动发送</span>
-                  <button class="queued-send" on:click={() => sendNow(m.id)} title="并进正在跑的这一轮（引导当前回答，不打断）">立即发送</button>
+                  <button class="queued-send" on:click={() => sendNow(m.id, 'interrupt')} title="中断当前操作（工具/回答让位），新指令立即生效">立即发送</button>
+                  <button class="queued-send" on:click={() => sendNow(m.id, 'steer')} title="不打断：跑完当前这步就并入本轮。静默生效，不占对话气泡">引导</button>
                 </div>
               {:else if m.steered}
                 <div class="queued-row"><span class="queued-badge steered">已引导当前回答</span></div>
+              {:else if m.interrupted}
+                <div class="queued-row"><span class="queued-badge steered">已中断当前操作并立即发送</span></div>
               {/if}
             </div>
           </div>
+          {/if}
         {:else if m.role === 'assistant'}
           <div class="msg assistant">
             <div class="bubble asst-bubble">
@@ -5685,13 +5737,24 @@
             {/each}
           </div>
         {/if}
+        {#if (guided[curKey()] || []).length > 0}
+          <!-- 已引导标记（2026-10-22）：静默提示,不占对话气泡位;本轮结束自动消失 -->
+          <div class="guided-row">
+            {#each guided[curKey()] as g}
+              <span class="guided-chip" title={`不打断当前操作,跑完这步就并入:${g.text}`}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+                已引导 · {g.text.length > 40 ? g.text.slice(0, 40) + '…' : g.text}
+              </span>
+            {/each}
+          </div>
+        {/if}
         <textarea
           class="composer-input"
           rows="1"
           bind:this={composerInputEl}
           bind:value={input}
           placeholder={streaming
-            ? '当前会话运行中：Enter 发送会先排队（本轮结束后自动发出）；想马上引导当前回答，点气泡上的「立即发送」'
+            ? '当前会话运行中：Enter 发送会先排队（本轮结束后自动发出）；要马上生效，发送后点气泡上的「立即发送」（打断）或「引导」（不打断）'
             : '输入消息，Enter 发送，Shift+Enter 换行（支持粘贴截图、拖拽文件）'}
           on:keydown={handleKey}
           on:input={autoRows}
@@ -9346,6 +9409,54 @@
   }
   .queued-send:hover {
     background: color-mix(in srgb, var(--accent, #4a9) 14%, transparent);
+  }
+  /* 引导消息的静默轻量行（历史回放）：不占气泡位，居中小字 */
+  .steer-line {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    justify-content: center;
+    margin: 4px 0;
+    font-size: 12px;
+    color: var(--text-dim, #888);
+    max-width: 78%;
+    margin-left: auto;
+    margin-right: 0;
+  }
+  .steer-line-badge {
+    flex: none;
+    padding: 1px 8px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--accent, #4a9) 10%, transparent);
+    color: var(--accent, #4a9);
+  }
+  .steer-line-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* 「已引导」静默提示（输入区上方，本轮结束消失） */
+  .guided-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 2px 2px 6px;
+  }
+  .guided-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    padding: 3px 10px;
+    border-radius: 10px;
+    font-size: 12px;
+    color: var(--accent, #4a9);
+    background: color-mix(in srgb, var(--accent, #4a9) 10%, transparent);
+  }
+  .guided-chip svg {
+    width: 12px;
+    height: 12px;
+    flex: none;
   }
   .msg.assistant {
     justify-content: flex-start;

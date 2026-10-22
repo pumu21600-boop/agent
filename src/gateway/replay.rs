@@ -87,6 +87,14 @@ pub fn apply_outgoing_transforms(messages: &mut Value, model_id: &str, compat: &
         None => return,
     };
     arr.retain(|m| m.get("display_only").and_then(Value::as_bool) != Some(true));
+    // 引导/打断消息的前端渲染标记（steered/interrupted）：随会话落盘给界面回放用，
+    // 模型不需要也不该看到（2026-10-22）——与 display_only 同一处统一剥。
+    for m in arr.iter_mut() {
+        if let Some(obj) = m.as_object_mut() {
+            obj.remove("steered");
+            obj.remove("interrupted");
+        }
+    }
     let preserve = should_preserve_replay(model_id, compat);
 
     for msg in arr.iter_mut() {

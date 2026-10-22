@@ -43,8 +43,14 @@ impl ChatGate {
 impl agent::ApprovalGate for ChatGate {
     /// 025：核心循环每个决策点取一次「立即发送（引导）」的消息并入本轮（原轮不打断）；
     /// 排队等下一轮的那些留在队列里，由服务层收尾取走。
-    fn take_steering(&self) -> Vec<String> {
+    fn take_steering(&self) -> Vec<crate::core::steer::SteerMsg> {
         self.steer.drain_immediate(&self.session_id)
+    }
+
+    /// 2026-10-22「立即发送」分家：打断信号（置位让审批/工具/流式三个等待点让位，
+    /// 消息并入本轮继续；与「停止」的取消信号平行传播——取消终止整轮，打断让位后继续）。
+    fn interrupt_flag(&self) -> std::sync::Arc<crate::core::cancel::CancelFlag> {
+        self.steer.interrupt_flag(&self.session_id)
     }
 
     /// B2（Plan 档）：只读放行；Normal/Dangerous 直接驳回（不进审批弹窗）。

@@ -153,8 +153,16 @@ pub trait ApprovalGate: Send + Sync {
     fn ask(&self, tool: &str, args: &str) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
     /// N1/025「立即发送（引导）」的运行中消息：核心循环每个决策点取一次并入本轮；
     /// 默认无（测试与其它实现不受影响）。只取「立即」的，排队的等本轮结束再发。
-    fn take_steering(&self) -> Vec<String> {
+    fn take_steering(&self) -> Vec<crate::core::steer::SteerMsg> {
         Vec::new()
+    }
+    /// 打断信号（2026-10-22「立即发送」分家：打断让位，引导不打断）。工具执行与
+    /// 流式输出 select! 它当场让位；决策点取走打断消息时由队列侧复位。
+    /// 默认返回一个永不置位的信号（测试与 headless 等实现不受影响——它们没有
+    /// 「立即发送」入口，天然无人置位）。
+    fn interrupt_flag(&self) -> Arc<CancelFlag> {
+        static NEVER: std::sync::OnceLock<Arc<CancelFlag>> = std::sync::OnceLock::new();
+        NEVER.get_or_init(|| Arc::new(CancelFlag::new())).clone()
     }
 }
 
@@ -175,6 +183,7 @@ async fn run_chain(
     ctx: &[Value],
     tools_def: Option<&Value>,
     cancel: &CancelFlag,
+    interrupt: &CancelFlag,
     usage_ctx: &UsageCtx,
     step: u32,
     on_event: &(impl Fn(AgentEvent) + Send + Sync),
@@ -201,7 +210,7 @@ async fn run_chain(
             notices.push(note);
         }
         outcome = gateway
-            .stream_chat(usage_ctx, ch, &Value::Array(ctx.to_vec()), tools_def, cancel, |chunk| {
+            .stream_chat(usage_ctx, ch, &Value::Array(ctx.to_vec()), tools_def, cancel, Some(interrupt), |chunk| {
                 let delta = extract_delta(chunk);
                 if !delta.content.is_empty() {
                     streamed_content.fetch_add(
@@ -222,6 +231,7 @@ async fn run_chain(
             .await;
         match &outcome {
             Ok(ChatOutcome::Done(_)) => break,
+            Ok(ChatOutcome::Interrupted(_)) => break, // 打断不是错误，不降级——半截落地后本轮继续
             Ok(ChatOutcome::Cancelled) => return (outcome, notices),
             Err(_) => continue, // 换下一个渠道
         }
@@ -408,6 +418,10 @@ pub async fn run_task(
     // 起点可由 server 从上一轮的用量快照带入（跨轮沿用样本，见 LoopChannels::prior_anchor）。
     let mut anchor: Option<(u64, u64)> = channels.prior_anchor.filter(|(p, e)| *p > 0 && *e > 0);
 
+    // 打断信号（2026-10-22「立即发送」分家）：流式输出与工具执行两个等待点
+    // select! 它当场让位（半截落地/工具按已中断回喂），决策点取走打断消息时复位；
+    // 整轮生命周期内同一实例（clear 不 remove，见 SteerQueue）。
+    let interrupt = gate.interrupt_flag();
     // 步数上限：0 = 不限（2026-10-03 用户拍板——大项目 100+ 次工具调用是常态，步数
     // 上限本只该防死循环，而防死循环有取消标志/花费硬闸两道缰绳，不该由它
     // 把长任务拦腰砍断）。非 0 时是硬上限：撞顶即止并抛 StepLimit（前端提示可回「继续」）。
@@ -426,8 +440,19 @@ pub async fn run_task(
         // 落 Snapshot 让追加消息立刻进会话文件；前端按 Steer 事件补用户气泡。
         let steer = gate.take_steering();
         if !steer.is_empty() {
-            let added: Vec<Value> =
-                steer.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+            // 引导/打断消息进上下文与落盘都带标记（模型照常看到内容——它就是给
+            // 模型的指令；标记只是给前端的渲染提示，发送侧 replay 剥掉）：
+            // 引导 steered=true（静默「已引导」行，2026-10-22 用户定案）；
+            // 打断 interrupted=true（正常用户气泡——立即发送的消息要在对话里）。
+            let added: Vec<Value> = steer
+                .iter()
+                .map(|s| match s.mode {
+                    crate::core::steer::SteerMode::Interrupt => {
+                        json!({ "role": "user", "content": s.text, "interrupted": true })
+                    }
+                    _ => json!({ "role": "user", "content": s.text, "steered": true }),
+                })
+                .collect();
             observability::event(
                 EventType::State,
                 json!({ "kind": "steer", "count": added.len(), "step": step }),
@@ -538,6 +563,7 @@ pub async fn run_task(
             &msgs,
             tools_def.as_ref(),
             cancel,
+            &interrupt,
             &usage_ctx,
             step as u32,
             &on_event,
@@ -556,6 +582,16 @@ pub async fn run_task(
 
         let turn = match outcome {
             ChatOutcome::Cancelled => return Ok(LoopOutcome::Cancelled),
+            ChatOutcome::Interrupted(t) => {
+                // 「立即发送」打断（2026-10-22）：流式被用户插话让位——半截回答
+                // 落地（有内容才落），**本轮继续**：下一个决策点（循环顶部
+                // take_steering）取走打断指令，模型带着「自己的半截回答 + 新指令」继续。
+                if !t.content.trim().is_empty() {
+                    msgs.push(json!({ "role": "assistant", "content": t.content }));
+                    on_event(AgentEvent::Snapshot { messages: snapshot_msgs(&msgs) });
+                }
+                continue;
+            }
             ChatOutcome::Done(t) => t,
         };
 
@@ -666,8 +702,16 @@ pub async fn run_task(
             // 已流出的回答，模型下一步就看到），没有才是真的结束。
             let steer = gate.take_steering();
             if !steer.is_empty() {
-                let added: Vec<Value> =
-                    steer.iter().map(|t| json!({ "role": "user", "content": t })).collect();
+                // 同决策点：按模式打标记（引导=steered 静默行 / 打断=interrupted 气泡）
+                let added: Vec<Value> = steer
+                    .iter()
+                    .map(|s| match s.mode {
+                        crate::core::steer::SteerMode::Interrupt => {
+                            json!({ "role": "user", "content": s.text, "interrupted": true })
+                        }
+                        _ => json!({ "role": "user", "content": s.text, "steered": true }),
+                    })
+                    .collect();
                 observability::event(
                     EventType::State,
                     json!({ "kind": "steer", "phase": "post_answer", "count": added.len(), "step": step }),
@@ -870,9 +914,10 @@ pub async fn run_task(
             let args = call.arguments.clone();
             let runner = subagent_runner.clone();
             let parent = parent_sid.clone();
+            let interrupt = interrupt.clone();
             futs.push(Box::pin(async move {
                 let exec = exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent);
-                (i, exec_with_cancel(cancel, exec).await)
+                (i, exec_with_cancel(cancel, &interrupt, exec).await)
             }));
         }
         // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
@@ -980,7 +1025,7 @@ pub async fn run_task(
                     channels.subagents.as_ref(),
                     gate.session_id(),
                 );
-                match exec_with_cancel(cancel, exec).await {
+                match exec_with_cancel(cancel, &interrupt, exec).await {
                     Ok(mut s) => {
                         // 截图标记同并行路径：剥出单放，回填时升级多模态
                         if let Some(img) = crate::computer::take_image(&mut s) {
@@ -1045,8 +1090,9 @@ mod tests {
         assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
     }
 
-    // —— 坑 31 ① 收口：工具执行期取消闸（exec_with_cancel）——
-    // 卡住的工具（永不完成的 future）+ 点停止 → 当场返回「已取消」，不干等工具超时。
+    // —— 坑 31 ① 收口 + 2026-10-22「立即发送」分家：工具执行期两道闸（exec_with_cancel）——
+    // 卡住的工具（永不完成的 future）+ 点停止 → 当场返回「已取消」；
+    // + 点「立即发送」→ 当场返回「已中断」（本轮继续，下一个决策点取走新指令）。
     #[tokio::test]
     async fn tool_exec_cancel_gate_interrupts_pending_tool() {
         let flag = Arc::new(CancelFlag::new());
@@ -1058,17 +1104,36 @@ mod tests {
         // 唯一出路是取消臂：2s 上限远小于「干等工具自己超时」的旧行为
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            exec_with_cancel(&flag, std::future::pending::<Result<String, String>>()),
+            exec_with_cancel(&flag, &CancelFlag::new(), std::future::pending::<Result<String, String>>()),
         )
         .await
         .expect("点停止必须在 2s 内打断卡住的工具（旧行为：干等工具超时 ~30s）");
         assert_eq!(r, Err("已取消：用户点了结束回答".to_string()));
     }
 
+    /// 「立即发送」打断臂：打断信号置位 → 工具按「已中断」回喂（文案区分于停止；
+    /// 循环不终止是 run_task 层的职责，这里锁的是闸本身的即时性）。
+    #[tokio::test]
+    async fn tool_exec_interrupt_gate_yields_immediately() {
+        let interrupt = Arc::new(CancelFlag::new());
+        let setter = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            setter.set();
+        });
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            exec_with_cancel(&CancelFlag::new(), &interrupt, std::future::pending::<Result<String, String>>()),
+        )
+        .await
+        .expect("「立即发送」必须在 2s 内让卡住的工具让位");
+        assert!(matches!(r, Err(ref e) if e.contains("已中断")), "打断文案要说人话: {r:?}");
+    }
+
     #[tokio::test]
     async fn tool_exec_cancel_gate_passes_through_completion() {
         let flag = CancelFlag::new();
-        let r = exec_with_cancel(&flag, async { Ok("完成".to_string()) }).await;
+        let r = exec_with_cancel(&flag, &CancelFlag::new(), async { Ok("完成".to_string()) }).await;
         assert_eq!(r, Ok("完成".to_string()), "未点停止时工具结果原样通过");
     }
 
