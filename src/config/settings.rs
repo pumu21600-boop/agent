@@ -872,8 +872,25 @@ impl Settings {
 /// `load`（启动/首次读）与**外部改动重载**（agent 或用户拿文件工具直接改了
 /// settings.json）共用这一把尺子——两边迁移语义必须完全一致，否则「同一份文件，
 /// 重启后是一种状态、热加载后是另一种」比不热加载更难查。历史迁移链：
-/// 旧字段名 → 老版无 configs 挽救 → key 三级归位 → 信任键合并 → ensure_active_config。
-/// 解析失败返回 Err（调用方各自处理：load 备份坏文件，重载保持内存现状）。
+/// 旧字段名 → 老版无 configs 挽救 → key 三级归位 → ensure_active_config
+/// （信任键合并已随验签机制移除）。解析失败返回 Err（调用方各自处理：load 备份
+/// 坏文件，重载保持内存现状）。
+///
+/// 全史格式考古定案（2026-10-22，自 09-02 施工单 001 起 47 个提交逐代对账）：
+/// - v0（09-02）：顶层 provider_id/base_url/model/models/key_cipher 五字段，无
+///   configs——走下方挽救路径，顶层 key 直接挂到挽救出的配置（2026-10-22 垫片改：
+///   原先绕三跳靠 providers.json 默认 base_url 兜底，预设 id 收敛删除的场合 key
+///   会卡死在过渡槽静默丢失；三跳链保留给 v1/v2 时代带 configs 的顶层 key）。
+/// - profiles 时代（09-02）：profiles/active_profile_id → migrate_legacy_field_names。
+/// - configs 时代（09-02 起）：key 从顶层共享逐级收紧到配置独占（v1/v2/v2.4）。
+/// - Config.thinking_budget（09-03 一天窗口，P8.2 加入、同日 P8.4 照抄 OpenClaw
+///   删除）：**有意不迁**——数值语义已被档位化 thinking + thinking_style 形态
+///   取代，无迁移目标；serde 忽略未知字段，读旧文件静默丢弃该键。
+/// - trusted_plugins 与 mcp_servers[].confirmed/risk：随验签/每服务审批档机制
+///   移除（2026-10-08 用户拍板），旧键 serde 自然忽略，不迁。
+/// - mcp_servers[].transport：09-14 时代只有 stdio 无此键；serde default="stdio"。
+///
+/// 未来字段改名只改 migrate_legacy_field_names（旧名→新名一行），勿另开入口。
 pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Error> {
     let mut s = parse_settings(text)?;
     // 若旧版完全没有 configs 数组，从顶层字段挽救一套配置
@@ -885,6 +902,11 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
         let model = legacy.model.unwrap_or_else(|| "deepseek-chat".to_string());
         let models = legacy.models.unwrap_or_default();
         let cap = ModelCapabilities::default();
+        // v0 顶层 key 直接挂到挽救出的这套配置——它本来就属于这套配置，不必绕
+        // providers 预设兜底的 provider→url→config 三跳（那条路在预设 id 被收敛
+        // 删除的场合会把 key 卡死在过渡槽里静默丢失）；三跳链留给 v1/v2 时代
+        // 带 configs 的顶层 key（见下方两段）。
+        let key_cipher = s.key_cipher.take();
         s.configs.push(Config {
             id: new_config_id(),
             name: "配置 1".to_string(),
@@ -892,7 +914,7 @@ pub(crate) fn settings_from_text(text: &str) -> Result<Settings, serde_json::Err
             base_url,
             model,
             models,
-            key_cipher: None,
+            key_cipher,
             context_length: legacy.context_length,
             max_output_tokens: legacy.max_output_tokens,
             temperature: legacy.temperature,

@@ -124,6 +124,53 @@
     }
 
     #[test]
+    fn backward_compat_v0_top_level_rescue() {
+        // 施工单 001（09-02）的最初格式：顶层五字段，无 configs 无 profiles。
+        // 顶层 key 直接挂到挽救出的配置（不依赖 providers 预设兜底——那条路在
+        // 预设 id 被收敛删除的场合会把 key 卡死在过渡槽里静默丢失）。
+        let v0 = r#"{
+            "provider_id": "deepseek",
+            "base_url": "",
+            "model": "deepseek-chat",
+            "models": ["deepseek-chat", "deepseek-reasoner"],
+            "key_cipher": "v0-dpapi-cipher"
+        }"#;
+        let s = settings_from_text(v0).expect("v0 顶层格式必须可挽救");
+        assert_eq!(s.configs.len(), 1, "顶层字段挽救成一套配置");
+        let c = s.active().expect("挽救后必须有激活配置");
+        assert_eq!(c.provider_id, "deepseek");
+        assert_eq!(c.model, "deepseek-chat");
+        assert_eq!(c.models, vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]);
+        assert_eq!(c.key_cipher.as_deref(), Some("v0-dpapi-cipher"), "v0 顶层 key 三跳归位到配置");
+        assert!(s.keys.is_empty(), "keys 过渡槽归位后清空");
+        // 落盘不写顶层镜像与过渡槽
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(val.get("provider_id").is_none(), "顶层镜像 provider_id 不再序列化");
+        assert!(val.get("key_cipher").is_none(), "顶层 key_cipher 过渡槽不序列化");
+        assert!(val.get("keys").is_none(), "keys 过渡槽不序列化");
+    }
+
+    #[test]
+    fn backward_compat_pre_b84_thinking_budget_dropped() {
+        // 09-03 一天窗口的中间格式（P8.2 加 Config.thinking_budget，同日 P8.4 照抄
+        // OpenClaw 覆盖删除）：有意不迁——数值语义已被档位化 thinking + thinking_style
+        // 形态取代，无迁移目标。解析必须不炸、thinking 档位保留、死键静默丢弃。
+        let legacy = r#"{
+            "configs": [{
+                "id": "cfg-mid", "name": "中间格式", "provider_id": "deepseek",
+                "base_url": "https://api.deepseek.com", "model": "deepseek-chat",
+                "thinking": "high", "thinking_budget": 4096
+            }]
+        }"#;
+        let s = parse_settings(legacy).expect("中间格式必须可解析");
+        assert_eq!(s.configs[0].thinking.as_deref(), Some("high"), "thinking 档位保留");
+        assert_eq!(s.configs[0].thinking_style, None);
+        let text = serde_json::to_string(&s).unwrap();
+        assert!(!text.contains("thinking_budget"), "死字段落盘不写");
+    }
+
+    #[test]
     fn backward_compat_field_name_migration() {
         // 配置面收敛：serde alias 垫片退役，旧字段名兼容收拢到 parse_settings 单一入口。
         // ① 三组旧名各自迁入；② 新旧并存以新名为准（旧键删除）；③ 落盘不再写旧名。
