@@ -12,7 +12,7 @@ description: 创建与保真修改 .pptx：增量改字不动版式
 3. **改已有 pptx 优先走 `replace` 保真增量改，不是 `text→spec→make` 重排**。replace 只动 ops 指定的文字/页，动画、主题、模板、母版原样保留；make 是整册重打，只用于「新建」或「用户明确接受版式重排的整册重做」。
 4. **默认交付 `<原名>_updated.pptx` 副本，保原件**；用户明说「原地改/覆盖原文件」才 out 写原路径。
 5. 不用 subagent_spawn 验证；改完 `text <输出.pptx>` 回读核对页数与文案，**再跑 `check.js` 结构验收（1.5 节）**，check 有 FAIL 就不许收尾。
-6. 依赖缺失只许装到 `~/.agent/skill-modules`；装不上停下来如实报告。
+6. 依赖缺失只许装到 `~/.pawch-agent/skill-modules`；装不上停下来如实报告。
 
 ## 0. 环境检测（任务第一步）
 
@@ -93,5 +93,5 @@ node "<技能目录>\scripts\check.js" <输出.pptx> --expect "新文本" --not 
 ## 5. 环境安装（仅缺依赖时）
 
 ```
-npm install --prefix "%USERPROFILE%\.agent\skill-modules" pptxgenjs jszip
+npm install --prefix "%USERPROFILE%\.pawch-agent\skill-modules" pptxgenjs jszip
 ```

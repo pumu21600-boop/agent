@@ -122,7 +122,7 @@
   <!-- 宿主能力（2026-10-06 重整后不再是插件，留在设置页）：Git 运行时状态卡片从
      git-panel 插件分区搬来（哪个 git 在生效 + 重新检测）；沙箱自检同理 -->
   <div class="group-label">宿主能力</div>
-  <div class="plug-row" title="git.exe 发现链：环境变量 AGENT_GIT_PATH → PATH → 注册表 → 常见安装位置 → exe 同级 tools/git → 内置 zip 懒解压">
+  <div class="plug-row" title="git.exe 发现链：环境变量 PAWCH_AGENT_GIT_PATH（旧名 AGENT_GIT_PATH 兼容一个版本）→ PATH → 注册表 → 常见安装位置 → exe 同级 tools/git → 内置 zip 懒解压">
     <div class="plug-ico">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg>
     </div>

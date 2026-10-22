@@ -9,7 +9,7 @@ pub(crate) fn git_exe() -> Result<PathBuf, String> {
     static GIT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     GIT.get_or_init(|| {
         // 1) 显式环境变量
-        if let Ok(p) = std::env::var("AGENT_GIT_PATH") {
+        if let Some(p) = crate::config::env_pawch("GIT_PATH") {
             let pb = PathBuf::from(p);
             if pb.is_file() {
                 register_git_dirs(&pb);
@@ -191,22 +191,28 @@ pub(crate) fn git_version(git: &Path) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// 内置 git 运行时目录（懒解压目标）：`%LOCALAPPDATA%\agent\runtime\git`。
+/// 内置 git 运行时目录（懒解压目标）：`%LOCALAPPDATA%\pawch-agent\runtime\git`。
 /// 放用户目录而不是程序目录：程序可能装在只读位置（Program Files），且卸载重装不丢。
+/// 2026-10-22 改名迁移轮：`agent` → `pawch-agent`。旧目录（`%LOCALAPPDATA%\agent\...`，
+/// 已解压的缓存）兼容一个版本——有就直接用，没有才解压新的；纯缓存，搬不搬都不丢数据。
 pub(crate) fn bundled_runtime_dir() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|d| PathBuf::from(d).join("agent").join("runtime").join("git"))
+    let local = std::env::var("LOCALAPPDATA").ok().filter(|s| !s.is_empty())?;
+    let base = PathBuf::from(local);
+    let legacy = base.join("agent").join("runtime").join("git");
+    if legacy.is_dir() {
+        return Some(legacy);
+    }
+    Some(base.join("pawch-agent").join("runtime").join("git"))
 }
 
 /// 随包携带的 MinGit 压缩包候选位置：
-/// `AGENT_GIT_ZIP` 环境变量 → exe 同级 `tools\git-runtime.zip`（打包分发布局）
-/// → exe 上两级 `runtime\git-runtime.zip`（开发布局：target\release\agent.exe → 仓库根）。
+/// `PAWCH_AGENT_GIT_ZIP`（旧名 `AGENT_GIT_ZIP` 兼容一个版本）环境变量 → exe 同级
+/// `tools\git-runtime.zip`（打包分发布局）
+/// → exe 上两级 `runtime\git-runtime.zip`（开发布局：target\release\pawch-agent.exe → 仓库根）。
 pub(crate) fn bundled_zip_candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(p) = std::env::var("AGENT_GIT_ZIP")
-        && !p.trim().is_empty() {
+    if let Some(p) = crate::config::env_pawch("GIT_ZIP")
+        && !p.to_string_lossy().trim().is_empty() {
             v.push(PathBuf::from(p));
         }
     if let Ok(exe) = std::env::current_exe()

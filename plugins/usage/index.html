@@ -59,7 +59,7 @@
   </div>
 
 <script>
-// —— 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对 ——
+// —— 插件契约 v1：等宿主 pawch:init 再发请求；pawch:request/response 按 id 配对 ——
 let seq = 0;
 const pending = new Map();
 let rate = 7.2;
@@ -68,7 +68,7 @@ let booted = false;
 
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
-  if (d.type === 'agent:init') {
+  if (d.type === 'pawch:init') {
     // 主题跟着宿主走（宿主切主题会重发 init）；但 boot 只跑一次——
     // 重复 init 再 load 一遍会叠加轮询定时器（面板越切越卡）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
@@ -77,7 +77,7 @@ window.addEventListener('message', (ev) => {
       boot();
     }
   }
-  if (d.type === 'agent:response') {
+  if (d.type === 'pawch:response') {
     const r = pending.get(d.id);
     if (!r) return;
     pending.delete(d.id);
@@ -89,10 +89,10 @@ function req(method, params) {
   return new Promise((res, rej) => {
     const id = 'r' + ++seq;
     pending.set(id, { res, rej });
-    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
   });
 }
-parent.postMessage({ type: 'agent:hello' }, '*');
+parent.postMessage({ type: 'pawch:hello' }, '*');
 
 const $ = (id) => document.getElementById(id);
 const num = (n) => (n ?? 0).toLocaleString('zh-CN');

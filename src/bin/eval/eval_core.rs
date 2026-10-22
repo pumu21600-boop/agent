@@ -253,9 +253,12 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 /// 服务自身管理的运行时文件（eval 断言应忽略，不算「任务改动」）：
-/// .agent/ 记忆层、AGENTS.md 模板、.gitignore（服务会自动建/追加）、.git/、.attachments/。
+/// .agent/ 记忆层（工作区根，不在改名轮范围）、AGENTS.md 模板、.gitignore
+/// （服务会自动建/追加）、.git/、.attachments/。
 fn is_runtime_file(rel: &str) -> bool {
     let lower = rel.to_lowercase();
+    // 工作区 .agent/（项目记忆 + 影子仓库）不在 2026-10-22 改名轮范围（只改应用目录
+    // 与用户目录两个根），这里维持 .agent/ 一种
     lower.starts_with(".agent/")
         || lower.starts_with(".git/")
         || lower.starts_with(".attachments/")
@@ -528,7 +531,7 @@ mod tests {
         std::fs::remove_file(ws.join("b.txt")).unwrap();
         assert!(!run_assertion(&a("files_unchanged", "", "", ""), &ws, &before, &BTreeSet::new()).0);
 
-        // 运行时文件（.agent/ 等）怎么动都不算任务改动
+        // 运行时文件（.pawch-agent/ 等）怎么动都不算任务改动
         std::fs::write(ws.join("b.txt"), "2").unwrap();
         std::fs::create_dir_all(ws.join(".agent")).unwrap();
         std::fs::write(ws.join(".agent").join("events.log"), "changed").unwrap();

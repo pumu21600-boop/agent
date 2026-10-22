@@ -15,7 +15,7 @@ pub mod settings_schema;
 ///
 /// 判定：exe 同级存在 `config.toml` 或 `web` 目录 ⇒ 认定随包运行，一切相对资源
 /// （config.toml / settings.json / providers.json / prompts / web/dist / plugins / logs）
-/// 都落在 exe 同级。`cargo run` 与 `target\release\agent.exe` 直接跑时同级没有这些
+/// 都落在 exe 同级。`cargo run` 与 `target\release\pawch-agent.exe` 直接跑时同级没有这些
 /// 目录，行为与从前（CARGO_MANIFEST_DIR）完全一致，开发流程不受影响。
 pub fn app_root() -> std::path::PathBuf {
     if let Ok(exe) = std::env::current_exe()
@@ -25,6 +25,17 @@ pub fn app_root() -> std::path::PathBuf {
         return dir.to_path_buf();
     }
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// 读本产品自己的环境变量（2026-10-22 改名迁移轮）：新名 `PAWCH_AGENT_<后缀>` 优先，
+/// 旧名 `AGENT_<后缀>` 兼容一个版本——用户脚本/文档/习惯不会一夜切换，两种都认。
+/// 第三方约定的变量（DEEPSEEK_API_KEY / SOFFICE_PATH 等）不走这里，原样读。
+pub fn env_pawch(suffix: &str) -> Option<std::ffi::OsString> {
+    let new = format!("PAWCH_AGENT_{suffix}");
+    if let Some(v) = std::env::var_os(&new) {
+        return Some(v);
+    }
+    std::env::var_os(format!("AGENT_{suffix}"))
 }
 
 #[cfg(test)]
@@ -39,6 +50,27 @@ mod app_root_tests {
         assert_eq!(root, std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         assert!(root.join("config.toml").is_file(), "源码根应有 config.toml");
         assert!(root.join("providers.json").is_file(), "源码根应有 providers.json");
+    }
+
+    /// env_pawch：新名优先、旧名回落、都没有 None（改名迁移轮兼容一个版本）。
+    /// 变量名全网独占（别的测试不碰这三个名），set_var 是进程全局的——单测+独占名才安全。
+    #[test]
+    fn env_pawch_prefers_new_falls_back_legacy() {
+        const NEW: &str = "PAWCH_AGENT_RENAME_PROBE";
+        const OLD: &str = "AGENT_RENAME_PROBE";
+        unsafe {
+            std::env::remove_var(NEW);
+            std::env::remove_var(OLD);
+        }
+        assert!(env_pawch("RENAME_PROBE").is_none(), "两边都没有 → None");
+        unsafe { std::env::set_var(OLD, "legacy") };
+        assert_eq!(env_pawch("RENAME_PROBE").as_deref(), Some(std::ffi::OsStr::new("legacy")), "旧名回落");
+        unsafe { std::env::set_var(NEW, "fresh") };
+        assert_eq!(env_pawch("RENAME_PROBE").as_deref(), Some(std::ffi::OsStr::new("fresh")), "新名优先");
+        unsafe {
+            std::env::remove_var(NEW);
+            std::env::remove_var(OLD);
+        }
     }
 }
 

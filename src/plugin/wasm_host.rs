@@ -9,7 +9,7 @@
 //!   钉住路径判定，不是全局根——后台任务切换工作区不会串界；canonicalize 防穿越
 //!   与 junction，绝对路径拒绝，256KB 上限，非 UTF-8 拒读）；
 //! - `host.http_get`：GET 公网（逐跳 SSRF 闸与 web_fetch 同一道、同一个
-//!   `AGENT_WEB_ALLOW_PRIVATE` 调试开关；10s 超时，返回体上限 64KB——宿主函数的
+//!   `PAWCH_AGENT_WEB_ALLOW_PRIVATE` 调试开关；10s 超时，返回体上限 64KB——宿主函数的
 //!   结果会整段进模型上下文，不能沿用 web_fetch 的 2MB）。
 //!
 //! 权限闸（「权限声明过闸」）：manifest `permissions` 数组里声明 `storage` /
@@ -222,7 +222,7 @@ fn fs_read_ws(ws: &Path, rel: &str) -> String {
 const HOST_HTTP_MAX_BYTES: usize = 64 * 1024;
 
 /// http_get：GET 公网。SSRF 逐跳闸复用 web_fetch 同一道（含
-/// `AGENT_WEB_ALLOW_PRIVATE=1` 本地调试开关）；10s 总超时——WASM 调用整层
+/// `PAWCH_AGENT_WEB_ALLOW_PRIVATE=1` 本地调试开关）；10s 总超时——WASM 调用整层
 /// 30s 墙钟，网络段必须留得出余量。
 fn http_get(handle: &Option<tokio::runtime::Handle>, url: &str) -> String {
     let Some(handle) = handle else {

@@ -3,21 +3,23 @@
 //! 行为：
 //! - 无参数双击：5173 已在跑 → 直接打开浏览器；未跑 → 自己以后台方式再起一个（隐藏窗口，
 //!   关终端不影响），然后打开浏览器；已是后台子进程则直接跑服务。
-//! - `agent.exe start`：后台启动服务（已跑则只开浏览器），与双击等价但不阻塞终端。
-//! - `agent.exe stop`：结束其他 agent.exe 服务进程（不杀自己）。
-//! - `agent.exe status`：打印 5173 监听状态与进程信息。
-//! - `agent.exe run <消息> [选项]`：无头会话一次性唤醒——打本地服务跑完整轮，
+//! - `pawch-agent.exe start`：后台启动服务（已跑则只开浏览器），与双击等价但不阻塞终端。
+//! - `pawch-agent.exe stop`：结束其他 pawch-agent.exe 服务进程（不杀自己；改名过渡版连旧名 agent.exe 一起收）。
+//! - `pawch-agent.exe status`：打印 5173 监听状态与进程信息。
+//! - `pawch-agent.exe run <消息> [选项]`：无头会话一次性唤醒——打本地服务跑完整轮，
 //!   把最终回答打印到终端（程序化唤醒的 CLI 入口；选项见 parse_run_args）。
-//! - `agent.exe --install`：写 HKCU Run 开机自启（最小化启动）；`--uninstall` 移除。
-//! - `agent.exe --minimized`：后台子进程入口（隐藏窗口跑服务）。
+//! - `pawch-agent.exe --install`：写 HKCU Run 开机自启（最小化启动）；`--uninstall` 移除。
+//! - `pawch-agent.exe --minimized`：后台子进程入口（隐藏窗口跑服务）。
 
 use std::path::PathBuf;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const RUN_VALUE: &str = "AgentLocalBuild";
+const RUN_VALUE: &str = "PawchAgent";
+/// 改名迁移轮（2026-10-22）之前的自启项名：安装时一并删掉，防两个 exe 抢 5173。
+const RUN_VALUE_LEGACY: &str = "AgentLocalBuild";
 
 fn exe_path() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agent.exe"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pawch-agent.exe"))
 }
 
 /// 5173 是否已有监听（TCP 连接探针，200ms 超时）。
@@ -30,16 +32,28 @@ pub fn port_open(host: &str, port: u16) -> bool {
     .is_ok()
 }
 
-/// 本 exe 的其他服务进程（除自己外正在跑的 agent.exe）。
+/// 本 exe 的其他服务进程（除自己外正在跑的服务进程）。
+///
+/// 改名迁移轮（2026-10-22）过渡版：镜像名两个都枚举——`pawch-agent.exe`（新名）与
+/// `agent.exe`（旧名）。用户机器上旧名服务可能还在跑（start.bat 换名前起的），只认
+/// 新名的话 `pawch-agent.exe stop` 停不掉它、端口被占新服务起不来。一个版本后删旧名。
 fn sibling_pids() -> Vec<u32> {
     use std::os::windows::process::CommandExt;
     // 用 tasklist 兜底枚举（零新依赖；沙箱探针里 tasklist 受限，但自管理跑在用户干净环境）
-    let list = std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq agent.exe", "/FO", "CSV", "/NH"])
-        .creation_flags(0x0800_0000) // 不闪控制台窗口
-        .output();
-    let Ok(list) = list else { return Vec::new() };
-    parse_pids(&String::from_utf8_lossy(&list.stdout), std::process::id())
+    let mut out = Vec::new();
+    for image in ["pawch-agent.exe", "agent.exe"] {
+        let list = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"])
+            .creation_flags(0x0800_0000) // 不闪控制台窗口
+            .output();
+        let Ok(list) = list else { continue };
+        for pid in parse_pids(&String::from_utf8_lossy(&list.stdout), std::process::id()) {
+            if !out.contains(&pid) {
+                out.push(pid);
+            }
+        }
+    }
+    out
 }
 
 /// 解析 `tasklist /FO CSV /NH` 输出里的 PID（排除自己）。纯函数（可单测）：
@@ -47,7 +61,7 @@ fn sibling_pids() -> Vec<u32> {
 fn parse_pids(text: &str, me: u32) -> Vec<u32> {
     let mut out = Vec::new();
     for line in text.lines() {
-        // "agent.exe","1234","Console","1","17,280 K"
+        // "pawch-agent.exe","1234","Console","1","17,280 K"
         let cols: Vec<&str> = line.split("\",\"").collect();
         if cols.len() >= 2
             && let Ok(pid) = cols[1].trim_matches('"').parse::<u32>()
@@ -92,11 +106,14 @@ fn spawn_detached(extra_args: &[&str]) -> anyhow::Result<()> {
 }
 
 /// HKCU Run 开机自启：登录后最小化启动（后台跑服务，不弹窗口）。
+/// 写入新项名的同时删掉改名迁移轮（2026-10-22）之前的旧项——旧项指向旧 exe 路径，
+/// 留着的话登录时两个 exe 都起、抢 5173。
 fn set_autostart(enable: bool) -> anyhow::Result<()> {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW};
     use std::os::windows::ffi::OsStrExt;
     let key_w: Vec<u16> = std::ffi::OsStr::new(RUN_KEY).encode_wide().chain([0]).collect();
     let val_w: Vec<u16> = std::ffi::OsStr::new(RUN_VALUE).encode_wide().chain([0]).collect();
+    let legacy_w: Vec<u16> = std::ffi::OsStr::new(RUN_VALUE_LEGACY).encode_wide().chain([0]).collect();
     unsafe {
         if enable {
             let cmd = format!("\"{}\" --minimized", exe_path().display());
@@ -118,6 +135,8 @@ fn set_autostart(enable: bool) -> anyhow::Result<()> {
             }
             let bytes = (cmd_w.len() * 2) as u32;
             let rc = RegSetValueExW(hkey, val_w.as_ptr(), 0, REG_SZ, cmd_w.as_ptr() as *const u8, bytes);
+            // 旧项名一并删（改名迁移轮过渡）：指向旧 exe，留着登录时双起抢端口
+            RegDeleteValueW(hkey, legacy_w.as_ptr());
             windows_sys::Win32::Foundation::CloseHandle(hkey as _);
             if rc != 0 {
                 anyhow::bail!("写开机自启注册表失败: {rc}");
@@ -137,6 +156,7 @@ fn set_autostart(enable: bool) -> anyhow::Result<()> {
             );
             if rc == 0 {
                 RegDeleteValueW(hkey, val_w.as_ptr());
+                RegDeleteValueW(hkey, legacy_w.as_ptr());
                 windows_sys::Win32::Foundation::CloseHandle(hkey as _);
             }
         }
@@ -156,7 +176,7 @@ pub fn handle(argv: &[String], host: &str, port: u16) -> bool {
             } else if pids.is_empty() {
                 println!("[agent] stopped: {url} no listener, no service process");
             } else {
-                println!("[agent] starting: {} agent.exe alive but {url} not listening yet", pids.len());
+                println!("[agent] starting: {} service process alive but {url} not listening yet", pids.len());
             }
             true
         }
@@ -266,7 +286,7 @@ pub(super) struct RunArgs {
 }
 
 /// 解析 `run` 子选项（纯函数，可单测）：
-/// `agent.exe run <消息...> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]`
+/// `pawch-agent.exe run <消息...> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]`
 /// 消息可以是多个词（自动拼接），也可以只给一条完整字符串。
 pub(super) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut words: Vec<String> = Vec::new();
@@ -321,14 +341,14 @@ fn run_cli(host: &str, port: u16, args: &[String]) -> ! {
         Err(e) => {
             eprintln!("[agent] {e}");
             eprintln!(
-                "usage: agent.exe run <消息> [--session <id>] [--model <m>] [--mode read-only|auto|full-access] [--timeout <秒>] [--approve] [--json]"
+                "usage: pawch-agent.exe run <消息> [--session <id>] [--model <m>] [--mode read-only|auto|full-access] [--timeout <秒>] [--approve] [--json]"
             );
             std::process::exit(2);
         }
     };
     let url = format!("http://{host}:{port}/api/headless/run");
     if !port_open(host, port) {
-        eprintln!("[agent] 服务未在 http://{host}:{port} 监听：先 agent.exe start（或双击 agent.exe）");
+        eprintln!("[agent] 服务未在 http://{host}:{port} 监听：先 pawch-agent.exe start（或双击 pawch-agent.exe）");
         std::process::exit(1);
     }
     // 坑 17：reqwest 在 Windows 上会读系统代理注册表，环回请求被代理接走返 502——
@@ -453,8 +473,8 @@ mod tests {
 
     #[test]
     fn parse_pids_reads_csv_and_skips_self() {
-        let text = "\"agent.exe\",\"1234\",\"Console\",\"1\",\"17,280 K\"\r\n\
-                    \"agent.exe\",\"4321\",\"Console\",\"1\",\"20,000 K\"\r\n\
+        let text = "\"pawch-agent.exe\",\"1234\",\"Console\",\"1\",\"17,280 K\"\r\n\
+                    \"pawch-agent.exe\",\"4321\",\"Console\",\"1\",\"20,000 K\"\r\n\
                     \r\n";
         // 自己（1234）必须被排除，否则 stop 会把自己也杀掉
         assert_eq!(parse_pids(text, 1234), vec![4321]);
@@ -463,7 +483,7 @@ mod tests {
         assert!(parse_pids("INFO: No tasks are running which match the specified criteria.", 1).is_empty());
         assert!(parse_pids("", 1).is_empty());
         // 只有一列（异常输出）不 panic、不产 PID
-        assert!(parse_pids("\"agent.exe\"", 1).is_empty());
+        assert!(parse_pids("\"pawch-agent.exe\"", 1).is_empty());
     }
 
     #[test]
@@ -486,7 +506,7 @@ mod tests {
     /// status 分支是只读的（打印 + 探针），可以在测试里安全跑通，确认没有 panic。
     #[test]
     fn status_command_takes_over_without_side_effects() {
-        let argv = vec!["agent.exe".to_string(), "status".to_string()];
+        let argv = vec!["pawch-agent.exe".to_string(), "status".to_string()];
         assert!(handle(&argv, "127.0.0.1", 1), "status 应接管并立刻返回");
     }
 }

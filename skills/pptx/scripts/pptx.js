@@ -7,7 +7,7 @@
  *   node pptx.js replace <ops.json|-> <in.pptx> <out.pptx>
  * replace = 改「已有 pptx」的正门：只动 ops 指定的文本/页，动画/主题/版式
  * 原样保留。默认交付 _updated 副本。
- * 依赖解析顺序：~/.agent/skill-modules → 本脚本目录 → 当前目录。
+ * 依赖解析顺序：~/.pawch-agent/skill-modules → 本脚本目录 → 当前目录。
  */
 const fs = require('fs');
 const path = require('path');
@@ -15,7 +15,7 @@ const os = require('os');
 
 function need(name) {
   const bases = [
-    path.join(os.homedir(), '.agent', 'skill-modules', 'node_modules'),
+    path.join(os.homedir(), '.pawch-agent', 'skill-modules', 'node_modules'),
     path.join(__dirname, 'node_modules'),
     path.join(process.cwd(), 'node_modules'),
   ];
@@ -24,7 +24,7 @@ function need(name) {
   }
   console.error(
     `missing dependency ${name}. install once (usable from any workspace):\n` +
-      `  npm install --prefix "%USERPROFILE%\\.agent\\skill-modules" ${name}\n` +
+      `  npm install --prefix "%USERPROFILE%\\.pawch-agent\\skill-modules" ${name}\n` +
       `or in the workspace: npm install ${name}`
   );
   process.exit(2);

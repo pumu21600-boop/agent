@@ -6,7 +6,8 @@
 //! - 授权事务在后台线程跑，HTTP 端点只发起 + 返回授权 URL，状态由 GET /api/mcp 轮询带回
 //!   （ZCode 是 caller 等待 + 300s 事务寿命双轨）；
 //! - token 存独立文件 `mcp_tokens.json`（DPAPI 逐条加密、原子写），不占 settings.json 写入路径；
-//! - 环境变量 `AGENT_MCP_OAUTH_NO_BROWSER=1` 时不调系统浏览器（无头/自动化验证用），
+//! - 环境变量 `PAWCH_AGENT_MCP_OAUTH_NO_BROWSER=1`（旧名 `AGENT_MCP_OAUTH_NO_BROWSER`
+//!   兼容一个版本）时不调系统浏览器（无头/自动化验证用），
 //!   授权 URL 由 tx_status 带回，调用方自行完成「浏览器那一步」。
 
 use std::collections::HashMap;
@@ -184,7 +185,7 @@ fn tx_set(name: &str, status: &str, message: &str, url: &str) {
 }
 
 /// 发起授权（后台线程跑完整流程，立即返回）。授权 URL 会尝试调系统浏览器打开
-/// （AGENT_MCP_OAUTH_NO_BROWSER=1 时跳过，改由 tx_status 带回给前端展示）。
+/// （PAWCH_AGENT_MCP_OAUTH_NO_BROWSER=1 时跳过，改由 tx_status 带回给前端展示）。
 pub fn start_authorize(name: &str, cfg: &McpServerCfg) -> Result<Value, String> {
     let Some(oauth) = cfg.oauth.clone() else {
         return Err("该 MCP 服务未配置 OAuth".into());
@@ -396,7 +397,7 @@ fn spawn_callback_server(path: &str, state: &str) -> Result<(u16, Receiver<Resul
 
 /// 打开系统浏览器（默认浏览器；与「网页面板 → 在默认浏览器中打开」同款 explorer 转发）。
 fn open_system_browser(url: &str) {
-    if std::env::var("AGENT_MCP_OAUTH_NO_BROWSER").is_ok() {
+    if crate::config::env_pawch("MCP_OAUTH_NO_BROWSER").is_some() {
         return;
     }
     let _ = std::process::Command::new("explorer")

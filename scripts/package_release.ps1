@@ -1,8 +1,8 @@
 # package_release.ps1 - build a self-contained Windows release folder (and zip).
 #
-# Layout produced (agent.exe resolves everything relative to its own directory):
+# Layout produced (pawch-agent.exe resolves everything relative to its own directory):
 #   agent-<version>-win64\
-#     agent.exe            service binary (start/stop/status self-management built in)
+#     pawch-agent.exe      service binary (start/stop/status self-management built in)
 #     config.toml          server/gateway/approval/sandbox/context/recovery/memory config
 #     providers.json       provider presets
 #     prompts\system.md    system conventions (edited from the UI)
@@ -54,8 +54,8 @@ if (-not $SkipBuild) {
     cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 }
-$exe = Join-Path $root "target\release\agent.exe"
-if (-not (Test-Path $exe)) { throw "target\release\agent.exe not found (run without -SkipBuild)" }
+$exe = Join-Path $root "target\release\pawch-agent.exe"
+if (-not (Test-Path $exe)) { throw "target\release\pawch-agent.exe not found (run without -SkipBuild)" }
 
 # --- 2. frontend ---
 $distSrc = Join-Path $root "web\dist"
@@ -71,13 +71,13 @@ if (-not $SkipFrontend) {
 if (-not (Test-Path (Join-Path $distSrc "index.html"))) { throw "web\dist\index.html missing" }
 
 # --- 3. assemble ---
-$name = "agent-$version-win64"
+$name = "pawch-agent-$version-win64"
 if ($Slim) { $name = "$name-slim" }
 $out = Join-Path $root (Join-Path $OutRoot $name)
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 
-Copy-Item $exe (Join-Path $out "agent.exe")
+Copy-Item $exe (Join-Path $out "pawch-agent.exe")
 New-Item -ItemType Directory -Path (Join-Path $out "web") -Force | Out-Null
 Copy-Item $distSrc (Join-Path $out "web\dist") -Recurse -Force
 
@@ -108,23 +108,23 @@ $startBat = @"
 @echo off
 rem Start the local agent service in the background and open the browser.
 cd /d "%~dp0"
-if not exist "agent.exe" (
-  echo [start] agent.exe not found.
+if not exist "pawch-agent.exe" (
+  echo [start] pawch-agent.exe not found.
   pause
   exit /b 1
 )
-agent.exe start
+pawch-agent.exe start
 "@
 $stopBat = @"
 @echo off
 rem Stop the running agent service.
 cd /d "%~dp0"
-if not exist "agent.exe" (
-  echo [stop] agent.exe not found. Nothing to stop.
+if not exist "pawch-agent.exe" (
+  echo [stop] pawch-agent.exe not found. Nothing to stop.
   pause
   exit /b 1
 )
-agent.exe stop
+pawch-agent.exe stop
 pause
 "@
 Set-Content -Path (Join-Path $out "start.bat") -Value $startBat -Encoding ASCII

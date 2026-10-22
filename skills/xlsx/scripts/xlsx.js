@@ -9,7 +9,7 @@
  *   node xlsx.js tocsv <in.xlsx> [sheet名] <out.csv>
  * patch = 改「已有文件」的正门：ExcelJS 载入原工作簿，按 ops 增量改，其余
  * 样式/公式/合并单元格/列宽原样保留。默认交付 _updated 副本（out 自定）。
- * 依赖解析顺序：~/.agent/skill-modules → 本脚本目录 → 当前目录。
+ * 依赖解析顺序：~/.pawch-agent/skill-modules → 本脚本目录 → 当前目录。
  */
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +17,7 @@ const os = require('os');
 
 function need(name) {
   const bases = [
-    path.join(os.homedir(), '.agent', 'skill-modules', 'node_modules'),
+    path.join(os.homedir(), '.pawch-agent', 'skill-modules', 'node_modules'),
     path.join(__dirname, 'node_modules'),
     path.join(process.cwd(), 'node_modules'),
   ];
@@ -26,7 +26,7 @@ function need(name) {
   }
   console.error(
     `missing dependency ${name}. install once (usable from any workspace):\n` +
-      `  npm install --prefix "%USERPROFILE%\\.agent\\skill-modules" ${name}\n` +
+      `  npm install --prefix "%USERPROFILE%\\.pawch-agent\\skill-modules" ${name}\n` +
       `or in the workspace: npm install ${name}`
   );
   process.exit(2);
@@ -207,7 +207,7 @@ function loadWorkbook(file) {
 // 找不到就返回 null（不退出）——给「补全」这类非硬依赖用
 function softNeed(name) {
   const bases = [
-    path.join(os.homedir(), '.agent', 'skill-modules', 'node_modules'),
+    path.join(os.homedir(), '.pawch-agent', 'skill-modules', 'node_modules'),
     path.join(__dirname, 'node_modules'),
     path.join(process.cwd(), 'node_modules'),
   ];

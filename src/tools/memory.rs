@@ -446,6 +446,8 @@ mod tests {
                 crate::memory::GlobalDirs {
                     install: log_dir.join("global"),
                     user: log_dir.join("user"),
+                    install_legacy: log_dir.join("global-legacy"),
+                    user_legacy: log_dir.join("user-legacy"),
                 },
             )))),
             mem_cfg: Arc::new(MemoryConfig { enabled: mem_on, persist_sensitive: false, profile_max_chars: 2500 }),

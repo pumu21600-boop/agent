@@ -12,7 +12,7 @@ description: 创建与保真修改 .docx：改字不动版式，原地覆盖原�
 3. **「改」已有文档 = nodes 读出 → 改 spec → make 输出到原同一路径覆盖**。这就是用户视角的原地改：不新建 `xxx2.docx`、不留中间文件（除非用户明确要求保留）。
 4. **不许用 subagent_spawn 验证**——本技能的 `fonts`/`read` 就是验证工具。**本机没有 Python**，任何「用 python-pptx/Python 脚本处理」的想法都是错的，直接走本脚本。
 5. 改完必须回读验证：动了字体就跑 `fonts`，动了内容就跑 `read`；**最稳妥是两条都跑再加 `check.js`**（下方 1.5 节），check 有 FAIL 就不许收尾。
-6. 依赖缺失时只允许跑页尾的安装命令装到 `~/.agent/skill-modules`；装不上就停下来如实报告，不要降级凑合。
+6. 依赖缺失时只允许跑页尾的安装命令装到 `~/.pawch-agent/skill-modules`；装不上就停下来如实报告，不要降级凑合。
 
 ## 0. 环境检测（任务第一步，不跳过）
 
@@ -125,5 +125,5 @@ node "<技能目录>\scripts\check.js" <输出.docx> --expect "新文本" --not 
 ## 5. 环境安装（仅缺依赖时）
 
 ```
-npm install --prefix "%USERPROFILE%\.agent\skill-modules" docx mammoth jszip
+npm install --prefix "%USERPROFILE%\.pawch-agent\skill-modules" docx mammoth jszip
 ```

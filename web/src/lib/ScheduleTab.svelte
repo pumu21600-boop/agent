@@ -14,7 +14,7 @@
   let schedulesData = [];
   let scheduleNotices = [];
   // 用户 2026-10-05 实锤：完成记录改成小字一行，右边给个 × 关掉——原来整行按钮太占地方，
-  // 「去查看」任务卡片上已有。× 关掉必须落盘：壳重启只重载 WebView（agent.exe 服务常驻），
+  // 「去查看」任务卡片上已有。× 关掉必须落盘：壳重启只重载 WebView（pawch-agent.exe 服务常驻），
   // 设置弹窗每次重开也重建组件——只做内存过滤的话，叉掉的刷新一下就回来。
   let dismissedNotices = {};
   $: visibleNotices = scheduleNotices.filter((n) => !dismissedNotices[n.ts + n.task_id]);

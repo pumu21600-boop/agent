@@ -353,7 +353,7 @@
     adoptWinApi();
     window.addEventListener('agentwinready', adoptWinApi);
     // 插件桥监听必须**同步**挂：右栏面板（trace/board/usage 等）iframe 一 load 完就发
-    // agent:hello/agent:request，而下面那个 onMount 的启动流水线要 await
+    // pawch:hello/pawch:request（旧名 agent: 兼容一个版本），而下面那个 onMount 的启动流水线要 await
     // loadProviders→loadSettings→loadSessions（重会话恢复要几秒）。监听挂晚了，
     // 这期间到的消息全部丢失，面板卡「桥调用超时」且不重试（headless 全新 profile +
     // 7778 条消息会话必现；用户机器上偶发）。监听体不依赖这些数据，只管先接住。
@@ -375,7 +375,7 @@
     document.addEventListener('click', closeMenusOnOutside);
     // 2026-10-08 修：三个根级监听器原无配对清理——生产态 App 只挂一次无感，
     // dev 的 HMR 每次热替换都销毁重建，message 监听累积会让插件桥的每次
-    // agent:request 被新旧实例各处理一次（reply 发两遍）。
+    // pawch:request 被新旧实例各处理一次（reply 发两遍）。
     return () => {
       clearInterval(t);
       clearTimeout(rzT);
@@ -3770,7 +3770,7 @@
     if (extsBridgeReady) {
       for (const name of Object.keys(extFrameEls)) {
         const ext = extList.find((e) => e.name === name);
-        postToName(name, { type: 'agent:init', payload: extInitPayload(ext) });
+        postToNameBoth(name, { type: 'pawch:init', payload: extInitPayload(ext) });
       }
     }
   }
@@ -4913,9 +4913,9 @@
     rightPanelOpen = false;
     terminalOpen = false;
     if (slotEvent) {
-      const msg = { type: 'agent:slot', slot: slotEvent.slot, id: slotEvent.id || '', title: slotEvent.title || '' };
+      const msg = { type: 'pawch:slot', slot: slotEvent.slot, id: slotEvent.id || '', title: slotEvent.title || '' };
       // 注意：打开的瞬间后台那个常驻 iframe 会被卸载，别往里投——排队等**面板** iframe load 时投
-      if (wasOpenSame && extFrameEls[e.name] && extFrameEls[e.name].contentWindow) postToName(e.name, msg);
+      if (wasOpenSame && extFrameEls[e.name] && extFrameEls[e.name].contentWindow) postToNameBoth(e.name, msg);
       else extPendingMsgs.push({ name: e.name, msg });
     }
   }
@@ -4931,7 +4931,7 @@
     // 弹窗型插件那个 iframe 绑的是 extPopupFrame，同样要登记（后台 iframe 此时已卸载）
     if (extPopupFrame && extPopup && extPopup.name === name) extFrameEls[name] = extPopupFrame;
     const ext = extList.find((e) => e.name === name);
-    postToName(name, { type: 'agent:init', payload: extInitPayload(ext) });
+    postToNameBoth(name, { type: 'pawch:init', payload: extInitPayload(ext) });
     extPendingMsgs = extPendingMsgs.filter((p) => {
       if (p.name !== name) return true;
       postToName(name, p.msg);
@@ -4947,7 +4947,7 @@
     extOpen = true;
     rightPanelOpen = false;
     terminalOpen = false;
-    if (!wasOpenSame) extPendingMsgs.push({ name: e.name, msg: { type: 'agent:init', payload: extInitPayload(e) } });
+    if (!wasOpenSame) extPendingMsgs.push({ name: e.name, msg: { type: 'pawch:init', payload: extInitPayload(e) } });
   }
 
   /// 扩展启用/停用：写设置 + 刷新清单
@@ -5102,13 +5102,22 @@
     if (el && el.contentWindow) el.contentWindow.postMessage(msg, '*');
   }
 
+  /// 插件桥协议双前缀发送（改名迁移轮 2026-10-22：agent:* → pawch:*，兼容一个版本）：
+  /// init / slot / event 这类「不等请求」的消息两种前缀都发——在役旧插件（改名轮之前
+  /// 用户自建的）只听 agent:，新插件只听 pawch:，各得其所。请求回复不走这里（必须按
+  /// 请求方的前缀回，见 onExtMessage）。
+  function postToNameBoth(name, msg) {
+    postToName(name, msg);
+    postToName(name, { ...msg, type: msg.type.replace(/^pawch:/, 'agent:') });
+  }
+
   /// 广播「当前会话变了」给所有已启用插件面板：时间线只显示当前对话
   /// （用户 2026-10-07 拍板），切会话/切工作区/新对话后面板必须跟着换数据——
   /// iframe 常驻不重载，不广播就还停在旧对话上。通用事件，不认的类型按插件
   /// 契约忽略。
   function notifyExtsSession(id) {
     for (const e of enabledExts) {
-      postToName(e.name, { type: 'agent:event', event: 'session', id: id || '' });
+      postToNameBoth(e.name, { type: 'pawch:event', event: 'session', id: id || '' });
     }
   }
   /// 切换当前会话的唯一入口：赋值 + 广播。
@@ -5155,21 +5164,26 @@
     if (ext.enabled === false) return; // 停用的扩展不服务
     const perms = ext.permissions || [];
     const d = ev.data || {};
-    if (d.type === 'agent:hello') {
-      postToName(from, { type: 'agent:init', payload: extInitPayload(ext) });
+    // 协议类型去前缀归一（改名迁移轮兼容一个版本：agent:* 与 pawch:* 都认）
+    const protoBase = typeof d.type === 'string' ? d.type.replace(/^(agent|pawch):/, '') : '';
+    if (protoBase === 'hello') {
+      postToNameBoth(from, { type: 'pawch:init', payload: extInitPayload(ext) });
       return;
     }
     // 弹窗型插件的内容高度上报（通用协议，不占权限）：插件页把自身高度 post 过来，
     // 宿主让弹窗下边缘贴着内容——固定高度会在内容下方留一条空白（用户实锤：
     // 「下边缘为什么不直接到确定取消刚好下面」）。夹在 [260, 视口-140] 防爆框。
-    if (d.type === 'agent:resize' && extPopup && ev.source === extPopupFrame?.contentWindow) {
+    if (protoBase === 'resize' && extPopup && ev.source === extPopupFrame?.contentWindow) {
       const h = Number(d.height) || 0;
       if (h > 0) extPopupFrameH = Math.max(200, Math.min(h, window.innerHeight - 140));
       return;
     }
-    if (d.type !== 'agent:request') return;
+    if (protoBase !== 'request') return;
     const id = d.id;
-    const reply = (ok, result) => postToName(from, { type: 'agent:response', id, ok, result });
+    // 回复按请求方的前缀回（agent:request ↔ agent:response，pawch: 同理）——消息按
+    // type 配对，前缀错了插件侧 pending 永远等不到 reply
+    const respType = String(d.type).replace(/:request$/, ':response');
+    const reply = (ok, result) => postToName(from, { type: respType, id, ok, result });
     // 桥上的 GET 回传的必须是**解析后的 JSON**：fetch 的 Response 过不了 postMessage 的
     // 结构化克隆——真机原话 "Response object could not be cloned"，插件侧只看到这句天书，
     // 面板整个瘫掉（用量/价格/trace/工作区/git 六个只读方法全走这里）。

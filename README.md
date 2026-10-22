@@ -1,7 +1,7 @@
 # Pawch Agent
 
 Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。版本号以 `Cargo.toml` 为准（当前 0.32.x）。
-源码 crate 与二进制的技术标识符仍叫 `agent`（`agent.exe` / `agent-desktop.exe`、数据目录 `.agent/`），产品显示名是 **Pawch Agent**。
+2026-10-22 改名迁移轮后，crate 与二进制统一为 `pawch-agent` 正名（`pawch-agent.exe` / `pawch-agent-desktop.exe`、用户目录 `~/.pawch-agent/`、应用状态目录 `<app_root>/.pawch-agent/`、环境变量前缀 `PAWCH_AGENT_*`、插件桥协议 `pawch:*`）；旧标识符（`agent` / `AGENT_*` / `agent:*`）兼容读一个版本。产品显示名是 **Pawch Agent**。
 逐阶段施工记录与踩坑见 [docs/ROADMAP.md](docs/ROADMAP.md)，日志格式见 [docs/jsonl-schema.md](docs/jsonl-schema.md)，全部 HTTP/SSE 接口见 [docs/api.md](docs/api.md)。
 
 ## 功能总览
@@ -12,7 +12,7 @@ Rust 后端（axum）+ Svelte 前端（Vite）+ SSE 流式。版本号以 `Cargo
 - **执行沙箱**：Job Objects 整树击杀 + 受限 token + 环境白名单（密钥不进沙箱）为默认档；`appcontainer` 为实验档（探测链不过自动回退，UI 明示当前生效档）。浏览器工具走 Chromium 自带站点隔离，不进 Windows 沙箱。
 - **上下文与恢复**：token 预算裁剪、工具结果头尾压缩、`read_page` 分页；danger≥1 工具执行前拍影子仓库检查点，撤销只回退本任务改过的文件（绝不整树 reset）。
 - **会话**：每会话一个文件落盘，刷新/重启自动恢复；置顶/归档/分叉/重命名/批量管理；侧栏项目树（工作区维度）。
-- **记忆**：双层存储（全局 `~/.agent` + 项目 `.agent/memory`）+ events.log 事件流水（默认脱敏）+ AGENTS.md 双层注入 + 滚动摘要；系统约定（`prompts/system.md`）每轮任务实时读盘。记忆库星云：会话压成检索正文，语义向量 + 词法混合排序，前端体积渲染。
+- **记忆**：双层存储（全局 `~/.pawch-agent` + 项目 `.agent/memory`）+ events.log 事件流水（默认脱敏）+ AGENTS.md 双层注入 + 滚动摘要；系统约定（`prompts/system.md`）每轮任务实时读盘。记忆库星云：会话压成检索正文，语义向量 + 词法混合排序，前端体积渲染。
 - **Skills**：`skills/` 下的 `SKILL.md`（frontmatter：name/description）；system 提示只注入「名字+一句话」，模型按需用 `read_skill` 拉全文。
 - **插件（契约 v1）**：一个目录 + 一份 manifest.json = 一个插件，清单只声明「有什么」（面板/工具/权限），不分类型；对外只留四个词：**Skill / MCP / 插件 / 沙箱**。面板跑在沙箱 iframe 里经 postMessage 白名单桥取数据；模型自产插件走 draft 隔离区（内存、权限清空、一键转正）；「插件制作器」内置插件把「说清需求 → 选定工作区 → 新对话自动带上规范提示词」跑成一键流程。契约全文见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)。
 - **用量与成本**：每次模型调用在网关单点记账（token 分 prompt/completion/cache 三路 + 请求/失败/延迟分位 + 记账时算定冻结的费用），落 `logs/usage/ledger.jsonl`；「用量价格」插件在右侧面板显示**当前对话**的用量与费用，价格按「渠道 host + 模型 id」每百万 token 单价手填；红线 = 全局花费上限硬闸（`[cost] spend_cap_usd`）。
@@ -32,7 +32,7 @@ cargo run                            # 前台调试运行（关终端即停）
 
 `dev.bat` 起 vite 5174 热更（/api 自动代理到 5173 主服务），改 `web/src` 即时生效。
 
-**无头会话**（程序化唤醒，子代理/定时/脚本集成走这条）：`agent.exe run <消息> [--session <id>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]`——唤醒一条会话跑完整轮，打印最终回答（退出码 0=完成）。
+**无头会话**（程序化唤醒，子代理/定时/脚本集成走这条）：`pawch-agent.exe run <消息> [--session <id>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]`——唤醒一条会话跑完整轮，打印最终回答（退出码 0=完成）。
 
 **定时任务**：设置 → 定时 页签（5 段 cron，本地时区）；到点唤醒 agent 跑一轮，完成记录可回看；任务类型 = 固定消息 / 记忆提醒（到点先检索最近对话让 agent 列「要跟进/待办」）。
 
@@ -41,7 +41,7 @@ cargo run                            # 前台调试运行（关终端即停）
 ## 目录结构
 
 ```
-agent/
+pawch-agent/
 ├── src/            # Rust 后端
 │   ├── server/     #   axum：全部 HTTP/SSE 接口 + 审批门 + 网关装配（16 个子模块）
 │   ├── core/       #   核心循环、取消注册表（会话级）、审批规则引擎（rules.rs）
@@ -94,7 +94,7 @@ agent/
 
 # 插件（契约 v1，二合一）
 
-一个插件 = 一个目录 + 一份 manifest.json，打开：设置 → 插件 → 打开（面板停靠右侧）；纯工具插件只显示工具清单。iframe 用 `sandbox="allow-scripts"` 隔离（不透明源，读不到宿主 DOM/localStorage/cookie，也 fetch 不到 `/api`），唯一通道是 postMessage 白名单桥：入口页发 `agent:hello` 握手，宿主回 `agent:init`（版本/运行根/主题/当前会话），之后 `agent:request` 调 `app.info` / `workspace.info` / `workspace.files` / `git.status` / `memory.search` / `session.info` / `composer.insert` / `notify` / `bus.publish` / `workspace.write` / `storage.read·write·delete` / `usage.session` / `usage.prices` / `usage.prices.save` / `usage.recompute`——**未在 manifest 声明权限的一律拒绝**（各方法权限与语义、manifest 全部字段见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)）。
+一个插件 = 一个目录 + 一份 manifest.json，打开：设置 → 插件 → 打开（面板停靠右侧）；纯工具插件只显示工具清单。iframe 用 `sandbox="allow-scripts"` 隔离（不透明源，读不到宿主 DOM/localStorage/cookie，也 fetch 不到 `/api`），唯一通道是 postMessage 白名单桥：入口页发 `pawch:hello` 握手，宿主回 `pawch:init`（版本/运行根/主题/当前会话），之后 `pawch:request` 调 `app.info` / `workspace.info` / `workspace.files` / `git.status` / `memory.search` / `session.info` / `composer.insert` / `notify` / `bus.publish` / `workspace.write` / `storage.read·write·delete` / `usage.session` / `usage.prices` / `usage.prices.save` / `usage.recompute`——**未在 manifest 声明权限的一律拒绝**（各方法权限与语义、manifest 全部字段见 [docs/plugin-contract-v1.md](docs/plugin-contract-v1.md)）。
 
 - **来源与版本**：`source` 三值 built_in / user / model_generated；`apiVersion` 不匹配 → 拒载并提示升级（无 shim）；未知字段一律忽略。
 - **draft 隔离区**（模型自产）：只在内存（重启即失）、权限一律清空；「转正」（落盘、来源改 user）或「丢弃」。
@@ -165,12 +165,12 @@ cargo run                                # 终端 2：127.0.0.1:5173
   —— 首次从华为云镜像下载 MinGit（GitHub 兜底）、做体积 + 归档完整性双重校验，
   然后放到 `<exe 同级>\tools\git-runtime.zip`（默认 `target\release\tools\`）。
 - **运行时发现顺序**（`src/tools/mod.rs::git_exe`）：
-  1. `AGENT_GIT_PATH` 环境变量；
+  1. `PAWCH_AGENT_GIT_PATH`（旧名 `AGENT_GIT_PATH` 兼容一个版本）环境变量；
   2. 系统 PATH → 3. 注册表 → 4. 常见安装位置（用户自己装的 git，优先使用）；
   5. exe 同级 `tools\git\`（想手动放便携版就放这）；
-  6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\agent\runtime\git` 再使用
+  6. **内置 zip 懒解压**：解压到 `%LOCALAPPDATA%\pawch-agent\runtime\git` 再使用（旧路径 `%LOCALAPPDATA%\agent\runtime\git` 的已解压缓存兼容一个版本）
      （只发生在没装 git 的机器上，解压一次记 `git.runtime_extracted`；之后启动直接复用）。
-- 覆盖 zip 位置可用环境变量 `AGENT_GIT_ZIP`（调试用）。
+- 覆盖 zip 位置可用环境变量 `PAWCH_AGENT_GIT_ZIP`（旧名 `AGENT_GIT_ZIP` 兼容一个版本，调试用）。
 - **界面上能看到**：设置 → 插件 页的「宿主能力」区有「Git 运行时」一行（git 运行时状态卡片，
   2026-10-06 插件重整后从 git 插件分区搬来），显示当前用的是系统 Git / 便携版 / 内置运行时、
   版本与路径，「重新检测」按钮手动刷新；没检测到 git 时会明说「用不了」并给出安装方法。
@@ -184,13 +184,13 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 # 只组装不重编译：-SkipBuild -SkipFrontend / 只出目录不打 zip：-SkipZip
 ```
 
-产出 `dist\agent-<版本>-win64\`（+ 同名 zip，约 43MB）：`agent.exe`（服务二进制，start/stop/status 自管理内置）、`config.toml` `providers.json` `prompts\` `plugins\`、`web\dist\`（前端产物）、`tools\git-runtime.zip`（内置 MinGit，未跑 bundle_git.ps1 时缺，缺了就要系统 git）、`start.bat` `stop.bat` `README.md` `LICENSE`。把整个目录拷到任意位置（含没装 Rust/Node 的机器）双击 `start.bat` 即用——exe 同级就是运行根，配置、会话、日志、插件全落在那个目录里，不碰源码树。
+产出 `dist\pawch-agent-<版本>-win64\`（+ 同名 zip，约 43MB）：`pawch-agent.exe`（服务二进制，start/stop/status 自管理内置）、`config.toml` `providers.json` `prompts\` `plugins\`、`web\dist\`（前端产物）、`tools\git-runtime.zip`（内置 MinGit，未跑 bundle_git.ps1 时缺，缺了就要系统 git）、`start.bat` `stop.bat` `README.md` `LICENSE`。把整个目录拷到任意位置（含没装 Rust/Node 的机器）双击 `start.bat` 即用——exe 同级就是运行根，配置、会话、日志、插件全落在那个目录里，不碰源码树。
 
 ### 两种包：完整版 / 精简版
 
 发布产物分两档，区别只有一件事：**带不带内置 MinGit**。
 
-| | 完整版（默认，`agent-<版本>-win64`） | 精简版（`-Slim`，`agent-<版本>-win64-slim`） |
+| | 完整版（默认，`pawch-agent-<版本>-win64`） | 精简版（`-Slim`，`pawch-agent-<版本>-win64-slim`） |
 |---|---|---|
 | 内置 MinGit | 带（`tools\git-runtime.zip`，zip 大约 +37MB） | 不带，包体更小 |
 | 机器没装 git 时 | 检查点/撤销/改动清单/时间线任务快照照常用（懒解压内置包） | 这些功能不可用；界面照实说「没检测到 git」并给出安装方法，不静默变样 |

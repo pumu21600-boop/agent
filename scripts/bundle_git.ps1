@@ -1,4 +1,4 @@
-# bundle_git.ps1 — fetch MinGit once, place it next to agent.exe so the product carries its own git.
+# bundle_git.ps1 — fetch MinGit once, place it next to pawch-agent.exe so the product carries its own git.
 #
 # Usage (from repo root):
 #   powershell -ExecutionPolicy Bypass -File scripts\bundle_git.ps1
@@ -11,7 +11,8 @@
 #
 # The app itself NEVER downloads anything at runtime: it uses the user's own git first (PATH /
 # registry / common locations); only when none is found does it lazily extract this zip into
-# %LOCALAPPDATA%\agent\runtime\git — no network, no admin rights.
+# %LOCALAPPDATA%\pawch-agent\runtime\git — no network, no admin rights.
+# (2026-10-22 改名轮：旧路径 %LOCALAPPDATA%\agent\runtime\git 的已解压缓存兼容一个版本，见 src/tools/git.rs)
 #
 # NOTE: this file is intentionally ASCII-only. Windows PowerShell 5.1 parses BOM-less UTF-8
 # scripts as ANSI, which corrupts non-ASCII text (a known pitfall in this project).
@@ -74,4 +75,4 @@ $tools = Join-Path $OutDir "tools"
 New-Item -ItemType Directory -Force -Path $tools | Out-Null
 Copy-Item $zip (Join-Path $tools "git-runtime.zip") -Force
 Write-Host "[bundle-git] placed: $(Join-Path $tools 'git-runtime.zip')"
-Write-Host "[bundle-git] done - on a machine without git it extracts to %LOCALAPPDATA%\agent\runtime\git on first use"
+Write-Host "[bundle-git] done - on a machine without git it extracts to %LOCALAPPDATA%\pawch-agent\runtime\git on first use"

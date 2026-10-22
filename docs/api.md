@@ -11,7 +11,7 @@ DNS rebinding，这层校验补的就是它。不带 `Origin` 的命令行客户
 | POST | `/api/chat` | 对话主入口，SSE 流式（content / reasoning / tool_call / tool_result / approval_request / plan_proposal / notice / **reset** / error / done；`reset` = 降级链换渠道重试，前端按给的长度丢掉本步已推的半截内容） |
 | POST | `/cancel?session=<id>` | 停止指定会话当前这一轮（不带 `session` = 停全部在跑任务） |
 | GET | `/api/cancel?session=<id>` | 查询取消状态 |
-| POST | `/api/headless/run` | 无头会话：程序化唤醒一条会话跑完整轮，返回结构化结果（session_id/status/answer/tool_calls/用量/notices）；`status` = done·cancelled·timeout·error。无人值守时命中审批的动作按 `on_approval` 处理（缺省 deny 拒绝并回喂模型，`approve` 才放行）；会话在跑返回 409。CLI 等价入口：`agent.exe run <消息> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]` |
+| POST | `/api/headless/run` | 无头会话：程序化唤醒一条会话跑完整轮，返回结构化结果（session_id/status/answer/tool_calls/用量/notices）；`status` = done·cancelled·timeout·error。无人值守时命中审批的动作按 `on_approval` 处理（缺省 deny 拒绝并回喂模型，`approve` 才放行）；会话在跑返回 409。CLI 等价入口：`pawch-agent.exe run <消息> [--session <id>] [--model <m>] [--mode <档位>] [--timeout <秒>] [--approve] [--json]` |
 | GET / POST / DELETE | `/api/schedules` | 定时任务：清单（含下次运行时间/cron 人话/最近完成通知）/ 新建改（id 空=新建）/ 删除 |
 | POST | `/api/schedules/run?id=` | 立即运行一次（不打乱排期；结果进完成记录） |
 | GET | `/api/health` | 健康检查 |

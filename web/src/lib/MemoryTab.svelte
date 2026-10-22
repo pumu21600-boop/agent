@@ -9,8 +9,8 @@
   const openGalaxy = () => dispatch('openGalaxy');
 
   // —— 记忆分区（约定文件编辑 + 自动记忆）——
-  // 系统约定 prompts/system.md、全局约定 ~/.agent/AGENTS.md、项目约定 工作区根 AGENTS.md、
-  // 自动记忆 <app_root>/.agent/profile.md（agent 也会写，行级增改；用户可自由编辑）。
+  // 系统约定 prompts/system.md、全局约定 ~/.pawch-agent/AGENTS.md（旧名 ~/.agent 兼容一个版本）、项目约定 工作区根 AGENTS.md、
+  // 自动记忆 <app_root>/.pawch-agent/profile.md（agent 也会写，行级增改；用户可自由编辑）。
   // 文本框始终显示文件当前内容：进入分区/切 chips/保存后都回读一次盘。
   let memData = null;
   let memTab = 'system';

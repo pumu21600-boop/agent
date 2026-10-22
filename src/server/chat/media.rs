@@ -292,16 +292,22 @@ impl MediaAttachment {
 }
 
 
-/// 找 LibreOffice（soffice）：环境变量 AGENT_SOFFICE_PATH / SOFFICE_PATH →
-/// PATH 各目录 → Windows 常见安装路径。都没有返回 None——调用方走「如实说处理不了」
-/// 的分支，不许静默降级。（与技能 check.js 的 SOFFICE_PATH 约定保持同一套）
+/// 找 LibreOffice（soffice）：环境变量 PAWCH_AGENT_SOFFICE_PATH（旧名 AGENT_SOFFICE_PATH
+/// 兼容一个版本）/ 第三方约定的 SOFFICE_PATH → PATH 各目录 → Windows 常见安装路径。
+/// 都没有返回 None——调用方走「如实说处理不了」的分支，不许静默降级。
+/// （与技能 check.js 的 SOFFICE_PATH 约定保持同一套）
 pub fn find_soffice() -> Option<PathBuf> {
-    for key in ["AGENT_SOFFICE_PATH", "SOFFICE_PATH"] {
-        if let Some(v) = std::env::var_os(key) {
-            let p = PathBuf::from(v);
-            if p.is_file() {
-                return Some(p);
-            }
+    let mut keys: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(v) = crate::config::env_pawch("SOFFICE_PATH") {
+        keys.push(v);
+    }
+    if let Some(v) = std::env::var_os("SOFFICE_PATH") {
+        keys.push(v);
+    }
+    for v in keys {
+        let p = PathBuf::from(v);
+        if p.is_file() {
+            return Some(p);
         }
     }
     if let Some(path_var) = std::env::var_os("PATH") {

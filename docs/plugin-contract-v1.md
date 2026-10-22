@@ -1,6 +1,9 @@
 # 插件契约 v1（施工单 027 / ）
 
 > 定案日期：2026-09-19（对话拍板，执行不得推翻的部分已写进施工单 027「设计定案」）。
+> **2026-10-22 改名迁移轮**：桥协议前缀 `agent:*` → `pawch:*`（hello/init/request/response/event/slot/resize
+> 七个类型）。宿主兼容一个版本：入站两种前缀都认；init/event/slot 双前缀都发；请求回复按请求方
+> 前缀回。改名轮之前用户自建的旧插件（只听 `agent:*`）不受影响，新插件一律用 `pawch:*`。
 > 配套代码：`src/plugin/contract.rs`（契约校验）、`src/plugin/ui.rs`（面板插件）、
 > `src/plugin/wasm.rs`（工具引擎）、`src/plugin/draft.rs`（draft 隔离区）、`src/storage.rs`（存储一门）、
 > `src/hooks.rs`（钩子四挂点）。
@@ -46,7 +49,7 @@ WASM 不再是一种「插件」，降为**插件工具的可选实现 / 沙箱�
 | tool_file | 否 | 工具文件（.wat/.wasm，目录形态专用；裸文件形态无需清单） |
 | settings_entry | 否 | 插件自带设置页（相对插件目录的文件，如 prices.html）；宿主在设置→插件卡片上渲染「设置」按钮打开它。dock 面板插件不给「设置」按钮——设置从侧边栏面板内进（如用量的价格表在面板里有入口） |
 | ui | 否 | 宿主界面插槽（v1 支持 toolbar / composer / **dock**——dock = 右侧面板「产物/预览/网页」旁多一个页签，如内置「用量价格」插件） |
-| popup | 否 | `true` = 设置→插件卡片点「打开」时开**居中小窗口**（模态）而非右侧大面板；表单型插件用它（用户 2026-10-08 拍板：要弹窗不要侧栏）。缺省 false = 老行为。小窗口高度**贴内容**：插件页把自身高度 post 给宿主（`parent.postMessage({type:'agent:resize', height})`，不占权限），宿主夹在 [200, 视口-140] 内设置 iframe 行内高度。注意两个坑：① 要量**内容驱动的包裹元素**（如 `<main id=wrap>`），不能量 `documentElement.scrollHeight`——它不低于当前视口高度，框一旦撑大就再也报不小（清空收不回）；② 宿主侧 iframe 样式须 `flex:none` 且不留大 min-height，否则行内高度被压住 |
+| popup | 否 | `true` = 设置→插件卡片点「打开」时开**居中小窗口**（模态）而非右侧大面板；表单型插件用它（用户 2026-10-08 拍板：要弹窗不要侧栏）。缺省 false = 老行为。小窗口高度**贴内容**：插件页把自身高度 post 给宿主（`parent.postMessage({type:'pawch:resize', height})`，不占权限），宿主夹在 [200, 视口-140] 内设置 iframe 行内高度。注意两个坑：① 要量**内容驱动的包裹元素**（如 `<main id=wrap>`），不能量 `documentElement.scrollHeight`——它不低于当前视口高度，框一旦撑大就再也报不小（清空收不回）；② 宿主侧 iframe 样式须 `flex:none` 且不留大 min-height，否则行内高度被压住 |
 | permissions | 否 | 能力白名单（面板桥与 WASM 工具共用这一数组）：面板桥值 `composer.insert` / `workspace.write` / `bus.publish` / `notify` / `storage` / `usage.prices`（写模型价格表与币种、触发历史重算）/ `clipboard`（写剪贴板，宿主页代写——插件 iframe 是 sandbox 不透明源，剪贴板 API 不归它使）/ `session.create`（在指定工作区新建对话并预填输入框，插件制作器用）/ `settings.feature` / `action.run`，**未声明的一律拒绝**；WASM 工具宿主函数值（2026-10-22）：`storage`（host.storage_get/set，面板与工具两半共用同一命名空间）/ `fs_read`（host.fs_read，只读本任务工作区内文本文件，≤256KB/UTF-8，越界拒绝）/ `http`（host.http_get，GET 公网，逐跳 SSRF 闸、10s 超时、响应体 ≤64KB）——导入未声明的宿主函数在实例化时失败（「宿主函数未授权」）；面板值在工具侧忽略、宿主值在面板侧忽略 |
 | skills | 否 | 插件自带的技能目录（相对插件目录，如 `"skills"`）：每个子目录一个 SKILL.md 即一个技能，进系统提示的「可用技能」索引（模型 read_skill 可读，返回头部带技能目录绝对路径）。纯技能插件可以既不写 entry 也不写 ui。同名规则：项目/全局技能 > 工作区插件 > 内置插件；停用插件不贡献技能。技能页不列插件技能（管理在插件页），composer 的 $ 选择菜单含插件技能 |
 
@@ -137,7 +140,7 @@ UI 提示升级，**永不做 shim**；README 写明 v0.x 期间不保证插件�
   由服务端从会话文件算。注意日志顶层 `session_id` 是**进程级**日志会话（进程重启即换），
   与工作区无关，别拿它归属（踩过：按它过滤 = 时间线全空）。
 
-> **宿主侧回传纪律（2026-09-24 补，所有桥方法通用）**：`agent:response` 的 `result` 必须是
+> **宿主侧回传纪律（2026-09-24 补，所有桥方法通用）**：`pawch:response` 的 `result` 必须是
 > **解析后的普通 JSON 对象**。`fetch` 的 `Response` 过不了 `postMessage` 的结构化克隆，
 > 原样回传会让插件侧只看到 `Failed to execute 'postMessage' on 'Window': Response object
 > could not be cloned.`（面板整个瘫掉）；当成数据用更阴——`r.path` / `r.extensions` 之类的
@@ -185,7 +188,7 @@ timeout_ms = 5000
 
 > ** 真机坑（面板插件必读）**：宿主在面板 iframe 的 `load` 事件之后才登记该 frame，
 > 之前的 postMessage 会被宿主按「未知来源」丢弃。因此**初始拉数据必须等宿主推来的
-> `agent:init` 再发起**（见 plugins/trace/index.html），脚本一加载就调用只读桥会一直超时。
+> `pawch:init` 再发起**（见 plugins/trace/index.html），脚本一加载就调用只读桥会一直超时。
 
 ## 八、准入机制的现状（2026-10-08：审核与验签移除，生态起来再重建）
 

@@ -1245,7 +1245,12 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
-            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
         );
         // 收集每次 ContextUsage（pressure, projected）与 ApiUsage 次数
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(Option<u64>, u64)>::new()));
@@ -1415,7 +1420,12 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
-            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
         );
         let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let snaps = Arc::new(std::sync::Mutex::new(Vec::<Vec<Value>>::new()));
@@ -1568,7 +1578,12 @@ mod tests {
         let mem = Memory::open_at(
             &ws,
             &MemoryConfig { enabled: false, persist_sensitive: false, profile_max_chars: 2500 },
-            crate::memory::GlobalDirs { install: ws.join("global"), user: ws.join("user") },
+            crate::memory::GlobalDirs {
+                install: ws.join("global"),
+                user: ws.join("user"),
+                install_legacy: ws.join("global-legacy"),
+                user_legacy: ws.join("user-legacy"),
+            },
         );
         struct G;
         impl ApprovalGate for G {

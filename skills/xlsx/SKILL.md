@@ -12,7 +12,7 @@ description: 创建与保真修改 .xlsx：公式/样式/合并全保留
 3. **改已有表格一律走 `patch` 保真增量改，不要走 `read → 改 JSON → make` 重写**（make 是整表重打，颜色/合并单元格/列宽全丢）。patch 只动 ops 指定的单元格，其余原样。
 4. **默认交付 `<原名>_updated.xlsx` 副本，保原件**；用户明说「原地改/覆盖原文件」才 out 写原路径。
 5. 不用 subagent_spawn 验证；改完 `read <输出> <sheet> 3` 抽查前几行，**再跑 `check.js` 结构验收（上方 patch 步骤）**，check 有 FAIL 就不许收尾。
-6. 依赖缺失只许装到 `~/.agent/skill-modules`；装不上停下来如实报告。
+6. 依赖缺失只许装到 `~/.pawch-agent/skill-modules`；装不上停下来如实报告。
 
 ## 0. 环境检测（任务第一步）
 
@@ -94,5 +94,5 @@ make（仅新建用）：`{"sheets":[{"name":"月度","rows":[["月份","销售�
 ## 5. 环境安装（仅缺依赖时）
 
 ```
-npm install --prefix "%USERPROFILE%\.agent\skill-modules" xlsx exceljs
+npm install --prefix "%USERPROFILE%\.pawch-agent\skill-modules" xlsx exceljs
 ```

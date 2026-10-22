@@ -63,8 +63,8 @@ pub(crate) fn webview2_runtime_exes(pf: &str, pf86: &str) -> Vec<PathBuf> {
 }
 
 pub(crate) fn find_browser_exe() -> Result<PathBuf, String> {
-    if let Ok(p) = std::env::var("AGENT_BROWSER_PATH")
-        && !p.trim().is_empty()
+    if let Some(p) = crate::config::env_pawch("BROWSER_PATH")
+        && !p.to_string_lossy().trim().is_empty()
     {
         let p = PathBuf::from(p);
         if p.is_file() {
@@ -417,11 +417,11 @@ pub(crate) fn get_tab(session: &BrowserSession, id: &str) -> Result<Arc<WebTab>,
 }
 
 /// 桌面壳没跑时给人的话（不静默、不偷偷拉 Edge）。
-pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Pawch Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 AGENT_BROWSER_HEADLESS=1。";
+pub(crate) const NO_SHELL_HINT: &str = "桌面壳没运行，内置浏览器不可用。网页在桌面壳的 child webview 里跑（不再另起 Edge 进程）：请启动 Pawch Agent 桌面壳（start.bat 现在会一起起壳），或在本面板「⋯ → 在默认浏览器中打开」看网页。确需无头模式（自动化/CI）设环境变量 PAWCH_AGENT_BROWSER_HEADLESS=1。";
 
 /// 是否允许无头模式（默认关——没有壳就不起 Edge）。
 pub(crate) fn headless_allowed() -> bool {
-    std::env::var("AGENT_BROWSER_HEADLESS")
+    crate::config::env_pawch("BROWSER_HEADLESS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

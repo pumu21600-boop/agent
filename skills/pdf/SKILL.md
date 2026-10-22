@@ -11,7 +11,7 @@ description: PDF 文本提取/合并/拆分；HTML 排版转 PDF
 2. **只用 `scripts/pdf.js`，不许自造解析脚本、不许上 Python**（本机没有 Python；pypdf/reportlab 路线直接堵死）。
 3. 生成 PDF **一律走 `fromhtml`**（HTML+CSS 排版，中文用系统字体栈）；不要去拼 pdf-lib 画布——它画不了中文标准字体，拼出来是乱码/豆腐块。
 4. 不用 subagent_spawn 验证；`text <out.pdf> 2` 回抽文字就是验证。
-5. 依赖缺失只许装到 `~/.agent/skill-modules`；装不上停下来如实报告。
+5. 依赖缺失只许装到 `~/.pawch-agent/skill-modules`；装不上停下来如实报告。
 
 ## 0. 环境检测（任务第一步）
 
@@ -70,5 +70,5 @@ node "<技能目录>\scripts\pdf.js"
 ## 4. 环境安装（仅缺依赖时）
 
 ```
-npm install --prefix "%USERPROFILE%\.agent\skill-modules" pdf-parse@1.1.1 pdf-lib @pdf-lib/fontkit
+npm install --prefix "%USERPROFILE%\.pawch-agent\skill-modules" pdf-parse@1.1.1 pdf-lib @pdf-lib/fontkit
 ```

@@ -463,7 +463,7 @@ pub fn probe_memory_cap(limits: SandboxLimits) -> ProbeResult {
 /// 定位 hog 可执行文件：测试二进制在 target/debug/deps/，hog 在 target/debug/。
 #[cfg(test)]
 fn find_hog() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AGENT_HOG_EXE") {
+    if let Some(p) = crate::config::env_pawch("HOG_EXE") {
         let p = PathBuf::from(p);
         if p.exists() {
             return Some(p);

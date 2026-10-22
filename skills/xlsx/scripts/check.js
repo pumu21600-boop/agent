@@ -19,7 +19,7 @@ const os = require('os');
 
 function need(name) {
   const bases = [
-    path.join(os.homedir(), '.agent', 'skill-modules', 'node_modules'),
+    path.join(os.homedir(), '.pawch-agent', 'skill-modules', 'node_modules'),
     path.join(__dirname, 'node_modules'),
     path.join(process.cwd(), 'node_modules'),
   ];
@@ -111,7 +111,7 @@ async function main() {
   // ---- OOXML 三兄弟：zip 完整性 + 主 part + 数量/文本断言 ----
   if (ext === '.docx' || ext === '.xlsx' || ext === '.pptx') {
     if (!JSZip) {
-      console.error('FAIL: jszip 不可用（装 ~/.agent/skill-modules），无法做结构验收');
+      console.error('FAIL: jszip 不可用（装 ~/.pawch-agent/skill-modules），无法做结构验收');
       process.exit(2);
     }
     let zip;

@@ -389,7 +389,7 @@ pub struct Settings {
     pub schedules: Vec<crate::schedule::ScheduleTask>,
 
     /// 完成记录里被用户 × 掉的通知 key（notice_key = ts+task_id）。
-    /// notices 缓冲本身重启即失，但桌面壳重启不重建 agent.exe 服务、设置弹窗每次重开
+    /// notices 缓冲本身重启即失，但桌面壳重启不重建 pawch-agent.exe 服务、设置弹窗每次重开
     /// 都重建组件，× 不落盘就会「明明叉掉了又回来」（2026-10-05 用户实锤）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schedule_dismissed: Vec<String>,

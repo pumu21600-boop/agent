@@ -86,7 +86,7 @@
   </div>
 
 <script>
-// —— 插件契约 v1：等宿主 agent:init 再发请求 ——
+// —— 插件契约 v1：等宿主 pawch:init 再发请求 ——
 let seq = 0;
 const pending = new Map();
 let channels = [];
@@ -97,13 +97,13 @@ let rate = 7.2;
 
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
-  if (d.type === 'agent:init') {
+  if (d.type === 'pawch:init') {
     // 主题跟着宿主；boot 只跑一次——切主题重发 init 若再 load 一遍，
     // 没保存的新增行就会被服务器上的旧表冲掉（用户实锤丢行）
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) { booted = true; boot(); }
   }
-  if (d.type === 'agent:response') {
+  if (d.type === 'pawch:response') {
     const r = pending.get(d.id);
     if (!r) return;
     pending.delete(d.id);
@@ -114,10 +114,10 @@ function req(method, params) {
   return new Promise((res, rej) => {
     const id = 'r' + ++seq;
     pending.set(id, { res, rej });
-    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
   });
 }
-parent.postMessage({ type: 'agent:hello' }, '*');
+parent.postMessage({ type: 'pawch:hello' }, '*');
 
 const $ = (id) => document.getElementById(id);
 const say = (text, ok) => { $('msg').textContent = text; $('msg').className = 'msg ' + (ok ? 'ok' : 'err'); };

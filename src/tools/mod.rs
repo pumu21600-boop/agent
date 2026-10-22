@@ -987,13 +987,13 @@ mod tests {
     async fn unsandboxed_inherits_full_env() {
         init_logger();
         // 差分断言：父进程环境里的变量，本机直跑子进程能看到（沙箱白名单看不到）
-        unsafe { std::env::set_var("AGENT_P4_UNSAFE_MARKER", "local-run-ok") };
+        unsafe { std::env::set_var("PAWCH_AGENT_P4_UNSAFE_MARKER", "local-run-ok") };
         let mut c = cfg();
         c.unsandboxed = true;
-        let r = execute(&c, "shell", r#"{"command":"echo %AGENT_P4_UNSAFE_MARKER%"}"#).await.unwrap();
+        let r = execute(&c, "shell", r#"{"command":"echo %PAWCH_AGENT_P4_UNSAFE_MARKER%"}"#).await.unwrap();
         assert!(r.contains("local-run-ok"), "本机直跑应继承完整环境: {r}");
 
-        let r2 = execute(&cfg(), "shell", r#"{"command":"echo %AGENT_P4_UNSAFE_MARKER%"}"#).await;
+        let r2 = execute(&cfg(), "shell", r#"{"command":"echo %PAWCH_AGENT_P4_UNSAFE_MARKER%"}"#).await;
         let out2 = r2.unwrap();
         assert!(
             !out2.contains("local-run-ok"),
@@ -1025,7 +1025,11 @@ mod tests {
             return; // 无 LOCALAPPDATA 的环境跳过
         }
         let d = bundled_runtime_dir().expect("有 LOCALAPPDATA 就应有运行时目录");
-        assert!(d.ends_with(Path::new("agent").join("runtime").join("git")), "{d:?}");
+        // 改名迁移轮（2026-10-22）：新路径 pawch-agentuntimegit；旧路径
+        // agentuntimegit 的已解压缓存存在时兼容复用一个版本
+        let ok = d.ends_with(Path::new("pawch-agent").join("runtime").join("git"))
+            || d.ends_with(Path::new("agent").join("runtime").join("git"));
+        assert!(ok, "{d:?}");
     }
 
     #[test]

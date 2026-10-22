@@ -174,7 +174,7 @@
 
 | `kind` | 说明 | 关键字段 |
 | --- | --- | --- |
-| `headless.run` | 无头会话被程序化唤醒（/api/headless/run 或 agent.exe run） | `session`、`purpose`（cli/schedule/subagent…）、`mode`、`auto_approve`、`timeout_secs` |
+| `headless.run` | 无头会话被程序化唤醒（/api/headless/run 或 pawch-agent.exe run） | `session`、`purpose`（cli/schedule/subagent…）、`mode`、`auto_approve`、`timeout_secs` |
 | `headless.done` | 无头会话整轮结束 | `session`、`status`（done/cancelled/timeout/error）、`purpose`、`duration_ms`、`requests`、`prompt_tokens` |
 | `headless.rejected` | 唤醒被拒（会话正在运行中，409） | `session`、`reason` |
 | `headless.timeout` | 整轮超时已取消（任务在后台收尾） | `session`、`secs` |

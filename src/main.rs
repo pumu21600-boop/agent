@@ -46,6 +46,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // —— 改名迁移轮（2026-10-22）：旧根 `.agent` → 新根 `.pawch-agent` 一次性搬迁 ——
+    // 只搬新根没有的、绝不覆盖、旧根永不删；读侧另有一个版本的旧根回落
+    // （memory::compat_read_text）。放在服务路径最前面：后面所有读都该看到新根。
+    let (moved_install, moved_user) = memory::migrate_renamed_roots();
+    if !moved_install.is_empty() || !moved_user.is_empty() {
+        println!(
+            "[pawch-agent] 目录改名迁移完成：安装根 {:?}，用户根 {:?}（旧根 .agent 保留，兼容读一个版本）",
+            moved_install, moved_user
+        );
+    }
+
     // —— 供应商预设：providers.json 数据驱动 ——
     gateway::providers::init(&manifest.join("providers.json"))?;
 

@@ -1,11 +1,11 @@
 //! Pawch Agent 桌面壳—— 窗口 + 托盘 + 服务保活 + **child webview 宿主**
 //!
 //! 设计（窄而刚 v1）：
-//! - WebView 直接加载 http://127.0.0.1:5173（前端零改动，agent.exe 是唯一真源）；
-//! - 启动时探测 5173，未起则 spawn `<repo>/target/release/agent.exe`（start.bat 内置化）；
+//! - WebView 直接加载 http://127.0.0.1:5173（前端零改动，pawch-agent.exe 是唯一真源）；
+//! - 启动时探测 5173，未起则 spawn `<repo>/target/release/pawch-agent.exe`（start.bat 内置化）；
 //! - 托盘：左键显示/聚焦窗口，右键菜单（打开主窗口 / 退出壳）；
 //! - 壳退出**不杀**服务（服务独立生命周期）；
-//! - agent.exe 路径按开发机布局解析（desktop/ 的上两级 target/release）；
+//! - pawch-agent.exe 路径按开发机布局解析（desktop/ 的上两级 target/release）；
 //!   未来打包分发时改为同级目录探测（留口）。
 //!
 //! 内置浏览器改造：浏览器不再由服务另起一个无头 Edge 进程，而是**把网页变成
@@ -44,7 +44,7 @@ const CDP_PORT: u16 = 9223;
 /// 渲染缩放的 flag（外部方案踩过的坑）。
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
  --remote-debugging-port=9223 --remote-debugging-address=127.0.0.1";
-/// 服务端 webview 控制通道（agent.exe 监听，壳来连）
+/// 服务端 webview 控制通道（pawch-agent.exe 监听，壳来连）
 const CTL_ADDR: (&str, u16) = ("127.0.0.1", 9225);
 /// 单实例守卫端口（第二个壳直接退出，不抢 CDP 端口）
 const GUARD_PORT: u16 = 9224;
@@ -160,19 +160,19 @@ fn win_start_resize(win: tauri::Window, dir: String) {
     let _ = win.start_resize_dragging(d);
 }
 
-/// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/agent.exe`
+/// 服务 exe 路径：desktop/ 的上一级就是仓库根 → `<repo>/target/release/pawch-agent.exe`
 /// （开发机布局；原稿多退了一级指向 Desktop\target\release，壳从来没能自己拉起过
 /// 服务——以前服务总是手动起着的，bug 一直被掩盖。start.bat 改靠壳保活后必须修）。
 /// 打包分发时改为同级目录探测（留口）。
 fn service_exe() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if let Some(repo) = manifest.parent() {
-        let p = repo.join("target").join("release").join("agent.exe");
+        let p = repo.join("target").join("release").join("pawch-agent.exe");
         if p.is_file() {
             return p;
         }
     }
-    PathBuf::from("target/release/agent.exe")
+    PathBuf::from("target/release/pawch-agent.exe")
 }
 
 fn service_alive() -> bool {
@@ -225,7 +225,7 @@ use std::path::Path;
 
 /// 壳日志（release 下无控制台，写文件兜底；只记 webview 宿主的诊断信息）。
 fn slog(msg: &str) {
-    let path = std::env::temp_dir().join("agent-shell.log");
+    let path = std::env::temp_dir().join("pawch-agent-shell.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -241,7 +241,7 @@ fn slog(msg: &str) {
 /// 9224 被无关程序占了）→ **放弃守卫继续启动**——不能因为一个无关端口把壳拦死。
 /// 返回的 listener 必须保活（drop 即释放）。
 fn instance_guard() -> Option<TcpListener> {
-    let lock = std::env::temp_dir().join("agent-shell.lock");
+    let lock = std::env::temp_dir().join("pawch-agent-shell.lock");
     // 先读后写：写在自己 bind 成功之后，否则第二个壳会把第一个的 PID 覆盖掉、把自己
     // 误判成"没有别的壳在跑"
     let other_pid = std::fs::read_to_string(&lock)

@@ -114,7 +114,7 @@ struct Collectors {
     last_snapshot: std::sync::Mutex<Vec<Value>>,
     summary: std::sync::Mutex<Option<String>>,
     /// 会话用量快照（与 /api/chat 同一份口径）：无头轮过去完全不落盘，导致
-    /// `agent.exe run` / 定时任务 / 子代理跑过的会话切回去圆环是空的——现在同样维护。
+    /// `pawch-agent.exe run` / 定时任务 / 子代理跑过的会话切回去圆环是空的——现在同样维护。
     usage: std::sync::Mutex<crate::session::SessionUsage>,
 }
 

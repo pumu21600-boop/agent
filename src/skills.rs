@@ -334,13 +334,18 @@ pub fn save(name: &str, description: &str, content: &str) -> Result<String, Stri
     if stale != dir && stale.is_dir() {
         migrate_skill_dir(&stale, &dir);
     }
-    // 旧「全局」根（`~/.agent/skills`，v0.32.32 搬根前的位置）遗留同名副本也并进来（换根后别留双份，
+    // 旧「全局」根（`~/.agent/skills`，v0.32.32 搬根前的位置；2026-10-22 改名轮后
+    // 又多了 `~/.pawch-agent/skills` 之前的那一份）遗留同名副本也并进来（换根后别留双份，
     // 资产同样要保住）。这里必须认用户根：记忆层全局根 2026-10-09 搬到 app_root/.agent 后，
     // 跟着 install_state_dir() 走就再也找到真遗留副本了（AGENTS.md 回滚用户根后它又是活根，
     // 但 skills 资产在搬根之前就在旧根，仍要捞）。
-    let legacy = crate::memory::user_global_dir().join("skills").join(name);
-    if legacy != dir && legacy.is_dir() {
-        migrate_skill_dir(&legacy, &dir);
+    for legacy_root in [
+        crate::memory::user_global_dir().join("skills").join(name),
+        crate::memory::legacy_roots().user_legacy.join("skills").join(name),
+    ] {
+        if legacy_root != dir && legacy_root.is_dir() {
+            migrate_skill_dir(&legacy_root, &dir);
+        }
     }
     Ok(dir.to_string_lossy().to_string())
 }

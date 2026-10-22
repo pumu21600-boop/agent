@@ -1,6 +1,6 @@
 //! 长活子进程的生命周期保险丝（起）—— Job Object + KILL_ON_JOB_CLOSE。
 //!
-//! 为什么需要：服务进程被**硬杀**（`agent.exe stop` 走 taskkill /F、崩溃、重启）时，
+//! 为什么需要：服务进程被**硬杀**（`pawch-agent.exe stop` 走 taskkill /F、崩溃、重启）时，
 //! `Child::kill()` 那套优雅路径根本来不及跑，子进程会作为孤儿继续活着、占着端口与
 //! 内存——真机踩过：用户机器上留了一个杀不掉的提权孤儿 Edge。把子进程收进
 //! 只带 kill-on-close 的 Job 后，服务进程一死（句柄全关），整棵树跟着团灭。

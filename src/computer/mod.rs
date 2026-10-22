@@ -258,15 +258,15 @@ fn cmd_screenshot(v: &Value, max_chars: usize) -> Result<String, String> {
 
 #[cfg(test)]
 mod real_input_tests {
-    //! 真实键鼠 e2e（默认忽略，AGENT_COMPUTER_E2E=1 才跑）。
+    //! 真实键鼠 e2e（默认忽略，PAWCH_AGENT_COMPUTER_E2E=1 才跑；旧名 AGENT_COMPUTER_E2E 兼容一个版本）。
     //! 靶子是记事本：自己拉起来、自己聚焦、自己输入、自己收。**绝不碰用户前台**——
-    //! 没有 AGENT_COMPUTER_E2E 环境变量时整个测试跳过（CI/别人机器上不误触）。
+    //! 没有 PAWCH_AGENT_COMPUTER_E2E 环境变量时整个测试跳过（CI/别人机器上不误触）。
     use super::*;
 
     #[test]
-    #[ignore = "真实键鼠：AGENT_COMPUTER_E2E=1 才跑（会动你的桌面）"]
+    #[ignore = "真实键鼠：PAWCH_AGENT_COMPUTER_E2E=1 才跑（会动你的桌面）"]
     fn type_into_notepad_lands() {
-        if std::env::var("AGENT_COMPUTER_E2E").is_err() {
+        if crate::config::env_pawch("COMPUTER_E2E").is_none() {
             return;
         }
         // 靶子记事本：自己拉、自己收（Child 句柄 kill，不留进程）
@@ -287,7 +287,7 @@ mod real_input_tests {
             "前台应是记事本"
         );
         // 1) unicode 输入落地（中文/符号同路径，UTF-16 码元直灌）
-        let marker = format!("AGENT_E2E_{}", std::process::id());
+        let marker = format!("PAWCH_AGENT_E2E_{}", std::process::id());
         input::type_text(&marker);
         std::thread::sleep(std::time::Duration::from_millis(400));
         let c1 = window::edit_control_text(w.hwnd).unwrap_or_default();

@@ -1,5 +1,5 @@
 [package]
-name = "agent"
+name = "pawch-agent"
 version = "0.32.0"
 edition = "2024"
 description = "Pawch Agent —— 跑在 Windows 上的自主办事 Agent（Rust + Svelte，本地优先，SSE 流式）"

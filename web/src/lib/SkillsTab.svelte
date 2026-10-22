@@ -13,7 +13,7 @@
   let skillMsg = '';
   let skillEditor = null; // { isNew, name, description, content, source }
   // 用户 2026-10-02：新建输入框不再预填模板（正文自己写；name/description 由保存时回填校验）
-  // 新建默认走全局（保存位置由后端定：无同名已存在技能 → ~/.agent/skills/）
+  // 新建默认走全局（保存位置由后端定：无同名已存在技能 → ~/.pawch-agent/skills/）
   function newSkill() {
     skillEditor = { isNew: true, name: '', description: '', content: '', source: 'global' };
   }

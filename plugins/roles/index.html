@@ -46,18 +46,18 @@
   <div id="body"><div class="empty">读取中…</div></div>
 
 <script>
-// 插件契约 v1：等宿主 agent:init 再发请求；agent:request/response 按 id 配对
+// 插件契约 v1：等宿主 pawch:init 再发请求；pawch:request/response 按 id 配对
 let seq = 0;
 const pending = new Map();
 let booted = false;
 
 window.addEventListener('message', (ev) => {
   const d = ev.data || {};
-  if (d.type === 'agent:init') {
+  if (d.type === 'pawch:init') {
     document.body.classList.toggle('light', ((d.payload || {}).theme) === 'light');
     if (!booted) { booted = true; boot(); }
   }
-  if (d.type === 'agent:response') {
+  if (d.type === 'pawch:response') {
     const r = pending.get(d.id);
     if (!r) return;
     pending.delete(d.id);
@@ -68,8 +68,8 @@ function req(method, params) {
   return new Promise((res, rej) => {
     const id = 'r' + ++seq;
     pending.set(id, { res, rej });
-    parent.postMessage({ type: 'agent:request', id, method, params }, '*');
-    // 2026-10-08 修：宿主不响应（agent:response 丢失/被早退）时 Promise 永久
+    parent.postMessage({ type: 'pawch:request', id, method, params }, '*');
+    // 2026-10-08 修：宿主不响应（pawch:response 丢失/被早退）时 Promise 永久
     // pending——面板卡在「读取中…」且无重试无提示，pending 条目也永不清理。
     // 补 8s 超时（与 board/trace 同一范式）。
     setTimeout(() => {
@@ -80,7 +80,7 @@ function req(method, params) {
     }, 8000);
   });
 }
-parent.postMessage({ type: 'agent:hello' }, '*');
+parent.postMessage({ type: 'pawch:hello' }, '*');
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));

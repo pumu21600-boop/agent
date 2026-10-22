@@ -190,7 +190,7 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 /// （DNS 在代理侧完成）本地确实可能查不到，显式设 AGENT_WEB_ALLOW_PRIVATE=1 放开。
 /// 本地 dev 要抓 127.0.0.1 也走这个开关（与 AGENT_WEB_DEBUG_DIR / AGENT_BROWSER_PATH 同款）。
 async fn ensure_public_target(url: &str) -> Result<(), String> {
-    if std::env::var("AGENT_WEB_ALLOW_PRIVATE").is_ok() {
+    if crate::config::env_pawch("WEB_ALLOW_PRIVATE").is_some() {
         return Ok(());
     }
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("url 解析失败: {e}"))?;
@@ -334,8 +334,9 @@ pub(crate) async fn web_search(args: &str, max_chars: usize) -> Result<String, S
                     "bing" => parse_bing(&html, count),
                     _ => parse_ddg(&html, count),
                 };
-                // 调试开关：设了 AGENT_WEB_DEBUG_DIR 就把原始页面落盘（排查搜索/抓取解析问题用）
-                if let Ok(dir) = std::env::var("AGENT_WEB_DEBUG_DIR") {
+                // 调试开关：设了 PAWCH_AGENT_WEB_DEBUG_DIR（旧名 AGENT_WEB_DEBUG_DIR 兼容一个版本）
+                // 就把原始页面落盘（排查搜索/抓取解析问题用）
+                if let Some(dir) = crate::config::env_pawch("WEB_DEBUG_DIR") {
                     let file = format!("web_{}.html", name.replace(' ', "_"));
                     let _ = std::fs::write(std::path::Path::new(&dir).join(file), &html);
                 }
@@ -656,7 +657,7 @@ mod tests {
     async fn ssrf_guard_blocks_private_target_before_connecting() {
         // 审计 12：闸在发送之前——环回目标第一跳 ensure_public_target 就该拒，
         // 连接根本不建立（本机若显式开了私网抓取开关，本用例失去前提，如实跳过）
-        if std::env::var("AGENT_WEB_ALLOW_PRIVATE").is_ok() {
+        if crate::config::env_pawch("WEB_ALLOW_PRIVATE").is_some() {
             return;
         }
         let client = web_client().unwrap();

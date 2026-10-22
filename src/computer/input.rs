@@ -334,7 +334,8 @@ mod tests {
 
     /// 组合键解析覆盖生产入口用到的写法。**只测解析，不发键**——
     /// 真发键的单测会打到用户当前桌面（alt+f4 在无焦点窗口时弹「关闭 Windows」，
-    /// 2026-10-21 实锤）。真正发键的通路由 AGENT_COMPUTER_E2E 那条记事本 e2e 覆盖。
+    /// 2026-10-21 实锤）。真正发键的通路由 PAWCH_AGENT_COMPUTER_E2E（旧名 AGENT_COMPUTER_E2E
+/// 兼容一个版本）那条记事本 e2e 覆盖。
     #[test]
     fn combo_requires_known_keys() {
         assert_eq!(parse_combo("ctrl+c").unwrap(), vec![VK_CONTROL, 0x43]);
