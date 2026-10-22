@@ -6533,13 +6533,11 @@
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h5"/></svg>
                     在默认浏览器中打开
                   </button>
-                  {#if webNative}
-                    <!-- 壳里的 child webview 能开真 DevTools（无头时代做不到） -->
-                    <button on:click={() => { webCloseMenu(); webMenuAction('devtools'); }}>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4.5 4.5 0 0 0-6 6L3 18l3 3 5.7-5.7a4.5 4.5 0 0 0 6-6L14 14l-4-4 4.7-3.7z"/></svg>
-                      开发者工具
-                    </button>
-                  {/if}
+                  <!-- 无头模式没有「开发者工具」项：面板里是截图流，没有可挂真 DevTools 的
+                       实体（服务端 /api/browser/devtools 对无头模式返回 opened:false 并引导
+                       「在默认浏览器中打开后按 F12」）。壳模式的「⋯」菜单是壳里浮层
+                       （web/public/menu.html），「开发者工具」项在那边——child webview
+                       才有真 DevTools 可开。 -->
                 </div>
               {/if}
             </div>
