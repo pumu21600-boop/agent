@@ -1,6 +1,5 @@
 <script>
   import { onMount, afterUpdate, onDestroy, tick } from 'svelte';
-  import Select from './Select.svelte';
   import Galaxy from './Galaxy.svelte';
   // docx 排版预览（2026-10-02 用户实锤「要能看排版，完全体」）：mammoth 把 docx
   // 容器转成 HTML 再沙箱 iframe 渲染（表格/列表/图片/标题层级全保留）
@@ -17,6 +16,10 @@
   import MemoryTab from './lib/MemoryTab.svelte';
   import SkillsTab from './lib/SkillsTab.svelte';
   import McpTab from './lib/McpTab.svelte';
+  import AppearanceTab from './lib/AppearanceTab.svelte';
+  import ModelTab from './lib/ModelTab.svelte';
+  import RolesTab from './lib/RolesTab.svelte';
+  import ExtTab from './lib/ExtTab.svelte';
   import ScheduleTab from './lib/ScheduleTab.svelte';
   import { fmtBytes, relTime, fmtTok, norm, configLabel, gitStatusLabel, normPath, relShort, contentText, webNormalizeUrl, riskLabelFor } from './lib/format.js';
   import { parseCssColor, rgbToHex, rgbAlpha, hexWithAlpha, structuralSelector, pathOf, findByPath, makeUid, ELEMENT_ALIASES, escalateCss, microCss } from './lib/dom.js';
@@ -2212,7 +2215,10 @@
 
   // —— CSS 注入器：用户自定义 CSS，实时生效并记住 ——
   let customCss = localStorage.getItem('customCss') || '';
-  function applyCustomCss() {
+  function applyCustomCss(css) {
+    // 设置分区的注入框搬进 AppearanceTab 后，输入框 bind 的是组件 prop——根这份值
+    // 由 prop 绑定回传；显式带参保证同一事件里拿到的就是刚敲进去的文本
+    if (css !== undefined) customCss = css;
     let el = document.getElementById('user-custom-css');
     if (!el) {
       el = document.createElement('style');
@@ -6745,501 +6751,84 @@
           <button class:active={settingsTab === 'schedule'} on:click={() => pickSettingsTab('schedule')}><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg> 定时</button>
         </div>
         <div class="settings-content">
-        {#if settingsTab === 'appearance'}
-          <div class="field">
-            <label>主题</label>
-            <div class="theme-opts">
-              <button class="theme-opt" class:active={themeMode === 'dark'} on:click={() => applyThemeMode('dark')}>深色</button>
-              <button class="theme-opt" class:active={themeMode === 'light'} on:click={() => applyThemeMode('light')}>浅色</button>
-              <button class="theme-opt" class:active={themeMode === 'system'} on:click={() => applyThemeMode('system')}>跟随系统</button>
-            </div>
-          </div>
-          <div class="field">
-            <label>背景壁纸</label>
-            <div class="wp-row">
-              <label class="theme-opt wp-pick">选择图片
-                <input type="file" accept="image/*" on:change={onWallpaperPick} />
-              </label>
-              {#if wallpaper}
-                <button class="theme-opt" on:click={clearWallpaper}>清除壁纸</button>
-                <span class="wp-opacity">不透明度 <b>{wallpaperOpacity}</b>
-                  <input type="range" min="0" max="100" bind:value={wallpaperOpacity} />
-                </span>
-              {/if}
-            </div>
-            {#if wallpaperMsg}<div class="param-hint">{wallpaperMsg}</div>{/if}
-          </div>
-          {#if features.css_tool}
-          <div class="field">
-            <label>CSS 注入器</label>
-            <textarea
-              class="agents-editor css-injector"
-              rows="8"
-              spellcheck="false"
-              bind:value={customCss}
-              on:input={() => applyCustomCss()}
-              placeholder={'直接写 CSS 规则，实时生效并记住。例如：\n.composer { border-radius: 24px; }\n.chat-head { display: none; }'}
-            ></textarea>
-            {#if microCss(microTweaks)}
-              <label>微调生成的规则（只读预览）</label>
-              <textarea
-                class="agents-editor css-injector micro-readonly"
-                rows="6"
-                spellcheck="false"
-                readonly
-                value={microCss(microTweaks)}
-              ></textarea>
-              <div class="sub-row">
-                <button class="btn" on:click={clearAllMicro}>清空全部微调规则</button>
-              </div>
-            {/if}
-            <div class="sub-row">
-              <button class="btn" on:click={exportCssRules}>导出规则</button>
-              <button class="btn" on:click={() => cssImportInput && cssImportInput.click()}>导入规则</button>
-              <input
-                class="css-rules-file"
-                type="file"
-                accept=".json,.css,.txt,application/json,text/css,text/plain"
-                bind:this={cssImportInput}
-                on:change={onImportCssRules}
-              />
-              <span class="param-hint" style="align-self:center">导入会覆盖现有规则</span>
-            </div>
-          </div>
-          <div class="field">
-            <label>界面微调模式</label>
-            <div class="sub-row">
-              <button class="btn" class:primary={editMode} on:click={() => (editMode = !editMode)}>
-                {editMode ? '● 微调中：右击界面元素即可修改（再点关闭）' : '开启微调：右击界面元素修改样式'}
-              </button>
-            </div>
-          </div>
-          {/if}
-        {/if}
-        {#if settingsTab === 'model'}
-
-      <div class="field">
-        <label>配置</label>
-        <div class="chips">
-          {#each configs as c}
-            <button
-              class="chip"
-              class:active={c.id === activeConfigId}
-              title={configLabel(c) + ' · ' + (c.model || '未选模型') + (c.has_key ? ' · 有key' : ' · 无key')}
-              on:click={() => manageConfig('apply', c.id)}
-            >
-              <span class="dot" class:haskey={c.has_key}></span>{configLabel(c)}
-            </button>
-          {/each}
-          <button class="chip add" on:click={newConfig}>新建配置</button>
-          <button class="chip del" on:click={deleteConfig}>删除当前</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label>配置名称</label>
-        <input
-          data-field="configName"
-          bind:value={configName}
-          placeholder="给这套配置起个名，如：商汤主力 / tokeness 免费"
-          on:input={() => autoSave({ name: configName })}
-        />
-      </div>
-
-      <div class="field">
-        <label>供应商</label>
-        <Select
-          value={providerId}
-          title="供应商预设"
-          options={[
-            ...providers.map((p) => ({ value: p.id, label: p.name })),
-            // 老渠道可能还挂在已下架的预设 id 上：回显为「旧预设」，不主动改它
-            ...(providerId && !providers.some((p) => p.id === providerId)
-              ? [{ value: providerId, label: providerId + '（旧预设）' }]
-              : []),
-          ]}
-          on:change={(e) => {
-            providerId = e.detail;
-            onProviderChange();
-          }}
-        />
-      </div>
-
-      <div class="field">
-        <label>Base URL</label>
-        <input
-          data-field="baseUrl"
-          bind:value={baseUrl}
-          placeholder="留空用预设默认"
-          on:input={() => autoSave({ base_url: baseUrl })}
-        />
-      </div>
-
-      <div class="field">
-        <label>API Key</label>
-        <div class="sub-row">
-          <input
-            bind:value={apiKey}
-            type="password"
-            style="flex: 1;"
-            placeholder={typingHint
-              ? `本配置已保存(…${typingHint})，重新输入即覆盖`
-              : '此配置还没有 key，填入即自动保存'}
-            on:blur={() => apiKey.trim() && autoSave({})}
-            on:keydown={(e) => e.key === 'Enter' && apiKey.trim() && autoSave({})}
-          />
-          {#if typingHint}
-            <button class="btn del-key" on:click={clearKey} title="清除此配置保存的 API Key">清除 Key</button>
-          {/if}
-        </div>
-      </div>
-
-      <div class="field">
-        <label>模型</label>
-        <div class="sub-row">
-          <Select
-            value={model}
-            placeholder="（点右侧获取模型）"
-            title="当前模型"
-            options={[
-              ...(model && !savedModels.includes(model) ? [{ value: model, label: model }] : []),
-              ...savedModels.map((m) => ({ value: m, label: m })),
-            ]}
-            on:change={(e) => {
-              model = e.detail;
-              autoSave({ model }, 0);
-            }}
-          />
-          <button class="btn primary" on:click={fetchModels}>获取模型</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label>模型参数（0=恢复默认）</label>
-        <div class="sub-row">
-          <input
-            class="num-input"
-            type="number"
-            min="0"
-            data-field="ctxLen"
-            bind:value={ctxLen}
-            title="上下文长度：决定圆环预算与历史裁剪时机"
-            on:change={() => autoSave({ context_length: Number(ctxLen) || 0 }, 0)}
-          />
-          <input
-            class="num-input"
-            type="number"
-            min="0"
-            data-field="maxOut"
-            bind:value={maxOut}
-            title="最大输出长度：随请求作为 max_tokens 发给渠道。思考开启时自动加思考余量（配置值+max(配置值,8192)）——上游把思考和正文算进同一个额度，不加余量正文会被思考挤断；端点拒收会自动回退原值"
-            on:change={() => autoSave({ max_output_tokens: Number(maxOut) || 0 }, 0)}
-          />
-        </div>
-      </div>
-
-      <div class="field">
-        <label>采样参数（留空=渠道默认）</label>
-        <div class="sub-row">
-          <input
-            class="num-input"
-            type="number" step="0.1" min="0" max="2"
-            placeholder="温度"
-            data-field="temperature"
-            bind:value={temperature}
-            title="temperature：越低越稳定，0=确定性输出"
-            on:change={() => autoSave({ temperature: temperature === null || temperature === '' ? -1 : Number(temperature) }, 0)}
-          />
-          <input
-            class="num-input"
-            type="number" step="0.05" min="0" max="1"
-            placeholder="top_p"
-            data-field="topP"
-            bind:value={topP}
-            title="top_p：核采样截断"
-            on:change={() => autoSave({ top_p: topP === null || topP === '' ? -1 : Number(topP) }, 0)}
-          />
-        </div>
-        <div class="param-hint">-1 = 清除该项</div>
-      </div>
-
-      <div class="field">
-        <label>模型能力标记</label>
-        <div class="caps-row">
-          <label class="cap-check">
-            <input
-              type="checkbox"
-              bind:checked={capabilities.tools}
-              on:change={() => autoSave({ capabilities }, 0)}
-            />
-            工具调用
-          </label>
-          <label class="cap-check">
-            <input
-              type="checkbox"
-              bind:checked={capabilities.vision}
-              on:change={() => autoSave({ capabilities }, 0)}
-            />
-            图片解析
-          </label>
-          <label class="cap-check">
-            <input
-              type="checkbox"
-              bind:checked={capabilities.video}
-              on:change={() => autoSave({ capabilities }, 0)}
-            />
-            视频解析
-          </label>
-          <label class="cap-check">
-            <input
-              type="checkbox"
-              bind:checked={capabilities.audio}
-              on:change={() => autoSave({ capabilities }, 0)}
-            />
-            音频解析
-          </label>
-        </div>
-      </div>
-
-      {/if}
-      {#if settingsTab === 'roles' && features.roles}
-      <div class="field roles-section">
-        <label>功能桥接</label>
-        <div class="roles-grid">
-          <div class="role-item">
-            <span class="role-name">会话摘要</span>
-            <Select
-              value={roles.summary ?? null}
-              title="会话摘要角色"
-              options={[
-                { value: null, label: '未配置：由主力渠道代跑摘要' },
-                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, summary: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-          <div class="role-item">
-            <span class="role-name">标题生成</span>
-            <Select
-              value={roles.title ?? null}
-              title="标题生成角色"
-              options={[
-                { value: null, label: '未配置：由主力渠道代跑标题' },
-                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, title: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-          <div class="role-item">
-            <span class="role-name">向量嵌入</span>
-            <Select
-              value={roles.embedding ?? null}
-              title="向量嵌入角色（记忆库语义检索用）"
-              options={[
-                { value: null, label: '未配置：记忆库用本地哈希向量（离线可用）' },
-                ...configs.map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, embedding: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-          <div class="role-item">
-            <span class="role-name">图片理解</span>
-            <Select
-              value={roles.vision ?? null}
-              title="图片理解专家"
-              options={[
-                { value: null, label: '未配置' },
-                ...configs
-                  .filter((c) => c.id === roles.vision || c.capabilities?.vision)
-                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.vision ? '' : '（未勾「图片解析」）'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, vision: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-          <div class="role-item">
-            <span class="role-name">视频理解</span>
-            <Select
-              value={roles.video ?? null}
-              title="视频理解专家"
-              options={[
-                { value: null, label: '未配置' },
-                ...configs
-                  .filter((c) => c.id === roles.video || c.capabilities?.video)
-                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.video ? '' : '（未勾「视频解析」）'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, video: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-          <div class="role-item">
-            <span class="role-name">音频理解</span>
-            <Select
-              value={roles.audio ?? null}
-              title="音频理解专家"
-              options={[
-                { value: null, label: '未配置' },
-                ...configs
-                  .filter((c) => c.id === roles.audio || c.capabilities?.audio)
-                  .map((c) => ({ value: c.id, label: `${configLabel(c)} · ${c.model || '未选模型'}${c.capabilities?.audio ? '' : '（未勾「音频解析」）'}` })),
-              ]}
-              on:change={(e) => {
-                roles = { ...roles, audio: e.detail };
-                autoSave({ roles }, 0);
-              }}
-            />
-          </div>
-        </div>
-      </div>
-      {/if}
+      <AppearanceTab
+        tab={settingsTab}
+        {themeMode}
+        {applyThemeMode}
+        {wallpaper}
+        bind:wallpaperOpacity
+        {wallpaperMsg}
+        {onWallpaperPick}
+        {clearWallpaper}
+        cssTool={features.css_tool}
+        bind:customCss
+        {applyCustomCss}
+        {microTweaks}
+        {clearAllMicro}
+        bind:editMode
+        {exportCssRules}
+        {onImportCssRules}
+      />
+      <ModelTab
+        tab={settingsTab}
+        {providers}
+        {configs}
+        {activeConfigId}
+        {configLabel}
+        {manageConfig}
+        {newConfig}
+        {deleteConfig}
+        bind:providerId
+        {onProviderChange}
+        bind:baseUrl
+        bind:apiKey
+        {typingHint}
+        {clearKey}
+        bind:configName
+        bind:model
+        {savedModels}
+        {fetchModels}
+        bind:ctxLen
+        bind:maxOut
+        bind:temperature
+        bind:topP
+        bind:capabilities
+        {autoSave}
+      />
+      <RolesTab tab={settingsTab} rolesShown={features.roles} {configs} {configLabel} bind:roles {autoSave} />
       <MemoryTab tab={settingsTab} showGalaxy={features.galaxy} on:openGalaxy={() => { settingsOpen = false; galaxyOpen = true; }} />
       <SkillsTab tab={settingsTab} skills={skillsData} loading={skillsLoading} confirm={confirmAsk} on:reload={loadSkills} />
       <McpTab tab={settingsTab} servers={mcpServers} on:action={(e) => mcpAction(e.detail.action, e.detail.name, e.detail.server)} on:reload={loadMcp} />
-      {#if settingsTab === 'ext'}
-        {#if extMsg}<div class="mcp-cmd">{extMsg}</div>{/if}
-
-        <!-- 用户 2026-10-05：「新建插件」与技能/MCP 同款——表单默认收起，点开才占地方 -->
-        <div class="sub-row">
-          <button class="btn primary" on:click={() => (extCreateOpen = true)}>新建插件</button>
-          <button class="btn" on:click={() => loadExt()}>刷新</button>
-        </div>
-        {#if extCreateOpen}
-          <div class="field">
-            <label>新建插件（工作区）</label>
-            <div class="sub-row">
-              <input placeholder="名称（字母数字-_）" bind:value={extCreateForm.name} style="max-width:160px" />
-              <input placeholder="一句话描述" bind:value={extCreateForm.description} />
-              <button class="btn primary" on:click={createExt} disabled={!extCreateForm.name.trim()}>创建</button>
-              <button class="btn" on:click={cancelCreateExt}>取消</button>
-            </div>
-          </div>
-        {/if}
-
-        <!-- 权限放开轮（用户 2026-10-02 拍板）：内置能力已全部插件化——Git/沙箱/功能桥接/
-             css-ui工具/记忆库/断线取消 现在是 plugins/ 下的真插件（功能总开关 = 插件开关，
-             host 侧 toggle_plugin 同步写 settings.features），此行起全是插件，没有特例行。
-             2026-10-06 重整：git-panel / sandbox-panel 移出插件位（能力留在宿主），5 个纯
-             技能插件降级成全局技能（住技能页），此行只剩 9 个插件 -->
-        <div class="group-label">插件 {builtInExts.length}</div>
-
-        {#each builtInExts as e}
-          <div class="plug-row" title={extTip(e)}>
-            <div class="plug-ico">
-              {#if extIcon(e.name)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(e.name)}</svg>{:else}{(e.title || e.name || '?').slice(0, 1).toUpperCase()}{/if}
-            </div>
-            <div class="plug-meta">
-              <div class="plug-title">{e.title}</div>
-              <div class="plug-desc">{e.description || e.dir}</div>
-            </div>
-            {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
-            {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
-            {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
-            {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
-            <span class="flex-sp"></span>
-            {#if e.draft}
-              <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
-              <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
-            {:else}
-              {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-              {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
-              {#if e.origin === 'user'}
-                <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录（不可恢复）">删除</button>
-              {/if}
-              <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
-            {/if}
-          </div>
-          {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
-        {/each}
-
-        {#if thirdPartyExts.length}
-          <div class="group-label">第三方 {thirdPartyExts.length}</div>
-          {#each thirdPartyExts as e}
-            <div class="plug-row" title={extTip(e)}>
-              <div class="plug-ico">
-                {#if extIcon(e.name)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{@html extIcon(e.name)}</svg>{:else}{(e.title || e.name || '?').slice(0, 1).toUpperCase()}{/if}
-              </div>
-              <div class="plug-meta">
-                <div class="plug-title">{e.title}</div>
-                <div class="plug-desc">{e.description || e.dir}</div>
-              </div>
-              {#if e.draft}<span class="plug-chip warn">草稿</span>{/if}
-              {#if e.origin === 'model_generated'}<span class="plug-chip">模型自产</span>{/if}
-              {#if e.source === 'workspace'}<span class="plug-chip" title={e.shadowed ? '同名内置插件被工作区这份覆盖' : ''}>{e.shadowed ? '覆盖内置' : '工作区'}</span>{/if}
-              {#if !e.ok}<span class="plug-chip warn">加载失败</span>{/if}
-              <span class="flex-sp"></span>
-              {#if e.draft}
-                <button class="btn ghost" on:click={() => promoteExt(e)}>转正</button>
-                <button class="btn ghost" on:click={() => discardExt(e)}>丢弃</button>
-              {:else}
-                {#if e.settings_entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExtPage(e, e.settings_entry)} disabled={!e.ok || e.enabled === false}>设置</button>{/if}
-                {#if e.entry && !isDockExt(e)}<button class="btn ghost" on:click={() => openExt(e)} disabled={!e.ok || e.enabled === false}>打开</button>{/if}
-                {#if e.origin === 'user'}
-                  <button class="btn ghost danger" on:click={() => removeExt(e)} title="删除插件目录，不可恢复">删除</button>
-                {/if}
-                <button class="switch" class:on={e.enabled !== false} role="switch" aria-checked={e.enabled !== false} aria-label="{e.title} 启用/停用" on:click={() => toggleExt(e)}><span class="knob"></span></button>
-              {/if}
-            </div>
-            {#if e.error}<div class="plug-sub">{e.error}</div>{/if}
-          {/each}
-        {/if}
-        <!-- 宿主能力（2026-10-06 重整后不再是插件，留在设置页）：Git 运行时状态卡片从
-             git-panel 插件分区搬来（哪个 git 在生效 + 重新检测）；沙箱自检同理 -->
-        <div class="group-label">宿主能力</div>
-        <div class="plug-row" title="git.exe 发现链：环境变量 AGENT_GIT_PATH → PATH → 注册表 → 常见安装位置 → exe 同级 tools/git → 内置 zip 懒解压">
-          <div class="plug-ico">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2M18 10.4c0 3-2.5 3.6-6 3.6"/></svg>
-          </div>
-          <div class="plug-meta">
-            <div class="plug-title">Git 运行时</div>
-            {#if gitRuntime && gitRuntime.ok}
-              <div class="plug-desc">{gitSourceLabel(gitRuntime.source)}{gitRuntime.version ? ' ' + gitRuntime.version : ''} · {gitRuntime.path}</div>
-            {:else if gitRuntime}
-              <!-- 缺 git 不许静默：这条就是安装指引 -->
-              <div class="plug-desc warn-text">没检测到 git，撤销/检查点/改动/审查用不了。{GIT_INSTALL_HINT}。</div>
-            {:else}
-              <div class="plug-desc">读取中…</div>
-            {/if}
-          </div>
-          <span class="flex-sp"></span>
-          <button class="btn ghost" disabled={!gitRuntime} on:click={() => loadGitRuntime(true)} title="重新跑一遍 git.exe 发现链">重新检测</button>
-        </div>
-        <div class="plug-row" title="沙箱执行机制归内核（Job Objects 整树击杀 + 受限 token）；这里看生效档位、跑自检">
-          <div class="plug-ico">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.4-7 10-4-1.6-7-5.5-7-10V6z"/><path d="M9.2 12l2 2 3.6-3.8"/></svg>
-          </div>
-          <div class="plug-meta">
-            <div class="plug-title">沙箱自检</div>
-            {#if sandboxInfo}
-              <div class="plug-desc">生效档位：{sandboxInfo.label || sandboxInfo.effective}{sandboxInfo.fallback_reason ? `（${sandboxInfo.fallback_reason}）` : ''}</div>
-            {:else}
-              <div class="plug-desc">读取中…</div>
-            {/if}
-          </div>
-          <span class="flex-sp"></span>
-          <button class="btn ghost" disabled={sandboxProbeBusy} on:click={runSandboxProbe} title="真拉起受限进程跑探针套件，验证隔离机制（Job Objects / 受限 token）">{sandboxProbeBusy ? '检测中…' : '检测'}</button>
-          {#if sandboxProbe}
-            {#if sandboxProbe.error}
-              <span class="plug-chip warn" title={sandboxProbe.error}>检测失败</span>
-            {:else}
-              <span class="plug-chip" class:ok={sandboxProbe.ok} class:warn={!sandboxProbe.ok} title={sandboxProbeTip(sandboxProbe)}>{sandboxProbe.ok ? '通过' : '有失败'}</span>
-            {/if}
-          {/if}
-        </div>
-        <div class="param-hint">目录：内置 {extInfo.app_dir || '（读取中）'} ｜ 工作区 {extInfo.workspace_dir || '（读取中）'}</div>
-      {/if}
+      <ExtTab
+        tab={settingsTab}
+        {extMsg}
+        {builtInExts}
+        {thirdPartyExts}
+        {extInfo}
+        {loadExt}
+        {createExt}
+        {cancelCreateExt}
+        bind:extCreateOpen
+        bind:extCreateForm
+        {openExt}
+        {openExtPage}
+        {isDockExt}
+        {extTip}
+        {extIcon}
+        {toggleExt}
+        {promoteExt}
+        {discardExt}
+        {removeExt}
+        {gitRuntime}
+        {gitSourceLabel}
+        {loadGitRuntime}
+        {sandboxInfo}
+        {sandboxProbe}
+        {sandboxProbeBusy}
+        {runSandboxProbe}
+        {sandboxProbeTip}
+        GIT_INSTALL_HINT={GIT_INSTALL_HINT}
+      />
 
       <ScheduleTab tab={settingsTab} workspace={workspace} recentWorkspaces={recentWorkspaces} on:open-session={(e) => openScheduleSession(e.detail.id)} />
 
@@ -8120,15 +7709,6 @@
     margin-top: 8px;
     padding-top: 8px;
     border-top: 1px solid var(--g2);
-  }
-  .num-input {
-    width: 100%;
-    background: var(--g1);
-    color: var(--g7);
-    border: 1px solid var(--g2);
-    border-radius: 6px;
-    padding: 6px 8px;
-    font-size: 12px;
   }
   .chat-head {
     display: flex;
@@ -9829,10 +9409,6 @@
     border: 1px solid color-mix(in srgb, var(--tint-orange-fg) 35%, transparent);
     border-radius: 6px;
   }
-  /* 插件行描述里的警示色（宿主能力行缺 git 提示用，与 plug-chip.warn 同一只色） */
-  .plug-desc.warn-text {
-    color: var(--tint-orange-fg);
-  }
   .commit-msg {
     width: 100%;
     box-sizing: border-box;
@@ -11056,59 +10632,6 @@
     flex-direction: column;
     gap: 20px;
   }
-  .theme-opts {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    align-items: center;
-  }
-  .theme-opt {
-    padding: 7px 16px;
-    border-radius: 8px;
-    border: 1px solid var(--g3);
-    background: var(--g2);
-    color: var(--g7);
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .theme-opt:hover {
-    border-color: var(--g4);
-  }
-  .theme-opt.active {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
-    font-weight: 650;
-  }
-  .wp-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-wrap: wrap;
-  }
-  .wp-pick input[type='file'] {
-    display: none;
-  }
-  .css-rules-file {
-    display: none;
-  }
-  .wp-opacity {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12.5px;
-    color: var(--g6);
-  }
-  .wp-opacity b {
-    color: var(--g7);
-    font-variant-numeric: tabular-nums;
-    min-width: 26px;
-    text-align: right;
-  }
-  .wp-opacity input[type='range'] {
-    width: 180px;
-    accent-color: var(--g5);
-  }
   .mem-stats {
     font-size: 12px;
     color: var(--g6);
@@ -11133,11 +10656,6 @@
     outline: none;
     border-color: var(--g4);
   }
-  .agents-editor.micro-readonly {
-    background: var(--g0);
-    color: var(--g5);
-    resize: vertical;
-  }
   /* MCP 插件分区 */
   .mcp-card {
     border: 1px solid var(--g3);
@@ -11161,13 +10679,6 @@
     background: var(--tint-yellow-bg);
     border-radius: 4px;
     padding: 1px 6px;
-  }
-  .mcp-cmd {
-    font-family: Consolas, monospace;
-    font-size: 11px;
-    color: var(--g5);
-    margin: 6px 0;
-    word-break: break-all;
   }
   .mcp-tools-list {
     font-size: 12px;
@@ -11196,117 +10707,6 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
-  }
-  .chips {
-    display: flex;
-    gap: 9px;
-    flex-wrap: wrap;
-  }
-  .chip {
-    padding: 7px 13px;
-    border-radius: 14px;
-    border: 1px solid var(--g3);
-    background: var(--g1);
-    color: var(--g6);
-    font-size: 12px;
-    cursor: pointer;
-  }
-  .chip.active {
-    background: var(--g3);
-    border-color: var(--g5);
-    color: var(--g7);
-  }
-  .dot {
-    display: inline-block;
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    margin-right: 6px;
-    background: var(--g4);
-    vertical-align: middle;
-  }
-  .dot.haskey {
-    background: var(--tint-green-fg);
-  }
-  /* 设置面板统一黑白：彩色只留给「已存 Key」的绿点（.dot.haskey） */
-  .chip.add {
-    color: var(--g6);
-    border-color: var(--g3);
-  }
-  .chip.add:hover {
-    color: var(--g7);
-    border-color: var(--g5);
-  }
-  .chip.del {
-    color: var(--g6);
-    border-color: var(--g3);
-  }
-  .chip.del:hover {
-    color: var(--g7);
-    border-color: var(--g5);
-  }
-  .del-key {
-    padding: 7px 10px;
-    font-size: 12px;
-    background: var(--g2);
-    border-color: var(--g4);
-    color: var(--g7);
-  }
-  .del-key:hover {
-    background: var(--g3);
-    border-color: var(--g5);
-  }
-  .caps-row {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    background: var(--g1);
-    border: 1px solid var(--g2);
-    border-radius: 8px;
-    padding: 8px 12px;
-  }
-  .cap-check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--g6);
-    cursor: pointer;
-  }
-  .cap-check input {
-    cursor: pointer;
-  }
-  .roles-section {
-    border-top: 1px solid var(--g2);
-    padding-top: 12px;
-    margin-top: 4px;
-  }
-  .roles-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px 18px;
-    margin-top: 8px;
-  }
-  .role-item {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .role-name {
-    font-size: 11px;
-    color: var(--g6);
-  }
-  /* 自绘下拉（Select 组件）在各容器里的尺寸：组件内部样式管外观，这里只调整体布局 */
-  .field > :global(.csel-wrap) {
-    width: 100%;
-  }
-  .sub-row > :global(.csel-wrap) {
-    flex: 1 1 auto;
-    width: auto;
-  }
-  .role-item :global(.csel) {
-    font-size: 12px;
-    padding: 6px 8px;
   }
   /* —— 插件页（用户 2026-09-30 指示：紧凑行——单行 + 开关，Git/沙箱并入「内置能力」，撤独立「运行状态」卡） ——
      plug-row / switch 一族样式已下沉 ui.css 全局：技能页、MCP 页（用户 2026-10-02 要求
