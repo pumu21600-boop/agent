@@ -445,9 +445,10 @@ pub async fn execute(cfg: &ExecConfig, name: &str, args: &str) -> Result<String,
     if name.starts_with(crate::mcp::PREFIX) {
         return crate::mcp::call_tool(name, args).await;
     }
-    // 017：WASM 插件工具分发（纯计算沙箱，自带边界）
+    // 017：WASM 插件工具分发（沙箱自带边界；fs_read 宿主函数按本任务钉住的
+    // 工作区判界，不走全局根——后台任务运行中切工作区不串界）
     if name.starts_with(crate::plugin::wasm::PREFIX) {
-        return crate::plugin::wasm::call_tool(name, args).await;
+        return crate::plugin::wasm::call_tool(name, args, &cfg.workspace).await;
     }
     match name {
         "read_file" => read_file(&cfg.workspace, args, cfg.max_chars, cfg.fs_unconfined),

@@ -1,0 +1,7 @@
+{
+  "apiVersion": 1,
+  "title": "汇率示例（http_get）",
+  "description": "WASM 宿主函数示例插件：声明 http 权限，调用宿主 http_get 抓公开汇率接口",
+  "version": "1.0.0",
+  "permissions": ["http"]
+}

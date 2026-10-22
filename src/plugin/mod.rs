@@ -8,6 +8,7 @@ pub mod contract;
 pub mod draft;
 pub mod ui;
 pub mod wasm;
+pub mod wasm_host;
 
 /// 工具简述：(工具名, 描述)。MCP 与 WASM 两条桥的下发/UI 共用同一形状。
 pub type ToolBrief = (String, String);

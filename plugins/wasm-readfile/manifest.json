@@ -1,0 +1,7 @@
+{
+  "apiVersion": 1,
+  "title": "读文件示例（fs_read）",
+  "description": "WASM 宿主函数示例插件：声明 fs_read 权限，读工作区内文本文件",
+  "version": "1.0.0",
+  "permissions": ["fs_read"]
+}

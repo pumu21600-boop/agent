@@ -1,0 +1,7 @@
+{
+  "apiVersion": 1,
+  "title": "记事本示例（storage）",
+  "description": "WASM 宿主函数示例插件：声明 storage 权限，save/load 持久 KV（重启不丢）",
+  "version": "1.0.0",
+  "permissions": ["storage"]
+}

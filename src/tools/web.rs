@@ -107,7 +107,7 @@ const WEB_BODY_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// 带逐跳 SSRF 闸的 GET（审计 12）：reqwest 自动重定向已关（web_client），这里手动跟，
 /// 每一跳（含 302/307 的 Location 目标）都先过 ensure_public_target 再发——域名目标也
 /// 解析判段，重定向进内网的路彻底堵死。预算与旧 Policy 对齐：连首发最多 6 次请求。
-async fn send_with_ssrf_guard(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, String> {
+pub(crate) async fn send_with_ssrf_guard(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, String> {
     let mut current = url.to_string();
     for hop in 0..=5 {
         ensure_public_target(&current).await?;

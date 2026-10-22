@@ -17,15 +17,19 @@
 //! - 导出 `describe() -> i64`（高 32 位=ptr，低 32 位=len；len==0 表示 0 终止字符串）
 //!   返回 JSON：{"tools":[{"name","description","schema"}]}
 //! - 导出 `run(action_ptr, action_len, payload_ptr, payload_len) -> i64`
-//!   action 固定 "call"；payload JSON：{"tool","args"}；返回 JSON：{"text":"..."}（或 {"error"}）
+//!   action 固定 "call"；payload JSON：{"tool","args"}；返回首选 JSON：{"text":"..."}
+//!   （或 {"error"}）；v1.1 起解析不出 JSON 或无 text/error 字段时按纯文本透传
+//!   （宿主函数结果直转的插件——http_get 响应体、fs_read 文件内容——无需自己拼 JSON）
 //!
 //! **v0 → v1**：v0 把 action 与 payload 写在同一个缓冲区、四个参数传 (ptr,len,ptr,len)，
 //! 于是「读第 1/2 个参数」与「读第 3/4 个参数」拿到的都是 payload —— action 形同虚设。
 //! v1 用一次 alloc 申请 `action+payload` 连续区（action 在前），四个参数各指其位；
 //! 读第 3/4 个参数的旧插件行为不变。
 //!
-//! 隔离模型：**每次调用新建实例**（无共享状态、无并发问题）；v1 仍不提供任何 host function
-//! ——插件是纯计算沙箱，天然无文件/网络边界问题。trap 一律捕获为 Err，绝不连坐宿主。
+//! 隔离模型：**每次调用新建实例**（无共享状态、无并发问题）。宿主函数按 manifest
+//! 权限声明有选择地链接（2026-10-22 当前批次条目 5，见 wasm_host.rs：storage /
+//! fs_read / http 三个口子）——未声明权限的插件、裸 .wasm/.wat 与模型自产 draft
+//! 仍是纯计算沙箱。trap 一律捕获为 Err，绝不连坐宿主。
 //!
 //! 信任模型：plugins/ 目录文件由用户主动放置（本地可信），工具默认 Normal 档；
 //! 未知/加载失败 → Dangerous（与 MCP 防线对齐）。
@@ -42,6 +46,7 @@ use std::{
 use serde_json::{json, Value};
 use wasmtime::{Engine, Instance, Module, Store};
 
+use crate::plugin::wasm_host::{self, HostCtx, HostPerms};
 use crate::plugin::{contract, ToolBrief};
 
 /// 工具全名前缀（wasm__<plugin>__<tool>）。
@@ -61,14 +66,14 @@ pub const SEP: &str = "__";
 /// 炸掉整个进程（debug/release 均复现；内联陷阱如 unreachable 正常）。开燃料
 /// =死循环插件从「空转 30s」升级为「炸宿主」，比不加更糟，故弃用。死循环的兜底
 /// 是 30s 墙钟超时 + 信号量封顶（最坏 4 条 blocking 线程被占，每条 30s 自终）。
-const WASM_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const WASM_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 /// 0 终止返回值最多扫 1MB（len==0 的老路径；v1 ABI 都带显式长度）。
 const WASM_CSTR_SCAN_MAX: usize = 1024 * 1024;
 /// 同时执行的 WASM 调用上限（纯计算沙箱，4 并发对合法插件绰绰有余；
 /// 封顶则恶意插件最坏也只能占住 4 条 blocking 线程，每条 30s 自终）。
 const WASM_MAX_CONCURRENT: usize = 4;
 
-fn engine() -> &'static Engine {
+pub(crate) fn engine() -> &'static Engine {
     static E: OnceLock<Engine> = OnceLock::new();
     E.get_or_init(Engine::default)
 }
@@ -97,6 +102,8 @@ pub struct PluginEntry {
     pub api_version: u32,
     /// draft 插件的内存字节（磁盘插件为 None；call_tool 优先用）
     pub inline: Option<Vec<u8>>,
+    /// 宿主函数权限（manifest permissions 声明 → 链接器授予；缺省全无 = 纯沙箱）
+    pub perms: HostPerms,
 }
 
 impl PluginEntry {
@@ -112,6 +119,7 @@ impl PluginEntry {
             version: String::new(),
             api_version: contract::API_VERSION,
             inline: None,
+            perms: HostPerms::default(),
         }
     }
 }
@@ -246,6 +254,15 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     if let Some(v) = mf.get("version").and_then(Value::as_str) {
         entry.version = v.to_string();
     }
+    // 宿主函数权限（条目 5）：声明过闸——未知权限名拒载（防拼错静默失效），
+    // 链接器只授予声明过的函数（导入未声明的宿主函数 = 实例化失败）
+    match HostPerms::from_manifest(&mf) {
+        Ok(p) => entry.perms = p,
+        Err(e) => {
+            entry.load_error = Some(e);
+            return entry;
+        }
+    }
     // 目录内只允许一个工具文件（多个 = 不知道加载哪个，显式报错不静默）
     let mut bins: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -265,7 +282,7 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
         0 => entry,
         1 => {
             let f = &bins[0];
-            match compile_tools(&std::fs::read(f).unwrap_or_default()) {
+            match compile_tools(&std::fs::read(f).unwrap_or_default(), &entry.perms, name) {
                 Ok(tools) => {
                     entry.tools = tools;
                     entry.file = f.clone();
@@ -284,18 +301,26 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     }
 }
 
-/// 加载单个插件：编译 + 实例化 + describe。
+/// 加载单个插件：编译 + 实例化 + describe。裸文件无 manifest → 零宿主权限。
 fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
-    match std::fs::read(file).map_err(|e| format!("读插件失败: {e}")).and_then(|b| compile_tools(&b)) {
+    let none = HostPerms::default();
+    match std::fs::read(file).map_err(|e| format!("读插件失败: {e}")).and_then(|b| compile_tools(&b, &none, stem)) {
         Ok(tools) => PluginEntry::new(stem, file.to_path_buf(), tools, None),
         Err(e) => PluginEntry::new(stem, file.to_path_buf(), Vec::new(), Some(e)),
     }
 }
 
 /// 编译 + describe 拿工具清单（scan / inline / call 共用的入口）。
-fn compile_tools(bytes: &[u8]) -> Result<Vec<(String, String, Value)>, String> {
+/// describe 阶段的宿主上下文给占位值（清单阶段不该碰 fs/http——碰了只会拿到
+/// 占位错误串，不影响 describe 返回工具清单；storage 命名空间按 stem 正确隔离）。
+fn compile_tools(bytes: &[u8], perms: &HostPerms, stem: &str) -> Result<Vec<(String, String, Value)>, String> {
     let module = Module::new(engine(), bytes).map_err(|e| format!("编译失败: {e}"))?;
-    let result = with_instance(&module, |store, inst| {
+    let ctx = HostCtx {
+        stem: stem.to_string(),
+        ws: crate::tools::workspace_root().to_path_buf(),
+        handle: tokio::runtime::Handle::try_current().ok(),
+    };
+    let result = with_instance(&module, perms, &ctx, |store, inst| {
         let mem = inst
             .get_export(&mut *store, "memory")
             .and_then(|e| e.into_memory())
@@ -331,8 +356,11 @@ fn compile_tools(bytes: &[u8]) -> Result<Vec<(String, String, Value)>, String> {
 }
 
 /// draft 插件：把内存字节编译进注册表（失败返回 Err，调用方整体拒绝）。
+/// draft 是模型自产——恒为零宿主权限纯沙箱（导入宿主函数会在 describe 实例化时
+/// 失败，等于整体拒绝，提示模型去掉 import）。
 pub fn load_inline(stem: &str, bytes: &[u8]) -> Result<(), String> {
-    let tools = compile_tools(bytes)?;
+    let none = HostPerms::default();
+    let tools = compile_tools(bytes, &none, stem)?;
     let mut entry = PluginEntry::new(stem, PathBuf::new(), tools, None);
     entry.origin = contract::ORIGIN_MODEL.to_string();
     entry.inline = Some(bytes.to_vec());
@@ -354,8 +382,11 @@ pub fn remove_inline(stem: &str) {
 
 /// 实例化并执行（每次调用全新 Store/Instance：无状态、无并发、崩不连坐）。
 /// 资源闸：StoreLimits 钉死内存/实例数（燃料不可用，见常量区注释）。
+/// 宿主函数按 perms 授予（wasm_host::build_linker）：未声明的宿主导入在此实例化失败。
 fn with_instance<T>(
     module: &Module,
+    perms: &HostPerms,
+    ctx: &HostCtx,
     f: impl FnOnce(&mut wasmtime::Store<wasmtime::StoreLimits>, &Instance) -> Result<T, String>,
 ) -> Result<T, String> {
     let limits = wasmtime::StoreLimitsBuilder::new()
@@ -366,32 +397,51 @@ fn with_instance<T>(
         .build();
     let mut store = Store::new(engine(), limits);
     store.limiter(|l| l); // StoreLimits: ResourceLimiter——超限的 grow/实例化直接失败
-    let linker = wasmtime::Linker::new(engine()); // v0：零 host function = 纯计算沙箱
+    let linker = wasm_host::build_linker(perms, ctx);
     let instance = linker
         .instantiate(&mut store, module)
-        .map_err(|e| format!("实例化失败: {e}"))?;
+        .map_err(|e| {
+            let s = e.to_string();
+            if s.contains("host::") {
+                format!(
+                    "实例化失败（宿主函数未授权）: {s}——插件导入的宿主函数必须先在 manifest.json 的 permissions 里声明"
+                )
+            } else {
+                format!("实例化失败: {s}")
+            }
+        })?;
     f(&mut store, &instance)
 }
 
 /// 调用插件工具（tools::execute 对 wasm__ 前缀分发到这里）。
 /// 停用的插件在此拒之门外（拒新调用）；在跑调用等完（独立实例 30s 自终）。
-pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, String> {
+/// `ws_root` = 本任务钉住的工作区（fs_read 宿主函数判界用它——后台任务运行中
+/// 用户切了全局工作区不会串界，与判级基准同一条纪律）。
+pub async fn call_tool(full_name: &str, args_json: &str, ws_root: &Path) -> Result<String, String> {
     let (stem, tool) = split_full_name(full_name).ok_or("非法插件工具名")?;
     if is_disabled(&stem) {
         return Err(format!("插件已停用（{stem}）：不接受新调用，可在设置里重新启用"));
     }
-    let bytes = {
+    let (bytes, perms) = {
         let reg = registry().read().unwrap_or_else(|e| e.into_inner());
         let e = reg.iter().find(|e| e.stem == stem).ok_or_else(|| format!("未知插件: {stem}"))?;
         if let Some(err) = &e.load_error {
             return Err(format!("插件加载失败（{stem}）: {err}"));
         }
-        match &e.inline {
+        let bytes = match &e.inline {
             Some(b) => b.clone(),
             None => std::fs::read(&e.file).map_err(|e| format!("读插件失败: {e}"))?,
-        }
+        };
+        (bytes, e.perms)
     };
     let module = Module::new(engine(), &bytes).map_err(|e| format!("编译失败: {e}"))?;
+    // 异步上下文里先抓运行时句柄（http 宿主函数在 blocking 线程上驱动网络闸用；
+    // 纯计算/storage/fs 路径不碰它，拿不到也不影响）
+    let ctx = HostCtx {
+        stem: stem.clone(),
+        ws: ws_root.to_path_buf(),
+        handle: tokio::runtime::Handle::try_current().ok(),
+    };
 
     let args: Value = if args_json.trim().is_empty() {
         json!({})
@@ -408,7 +458,7 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
         .map_err(|e| format!("WASM 并发闸已关闭: {e}"))?;
     // 阻塞执行（WASM 纯计算）丢 blocking 池 + 超时 30s
     let fut = tokio::task::spawn_blocking(move || {
-        with_instance(&module, |store, inst| {
+        with_instance(&module, &perms, &ctx, |store, inst| {
             let mem = inst
                 .get_export(&mut *store, "memory")
                 .and_then(|e| e.into_memory())
@@ -438,7 +488,13 @@ pub async fn call_tool(full_name: &str, args_json: &str) -> Result<String, Strin
                 .map_err(|e| format!("run trap: {e}"))?;
             let (rptr, rlen) = unpack(packed);
             let text = read_cstr(&mem, store, rptr, rlen)?;
-            let v: Value = serde_json::from_str(&text).map_err(|e| format!("run JSON 不合法: {e}"))?;
+            // v1.1 透传语义：run 返回首选 JSON {"text":"..."} / {"error":"..."}；
+            // 解析不出 JSON（宿主函数结果直转的常见形态，如 http_get 的响应体）
+            // 或 JSON 里没有 text/error 字段时，按纯文本原样返回。
+            let v: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => return Ok(text),
+            };
             if let Some(err) = v.get("error").and_then(Value::as_str) {
                 return Err(format!("WASM 工具报告失败: {err}"));
             }
@@ -676,7 +732,7 @@ mod tests {
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let out = rt
-            .block_on(call_tool("wasm__echo__echo", r#"{"x":1}"#))
+            .block_on(call_tool("wasm__echo__echo", r#"{"x":1}"#, &std::env::temp_dir()))
             .expect("插件调用应成功");
         // payload 里的键序由 serde_json 决定，按值断言（同时证明 action 没混进来：
         // 若两段共用指针，这里会回吐 "call" 而解析失败）
@@ -737,17 +793,17 @@ mod tests {
             "停用插件的工具不应下发"
         );
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let err = rt.block_on(call_tool("wasm__calc__echo", "{}")).unwrap_err();
+        let err = rt.block_on(call_tool("wasm__calc__echo", "{}", &std::env::temp_dir())).unwrap_err();
         assert!(err.contains("已停用"), "{err}");
         // 3) 恢复后可调
         set_disabled(&[]);
-        let out = rt.block_on(call_tool("wasm__calc__echo", r#"{"x":2}"#)).unwrap();
+        let out = rt.block_on(call_tool("wasm__calc__echo", r#"{"x":2}"#, &std::env::temp_dir())).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["args"]["x"], 2);
 
         // 4) draft inline：内存字节进同一注册表，调用同权
         load_inline("draft-echo", ECHO_WAT.as_bytes()).unwrap();
         assert!(has_plugin("draft-echo"));
-        let out = rt.block_on(call_tool("wasm__draft-echo__echo", r#"{"y":3}"#)).unwrap();
+        let out = rt.block_on(call_tool("wasm__draft-echo__echo", r#"{"y":3}"#, &std::env::temp_dir())).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["args"]["y"], 3);
         remove_inline("draft-echo");
         assert!(!has_plugin("draft-echo"));
@@ -805,7 +861,8 @@ mod tests {
              (func (export \"grow\") (param $n i32) (result i32) (memory.grow (local.get $n))) \
              (func (export \"size\") (result i32) (memory.size)))";
         let module = Module::new(engine(), wat).unwrap();
-        with_instance(&module, |store, inst| {
+        let ctx = HostCtx { stem: String::new(), ws: std::env::temp_dir(), handle: None };
+        with_instance(&module, &HostPerms::default(), &ctx, |store, inst| {
             let grow = inst
                 .get_typed_func::<i32, i32>(&mut *store, "grow")
                 .map_err(|e| e.to_string())?;
@@ -824,6 +881,94 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// 条目 5（宿主函数）：① 权限闸——导入宿主函数但 manifest 未声明 → 拒载且
+    /// 错误点名「宿主函数未授权」；② draft（模型自产）恒为零权限，导入宿主函数
+    /// 直接整体拒绝；③ 三个随包示例插件（wasm-rate/wasm-readfile/wasm-notepad）
+    /// 从仓库 plugins/ 真装载真调用——notepad 跨两次调用（两个独立实例）读回
+    /// 同一值证明持久化落在宿主侧，readfile 按传入工作区读文件。
+    #[test]
+    fn host_permission_gate_and_shipped_examples() {
+        let _g = lock();
+        // ① 权限闸：manifest 不声明 permissions + wat 导入 host.storage_get → 拒载
+        let dir = std::env::temp_dir().join(format!("agent-wasm-hostgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = dir.join("gate");
+        std::fs::create_dir_all(&gate).unwrap();
+        std::fs::write(gate.join("manifest.json"), r#"{"apiVersion":1,"title":"闸"}"#).unwrap();
+        std::fs::write(
+            gate.join("t.wat"),
+            r#"(module (import "host" "storage_get" (func $g (param i32 i32) (result i64)))
+                (memory (export "memory") 1)
+                (func (export "alloc") (param $n i32) (result i32) (i32.const 4096))
+                (func (export "describe") (result i64) (i64.const 0))
+                (func (export "run") (param i32 i32 i32 i32) (result i64) (call $g (i32.const 0) (i32.const 0))))"#,
+        )
+        .unwrap();
+        scan_and_load(&dir);
+        {
+            let reg = registry().read().unwrap_or_else(|e| e.into_inner());
+            let err = reg.iter().find(|e| e.stem == "gate").unwrap().load_error.clone().unwrap();
+            assert!(err.contains("宿主函数未授权"), "权限闸错误要说人话: {err}");
+        }
+        // ② draft 拒宿主导入：同款 wat 走 load_inline（无 manifest = 零权限）
+        assert!(load_inline("draft-gate", std::fs::read(gate.join("t.wat")).unwrap().as_slice()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ③ 三个随包示例：仓库 plugins/ 真装载
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        scan_and_load(&plugins);
+        {
+            let reg = registry().read().unwrap_or_else(|e| e.into_inner());
+            for (stem, expect_tools) in [
+                ("wasm-rate", vec!["rate"]),
+                ("wasm-readfile", vec!["read"]),
+                ("wasm-notepad", vec!["save", "load"]),
+            ] {
+                let e = reg.iter().find(|e| e.stem == stem)
+                    .unwrap_or_else(|| panic!("示例插件 {stem} 应在注册表"));
+                assert!(e.load_error.is_none(), "{stem} 加载失败: {:?}", e.load_error);
+                let names: Vec<&str> = e.tools.iter().map(|(n, _, _)| n.as_str()).collect();
+                assert_eq!(names, expect_tools, "{stem} 工具清单");
+            }
+            // 回归锁：面板插件（board 等带面板 permissions 的目录）在工具注册表里
+            // 不得因 permissions 数组被宿主权限解析误判而背上 load_error
+            // （宽容解析修复前的严格版会把 composer.insert 当未知权限拒载）
+            if let Some(board) = reg.iter().find(|e| e.stem == "board") {
+                assert!(board.load_error.is_none(), "面板插件不得被宿主权限解析误伤: {:?}", board.load_error);
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // notepad：save 写 → 跨实例 load 读回（持久化在宿主侧）
+        let saved = rt
+            .block_on(call_tool("wasm__wasm-notepad__save", r#"{"text":"你好 Pawch，宿主函数真跑通"}"#, &std::env::temp_dir()))
+            .expect("save 应成功");
+        assert_eq!(saved, "你好 Pawch，宿主函数真跑通", "save 读回保存值（纯文本透传）");
+        let loaded = rt
+            .block_on(call_tool("wasm__wasm-notepad__load", "{}", &std::env::temp_dir()))
+            .expect("load 应成功");
+        assert_eq!(loaded, "你好 Pawch，宿主函数真跑通", "跨实例读回 = 宿主侧持久化");
+
+        // readfile：按传入的工作区读文件 + 越界拒绝
+        let ws = std::env::temp_dir().join(format!("agent-wasm-rf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("note.txt"), "工作区里的文本").unwrap();
+        let out = rt
+            .block_on(call_tool("wasm__wasm-readfile__read", r#"{"path":"note.txt"}"#, &ws))
+            .expect("readfile 应成功");
+        assert_eq!(out, "工作区里的文本");
+        let esc = rt
+            .block_on(call_tool("wasm__wasm-readfile__read", r#"{"path":"../../secret.txt"}"#, &ws))
+            .expect_err("越界路径应报错");
+        assert!(esc.contains("越出工作区") || esc.contains("不存在"), "{esc}");
+        let _ = std::fs::remove_dir_all(&ws);
+
+        // 清理宿主侧存储（plugin_data/wasm-notepad——app_root 在测试态回落仓库根）
+        let _ = std::fs::remove_dir_all(crate::storage::plugin_root().join("wasm-notepad"));
     }
 
     /// 并发闸不泄滞：超过 WASM_MAX_CONCURRENT 的并发调用应全部正常完成
@@ -855,7 +1000,11 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..WASM_MAX_CONCURRENT * 3 {
             handles.push(tokio::spawn(async {
-                tokio::time::timeout(std::time::Duration::from_secs(20), call_tool("wasm__echo__echo", r#"{"x":1}"#)).await
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    call_tool("wasm__echo__echo", r#"{"x":1}"#, &std::env::temp_dir()),
+                )
+                .await
             }));
         }
         let mut all_ok = true;
