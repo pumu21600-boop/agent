@@ -172,8 +172,8 @@
 **当前批次（2026-10-22 用户拍板整批开工；顺序即下；整批收尾连 v0.32.33 之后 9 个提交统一打一个 tag，过程中每轮只提交+推送 dev 不打 tag）**：
 
 1. **旧设置迁移垫片**（原「留待大版本」提前）：settings.json 历史格式考古 + 读旧转新一次性落盘 + 测试；已有先例 = `migrate_legacy_trust_keys` 与 `disabled_extensions` serde alias（src/config/settings.rs）。
-2. **browser 工具真模型全流程**（原小项条目 2 并入）：渠道 StepFun step_plan + step-5-preview（key 由用户会话内提供、只走 `DEEPSEEK_API_KEY` 环境变量不落盘）；⚠️ 本机外网直连不通，跑前需用户开系统代理；临时实例照坑 17 流程（无头浏览器 = `AGENT_BROWSER_PATH` 指 `%LOCALAPPDATA%\Tabbit Browser\Application\Tabbit Browser.exe` + `AGENT_BROWSER_HEADLESS=1`；Git Bash 的 curl 发中文 JSON 必须 `--data-binary @文件`；绝不对临时实例跑 `agent.exe stop`，按 PID 杀；本地测试页 node 起静态服务即可覆盖 click/fill/select/scroll/导航/evaluate）。
-3. **引导中断真机验**：回答流式输出期间发 `steer:true` 引导，断言 = 引导并进本轮不丢、不另起空轮（坑 29 ② 修复的验证）。
+2. ~~**browser 工具真模型全流程**~~（✅ 2026-10-22 完成）：step-5-preview 真模型驱动，10 个方法（navigate/snapshot/fill/select/click/wait_for/scroll/get_state/evaluate/list）全部实际调用且有 tool_result 证据，本地静态页覆盖输入/下拉/提交/延迟内容/滚动/链接导航；全程 auto 档免审、Tabbit 无头稳定。渠道实测：step_plan 端点为 Anthropic Messages 协议，配置须 `provider_id="anthropic"`（stepfun 预设指向 OpenAI 端点不能用）；外网直连已通（此前「直连不通」记录过时），无需代理。
+3. ~~**引导中断真机验**~~（✅ 2026-10-22 完成）：流式输出第 5 片段时发 `steer:true`——第一答完整落地未打断、SSE steer 事件出现、模型同轮续跑 41-60、会话文件消息顺序 = user→assistant(完整答)→user(引导)→assistant(续答)、无空轮，坑 29 ② 修复语义全部断言通过。
 4. **工具级取消**（坑 31 ① 欠账转正）：浏览器工具执行期（超时 ~30s）点停止立即中断，不再干等工具返回。
 5. **WASM 宿主函数**（原「留口」转正）：ABI 扩展 + 权限声明过闸 + 示例插件（汇率/读文件/存储三类场景已向用户解释）；面板插件不走 WASM，零影响。
 6. **P2 二轮拆分**（原「可选」转正）：App.svelte 留根的 ext/模型/外观/角色页签 ~4900 行，范式见 docs/巨石拆分交接文档.md 与 P2 三步管线纪律。
