@@ -872,14 +872,7 @@ pub async fn run_task(
             let parent = parent_sid.clone();
             futs.push(Box::pin(async move {
                 let exec = exec_tool_call(&cfg, &name, &args, runner.as_ref(), &parent);
-                // 并行组同样可被取消即时中断（串行组同款，见下方 select! 注释）
-                (
-                    i,
-                    tokio::select! {
-                        r = exec => r,
-                        () = cancel.cancelled() => Err("已取消：用户点了结束回答".to_string()),
-                    },
-                )
+                (i, exec_with_cancel(cancel, exec).await)
             }));
         }
         // 并行完成即发 result 事件（时间线可见并发；进度与完成顺序一致）
@@ -987,16 +980,7 @@ pub async fn run_task(
                     channels.subagents.as_ref(),
                     gate.session_id(),
                 );
-                // 取消即时中断——工具卡在浏览器 CDP 调用里时，select! 到取消当场丢 future
-                // （以前只靠下个决策点轮询 is_set，用户点了「结束回答」还要干等工具超时，
-                // 期间服务端仍显示在跑，新消息被排进队列——用户实测实锤）
-                let exec = async {
-                    tokio::select! {
-                        r = exec => r,
-                        () = cancel.cancelled() => Err("已取消：用户点了结束回答".to_string()),
-                    }
-                };
-                match exec.await {
+                match exec_with_cancel(cancel, exec).await {
                     Ok(mut s) => {
                         // 截图标记同并行路径：剥出单放，回填时升级多模态
                         if let Some(img) = crate::computer::take_image(&mut s) {
@@ -1059,6 +1043,33 @@ mod tests {
         assert!(tools_def_for(&p).is_some(), "默认（tools=true）携带 tools");
         p.tools_enabled = false;
         assert!(tools_def_for(&p).is_none(), "勾掉「工具调用」后不再携带 tools；历史 tool_calls 回放不受影响");
+    }
+
+    // —— 坑 31 ① 收口：工具执行期取消闸（exec_with_cancel）——
+    // 卡住的工具（永不完成的 future）+ 点停止 → 当场返回「已取消」，不干等工具超时。
+    #[tokio::test]
+    async fn tool_exec_cancel_gate_interrupts_pending_tool() {
+        let flag = Arc::new(CancelFlag::new());
+        let setter = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            setter.set();
+        });
+        // 唯一出路是取消臂：2s 上限远小于「干等工具自己超时」的旧行为
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            exec_with_cancel(&flag, std::future::pending::<Result<String, String>>()),
+        )
+        .await
+        .expect("点停止必须在 2s 内打断卡住的工具（旧行为：干等工具超时 ~30s）");
+        assert_eq!(r, Err("已取消：用户点了结束回答".to_string()));
+    }
+
+    #[tokio::test]
+    async fn tool_exec_cancel_gate_passes_through_completion() {
+        let flag = CancelFlag::new();
+        let r = exec_with_cancel(&flag, async { Ok("完成".to_string()) }).await;
+        assert_eq!(r, Ok("完成".to_string()), "未点停止时工具结果原样通过");
     }
 
     // —— B3：plan 块解析 ——
