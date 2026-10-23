@@ -271,6 +271,10 @@ mod tests {
 
     #[test]
     fn tool_draft_compiles_inline_and_promotes_to_disk() {
+        // 与 wasm 测试族同一把注册表锁：promote 后有 has_plugin 断言，并行测试的
+        // scan_and_load 会整表换掉注册表（实测曾在断言与清理之间插入，断言挂、
+        // 落盘残留 plugins/draft-calc，后续所有跑全撞同名冲突）
+        let _g = crate::plugin::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mf = json!({"apiVersion": 1, "title": "草稿计算器", "tool_file": "calc.wat"});
         let f = files(&[("calc.wat", ECHO_WAT)]);
         submit("draft-calc", &mf, &f).unwrap();

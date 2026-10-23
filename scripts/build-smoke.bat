@@ -12,4 +12,4 @@ if not exist "%VCVARS%" (
 call "%VCVARS%" >nul
 cd /d %~dp0..
 set CARGO_TARGET_DIR=target-smoke
-cargo build --release --bin agent
+cargo build --release --bin pawch-agent

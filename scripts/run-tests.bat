@@ -12,4 +12,4 @@ if not exist "%VCVARS%" (
 )
 call "%VCVARS%" >nul
 cd /d %~dp0..
-cargo test --bin agent %*
+cargo test --bin pawch-agent %*

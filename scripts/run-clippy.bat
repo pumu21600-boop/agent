@@ -10,4 +10,4 @@ if not exist "%VCVARS%" (
 )
 call "%VCVARS%" >nul
 cd /d %~dp0..
-cargo clippy --bin agent %*
+cargo clippy --bin pawch-agent %*

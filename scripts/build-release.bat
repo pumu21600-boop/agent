@@ -10,4 +10,4 @@ if not exist "%VCVARS%" (
 )
 call "%VCVARS%" >nul
 cd /d %~dp0..
-cargo build --release --bin agent
+cargo build --release --bin pawch-agent

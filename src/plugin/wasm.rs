@@ -885,11 +885,12 @@ mod tests {
 
     /// 条目 5（宿主函数）：① 权限闸——导入宿主函数但 manifest 未声明 → 拒载且
     /// 错误点名「宿主函数未授权」；② draft（模型自产）恒为零权限，导入宿主函数
-    /// 直接整体拒绝；③ 三个随包示例插件（wasm-rate/wasm-readfile/wasm-notepad）
-    /// 从仓库 plugins/ 真装载真调用——notepad 跨两次调用（两个独立实例）读回
-    /// 同一值证明持久化落在宿主侧，readfile 按传入工作区读文件。
+    /// 直接整体拒绝；③ 三个示例插件（wasm-rate/wasm-readfile/wasm-notepad，
+    /// 2026-10-24 用户拍板移出随包 plugins/——验收使命完成，不再进面板与模型
+    /// 工具清单，留作本测试的夹具）真装载真调用——notepad 跨两次调用（两个
+    /// 独立实例）读回同一值证明持久化落在宿主侧，readfile 按传入工作区读文件。
     #[test]
-    fn host_permission_gate_and_shipped_examples() {
+    fn host_permission_gate_and_examples() {
         let _g = lock();
         // ① 权限闸：manifest 不声明 permissions + wat 导入 host.storage_get → 拒载
         let dir = std::env::temp_dir().join(format!("agent-wasm-hostgate-{}", std::process::id()));
@@ -917,8 +918,8 @@ mod tests {
         assert!(load_inline("draft-gate", std::fs::read(gate.join("t.wat")).unwrap().as_slice()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
 
-        // ③ 三个随包示例：仓库 plugins/ 真装载
-        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+        // ③ 三个示例插件：tests/fixtures 真装载（scan 对任意目录形态无差别）
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-plugins");
         scan_and_load(&plugins);
         {
             let reg = registry().read().unwrap_or_else(|e| e.into_inner());
