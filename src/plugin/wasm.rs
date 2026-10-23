@@ -254,15 +254,10 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     if let Some(v) = mf.get("version").and_then(Value::as_str) {
         entry.version = v.to_string();
     }
-    // 宿主函数权限（条目 5）：声明过闸——未知权限名拒载（防拼错静默失效），
-    // 链接器只授予声明过的函数（导入未声明的宿主函数 = 实例化失败）
-    match HostPerms::from_manifest(&mf) {
-        Ok(p) => entry.perms = p,
-        Err(e) => {
-            entry.load_error = Some(e);
-            return entry;
-        }
-    }
+    // 宿主函数授予（2026-10-24 用户拍板撤权限闸：「插件即能力」）：盘上插件
+    // 无条件全量授予，manifest 的 permissions 数组从此只归面板桥、工具侧不读；
+    // 模型自产 draft 仍恒为零权限纯沙箱（见 load_inline）
+    entry.perms = HostPerms::full();
     // 目录内只允许一个工具文件（多个 = 不知道加载哪个，显式报错不静默）
     let mut bins: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -301,10 +296,9 @@ fn load_dir_plugin(name: &str, dir: &Path) -> PluginEntry {
     }
 }
 
-/// 加载单个插件：编译 + 实例化 + describe。裸文件无 manifest → 零宿主权限。
+/// 加载单个插件：编译 + 实例化 + describe。裸文件同样是用户放置——同全量授予。
 fn load_plugin(stem: &str, file: &Path) -> PluginEntry {
-    let none = HostPerms::default();
-    match std::fs::read(file).map_err(|e| format!("读插件失败: {e}")).and_then(|b| compile_tools(&b, &none, stem)) {
+    match std::fs::read(file).map_err(|e| format!("读插件失败: {e}")).and_then(|b| compile_tools(&b, &HostPerms::full(), stem)) {
         Ok(tools) => PluginEntry::new(stem, file.to_path_buf(), tools, None),
         Err(e) => PluginEntry::new(stem, file.to_path_buf(), Vec::new(), Some(e)),
     }
@@ -382,7 +376,8 @@ pub fn remove_inline(stem: &str) {
 
 /// 实例化并执行（每次调用全新 Store/Instance：无状态、无并发、崩不连坐）。
 /// 资源闸：StoreLimits 钉死内存/实例数（燃料不可用，见常量区注释）。
-/// 宿主函数按 perms 授予（wasm_host::build_linker）：未声明的宿主导入在此实例化失败。
+/// 宿主函数授予见 scan/load_inline（盘上插件全量、draft 空）——draft 导入
+/// 宿主函数在此实例化失败。
 fn with_instance<T>(
     module: &Module,
     perms: &HostPerms,
@@ -404,7 +399,7 @@ fn with_instance<T>(
             let s = e.to_string();
             if s.contains("host::") {
                 format!(
-                    "实例化失败（宿主函数未授权）: {s}——插件导入的宿主函数必须先在 manifest.json 的 permissions 里声明"
+                    "实例化失败（宿主函数不可用）: {s}——宿主函数只对用户放置的插件开放，模型自产 draft 恒为纯计算沙箱，请改用纯计算实现"
                 )
             } else {
                 format!("实例化失败: {s}")
@@ -883,16 +878,19 @@ mod tests {
         .unwrap();
     }
 
-    /// 条目 5（宿主函数）：① 权限闸——导入宿主函数但 manifest 未声明 → 拒载且
-    /// 错误点名「宿主函数未授权」；② draft（模型自产）恒为零权限，导入宿主函数
-    /// 直接整体拒绝；③ 三个示例插件（wasm-rate/wasm-readfile/wasm-notepad，
-    /// 2026-10-24 用户拍板移出随包 plugins/——验收使命完成，不再进面板与模型
-    /// 工具清单，留作本测试的夹具）真装载真调用——notepad 跨两次调用（两个
-    /// 独立实例）读回同一值证明持久化落在宿主侧，readfile 按传入工作区读文件。
+    /// 宿主函数授予策略（2026-10-24 撤权限闸后）：① 盘上插件不声明 permissions
+    /// 也能用宿主函数——manifest 完全不提、wat 导入 host.storage_get，装载成功
+    /// 且调用真走宿主（缺键回 {"missing":true}）；② draft（模型自产）恒为纯计算
+    /// 沙箱，导入宿主函数直接整体拒绝；③ 三个示例插件（wasm-rate/wasm-readfile/
+    /// wasm-notepad，2026-10-24 用户拍板移出随包 plugins/——验收使命完成，不再
+    /// 进面板与模型工具清单，留作本测试的夹具）真装载真调用——notepad 跨两次
+    /// 调用（两个独立实例）读回同一值证明持久化落在宿主侧，readfile 按传入
+    /// 工作区读文件。
     #[test]
-    fn host_permission_gate_and_examples() {
+    fn host_grant_policy_and_examples() {
         let _g = lock();
-        // ① 权限闸：manifest 不声明 permissions + wat 导入 host.storage_get → 拒载
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // ① 盘上插件无条件全量：manifest 不声明 permissions + wat 导入 host.storage_get → 正常装载
         let dir = std::env::temp_dir().join(format!("agent-wasm-hostgate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -901,21 +899,34 @@ mod tests {
         std::fs::write(gate.join("manifest.json"), r#"{"apiVersion":1,"title":"闸"}"#).unwrap();
         std::fs::write(
             gate.join("t.wat"),
-            r#"(module (import "host" "storage_get" (func $g (param i32 i32) (result i64)))
+            r#"(module
+                (import "host" "storage_get" (func $g (param i32 i32) (result i64)))
                 (memory (export "memory") 1)
+                (data (i32.const 1024) "{\"tools\":[{\"name\":\"peek\",\"description\":\"storage peek\",\"schema\":{\"type\":\"object\"}}]}\00")
+                (data (i32.const 2048) "k\00")
                 (func (export "alloc") (param $n i32) (result i32) (i32.const 4096))
-                (func (export "describe") (result i64) (i64.const 0))
-                (func (export "run") (param i32 i32 i32 i32) (result i64) (call $g (i32.const 0) (i32.const 0))))"#,
+                (func $pack (param $p i32) (param $l i32) (result i64)
+                  (i64.or (i64.shl (i64.extend_i32_u (local.get $p)) (i64.const 32))
+                          (i64.extend_i32_u (local.get $l))))
+                (func (export "describe") (result i64) (call $pack (i32.const 1024) (i32.const 0)))
+                (func (export "run") (param i32 i32 i32 i32) (result i64) (call $g (i32.const 2048) (i32.const 1))))"#,
         )
         .unwrap();
         scan_and_load(&dir);
         {
             let reg = registry().read().unwrap_or_else(|e| e.into_inner());
-            let err = reg.iter().find(|e| e.stem == "gate").unwrap().load_error.clone().unwrap();
-            assert!(err.contains("宿主函数未授权"), "权限闸错误要说人话: {err}");
+            let e = reg.iter().find(|e| e.stem == "gate").expect("不声明 permissions 也应装载");
+            assert!(e.load_error.is_none(), "装载不应失败: {:?}", e.load_error);
+            assert_eq!(e.tools.len(), 1, "工具应登记");
         }
-        // ② draft 拒宿主导入：同款 wat 走 load_inline（无 manifest = 零权限）
-        assert!(load_inline("draft-gate", std::fs::read(gate.join("t.wat")).unwrap().as_slice()).is_err());
+        let out = rt
+            .block_on(call_tool("wasm__gate__peek", "{}", &std::env::temp_dir()))
+            .expect("宿主函数应无条件可用");
+        assert_eq!(out, "{\"missing\":true}", "调用真走宿主（缺键=missing，证明 storage_get 已链接）");
+        // ② draft 拒宿主导入：同款 wat 走 load_inline（模型自产 = 纯计算沙箱）
+        let inline_err = load_inline("draft-gate", std::fs::read(gate.join("t.wat")).unwrap().as_slice())
+            .expect_err("draft 导入宿主函数必须整体拒绝");
+        assert!(inline_err.contains("宿主函数不可用"), "拒绝理由要说人话: {inline_err}");
         let _ = std::fs::remove_dir_all(&dir);
 
         // ③ 三个示例插件：tests/fixtures 真装载（scan 对任意目录形态无差别）
@@ -934,15 +945,8 @@ mod tests {
                 let names: Vec<&str> = e.tools.iter().map(|(n, _, _)| n.as_str()).collect();
                 assert_eq!(names, expect_tools, "{stem} 工具清单");
             }
-            // 回归锁：面板插件（board 等带面板 permissions 的目录）在工具注册表里
-            // 不得因 permissions 数组被宿主权限解析误判而背上 load_error
-            // （宽容解析修复前的严格版会把 composer.insert 当未知权限拒载）
-            if let Some(board) = reg.iter().find(|e| e.stem == "board") {
-                assert!(board.load_error.is_none(), "面板插件不得被宿主权限解析误伤: {:?}", board.load_error);
-            }
         }
 
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         // notepad：save 写 → 跨实例 load 读回（持久化在宿主侧）
         let saved = rt
             .block_on(call_tool("wasm__wasm-notepad__save", r#"{"text":"你好 Pawch，宿主函数真跑通"}"#, &std::env::temp_dir()))

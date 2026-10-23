@@ -12,13 +12,14 @@
 //!   `PAWCH_AGENT_WEB_ALLOW_PRIVATE` 调试开关；10s 超时，返回体上限 64KB——宿主函数的
 //!   结果会整段进模型上下文，不能沿用 web_fetch 的 2MB）。
 //!
-//! 权限闸（「权限声明过闸」）：manifest `permissions` 数组里声明 `storage` /
-//! `fs_read` / `http`（面板桥权限与宿主权限共用这一数组，面板值在宿主侧忽略），
-//! Linker 只链接声明过的函数——导入未声明的宿主函数 = 实例化失败（天然闸，
-//! 无静默降级；拼错权限名同样死在这里，错误同一句人话）。裸 .wasm/.wat（无
-//! manifest）与模型自产 draft 插件恒为零权限纯沙箱。风险档不变：用户主动放置
-//! 的插件仍 Normal（信任模型见 wasm.rs 模块头；能力边界收在窄口子 + 闸内，
-//! 不靠审批档二次设防）。
+//! 授予策略（2026-10-24 用户拍板撤闸：「插件即能力」——做联网插件就联网、做
+//! 计算插件就计算，能力范围由插件作者决定，不由宿主审）：用户放进 plugins/ 的
+//! 插件（目录形态与裸文件）无条件拿到全部宿主函数；唯一例外是模型自产 draft
+//! 恒为纯计算沙箱（模型本就有等价的文件/网络工具，draft 不需要也不该自带宿主
+//! 口子）。真正的防线不在授予层而在函数本体：工作区判界 / SSRF 逐跳闸 / 大小
+//! 上限见各函数注释。manifest `permissions` 数组从此只归面板桥
+//! （composer.insert 等），工具侧不读。风险档不变：用户主动放置的插件仍
+//! Normal（信任模型见 wasm.rs 模块头）。
 //!
 //! 返回值约定（四个函数统一）：packed(ptr,len) 指向宿主经插件 `alloc` 写进线性
 //! 内存的 UTF-8 字符串——成功 = 数据本身（storage_get 缺键 = `{"missing":true}`，
@@ -32,12 +33,8 @@ use wasmtime::Caller;
 
 use crate::storage;
 
-/// manifest 权限名 → 常量（三个口子；与面板桥权限共用 permissions 数组）。
-pub const PERM_STORAGE: &str = "storage";
-pub const PERM_FS_READ: &str = "fs_read";
-pub const PERM_HTTP: &str = "http";
-
-/// 宿主函数权限集（manifest 声明 → 链接器授予；默认全无 = 纯沙箱）。
+/// 宿主函数权限集：盘上插件 = full（用户放置即信任），模型 draft = default
+/// （纯计算沙箱）。2026-10-24 撤权限闸后只剩这两档，不再按 manifest 细分。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostPerms {
     pub storage: bool,
@@ -46,29 +43,9 @@ pub struct HostPerms {
 }
 
 impl HostPerms {
-    /// 从 manifest 解析 permissions。**宽容解析**：permissions 数组是面板桥与
-    /// 宿主函数共用的白名单（面板插件早就用它声明 composer.insert/notify 等），
-    /// 这里只认三个宿主权限名，其余字符串是面板桥的、忽略；非字符串元素是
-    /// 畸形清单，Err。拼错宿主权限名不会静默失效——导入未授权的宿主函数
-    /// 会在实例化时被「宿主函数未授权」同一句人话拦下（双保险闸）。
-    pub fn from_manifest(mf: &Value) -> Result<Self, String> {
-        let mut p = Self::default();
-        match mf.get("permissions") {
-            None | Some(Value::Null) => {}
-            Some(Value::Array(a)) => {
-                for v in a {
-                    match v.as_str() {
-                        Some(PERM_STORAGE) => p.storage = true,
-                        Some(PERM_FS_READ) => p.fs_read = true,
-                        Some(PERM_HTTP) => p.http = true,
-                        Some(_) => {} // 面板桥权限（composer.insert/notify/…），与宿主函数无关
-                        None => return Err("permissions 数组里必须都是字符串".into()),
-                    }
-                }
-            }
-            Some(_) => return Err("permissions 必须是字符串数组".into()),
-        }
-        Ok(p)
+    /// 全量授予（用户放置的插件——插件即能力，权限范围由作者决定）。
+    pub fn full() -> Self {
+        Self { storage: true, fs_read: true, http: true }
     }
 }
 
@@ -84,7 +61,8 @@ pub struct HostCtx {
     pub handle: Option<tokio::runtime::Handle>,
 }
 
-/// 按权限构建 Linker：声明了才链接——未声明的宿主导入在 instantiate 时自然失败。
+/// 按权限构建 Linker：盘上插件全量链接；draft 空链接——draft 导入宿主函数在
+/// instantiate 时自然失败。
 pub fn build_linker(perms: &HostPerms, ctx: &HostCtx) -> wasmtime::Linker<wasmtime::StoreLimits> {
     let mut linker = wasmtime::Linker::new(super::wasm::engine());
     if perms.storage {
@@ -300,22 +278,13 @@ fn err_json(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn perms_parse_subset_and_ignore_panel_values() {
-        let p = HostPerms::from_manifest(&json!({"permissions": ["storage", "http"]})).unwrap();
-        assert!(p.storage && p.http && !p.fs_read);
-        let none = HostPerms::from_manifest(&json!({})).unwrap();
-        assert!(!none.storage && !none.fs_read && !none.http, "缺省=纯沙箱");
-        let none2 = HostPerms::from_manifest(&json!({"permissions": []})).unwrap();
-        assert!(!none2.storage && !none2.fs_read && !none2.http);
-        // 面板桥权限与宿主权限共用数组：面板值忽略、不报错（board 等面板插件
-        // 的 permissions 是给桥用的，宿主侧不得给它们打 load_error）
-        let hybrid = HostPerms::from_manifest(&json!({"permissions": ["composer.insert", "clipboard", "fs_read"]})).unwrap();
-        assert!(hybrid.fs_read && !hybrid.storage && !hybrid.http);
-        assert!(HostPerms::from_manifest(&json!({"permissions": "storage"})).is_err());
-        assert!(HostPerms::from_manifest(&json!({"permissions": [1]})).is_err());
+    fn perms_full_and_default_are_the_only_two_modes() {
+        let full = HostPerms::full();
+        assert!(full.storage && full.fs_read && full.http, "盘上插件=全量");
+        let none = HostPerms::default();
+        assert!(!none.storage && !none.fs_read && !none.http, "draft=纯沙箱");
     }
 
     #[test]
