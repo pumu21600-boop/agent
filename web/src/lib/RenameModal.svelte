@@ -5,6 +5,9 @@
   import { createEventDispatcher } from 'svelte';
   const dispatch = createEventDispatcher();
   function submit() {
+    // 会话标题不允许空（项目例外：留空=恢复文件夹名）。这里拦一道，
+    // 免得弹窗无声关闭让用户以为改成了（2026-10-24 E2E D3）。
+    if (modal && modal.kind === 'session' && !modal.value.trim()) return;
     dispatch('submit');
   }
   function close() {
@@ -33,7 +36,10 @@
       </div>
       <div class="rename-actions">
         <button class="btn" on:click={close}>取消</button>
-        <button class="btn primary" on:click={submit}>确定</button>
+        <button
+          class="btn primary"
+          disabled={modal.kind === 'session' && !modal.value.trim()}
+          on:click={submit}>确定</button>
       </div>
     </div>
   </div>

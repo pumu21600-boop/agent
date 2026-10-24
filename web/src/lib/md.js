@@ -2,7 +2,7 @@
 // 安全第一：先整体转义 HTML，再在已转义文本上做结构替换——{@html} 吃到的串里
 // 任何原始 < > 都已是 &lt; &gt;，模型输出/插件消息里的 HTML 永远不会被执行。
 // 支持：``` 围栏代码块、`行内代码`、**粗体**、*斜体*、### 标题、- 列表、1. 有序列表、
-// > 引用、--- 分隔线、[文字](http(s)链接)。链接只放行 http/https，其余协议剥成纯文本。
+// > 引用、--- 分隔线、GFM 表格（| 表头 | + | --- | 分隔行）、[文字](http(s)链接)。链接只放行 http/https，其余协议剥成纯文本。
 export function md(src) {
   if (!src) return '';
   // 1) 整体转义（引号也转，防属性注入）
@@ -43,7 +43,17 @@ export function md(src) {
     if (url.startsWith('/api/workspace/')) return `<a class="md-a doc-cite" href="${url}">${text}</a>`;
     return text;
   });
-  // 8) 列表（- / * / + 与 1. 两种；连续行整组成 ul/ol）
+  // 8) GFM 表格：首行含 |、次行是 | --- | 分隔行（:--- 左对齐只作识别、对齐样式不做）
+  t = t.replace(/(?:^[ \t]*\|?.*\|.*\n?)+/gm, (block) => {
+    const lines = block.trimEnd().split('\n').map((l) => l.trim());
+    if (lines.length < 2 || !/^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[1])) return block;
+    const cells = (l) => l.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+    const head = cells(lines[0]).map((c) => `<th>${c}</th>`).join('');
+    const rows = lines.slice(2).filter((l) => /\|/.test(l))
+      .map((l) => `<tr>${cells(l).map((c) => `<td>${c}</td>`).join('')}</tr>`).join('');
+    return `<table class="md-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+  });
+  // 9) 列表（- / * / + 与 1. 两种；连续行整组成 ul/ol）
   t = t.replace(/(?:^[ \t]*[-*+]\s+.+\n?)+/gm, (block) => {
     const items = block.trimEnd().split('\n').map((l) => `<li>${l.replace(/^[ \t]*[-*+]\s+/, '')}</li>`).join('');
     return `<ul class="md-ul">${items}</ul>`;
@@ -52,18 +62,18 @@ export function md(src) {
     const items = block.trimEnd().split('\n').map((l) => `<li>${l.replace(/^[ \t]*\d+[.、]\s+/, '')}</li>`).join('');
     return `<ol class="md-ol">${items}</ol>`;
   });
-  // 9) 引用
+  // 10) 引用
   t = t.replace(/(?:^&gt;\s?.+\n?)+/gm, (block) => {
     const lines = block.trimEnd().split('\n').map((l) => l.replace(/^&gt;\s?/, '')).join('<br />');
     return `<blockquote class="md-quote">${lines}</blockquote>`;
   });
-  // 10) 段落与换行：双换行分段，单换行转 <br>
+  // 11) 段落与换行：双换行分段，单换行转 <br>
   t = t
     .split(/\n{2,}/)
-    .map((p) => (p.trim() && !/^<(h[1-6]|ul|ol|pre|hr|blockquote|div)\b/i.test(p.trim()) ? `<p class="md-p">${p.trim()}</p>` : p.trim()))
+    .map((p) => (p.trim() && !/^<(h[1-6]|ul|ol|pre|hr|blockquote|div|table)\b/i.test(p.trim()) ? `<p class="md-p">${p.trim()}</p>` : p.trim()))
     .join('');
   t = t.replace(/\n/g, '<br />');
-  // 11) 还原占位
+  // 12) 还原占位
   t = t.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]).replace(/\u0001(\d+)\u0001/g, (_, i) => codes[+i]);
   return t;
 }

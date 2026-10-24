@@ -460,7 +460,6 @@
       rpFiles = [];
       rpArtifactsNote = '';
       rpWarn = '';
-      rpReviewBaseline = '';
       if (rpTab === 'git') loadReview();
       else if (rpTab === 'artifacts') loadArtifacts();
     } catch (e) {
@@ -1893,7 +1892,6 @@
       return;
     }
     rpArtifactsNote = '';
-    rpReviewBaseline = baseline;
     try {
       const r = await fetch(`/api/changes?baseline=${encodeURIComponent(baseline)}`).then((x) => x.json());
       rpFiles = r.files || [];
@@ -3157,7 +3155,7 @@
       // （2026-09-29 用户实锤「只回复两个字：收到」轮）；侧栏「未分组」里仍可手动打开。
       if (autoPick && currentSessionId === null) {
         const mine = sessions.filter(
-          (s) => s.workspace && normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase(),
+          (s) => !s.archived && s.workspace && normPath(s.workspace).toLowerCase() === normPath(workspace).toLowerCase(),
         );
         if (mine.length) await loadSession(mine[0].id);
       }
@@ -3268,7 +3266,6 @@
       rpFiles = [];
       rpArtifactsNote = '';
       rpWarn = '';
-      rpReviewBaseline = '';
       if (rpTab === 'git') loadReview();
       else if (rpTab === 'artifacts') loadArtifacts();
     } catch (e) {
@@ -3617,6 +3614,14 @@
       body: JSON.stringify({ id: s.id, archived: !s.archived }),
     });
     await loadSessions();
+    // 归档的正是当前会话：切到同项目最近一条未归档会话，没有则回新会话空态。
+    // 不切的话服务端 current 仍指向归档会话——侧栏看不见它，输入却还在往里写
+    // （2026-10-24 E2E D2 实锤：归档当前会话后发消息，消息进了归档会话）。
+    if (s.id === currentSessionId && !s.archived) {
+      const next = sessions.find((x) => !x.archived && x.id !== s.id);
+      if (next) await loadSession(next.id);
+      else await startNewSession();
+    }
   }
 
   async function forkSession(id) {
@@ -9104,6 +9109,24 @@
     padding: 10px 12px;
     margin: 6px 0 10px;
     overflow-x: auto;
+  }
+  .content .md-table {
+    border-collapse: collapse;
+    margin: 6px 0 10px;
+    font-size: 13px;
+    display: block;
+    overflow-x: auto;
+    white-space: normal;
+  }
+  .content .md-table th,
+  .content .md-table td {
+    border: 1px solid var(--g3);
+    padding: 5px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .content .md-table th {
+    background: var(--g1);
   }
   .content .md-pre code {
     font: 12px/1.55 Consolas, 'Cascadia Code', monospace;

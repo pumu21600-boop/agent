@@ -503,7 +503,7 @@ impl Gateway {
         let response = self
             .send(base_url, |c| Self::auth(c.get(&url), api_key, protocol))
             .await
-            .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"))?;
+            .with_context(|| format!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）"))?;
 
         let status = response.status();
         observability::event(EventType::State, json!({ "kind": "gateway.response", "status": status.as_u16() }));
@@ -842,7 +842,7 @@ impl Gateway {
             Ok(r) => r,
             Err(e) => {
                 record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
-                return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
+                return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）"));
             }
         };
 
@@ -875,7 +875,7 @@ impl Gateway {
                 Ok(r) => r,
                 Err(e) => {
                     record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
-                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
+                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）"));
                 }
             };
             if response.status().is_success() {
@@ -909,7 +909,7 @@ impl Gateway {
                 Ok(r) => r,
                 Err(e) => {
                     record_usage(ctx, base_url, provider_id.as_deref(), model, started.elapsed().as_millis() as u64, UsageOutcome::err("error", format!("{e:#}")));
-                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理或本机网络）"));
+                    return Err(anyhow!("请求渠道失败: {url}（网络层不通：检查 Clash/系统代理；若程序刚重新构建过，可能是安全软件拦了新程序的联网）"));
                 }
             };
             if response.status().is_success() {
